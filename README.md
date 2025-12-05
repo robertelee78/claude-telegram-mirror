@@ -102,7 +102,7 @@ Now your bot can see all messages in the group.
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/claude-telegram-mirror.git
+git clone https://github.com/robertelee78/claude-telegram-mirror.git
 cd claude-telegram-mirror
 
 # Install dependencies
@@ -117,22 +117,43 @@ node dist/cli.js install-hooks
 
 ## Configuration
 
-Set environment variables in your shell profile (`~/.bashrc` or `~/.zshrc`):
+### Step 1: Create Environment File
+
+Create `~/.telegram-env` with your credentials:
 
 ```bash
-# Required
+cat > ~/.telegram-env << 'EOF'
 export TELEGRAM_BOT_TOKEN="123456789:ABCdefGHIjklMNOpqrsTUVwxyz"
 export TELEGRAM_CHAT_ID="-1001234567890"
-
-# Optional
-export TELEGRAM_MIRROR=true               # Enable/disable mirroring
-export TELEGRAM_MIRROR_VERBOSE=false      # Show tool execution details
+export TELEGRAM_MIRROR=true
+EOF
 ```
 
-Then reload your shell:
+> **Why a separate file?** Most `.bashrc` files exit early for non-interactive shells (`case $- in *i*) ...`), which breaks background daemons. The `~/.telegram-env` file ensures variables are available regardless of shell mode.
+
+### Step 2: Source in Your Shell Profile
+
+Add to your `~/.bashrc` or `~/.zshrc`:
+
+```bash
+# Source Telegram mirror config
+[[ -f ~/.telegram-env ]] && source ~/.telegram-env
+```
+
+Then reload:
 ```bash
 source ~/.bashrc  # or source ~/.zshrc
 ```
+
+### Environment Variables
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `TELEGRAM_BOT_TOKEN` | Bot token from BotFather | Required |
+| `TELEGRAM_CHAT_ID` | Target chat/group ID | Required |
+| `TELEGRAM_MIRROR` | Enable mirroring | `false` |
+| `TELEGRAM_MIRROR_VERBOSE` | Show tool execution | `false` |
+| `TELEGRAM_BRIDGE_SOCKET` | Socket path | `/tmp/claude-telegram-bridge.sock` |
 
 ### Test Your Configuration
 
@@ -152,10 +173,13 @@ You should see:
 ### Start the Bridge
 
 ```bash
-# Run in foreground
-claude-telegram-mirror start
+# Using the startup script (recommended - handles env vars properly)
+./scripts/start-daemon.sh
 
-# Or use the CLI directly
+# Run in background
+nohup ./scripts/start-daemon.sh > /tmp/telegram-daemon.log 2>&1 &
+
+# Or use the CLI directly (requires env vars in current shell)
 node dist/cli.js start
 ```
 
@@ -304,16 +328,6 @@ tmux list-sessions
 # Check bridge logs for tmux target
 # Should show: "Session tmux target stored"
 ```
-
-## Environment Variables
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `TELEGRAM_BOT_TOKEN` | Bot token from BotFather | Required |
-| `TELEGRAM_CHAT_ID` | Target chat/group ID | Required |
-| `TELEGRAM_MIRROR` | Enable mirroring | `false` |
-| `TELEGRAM_MIRROR_VERBOSE` | Show tool execution | `false` |
-| `TELEGRAM_BRIDGE_SOCKET` | Socket path | `/tmp/claude-telegram-bridge.sock` |
 
 ## License
 

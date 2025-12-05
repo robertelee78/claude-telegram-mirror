@@ -32,6 +32,9 @@ Thumbs.db
 *.swp
 *.swo
 
+# Claude Flow metrics (generated)
+.claude-flow/metrics/
+
 # npm
 npm-debug.log*
 package-lock.json
