@@ -111,8 +111,12 @@ npm install
 # Build
 npm run build
 
-# Install Claude Code hooks
+# Install Claude Code hooks (global)
 node dist/cli.js install-hooks
+
+# Or install to a specific project (run from project directory)
+cd /path/to/your/project
+node /path/to/claude-telegram-mirror/dist/cli.js install-hooks --project
 ```
 
 ## Configuration
@@ -239,13 +243,20 @@ claude
 ### Commands
 
 ```bash
-claude-telegram-mirror start          # Start the bridge daemon
-claude-telegram-mirror status         # Show bridge status
-claude-telegram-mirror install-hooks  # Install Claude Code hooks
-claude-telegram-mirror uninstall-hooks # Remove hooks
-claude-telegram-mirror hooks          # Show hook status
-claude-telegram-mirror config         # Show configuration
-claude-telegram-mirror config --test  # Test Telegram connection
+# Daemon
+node dist/cli.js start                    # Start the bridge daemon
+node dist/cli.js status                   # Show bridge status
+
+# Hooks
+node dist/cli.js install-hooks            # Install hooks (global ~/.claude/settings.json)
+node dist/cli.js install-hooks --project  # Install hooks to current project
+node dist/cli.js install-hooks --force    # Force reinstall
+node dist/cli.js uninstall-hooks          # Remove hooks
+node dist/cli.js hooks                    # Show hook status
+
+# Configuration
+node dist/cli.js config                   # Show configuration
+node dist/cli.js config --test            # Test Telegram connection
 ```
 
 ## How Mirroring Works
@@ -272,7 +283,7 @@ When you send a message in the session's Forum Topic:
 ## Architecture
 
 ```
-packages/claude-telegram-mirror/
+claude-telegram-mirror/
 ├── src/
 │   ├── bot/
 │   │   ├── telegram.ts      # Telegram bot wrapper (grammy)
@@ -285,13 +296,14 @@ packages/claude-telegram-mirror/
 │   │   ├── injector.ts      # tmux input injection
 │   │   └── types.ts         # TypeScript types
 │   ├── hooks/
-│   │   └── installer.ts     # Hook installation
+│   │   └── installer.ts     # Hook installation (global + project)
 │   ├── utils/
 │   │   ├── config.ts        # Configuration loading
 │   │   └── logger.ts        # Logging (pino)
 │   └── cli.ts               # CLI entry point
 ├── scripts/
-│   └── telegram-hook.sh     # Hook script (called by Claude Code)
+│   ├── telegram-hook.sh     # Hook script (called by Claude Code)
+│   └── start-daemon.sh      # Startup script (sources ~/.telegram-env)
 └── dist/                    # Compiled JavaScript
 ```
 
@@ -329,6 +341,20 @@ Messages sent from Telegram are tracked to prevent echo:
 
 ## Troubleshooting
 
+### Hooks not firing (project has custom settings)
+
+If your project has `.claude/settings.json` with custom hooks, those override global hooks:
+
+```bash
+# Check if project has local settings
+ls -la .claude/settings.json
+
+# Install hooks to project (from project directory)
+node /path/to/claude-telegram-mirror/dist/cli.js install-hooks --project
+
+# Restart Claude Code after installing
+```
+
 ### Bridge not receiving events
 
 ```bash
@@ -338,8 +364,8 @@ ls -la /tmp/claude-telegram-bridge.sock
 # Check hook debug log
 cat /tmp/telegram-hook-debug.log
 
-# Verify hooks are installed
-claude-telegram-mirror hooks
+# Verify hooks are installed (global)
+node dist/cli.js hooks
 ```
 
 ### Messages going to wrong topic
