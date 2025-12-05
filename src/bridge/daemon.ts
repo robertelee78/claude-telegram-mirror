@@ -5,7 +5,7 @@
 
 import { EventEmitter } from 'events';
 import { TelegramBot } from '../bot/telegram.js';
-import { registerCommands, registerApprovalHandlers } from '../bot/commands.js';
+import { registerCommands, registerApprovalHandlers, registerToolDetailsHandler } from '../bot/commands.js';
 import { SocketServer } from './socket.js';
 import { SessionManager } from './session.js';
 import { InputInjector } from './injector.js';
@@ -36,6 +36,7 @@ export class BridgeDaemon extends EventEmitter {
   private sessionThreads: Map<string, number> = new Map(); // sessionId -> threadId
   private sessionTmuxTargets: Map<string, string> = new Map(); // sessionId -> tmux target
   private recentTelegramInputs: Set<string> = new Set(); // Track recent inputs from Telegram to avoid echo
+  private toolInputCache: Map<string, { tool: string; input: unknown; timestamp: number }> = new Map(); // Cache tool inputs for details button
 
   constructor(config?: TelegramMirrorConfig) {
     super();
@@ -102,6 +103,13 @@ export class BridgeDaemon extends EventEmitter {
           content: text
         }), true;
       }
+    });
+
+    // Register tool details handler (tap "Details" button on tool use messages)
+    registerToolDetailsHandler(this.bot.getBot(), (toolUseId: string) => {
+      const cached = this.toolInputCache.get(toolUseId);
+      if (!cached) return undefined;
+      return { tool: cached.tool, input: cached.input };
     });
 
     // Register approval handlers
@@ -470,14 +478,65 @@ export class BridgeDaemon extends EventEmitter {
     if (!this.config.verbose) return;
 
     const toolName = msg.metadata?.tool as string || 'Unknown';
+    const toolInput = msg.metadata?.input as Record<string, unknown> | undefined;
     const threadId = this.getSessionThreadId(msg.sessionId);
 
-    // Brief notification that a tool is running
-    await this.bot.sendMessage(
-      `🔧 *Running:* \`${toolName}\``,
-      { parseMode: 'Markdown' },
-      threadId
-    );
+    // Format brief preview based on tool type
+    let preview = '';
+    if (toolInput) {
+      if (toolName === 'Read' && toolInput.file_path) {
+        preview = ` \`${this.truncatePath(toolInput.file_path as string)}\``;
+      } else if (toolName === 'Write' && toolInput.file_path) {
+        preview = ` \`${this.truncatePath(toolInput.file_path as string)}\``;
+      } else if (toolName === 'Edit' && toolInput.file_path) {
+        preview = ` \`${this.truncatePath(toolInput.file_path as string)}\``;
+      } else if (toolName === 'Bash' && toolInput.command) {
+        const cmd = (toolInput.command as string).slice(0, 40);
+        preview = `\n\`${cmd}${(toolInput.command as string).length > 40 ? '...' : ''}\``;
+      } else if (toolName === 'Grep' && toolInput.pattern) {
+        preview = ` \`${toolInput.pattern}\``;
+      } else if (toolName === 'Glob' && toolInput.pattern) {
+        preview = ` \`${toolInput.pattern}\``;
+      } else if (toolName === 'Task' && toolInput.description) {
+        preview = ` ${toolInput.description}`;
+      }
+    }
+
+    // Generate unique ID for this tool use
+    const toolUseId = `tool_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+
+    // Store tool input for detail retrieval (with 5 min expiry)
+    this.toolInputCache.set(toolUseId, {
+      tool: toolName,
+      input: toolInput,
+      timestamp: Date.now()
+    });
+    setTimeout(() => this.toolInputCache.delete(toolUseId), 5 * 60 * 1000);
+
+    // Send with "Details" button if there's input to show
+    if (toolInput && Object.keys(toolInput).length > 0) {
+      await this.bot.sendWithButtons(
+        `🔧 *Running:* \`${toolName}\`${preview}`,
+        [{ text: '📋 Details', callbackData: `tooldetails:${toolUseId}` }],
+        { parseMode: 'Markdown' },
+        threadId
+      );
+    } else {
+      await this.bot.sendMessage(
+        `🔧 *Running:* \`${toolName}\`${preview}`,
+        { parseMode: 'Markdown' },
+        threadId
+      );
+    }
+  }
+
+  /**
+   * Truncate file path to show basename and parent
+   */
+  private truncatePath(path: string): string {
+    const parts = path.split('/');
+    if (parts.length <= 3) return path;
+    return `.../${parts.slice(-2).join('/')}`;
   }
 
   private async handleToolResult(msg: BridgeMessage): Promise<void> {

@@ -300,4 +300,50 @@ export function registerApprovalHandlers(
   });
 }
 
+/**
+ * Register tool details handler
+ */
+export function registerToolDetailsHandler(
+  bot: Bot<BotContext>,
+  getToolDetails: (toolUseId: string) => { tool: string; input: unknown } | undefined
+): void {
+  bot.callbackQuery(/^tooldetails:(.+)$/, async (ctx) => {
+    const toolUseId = ctx.match![1];
+
+    try {
+      const details = getToolDetails(toolUseId);
+
+      if (!details) {
+        await ctx.answerCallbackQuery({ text: 'Details expired (5 min cache)', show_alert: true });
+        return;
+      }
+
+      // Format the input nicely
+      const inputStr = typeof details.input === 'string'
+        ? details.input
+        : JSON.stringify(details.input, null, 2);
+
+      // Truncate if too long for Telegram
+      const truncatedInput = inputStr.length > 3000
+        ? inputStr.slice(0, 3000) + '\n... (truncated)'
+        : inputStr;
+
+      // Reply with full details (don't edit original - keep it clean)
+      await ctx.reply(
+        `📋 *Tool Details: ${details.tool}*\n\n\`\`\`json\n${truncatedInput}\n\`\`\``,
+        {
+          parse_mode: 'Markdown',
+          reply_parameters: { message_id: ctx.callbackQuery.message?.message_id || 0 }
+        }
+      );
+
+      await ctx.answerCallbackQuery();
+
+    } catch (error) {
+      logger.error('Failed to show tool details', { toolUseId, error });
+      await ctx.answerCallbackQuery({ text: 'Error loading details' });
+    }
+  });
+}
+
 export default registerCommands;
