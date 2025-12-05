@@ -77,16 +77,16 @@ function getHookScriptPath(): string {
 /**
  * Load Claude settings
  */
-function loadSettings(): ClaudeSettings {
-  if (!existsSync(CLAUDE_SETTINGS_FILE)) {
+function loadSettings(settingsPath: string = CLAUDE_SETTINGS_FILE): ClaudeSettings {
+  if (!existsSync(settingsPath)) {
     return {};
   }
 
   try {
-    const content = readFileSync(CLAUDE_SETTINGS_FILE, 'utf8');
+    const content = readFileSync(settingsPath, 'utf8');
     return JSON.parse(content);
   } catch (error) {
-    logger.warn('Failed to parse Claude settings, starting fresh', { error });
+    logger.warn('Failed to parse Claude settings, starting fresh', { error, path: settingsPath });
     return {};
   }
 }
@@ -94,13 +94,13 @@ function loadSettings(): ClaudeSettings {
 /**
  * Save Claude settings
  */
-function saveSettings(settings: ClaudeSettings): void {
+function saveSettings(settings: ClaudeSettings, settingsPath: string = CLAUDE_SETTINGS_FILE, configDir: string = CLAUDE_CONFIG_DIR): void {
   // Ensure directory exists
-  if (!existsSync(CLAUDE_CONFIG_DIR)) {
-    mkdirSync(CLAUDE_CONFIG_DIR, { recursive: true });
+  if (!existsSync(configDir)) {
+    mkdirSync(configDir, { recursive: true });
   }
 
-  writeFileSync(CLAUDE_SETTINGS_FILE, JSON.stringify(settings, null, 2));
+  writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
 }
 
 /**
@@ -125,14 +125,39 @@ function isHookInstalled(hooks: ClaudeHookConfig[] | undefined, scriptPath: stri
 /**
  * Install Telegram hooks
  */
-export function installHooks(options: { force?: boolean } = {}): {
+export function installHooks(options: { force?: boolean; project?: boolean } = {}): {
   success: boolean;
   installed: string[];
   skipped: string[];
+  settingsPath: string;
   error?: string;
 } {
   const installed: string[] = [];
   const skipped: string[] = [];
+
+  // Determine which settings file to use
+  let settingsPath = CLAUDE_SETTINGS_FILE;
+  let configDir = CLAUDE_CONFIG_DIR;
+
+  if (options.project) {
+    // Use current directory's .claude/settings.json
+    const projectSettings = join(process.cwd(), '.claude', 'settings.json');
+    const projectConfigDir = join(process.cwd(), '.claude');
+
+    if (!existsSync(projectConfigDir)) {
+      return {
+        success: false,
+        installed,
+        skipped,
+        settingsPath: projectSettings,
+        error: `No .claude directory found in ${process.cwd()}. Run from a Claude project directory.`
+      };
+    }
+
+    settingsPath = projectSettings;
+    configDir = projectConfigDir;
+    logger.info('Installing to project settings', { path: settingsPath });
+  }
 
   try {
     const scriptPath = getHookScriptPath();
@@ -141,21 +166,17 @@ export function installHooks(options: { force?: boolean } = {}): {
     // Ensure script is executable
     chmodSync(scriptPath, 0o755);
 
-    const settings = loadSettings();
+    const settings = loadSettings(settingsPath);
 
     // Initialize hooks object if needed
     if (!settings.hooks) {
       settings.hooks = {};
     }
 
-    // Hook types to install
-    const hookTypes = [
-      'PreToolUse',
-      'PostToolUse',
-      'Notification',
-      'Stop',
-      'UserPromptSubmit'
-    ];
+    // Hook types to install (fewer for project - just the essentials)
+    const hookTypes = options.project
+      ? ['Notification', 'Stop', 'UserPromptSubmit']
+      : ['PreToolUse', 'PostToolUse', 'Notification', 'Stop', 'UserPromptSubmit'];
 
     for (const hookType of hookTypes) {
       const existingHooks = settings.hooks[hookType];
@@ -165,28 +186,35 @@ export function installHooks(options: { force?: boolean } = {}): {
         continue;
       }
 
-      // Remove old telegram hooks if present
-      const filteredHooks = existingHooks?.filter(
-        h => !h.command.includes('telegram-hook')
-      ) || [];
+      // Handle array format (simple hooks)
+      if (Array.isArray(existingHooks)) {
+        // Remove old telegram hooks if present
+        const filteredHooks = existingHooks.filter(
+          h => !h.command?.includes('telegram-hook')
+        );
 
-      // Add new hook
-      filteredHooks.push(createHookConfig(scriptPath));
+        // Add new hook at the beginning (runs first)
+        filteredHooks.unshift(createHookConfig(scriptPath));
 
-      settings.hooks[hookType] = filteredHooks;
-      installed.push(hookType);
+        settings.hooks[hookType] = filteredHooks;
+        installed.push(hookType);
+      } else {
+        // No existing hooks, create new array
+        settings.hooks[hookType] = [createHookConfig(scriptPath)];
+        installed.push(hookType);
+      }
     }
 
-    saveSettings(settings);
+    saveSettings(settings, settingsPath, configDir);
 
-    logger.info('Hooks installed', { installed, skipped });
+    logger.info('Hooks installed', { installed, skipped, settingsPath });
 
-    return { success: true, installed, skipped };
+    return { success: true, installed, skipped, settingsPath };
 
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
     logger.error('Failed to install hooks', { error: errorMessage });
-    return { success: false, installed, skipped, error: errorMessage };
+    return { success: false, installed, skipped, settingsPath, error: errorMessage };
   }
 }
 

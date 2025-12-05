@@ -174,10 +174,15 @@ program
   .command('install-hooks')
   .description('Install Claude Code hooks')
   .option('-f, --force', 'Force reinstall hooks')
+  .option('-p, --project', 'Install to current project\'s .claude/settings.json (run from project directory)')
   .action((options) => {
-    console.log('📌 Installing Claude Code hooks...\n');
+    if (options.project) {
+      console.log(`📌 Installing hooks to project: ${process.cwd()}\n`);
+    } else {
+      console.log('📌 Installing Claude Code hooks (global)...\n');
+    }
 
-    const result = installHooks({ force: options.force });
+    const result = installHooks({ force: options.force, project: options.project });
 
     if (result.success) {
       if (result.installed.length > 0) {
@@ -188,7 +193,11 @@ program
         console.log('\n⚪ Already installed:');
         result.skipped.forEach(h => console.log(`   • ${h}`));
       }
-      console.log('\n✅ Hooks installed successfully\n');
+      console.log(`\n✅ Hooks installed to: ${result.settingsPath}\n`);
+
+      if (options.project) {
+        console.log('💡 Restart Claude Code in this project to activate hooks.\n');
+      }
     } else {
       console.error('❌ Failed to install hooks:', result.error);
       process.exit(1);

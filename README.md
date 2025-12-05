@@ -168,6 +168,47 @@ You should see:
 ✅ Test message sent to chat
 ```
 
+### Project-Level Settings (Important!)
+
+If your project has its own `.claude/settings.json` with custom hooks, those **override** the global hooks. You'll need to add the telegram hook to your project settings.
+
+Add this to your project's `.claude/settings.json` hooks section:
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "type": "command",
+        "command": "/opt/claude-telegram-mirror/scripts/telegram-hook.sh",
+        "timeout": 300000
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "/opt/claude-telegram-mirror/scripts/telegram-hook.sh",
+        "timeout": 300000
+      }
+    ],
+    "Notification": [
+      {
+        "type": "command",
+        "command": "/opt/claude-telegram-mirror/scripts/telegram-hook.sh",
+        "timeout": 300000
+      }
+    ]
+  }
+}
+```
+
+Or use this one-liner to add hooks to your current project:
+
+```bash
+# From your project directory
+node /opt/claude-telegram-mirror/dist/cli.js install-hooks --project
+```
+
 ## Usage
 
 ### Start the Bridge
