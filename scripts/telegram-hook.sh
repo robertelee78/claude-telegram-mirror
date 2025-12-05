@@ -201,26 +201,54 @@ format_message() {
 
     "Stop")
       local transcript_path=$(echo "$input" | jq -r '.transcript_path // ""')
-      local stop_hook_active=$(echo "$input" | jq -r '.stop_hook_active // "false"')
 
-      # Extract Claude's LATEST response from transcript
-      # This is how we capture assistant output since there's no AssistantResponse hook
+      # Extract NEW text content since last Stop
+      # Track what we've sent to avoid duplicates
       if [[ -n "$transcript_path" && -f "$transcript_path" ]]; then
         debug_log "Reading transcript: $transcript_path"
-        # Get the LAST assistant text response only (not all of them)
-        local last_response=$(grep '"type":"assistant"' "$transcript_path" 2>/dev/null | \
-          tail -1 | \
-          jq -r '.message.content[]? | select(.type == "text") | .text' 2>/dev/null)
 
-        debug_log "Last response: ${last_response:0:100}"
+        # Track last processed line using a state file
+        local state_file="$CONFIG_DIR/.last_line_${SESSION_ID}"
+        local last_line=0
+        if [[ -f "$state_file" ]]; then
+          last_line=$(cat "$state_file" 2>/dev/null || echo 0)
+        fi
 
-        if [[ -n "$last_response" ]]; then
-          jq -cn \
-            --arg type "agent_response" \
-            --arg sessionId "$SESSION_ID" \
-            --arg timestamp "$timestamp" \
-            --arg content "$last_response" \
-            '{type: $type, sessionId: $sessionId, timestamp: $timestamp, content: $content}'
+        local current_line=$(wc -l < "$transcript_path")
+        debug_log "Last processed: $last_line, Current: $current_line"
+
+        # Only process new lines
+        if [[ $current_line -gt $last_line ]]; then
+          local new_lines=$((current_line - last_line))
+          local all_text=""
+
+          # Process only NEW lines
+          while IFS= read -r line; do
+            local text=$(echo "$line" | jq -r 'select(.type == "assistant") | .message.content[]? | select(.type == "text") | .text' 2>/dev/null)
+            if [[ -n "$text" ]]; then
+              if [[ -n "$all_text" ]]; then
+                all_text="${all_text}
+
+${text}"
+              else
+                all_text="$text"
+              fi
+            fi
+          done < <(tail -n "$new_lines" "$transcript_path")
+
+          debug_log "New text length: ${#all_text}"
+
+          if [[ -n "$all_text" ]]; then
+            jq -cn \
+              --arg type "agent_response" \
+              --arg sessionId "$SESSION_ID" \
+              --arg timestamp "$timestamp" \
+              --arg content "$all_text" \
+              '{type: $type, sessionId: $sessionId, timestamp: $timestamp, content: $content}'
+          fi
+
+          # Update state
+          echo "$current_line" > "$state_file"
         fi
       fi
 
