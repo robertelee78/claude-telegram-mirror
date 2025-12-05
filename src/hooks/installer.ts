@@ -17,7 +17,7 @@ const CLAUDE_SETTINGS_FILE = join(CLAUDE_CONFIG_DIR, 'settings.json');
 const HOOK_SCRIPT_NAME = 'telegram-hook.sh';
 
 /**
- * Hook configuration for Claude Code
+ * Hook configuration for Claude Code (old format)
  */
 interface ClaudeHookConfig {
   type: 'command';
@@ -25,14 +25,25 @@ interface ClaudeHookConfig {
   timeout?: number;
 }
 
+/**
+ * Hook entry with matcher wrapper (required format for Claude Code)
+ */
+interface ClaudeHookEntry {
+  matcher: string;
+  hooks: ClaudeHookConfig[];
+}
+
+// Union type for hooks (can be old or new format)
+type ClaudeHookItem = ClaudeHookConfig | ClaudeHookEntry;
+
 interface ClaudeSettings {
   hooks?: {
-    PreToolUse?: ClaudeHookConfig[];
-    PostToolUse?: ClaudeHookConfig[];
-    Notification?: ClaudeHookConfig[];
-    Stop?: ClaudeHookConfig[];
-    UserPromptSubmit?: ClaudeHookConfig[];
-    [key: string]: ClaudeHookConfig[] | undefined;
+    PreToolUse?: ClaudeHookItem[];
+    PostToolUse?: ClaudeHookItem[];
+    Notification?: ClaudeHookItem[];
+    Stop?: ClaudeHookItem[];
+    UserPromptSubmit?: ClaudeHookItem[];
+    [key: string]: ClaudeHookItem[] | undefined;
   };
   [key: string]: unknown;
 }
@@ -104,22 +115,37 @@ function saveSettings(settings: ClaudeSettings, settingsPath: string = CLAUDE_SE
 }
 
 /**
- * Create hook configuration
+ * Create hook configuration with required matcher wrapper
+ * Claude Code requires: { matcher: "", hooks: [{ type, command }] }
  */
-function createHookConfig(scriptPath: string): ClaudeHookConfig {
+function createHookEntry(scriptPath: string): ClaudeHookEntry {
   return {
-    type: 'command',
-    command: scriptPath,
-    timeout: 300000 // 5 minutes for approvals
+    matcher: '',
+    hooks: [
+      {
+        type: 'command',
+        command: scriptPath
+      }
+    ]
   };
 }
 
 /**
- * Check if hook is already installed
+ * Check if hook is already installed (handles both old and new format)
  */
-function isHookInstalled(hooks: ClaudeHookConfig[] | undefined, scriptPath: string): boolean {
+function isHookInstalled(hooks: (ClaudeHookConfig | ClaudeHookEntry)[] | undefined, scriptPath: string): boolean {
   if (!hooks) return false;
-  return hooks.some(h => h.command === scriptPath || h.command.includes('telegram-hook'));
+  return hooks.some(h => {
+    // New format: { matcher, hooks: [...] }
+    if ('hooks' in h && Array.isArray(h.hooks)) {
+      return h.hooks.some(hh => hh.command?.includes('telegram-hook'));
+    }
+    // Old format: { type, command }
+    if ('command' in h) {
+      return h.command === scriptPath || h.command.includes('telegram-hook');
+    }
+    return false;
+  });
 }
 
 /**
@@ -186,21 +212,27 @@ export function installHooks(options: { force?: boolean; project?: boolean } = {
         continue;
       }
 
-      // Handle array format (simple hooks)
+      // Handle array format
       if (Array.isArray(existingHooks)) {
-        // Remove old telegram hooks if present
-        const filteredHooks = existingHooks.filter(
-          h => !h.command?.includes('telegram-hook')
-        );
+        // Remove old telegram hooks if present (handles both formats)
+        const filteredHooks = existingHooks.filter(h => {
+          if ('hooks' in h && Array.isArray(h.hooks)) {
+            return !h.hooks.some(hh => hh.command?.includes('telegram-hook'));
+          }
+          if ('command' in h) {
+            return !h.command?.includes('telegram-hook');
+          }
+          return true;
+        });
 
-        // Add new hook at the beginning (runs first)
-        filteredHooks.unshift(createHookConfig(scriptPath));
+        // Add new hook at the beginning (runs first) - use correct format
+        filteredHooks.unshift(createHookEntry(scriptPath));
 
         settings.hooks[hookType] = filteredHooks;
         installed.push(hookType);
       } else {
-        // No existing hooks, create new array
-        settings.hooks[hookType] = [createHookConfig(scriptPath)];
+        // No existing hooks, create new array with correct format
+        settings.hooks[hookType] = [createHookEntry(scriptPath)];
         installed.push(hookType);
       }
     }
@@ -236,12 +268,20 @@ export function uninstallHooks(): {
     }
 
     for (const hookType of Object.keys(settings.hooks)) {
-      const hooks = settings.hooks[hookType];
+      const hooks = settings.hooks[hookType] as (ClaudeHookConfig | ClaudeHookEntry)[];
       if (!hooks) continue;
 
-      const filteredHooks = hooks.filter(
-        h => !h.command.includes('telegram-hook')
-      );
+      const filteredHooks = hooks.filter(h => {
+        // New format: { matcher, hooks: [...] }
+        if ('hooks' in h && Array.isArray(h.hooks)) {
+          return !h.hooks.some(hh => hh.command?.includes('telegram-hook'));
+        }
+        // Old format: { type, command }
+        if ('command' in h) {
+          return !h.command?.includes('telegram-hook');
+        }
+        return true;
+      });
 
       if (filteredHooks.length < hooks.length) {
         removed.push(hookType);
@@ -250,7 +290,7 @@ export function uninstallHooks(): {
       if (filteredHooks.length === 0) {
         delete settings.hooks[hookType];
       } else {
-        settings.hooks[hookType] = filteredHooks;
+        settings.hooks[hookType] = filteredHooks as ClaudeHookConfig[];
       }
     }
 
@@ -287,7 +327,18 @@ export function checkHookStatus(): {
 
     if (settings.hooks) {
       for (const [hookType, hookConfigs] of Object.entries(settings.hooks)) {
-        if (hookConfigs?.some(h => h.command.includes('telegram-hook'))) {
+        const configs = hookConfigs as (ClaudeHookConfig | ClaudeHookEntry)[];
+        if (configs?.some(h => {
+          // New format: { matcher, hooks: [...] }
+          if ('hooks' in h && Array.isArray(h.hooks)) {
+            return h.hooks.some(hh => hh.command?.includes('telegram-hook'));
+          }
+          // Old format: { type, command }
+          if ('command' in h) {
+            return h.command?.includes('telegram-hook');
+          }
+          return false;
+        })) {
           hooks.push(hookType);
         }
       }
