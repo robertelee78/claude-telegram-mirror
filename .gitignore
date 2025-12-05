@@ -1,0 +1,37 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Environment and secrets
+.env
+.env.local
+.env.*.local
+
+# Config with secrets
+config.json
+
+# SQLite database
+*.db
+*.db-journal
+
+# Debug logs
+*.log
+
+# Session tracking files
+.session_active_*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# npm
+npm-debug.log*
+package-lock.json

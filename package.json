@@ -1,0 +1,54 @@
+{
+  "name": "claude-telegram-mirror",
+  "version": "1.0.0",
+  "description": "Bidirectional Telegram integration for Claude Code CLI",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "claude-telegram-mirror": "./dist/cli.js",
+    "ctm": "./dist/cli.js",
+    "telegram-hook": "./scripts/telegram-hook.sh"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/cli.js start",
+    "daemon": "node dist/cli.js start --foreground",
+    "status": "node dist/cli.js status",
+    "install-hooks": "node dist/cli.js install-hooks",
+    "uninstall-hooks": "node dist/cli.js uninstall-hooks",
+    "test": "vitest",
+    "test:coverage": "vitest --coverage",
+    "lint": "eslint src/",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run build && npm test"
+  },
+  "keywords": [
+    "claude",
+    "telegram",
+    "cli",
+    "mirror",
+    "bot",
+    "claude-code"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "grammy": "^1.21.0",
+    "better-sqlite3": "^11.0.0",
+    "commander": "^12.0.0",
+    "winston": "^3.11.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.8",
+    "@types/node": "^20.10.0",
+    "typescript": "^5.3.0",
+    "vitest": "^1.0.0",
+    "eslint": "^8.55.0",
+    "@typescript-eslint/eslint-plugin": "^6.0.0",
+    "@typescript-eslint/parser": "^6.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

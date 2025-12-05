@@ -1,0 +1,618 @@
+/**
+ * Bridge Daemon
+ * Central coordinator for Claude Code ↔ Telegram bridge
+ */
+
+import { EventEmitter } from 'events';
+import { TelegramBot } from '../bot/telegram.js';
+import { registerCommands, registerApprovalHandlers } from '../bot/commands.js';
+import { SocketServer } from './socket.js';
+import { SessionManager } from './session.js';
+import { InputInjector } from './injector.js';
+import { loadConfig, TelegramMirrorConfig } from '../utils/config.js';
+import {
+  formatAgentResponse,
+  formatToolExecution,
+  formatApprovalRequest,
+  formatError,
+  formatSessionStart,
+  formatSessionEnd
+} from '../bot/formatting.js';
+import logger from '../utils/logger.js';
+import type { BridgeMessage } from './types.js';
+
+/**
+ * Bridge Daemon Class
+ * Orchestrates all components
+ */
+export class BridgeDaemon extends EventEmitter {
+  private config: TelegramMirrorConfig;
+  private bot: TelegramBot;
+  private socket: SocketServer;
+  private sessions: SessionManager;
+  private injector: InputInjector;
+  private running = false;
+  private cleanupInterval: NodeJS.Timeout | null = null;
+  private sessionThreads: Map<string, number> = new Map(); // sessionId -> threadId
+  private sessionTmuxTargets: Map<string, string> = new Map(); // sessionId -> tmux target
+  private recentTelegramInputs: Set<string> = new Set(); // Track recent inputs from Telegram to avoid echo
+
+  constructor(config?: TelegramMirrorConfig) {
+    super();
+    this.config = config || loadConfig();
+    this.bot = new TelegramBot(this.config);
+    this.socket = new SocketServer(this.config.socketPath);
+    this.sessions = new SessionManager();
+    this.injector = new InputInjector();
+  }
+
+  /**
+   * Start the daemon
+   */
+  async start(): Promise<void> {
+    if (this.running) {
+      logger.warn('Daemon already running');
+      return;
+    }
+
+    logger.info('Starting bridge daemon...');
+
+    // Start socket server
+    await this.socket.listen();
+
+    // Initialize input injector for Telegram → CLI
+    const injectorReady = await this.injector.init();
+    if (injectorReady) {
+      logger.info('Input injector ready', {
+        method: this.injector.getMethod(),
+        tmuxSession: this.injector.getTmuxSession()
+      });
+    } else {
+      logger.warn('Input injection not available - Telegram → CLI disabled');
+    }
+
+    // Setup message routing
+    this.setupSocketHandlers();
+    this.setupBotHandlers();
+
+    // Register bot commands
+    registerCommands(this.bot.getBot(), {
+      getActiveSessions: async () => {
+        return this.sessions.getActiveSessions().map(s => ({
+          id: s.id,
+          startedAt: s.startedAt,
+          projectDir: s.metadata?.projectDir as string | undefined
+        }));
+      },
+      abortSession: async (sessionId: string) => {
+        this.sessions.endSession(sessionId, 'aborted');
+        this.socket.broadcast({
+          type: 'command',
+          sessionId,
+          timestamp: new Date().toISOString(),
+          content: 'abort'
+        });
+        return true;
+      },
+      sendToSession: async (sessionId: string, text: string) => {
+        return this.socket.broadcast({
+          type: 'user_input',
+          sessionId,
+          timestamp: new Date().toISOString(),
+          content: text
+        }), true;
+      }
+    });
+
+    // Register approval handlers
+    registerApprovalHandlers(this.bot.getBot(), async (approvalId, action) => {
+      const approval = this.sessions.getApproval(approvalId);
+      if (!approval) {
+        logger.warn('Approval not found', { approvalId });
+        return;
+      }
+
+      if (action === 'abort') {
+        this.sessions.endSession(approval.sessionId, 'aborted');
+        this.sessions.resolveApproval(approvalId, 'rejected');
+        this.socket.broadcast({
+          type: 'command',
+          sessionId: approval.sessionId,
+          timestamp: new Date().toISOString(),
+          content: 'abort'
+        });
+      } else {
+        this.sessions.resolveApproval(approvalId, action === 'approve' ? 'approved' : 'rejected');
+        this.socket.broadcast({
+          type: 'approval_response',
+          sessionId: approval.sessionId,
+          timestamp: new Date().toISOString(),
+          content: action,
+          metadata: { approvalId }
+        });
+      }
+    });
+
+    // Start bot
+    await this.bot.start();
+
+    // Start cleanup interval (every 5 minutes)
+    this.cleanupInterval = setInterval(() => {
+      this.sessions.expireOldApprovals();
+    }, 5 * 60 * 1000);
+
+    this.running = true;
+    logger.info('Bridge daemon started');
+
+    // Send startup notification
+    await this.bot.sendMessage(
+      '🟢 *Bridge Daemon Started*\n\n' +
+      'Claude Code sessions will now be mirrored here.',
+      { parseMode: 'Markdown' }
+    );
+  }
+
+  /**
+   * Setup socket message handlers (CLI → Telegram)
+   */
+  private setupSocketHandlers(): void {
+    this.socket.on('message', async (msg: BridgeMessage) => {
+      logger.debug('Received socket message', { type: msg.type, sessionId: msg.sessionId });
+
+      // Update session activity
+      const session = this.sessions.getSession(msg.sessionId);
+      if (session) {
+        this.sessions.updateActivity(msg.sessionId);
+      }
+
+      switch (msg.type) {
+        case 'session_start':
+          await this.handleSessionStart(msg);
+          break;
+
+        case 'session_end':
+          await this.handleSessionEnd(msg);
+          break;
+
+        case 'agent_response':
+          await this.ensureSessionExists(msg);
+          await this.handleAgentResponse(msg);
+          break;
+
+        case 'tool_start':
+          await this.ensureSessionExists(msg);
+          await this.handleToolStart(msg);
+          break;
+
+        case 'tool_result':
+          await this.ensureSessionExists(msg);
+          await this.handleToolResult(msg);
+          break;
+
+        case 'user_input':
+          await this.ensureSessionExists(msg);
+          await this.handleUserInput(msg);
+          break;
+
+        case 'approval_request':
+          await this.ensureSessionExists(msg);
+          await this.handleApprovalRequest(msg);
+          break;
+
+        case 'error':
+          await this.ensureSessionExists(msg);
+          await this.handleError(msg);
+          break;
+
+        case 'turn_complete':
+          // Claude fires Stop after every turn, not when session ends
+          // Just log it and update activity - don't close the topic
+          logger.debug('Turn complete', { sessionId: msg.sessionId });
+          break;
+
+        default:
+          logger.debug('Unknown message type', { type: msg.type });
+      }
+    });
+
+    this.socket.on('connect', (clientId: string) => {
+      logger.debug('Hook client connected', { clientId });
+    });
+
+    this.socket.on('disconnect', (clientId: string) => {
+      logger.debug('Hook client disconnected', { clientId });
+    });
+  }
+
+  /**
+   * Setup bot message handlers (Telegram → CLI)
+   */
+  private setupBotHandlers(): void {
+    // Handle text messages (forward to CLI)
+    this.bot.onMessage(async (text, chatId) => {
+      const session = this.sessions.getSessionByChatId(chatId);
+
+      if (!session) {
+        // No active session - maybe user is just chatting
+        logger.debug('Message received but no session attached', { chatId });
+        return;
+      }
+
+      // Get the tmux target for this session if available
+      const tmuxTarget = this.sessionTmuxTargets.get(session.id);
+      if (tmuxTarget) {
+        this.injector.setTmuxSession(tmuxTarget);
+      }
+
+      // Track this input so we don't echo it back when the hook fires
+      const inputKey = `${session.id}:${text.trim()}`;
+      this.recentTelegramInputs.add(inputKey);
+      // Auto-remove after 10 seconds
+      setTimeout(() => this.recentTelegramInputs.delete(inputKey), 10000);
+
+      // Inject input into Claude Code via tmux
+      const injected = await this.injector.inject(text);
+
+      if (injected) {
+        logger.info('Injected input to CLI', { sessionId: session.id, method: this.injector.getMethod() });
+        // Silently inject - no confirmation needed, user already sees their message
+      } else {
+        logger.warn('Failed to inject input', { sessionId: session.id });
+
+        // Only notify on failure
+        const threadId = this.getSessionThreadId(session.id);
+        await this.bot.sendMessage(
+          `⚠️ *Could not send input to CLI*\n\nNo tmux session found. Make sure Claude Code is running in tmux.`,
+          { parseMode: 'Markdown' },
+          threadId
+        );
+      }
+
+      // Also broadcast to socket for logging/other listeners
+      this.socket.broadcast({
+        type: 'user_input',
+        sessionId: session.id,
+        timestamp: new Date().toISOString(),
+        content: text
+      });
+    });
+  }
+
+  // ============ Message Handlers ============
+
+  private async handleSessionStart(msg: BridgeMessage): Promise<void> {
+    const hostname = msg.metadata?.hostname as string | undefined;
+    const projectDir = msg.metadata?.projectDir as string | undefined;
+    const tmuxTarget = msg.metadata?.tmuxTarget as string | undefined;
+
+    // Use Claude's native session_id from the message
+    // This ensures all events from the same Claude session map to the same Telegram thread
+    const sessionId = this.sessions.createSession(
+      this.config.chatId,
+      projectDir,
+      undefined,
+      hostname,
+      msg.sessionId  // Use Claude's session_id!
+    );
+
+    // Store tmux target for input injection
+    if (tmuxTarget) {
+      this.sessionTmuxTargets.set(sessionId, tmuxTarget);
+      logger.info('Session tmux target stored', { sessionId, tmuxTarget });
+    }
+
+    // Try to create a forum topic for this session
+    let threadId: number | null = null;
+    if (this.config.useThreads) {
+      const topicName = this.formatTopicName(sessionId, hostname, projectDir);
+      threadId = await this.bot.createForumTopic(topicName, 0); // Blue color (index 0)
+
+      if (threadId) {
+        this.sessions.setSessionThread(sessionId, threadId);
+        this.sessionThreads.set(sessionId, threadId);
+        logger.info('Session thread created', { sessionId, threadId });
+      }
+    }
+
+    // Broadcast session registered (with Claude's session ID)
+    this.socket.broadcast({
+      type: 'session_start',
+      sessionId,
+      timestamp: new Date().toISOString(),
+      content: 'Session registered',
+      metadata: { threadId }
+    });
+
+    // Build session info message
+    let sessionInfo = formatSessionStart(sessionId, projectDir, hostname);
+    if (tmuxTarget) {
+      sessionInfo += `\n📺 tmux: \`${tmuxTarget}\``;
+    }
+
+    // Notify user (in the thread if available)
+    await this.bot.sendMessage(
+      sessionInfo,
+      { parseMode: 'Markdown' },
+      threadId || undefined
+    );
+  }
+
+  /**
+   * Format topic name for a session
+   */
+  private formatTopicName(sessionId: string, hostname?: string, projectDir?: string): string {
+    const parts: string[] = [];
+
+    // Add hostname if available
+    if (hostname) {
+      parts.push(hostname);
+    }
+
+    // Add project directory basename
+    if (projectDir) {
+      const basename = projectDir.split('/').pop() || projectDir;
+      parts.push(basename);
+    }
+
+    // Add short session ID
+    const shortId = sessionId.replace('session-', '').substring(0, 8);
+    parts.push(shortId);
+
+    return parts.join(' • ') || `Session ${shortId}`;
+  }
+
+  /**
+   * Ensure a session exists (create on-the-fly if needed)
+   * This handles the race condition where user_input arrives before session_start
+   */
+  private async ensureSessionExists(msg: BridgeMessage): Promise<void> {
+    const existing = this.sessions.getSession(msg.sessionId);
+    if (existing) {
+      logger.debug('Session already exists', { sessionId: msg.sessionId, threadId: this.sessionThreads.get(msg.sessionId) });
+      return; // Session already exists
+    }
+
+    // Create session on-the-fly with Claude's session_id
+    logger.info('Creating session on-the-fly', { sessionId: msg.sessionId });
+
+    const hostname = msg.metadata?.hostname as string | undefined;
+    const projectDir = msg.metadata?.projectDir as string | undefined;
+    const tmuxTarget = msg.metadata?.tmuxTarget as string | undefined;
+
+    const sessionId = this.sessions.createSession(
+      this.config.chatId,
+      projectDir,
+      undefined,
+      hostname,
+      msg.sessionId
+    );
+
+    // Store tmux target if available
+    if (tmuxTarget) {
+      this.sessionTmuxTargets.set(sessionId, tmuxTarget);
+    }
+
+    // Create forum topic for this session
+    if (this.config.useThreads) {
+      const topicName = this.formatTopicName(sessionId, hostname, projectDir);
+      const threadId = await this.bot.createForumTopic(topicName, 0);
+
+      if (threadId) {
+        this.sessions.setSessionThread(sessionId, threadId);
+        this.sessionThreads.set(sessionId, threadId);
+        logger.info('Session thread created on-the-fly', { sessionId, threadId });
+
+        // Send session start notification in the new thread
+        let sessionInfo = formatSessionStart(sessionId, projectDir, hostname);
+        if (tmuxTarget) {
+          sessionInfo += `\n📺 tmux: \`${tmuxTarget}\``;
+        }
+        await this.bot.sendMessage(sessionInfo, { parseMode: 'Markdown' }, threadId);
+      }
+    }
+  }
+
+  /**
+   * Get thread ID for a session
+   */
+  private getSessionThreadId(sessionId: string): number | undefined {
+    // Check in-memory cache first
+    let threadId = this.sessionThreads.get(sessionId);
+    if (threadId) return threadId;
+
+    // Fallback to database
+    const dbThreadId = this.sessions.getSessionThread(sessionId);
+    if (dbThreadId) {
+      this.sessionThreads.set(sessionId, dbThreadId);
+      return dbThreadId;
+    }
+
+    return undefined;
+  }
+
+  private async handleSessionEnd(msg: BridgeMessage): Promise<void> {
+    const session = this.sessions.getSession(msg.sessionId);
+    if (session) {
+      const duration = Date.now() - session.startedAt.getTime();
+      const threadId = this.getSessionThreadId(msg.sessionId);
+
+      // Send end message in the session's thread
+      await this.bot.sendMessage(
+        formatSessionEnd(msg.sessionId, duration),
+        { parseMode: 'Markdown' },
+        threadId
+      );
+
+      // Close the forum topic if it exists
+      if (threadId) {
+        await this.bot.closeForumTopic(threadId);
+        this.sessionThreads.delete(msg.sessionId);
+      }
+
+      // Clean up tmux target
+      this.sessionTmuxTargets.delete(msg.sessionId);
+
+      this.sessions.endSession(msg.sessionId);
+    }
+  }
+
+  private async handleAgentResponse(msg: BridgeMessage): Promise<void> {
+    const threadId = this.getSessionThreadId(msg.sessionId);
+    await this.bot.sendMessage(
+      formatAgentResponse(msg.content),
+      { parseMode: 'Markdown' },
+      threadId
+    );
+  }
+
+  private async handleToolStart(msg: BridgeMessage): Promise<void> {
+    // Only show tool starts in verbose mode to avoid noise
+    if (!this.config.verbose) return;
+
+    const toolName = msg.metadata?.tool as string || 'Unknown';
+    const threadId = this.getSessionThreadId(msg.sessionId);
+
+    // Brief notification that a tool is running
+    await this.bot.sendMessage(
+      `🔧 *Running:* \`${toolName}\``,
+      { parseMode: 'Markdown' },
+      threadId
+    );
+  }
+
+  private async handleToolResult(msg: BridgeMessage): Promise<void> {
+    if (!this.config.verbose) return;
+
+    const toolName = msg.metadata?.tool as string || 'Unknown';
+    const toolInput = msg.metadata?.input;
+    const toolOutput = msg.content;
+    const threadId = this.getSessionThreadId(msg.sessionId);
+
+    await this.bot.sendMessage(
+      formatToolExecution(toolName, toolInput, toolOutput, this.config.verbose),
+      { parseMode: 'Markdown' },
+      threadId
+    );
+  }
+
+  private async handleUserInput(msg: BridgeMessage): Promise<void> {
+    const source = msg.metadata?.source as string || 'cli';
+
+    // Skip if this was explicitly marked as from Telegram
+    if (source === 'telegram') {
+      logger.debug('Skipping echo for telegram input (source=telegram)');
+      return;
+    }
+
+    // Check if this input was recently sent from Telegram (deduplication)
+    const inputKey = `${msg.sessionId}:${msg.content?.trim()}`;
+    if (this.recentTelegramInputs.has(inputKey)) {
+      logger.debug('Skipping echo for telegram input (dedup match)', { inputKey });
+      this.recentTelegramInputs.delete(inputKey); // Clean up
+      return;
+    }
+
+    // Wait for thread to be available (session_start creates thread async)
+    let threadId = this.getSessionThreadId(msg.sessionId);
+    if (!threadId) {
+      // Retry a few times with small delay - thread might be creating
+      for (let i = 0; i < 5; i++) {
+        await new Promise(resolve => setTimeout(resolve, 200));
+        threadId = this.getSessionThreadId(msg.sessionId);
+        if (threadId) break;
+      }
+    }
+
+    logger.debug('handleUserInput', { sessionId: msg.sessionId, threadId, source, content: msg.content?.substring(0, 50) });
+
+    // Show user input in Telegram (from CLI only)
+    await this.bot.sendMessage(
+      `👤 *User (cli):*\n${msg.content}`,
+      { parseMode: 'Markdown' },
+      threadId
+    );
+  }
+
+  private async handleApprovalRequest(msg: BridgeMessage): Promise<void> {
+    const approvalId = this.sessions.createApproval(msg.sessionId, msg.content);
+    const threadId = this.getSessionThreadId(msg.sessionId);
+
+    await this.bot.sendWithButtons(
+      formatApprovalRequest(msg.content),
+      [
+        { text: '✅ Approve', callbackData: `approve:${approvalId}` },
+        { text: '❌ Reject', callbackData: `reject:${approvalId}` },
+        { text: '🛑 Abort', callbackData: `abort:${approvalId}` }
+      ],
+      { parseMode: 'Markdown' },
+      threadId
+    );
+  }
+
+  private async handleError(msg: BridgeMessage): Promise<void> {
+    const threadId = this.getSessionThreadId(msg.sessionId);
+    await this.bot.sendMessage(
+      formatError(msg.content),
+      { parseMode: 'Markdown' },
+      threadId
+    );
+  }
+
+  /**
+   * Stop the daemon
+   */
+  async stop(): Promise<void> {
+    if (!this.running) return;
+
+    logger.info('Stopping bridge daemon...');
+
+    // Clear cleanup interval
+    if (this.cleanupInterval) {
+      clearInterval(this.cleanupInterval);
+      this.cleanupInterval = null;
+    }
+
+    // Send shutdown notification
+    try {
+      await this.bot.sendMessage(
+        '🔴 *Bridge Daemon Stopped*\n\n' +
+        'Session mirroring is now disabled.',
+        { parseMode: 'Markdown' }
+      );
+    } catch (error) {
+      logger.warn('Failed to send shutdown notification', { error });
+    }
+
+    // Stop components
+    await this.bot.stop();
+    await this.socket.close();
+    this.sessions.close();
+
+    this.running = false;
+    logger.info('Bridge daemon stopped');
+  }
+
+  /**
+   * Check if daemon is running
+   */
+  isRunning(): boolean {
+    return this.running;
+  }
+
+  /**
+   * Get daemon status
+   */
+  getStatus(): {
+    running: boolean;
+    clients: number;
+    sessions: { activeSessions: number; pendingApprovals: number };
+  } {
+    return {
+      running: this.running,
+      clients: this.socket.getClientCount(),
+      sessions: this.sessions.getStats()
+    };
+  }
+}
+
+export default BridgeDaemon;
