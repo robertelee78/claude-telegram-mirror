@@ -165,26 +165,64 @@ export class TelegramBot {
   private setupMessageQueueHandler(): void {
     this.messageQueue.setHandler(async (item) => {
       const threadId = item.threadId || item.options?.threadId;
+      const parseMode = item.options?.parseMode || 'Markdown';
 
-      if (item.buttons && item.buttons.length > 0) {
-        const keyboard = new InlineKeyboard();
-        item.buttons.forEach((btn, idx) => {
-          keyboard.text(btn.text, btn.callbackData);
-          if ((idx + 1) % 2 === 0) keyboard.row();
-        });
+      try {
+        if (item.buttons && item.buttons.length > 0) {
+          const keyboard = new InlineKeyboard();
+          item.buttons.forEach((btn, idx) => {
+            keyboard.text(btn.text, btn.callbackData);
+            if ((idx + 1) % 2 === 0) keyboard.row();
+          });
 
-        await this.bot.api.sendMessage(item.chatId, item.text, {
-          parse_mode: item.options?.parseMode || 'Markdown',
-          disable_notification: item.options?.disableNotification,
-          message_thread_id: threadId,
-          reply_markup: keyboard
-        });
-      } else {
-        await this.bot.api.sendMessage(item.chatId, item.text, {
-          parse_mode: item.options?.parseMode || 'Markdown',
-          disable_notification: item.options?.disableNotification,
-          message_thread_id: threadId
-        });
+          await this.bot.api.sendMessage(item.chatId, item.text, {
+            parse_mode: parseMode,
+            disable_notification: item.options?.disableNotification,
+            message_thread_id: threadId,
+            reply_markup: keyboard
+          });
+        } else {
+          await this.bot.api.sendMessage(item.chatId, item.text, {
+            parse_mode: parseMode,
+            disable_notification: item.options?.disableNotification,
+            message_thread_id: threadId
+          });
+        }
+      } catch (error) {
+        // If Markdown parsing failed, retry without parse_mode (plain text)
+        if (error instanceof GrammyError && error.error_code === 400 &&
+            error.description.includes("can't parse entities")) {
+          logger.warn('Markdown parsing failed, retrying as plain text', {
+            error: error.description
+          });
+
+          // Strip markdown formatting for plain text fallback
+          const plainText = item.text
+            .replace(/\*\*/g, '')  // Remove bold **
+            .replace(/\*/g, '')    // Remove italic *
+            .replace(/`/g, "'")    // Replace backticks with quotes
+            .replace(/_/g, '');    // Remove underscores
+
+          if (item.buttons && item.buttons.length > 0) {
+            const keyboard = new InlineKeyboard();
+            item.buttons.forEach((btn, idx) => {
+              keyboard.text(btn.text, btn.callbackData);
+              if ((idx + 1) % 2 === 0) keyboard.row();
+            });
+            await this.bot.api.sendMessage(item.chatId, plainText, {
+              disable_notification: item.options?.disableNotification,
+              message_thread_id: threadId,
+              reply_markup: keyboard
+            });
+          } else {
+            await this.bot.api.sendMessage(item.chatId, plainText, {
+              disable_notification: item.options?.disableNotification,
+              message_thread_id: threadId
+            });
+          }
+        } else {
+          throw error; // Re-throw other errors for retry logic
+        }
       }
     });
   }

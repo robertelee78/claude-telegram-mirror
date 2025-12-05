@@ -483,38 +483,54 @@ export class BridgeDaemon extends EventEmitter {
 
     // Format brief preview based on tool type
     let preview = '';
+    let hasUsefulInput = false; // Track if input is worth showing in Details
+
     if (toolInput) {
       if (toolName === 'Read' && toolInput.file_path) {
         preview = ` \`${this.truncatePath(toolInput.file_path as string)}\``;
+        hasUsefulInput = true;
       } else if (toolName === 'Write' && toolInput.file_path) {
         preview = ` \`${this.truncatePath(toolInput.file_path as string)}\``;
+        hasUsefulInput = true;
       } else if (toolName === 'Edit' && toolInput.file_path) {
         preview = ` \`${this.truncatePath(toolInput.file_path as string)}\``;
+        hasUsefulInput = true;
       } else if (toolName === 'Bash' && toolInput.command) {
-        const cmd = (toolInput.command as string).slice(0, 40);
-        preview = `\n\`${cmd}${(toolInput.command as string).length > 40 ? '...' : ''}\``;
+        const cmd = (toolInput.command as string).slice(0, 50);
+        preview = `\n\`${cmd}${(toolInput.command as string).length > 50 ? '...' : ''}\``;
+        hasUsefulInput = true;
       } else if (toolName === 'Grep' && toolInput.pattern) {
         preview = ` \`${toolInput.pattern}\``;
+        hasUsefulInput = true;
       } else if (toolName === 'Glob' && toolInput.pattern) {
         preview = ` \`${toolInput.pattern}\``;
+        hasUsefulInput = true;
       } else if (toolName === 'Task' && toolInput.description) {
         preview = ` ${toolInput.description}`;
+        hasUsefulInput = true;
+      } else if (toolName === 'WebFetch' && toolInput.url) {
+        preview = ` \`${(toolInput.url as string).slice(0, 40)}...\``;
+        hasUsefulInput = true;
+      } else if (toolName === 'WebSearch' && toolInput.query) {
+        preview = ` "${toolInput.query}"`;
+        hasUsefulInput = true;
       }
+      // BashOutput, KillShell, etc. just have IDs - not useful to show Details
     }
 
     // Generate unique ID for this tool use
     const toolUseId = `tool_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 
-    // Store tool input for detail retrieval (with 5 min expiry)
-    this.toolInputCache.set(toolUseId, {
-      tool: toolName,
-      input: toolInput,
-      timestamp: Date.now()
-    });
-    setTimeout(() => this.toolInputCache.delete(toolUseId), 5 * 60 * 1000);
+    // Send with "Details" button only if input is useful to show
+    if (hasUsefulInput) {
+      // Store tool input for detail retrieval (with 5 min expiry)
+      this.toolInputCache.set(toolUseId, {
+        tool: toolName,
+        input: toolInput,
+        timestamp: Date.now()
+      });
+      setTimeout(() => this.toolInputCache.delete(toolUseId), 5 * 60 * 1000);
 
-    // Send with "Details" button if there's input to show
-    if (toolInput && Object.keys(toolInput).length > 0) {
       await this.bot.sendWithButtons(
         `🔧 *Running:* \`${toolName}\`${preview}`,
         [{ text: '📋 Details', callbackData: `tooldetails:${toolUseId}` }],
@@ -522,6 +538,7 @@ export class BridgeDaemon extends EventEmitter {
         threadId
       );
     } else {
+      // No Details button for tools with unhelpful input (BashOutput, KillShell, etc.)
       await this.bot.sendMessage(
         `🔧 *Running:* \`${toolName}\`${preview}`,
         { parseMode: 'Markdown' },
