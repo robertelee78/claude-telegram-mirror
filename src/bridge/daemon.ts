@@ -309,16 +309,23 @@ export class BridgeDaemon extends EventEmitter {
       logger.info('Session tmux target stored', { sessionId, tmuxTarget });
     }
 
-    // Try to create a forum topic for this session
+    // Try to create a forum topic for this session (if one doesn't already exist)
     let threadId: number | null = null;
     if (this.config.useThreads) {
-      const topicName = this.formatTopicName(sessionId, hostname, projectDir);
-      threadId = await this.bot.createForumTopic(topicName, 0); // Blue color (index 0)
+      // Check if topic already exists (may have been created by ensureSessionExists race)
+      const existingThreadId = this.getSessionThreadId(sessionId);
+      if (existingThreadId) {
+        threadId = existingThreadId;
+        logger.info('Session thread already exists', { sessionId, threadId });
+      } else {
+        const topicName = this.formatTopicName(sessionId, hostname, projectDir);
+        threadId = await this.bot.createForumTopic(topicName, 0); // Blue color (index 0)
 
-      if (threadId) {
-        this.sessions.setSessionThread(sessionId, threadId);
-        this.sessionThreads.set(sessionId, threadId);
-        logger.info('Session thread created', { sessionId, threadId });
+        if (threadId) {
+          this.sessions.setSessionThread(sessionId, threadId);
+          this.sessionThreads.set(sessionId, threadId);
+          logger.info('Session thread created', { sessionId, threadId });
+        }
       }
     }
 
