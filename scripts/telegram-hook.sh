@@ -18,6 +18,9 @@ TELEGRAM_HOOK_DEBUG=1
 
 set -e
 
+# Trap to ensure clean exit and helpful error message
+trap 'debug_log "Script exiting with code $?"' EXIT
+
 # Get the directory of this script
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PACKAGE_DIR="$(dirname "$SCRIPT_DIR")"
