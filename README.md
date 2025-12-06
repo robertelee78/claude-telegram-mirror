@@ -2,15 +2,39 @@
 
 Bidirectional communication between Claude Code CLI and Telegram. Control your Claude Code sessions from your phone.
 
+## Quick Start
+
+```bash
+# 1. Clone and build
+git clone https://github.com/robertelee78/claude-telegram-mirror.git
+cd claude-telegram-mirror && npm install && npm run build
+
+# 2. Create a Telegram bot via @BotFather, get the token
+
+# 3. Create a supergroup with Topics enabled, add your bot as admin
+
+# 4. Get your chat ID (send message, then check getUpdates API)
+
+# 5. Configure environment
+cat > ~/.telegram-env << 'EOF'
+export TELEGRAM_BOT_TOKEN="your-token-here"
+export TELEGRAM_CHAT_ID="-100your-chat-id"
+export TELEGRAM_MIRROR=true
+EOF
+
+# 6. Install hooks and start
+node dist/cli.js install-hooks
+./scripts/start-daemon.sh
+```
+
 ## Features
 
-- **CLI → Telegram**: Mirror Claude's responses to a Telegram chat
+- **CLI → Telegram**: Mirror Claude's responses, tool usage, and notifications
 - **Telegram → CLI**: Send prompts from Telegram directly to Claude Code
 - **Session Threading**: Each Claude session gets its own Forum Topic
-- **Tool Visibility**: See tools Claude is running (Bash, Read, Write, etc.)
-- **tmux Integration**: Works with Claude Code running in tmux sessions
+- **Multi-System Support**: Run separate daemons on multiple machines
 
-## How It Works
+## Architecture
 
 ```
 ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
@@ -26,200 +50,108 @@ Bidirectional communication between Claude Code CLI and Telegram. Control your C
 └─────────────────┘     └─────────────────┘
 ```
 
-1. **Claude Code Hooks** capture events (user input, responses, tool use)
-2. **Hook Script** formats events as JSON and sends via Unix socket
-3. **Bridge Daemon** receives events and forwards to Telegram
-4. **Telegram Bot** displays messages in Forum Topics per session
-5. **Telegram → CLI** input is injected via `tmux send-keys`
+**Flow:**
+1. Claude Code hooks capture events (prompts, responses, tool use)
+2. Hook script sends JSON to bridge daemon via Unix socket
+3. Bridge forwards messages to Telegram Forum Topic
+4. Telegram replies are injected into CLI via `tmux send-keys`
+
+## Multi-System Architecture
+
+When running Claude Code on multiple machines, each system needs its own bot to avoid Telegram API conflicts (error 409: only one polling connection per bot token is allowed).
+
+**The model:**
+- **One daemon per host** - Each machine runs its own bridge daemon
+- **One bot per daemon** - Each daemon uses a unique Telegram bot
+- **Multiple sessions per host** - One daemon handles all Claude sessions on that machine
+- **Shared supergroup** - All bots post to the same Telegram supergroup
+
+### Setup for Multiple Systems
+
+1. **Create one bot per system** via [@BotFather](https://t.me/botfather)
+   - System A: `@claude_mirror_system_a_bot`
+   - System B: `@claude_mirror_system_b_bot`
+
+2. **Add all bots to the same supergroup** with admin permissions
+
+3. **Configure each system** with its own bot token:
+   ```bash
+   # On System A (~/.telegram-env)
+   export TELEGRAM_BOT_TOKEN="token-for-system-a-bot"
+   export TELEGRAM_CHAT_ID="-100shared-group-id"
+
+   # On System B (~/.telegram-env)
+   export TELEGRAM_BOT_TOKEN="token-for-system-b-bot"
+   export TELEGRAM_CHAT_ID="-100shared-group-id"  # Same group!
+   ```
+
+4. **Each daemon creates topics for its sessions** - Messages route correctly because each daemon only processes topics it created.
 
 ## Prerequisites
 
 - Node.js 18+
-- Claude Code CLI installed
+- Claude Code CLI
 - tmux (for bidirectional communication)
-- A Telegram account
+- Telegram account
 
 ## Telegram Setup
 
-### Step 1: Create a Telegram Bot
+### 1. Create a Bot
 
-1. Open Telegram and search for [@BotFather](https://t.me/botfather)
-2. Send `/newbot` to create a new bot
-3. Choose a name (e.g., "Claude Code Mirror")
-4. Choose a username (must end in `bot`, e.g., `my_claude_mirror_bot`)
-5. **Save the API token** - you'll need this (looks like `123456789:ABCdefGHIjklMNOpqrsTUVwxyz`)
+1. Message [@BotFather](https://t.me/botfather) → `/newbot`
+2. Choose name and username (must end in `bot`)
+3. Save the API token
 
-### Step 2: Create a Telegram Group with Forum Topics
+### 2. Create Supergroup with Topics
 
-1. Open Telegram and create a new group
-2. Add at least one other member (can remove later) or make it a public group temporarily
-3. Go to **Group Settings** (tap group name → Edit)
-4. Scroll down and enable **"Topics"** (this enables Forum Topics)
-5. The group will now show a "General" topic
+1. Create a new group in Telegram
+2. Add another member temporarily (required to upgrade)
+3. Group Settings → Enable **Topics**
 
-### Step 3: Add Your Bot to the Group
+### 3. Add Bot as Admin
 
-1. In the group, tap **Add Members**
-2. Search for your bot by username (e.g., `@my_claude_mirror_bot`)
-3. Add the bot to the group
+1. Add bot to group
+2. Group Settings → Administrators → Add your bot
+3. Enable: **Manage Topics**, **Post Messages**
 
-### Step 4: Make the Bot an Admin
+### 4. Get Chat ID
 
-The bot needs admin permissions to create Forum Topics:
+1. Send any message in the group
+2. Visit: `https://api.telegram.org/botYOUR_TOKEN/getUpdates`
+3. Copy the chat ID (including `-100` prefix)
 
-1. Go to **Group Settings** → **Administrators**
-2. Tap **Add Administrator**
-3. Select your bot
-4. Enable these permissions:
-   - **Manage Topics** (required for creating session threads)
-   - **Post Messages**
-   - **Delete Messages** (optional, for cleanup)
-5. Save changes
+### 5. Disable Privacy Mode
 
-### Step 5: Get Your Chat ID
-
-1. Send any message in the group (e.g., "test")
-2. Open this URL in your browser (replace `YOUR_BOT_TOKEN`):
-   ```
-   https://api.telegram.org/botYOUR_BOT_TOKEN/getUpdates
-   ```
-3. Look for `"chat":{"id":-100XXXXXXXXXX}` in the response
-4. **Copy the full ID including the `-100` prefix** (e.g., `-1001234567890`)
-
-### Step 6: Disable Privacy Mode (Important!)
-
-By default, bots only see messages that start with `/` or mention the bot. To receive all messages:
-
-1. Go back to [@BotFather](https://t.me/botfather)
-2. Send `/mybots`
-3. Select your bot
-4. Go to **Bot Settings** → **Group Privacy**
-5. Select **Turn off**
-
-Now your bot can see all messages in the group.
-
-## Installation
-
-```bash
-# Clone the repository
-git clone https://github.com/robertelee78/claude-telegram-mirror.git
-cd claude-telegram-mirror
-
-# Install dependencies
-npm install
-
-# Build
-npm run build
-
-# Install Claude Code hooks (global)
-node dist/cli.js install-hooks
-
-# Or install to a specific project (run from project directory)
-cd /path/to/your/project
-node /path/to/claude-telegram-mirror/dist/cli.js install-hooks --project
-```
+1. [@BotFather](https://t.me/botfather) → `/mybots` → Select bot
+2. Bot Settings → Group Privacy → **Turn off**
 
 ## Configuration
 
-### Step 1: Create Environment File
+### Environment Variables
 
-Create `~/.telegram-env` with your credentials:
+Create `~/.telegram-env`:
 
 ```bash
-cat > ~/.telegram-env << 'EOF'
 export TELEGRAM_BOT_TOKEN="123456789:ABCdefGHIjklMNOpqrsTUVwxyz"
 export TELEGRAM_CHAT_ID="-1001234567890"
 export TELEGRAM_MIRROR=true
-EOF
+# Optional:
+# export TELEGRAM_MIRROR_VERBOSE=true
+# export TELEGRAM_BRIDGE_SOCKET=/tmp/claude-telegram-bridge.sock
 ```
 
-> **Why a separate file?** Most `.bashrc` files exit early for non-interactive shells (`case $- in *i*) ...`), which breaks background daemons. The `~/.telegram-env` file ensures variables are available regardless of shell mode.
-
-### Step 2: Source in Your Shell Profile
-
-Add to your `~/.bashrc` or `~/.zshrc`:
+Source in your shell profile (`~/.bashrc` or `~/.zshrc`):
 
 ```bash
-# Source Telegram mirror config
 [[ -f ~/.telegram-env ]] && source ~/.telegram-env
 ```
 
-Then reload:
-```bash
-source ~/.bashrc  # or source ~/.zshrc
-```
-
-### Environment Variables
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `TELEGRAM_BOT_TOKEN` | Bot token from BotFather | Required |
-| `TELEGRAM_CHAT_ID` | Target chat/group ID | Required |
-| `TELEGRAM_MIRROR` | Enable mirroring | `false` |
-| `TELEGRAM_MIRROR_VERBOSE` | Show tool execution | `false` |
-| `TELEGRAM_BRIDGE_SOCKET` | Socket path | `/tmp/claude-telegram-bridge.sock` |
-
-### Test Your Configuration
+### Test Connection
 
 ```bash
-# Test the Telegram connection
 node dist/cli.js config --test
-```
-
-You should see:
-```
-✅ Bot connected: @your_bot_username
-✅ Test message sent to chat
-```
-
-### Project-Level Settings (Important!)
-
-If your project has its own `.claude/settings.json` with custom hooks, those **override** the global hooks. You'll need to add the telegram hook to your project settings.
-
-Add this to your project's `.claude/settings.json` hooks section:
-
-```json
-{
-  "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "",
-        "hooks": [{ "type": "command", "command": "/opt/claude-telegram-mirror/scripts/telegram-hook.sh" }]
-      }
-    ],
-    "PostToolUse": [
-      {
-        "matcher": "",
-        "hooks": [{ "type": "command", "command": "/opt/claude-telegram-mirror/scripts/telegram-hook.sh" }]
-      }
-    ],
-    "Stop": [
-      {
-        "matcher": "",
-        "hooks": [{ "type": "command", "command": "/opt/claude-telegram-mirror/scripts/telegram-hook.sh" }]
-      }
-    ],
-    "Notification": [
-      {
-        "matcher": "",
-        "hooks": [{ "type": "command", "command": "/opt/claude-telegram-mirror/scripts/telegram-hook.sh" }]
-      }
-    ],
-    "UserPromptSubmit": [
-      {
-        "matcher": "",
-        "hooks": [{ "type": "command", "command": "/opt/claude-telegram-mirror/scripts/telegram-hook.sh" }]
-      }
-    ]
-  }
-}
-```
-
-Or use this one-liner to add hooks to your current project:
-
-```bash
-# From your project directory
-node /opt/claude-telegram-mirror/dist/cli.js install-hooks --project
+# ✅ Bot connected: @your_bot_username
+# ✅ Test message sent to chat
 ```
 
 ## Usage
@@ -227,185 +159,80 @@ node /opt/claude-telegram-mirror/dist/cli.js install-hooks --project
 ### Start the Bridge
 
 ```bash
-# Using the startup script (recommended - handles env vars properly)
+# Foreground (recommended for first run)
 ./scripts/start-daemon.sh
 
-# Run in background
+# Background
 nohup ./scripts/start-daemon.sh > /tmp/telegram-daemon.log 2>&1 &
-
-# Or use the CLI directly (requires env vars in current shell)
-node dist/cli.js start
 ```
 
-### Run Claude Code in tmux
+### Run Claude in tmux
 
 ```bash
-# Start a tmux session
 tmux new -s claude
-
-# Run Claude Code
 claude
-
-# The bridge will auto-detect the tmux session
+# Bridge auto-detects tmux session
 ```
 
-### Commands
+### CLI Commands
 
 ```bash
-# Daemon
-node dist/cli.js start                    # Start the bridge daemon
-node dist/cli.js status                   # Show bridge status
-
-# Hooks
-node dist/cli.js install-hooks            # Install hooks (global ~/.claude/settings.json)
-node dist/cli.js install-hooks --project  # Install hooks to current project
-node dist/cli.js install-hooks --force    # Force reinstall
-node dist/cli.js uninstall-hooks          # Remove hooks
-node dist/cli.js hooks                    # Show hook status
-
-# Configuration
-node dist/cli.js config                   # Show configuration
-node dist/cli.js config --test            # Test Telegram connection
+node dist/cli.js start              # Start daemon
+node dist/cli.js status             # Show status
+node dist/cli.js config --test      # Test connection
+node dist/cli.js install-hooks      # Install global hooks
+node dist/cli.js install-hooks -p   # Install to current project
+node dist/cli.js hooks              # Show hook status
 ```
 
-## How Mirroring Works
+## Project-Level Hooks
 
-### CLI → Telegram
+If your project has `.claude/settings.json` with custom hooks, global hooks are overridden. Install hooks to the project:
 
-| Event | What's Mirrored |
-|-------|-----------------|
-| User types in CLI | "👤 User (cli): ..." |
-| Tool starts | "🔧 Running: Bash" with Details button |
-| Tool completes | Tool output (for significant results) |
-| Claude responds | "🤖 Claude: ..." (at end of turn) |
-| Session start | Creates new Forum Topic |
-| Session end | Topic remains (can be manually closed) |
-
-### Telegram → CLI
-
-When you send a message in the session's Forum Topic:
-1. Bridge receives the message
-2. Injects text into tmux via `send-keys`
-3. Submits with Enter key
-4. Claude processes and responds
-5. Response mirrors back to Telegram
-
-## Architecture
-
+```bash
+cd /path/to/your/project
+node /path/to/claude-telegram-mirror/dist/cli.js install-hooks --project
 ```
-claude-telegram-mirror/
-├── src/
-│   ├── bot/
-│   │   ├── telegram.ts      # Telegram bot wrapper (grammy)
-│   │   ├── commands.ts      # Bot commands and handlers
-│   │   └── formatting.ts    # Message formatting
-│   ├── bridge/
-│   │   ├── daemon.ts        # Main bridge orchestrator
-│   │   ├── socket.ts        # Unix socket server
-│   │   ├── session.ts       # Session management (SQLite)
-│   │   ├── injector.ts      # tmux input injection
-│   │   └── types.ts         # TypeScript types
-│   ├── hooks/
-│   │   └── installer.ts     # Hook installation (global + project)
-│   ├── utils/
-│   │   ├── config.ts        # Configuration loading
-│   │   └── logger.ts        # Logging (pino)
-│   └── cli.ts               # CLI entry point
-├── scripts/
-│   ├── telegram-hook.sh     # Hook script (called by Claude Code)
-│   └── start-daemon.sh      # Startup script (sources ~/.telegram-env)
-└── dist/                    # Compiled JavaScript
-```
+
+## How Messages Flow
+
+| Direction | Event | Display |
+|-----------|-------|---------|
+| CLI → Telegram | User types | 👤 User (cli): ... |
+| CLI → Telegram | Tool starts | 🔧 Running: Bash |
+| CLI → Telegram | Claude responds | 🤖 Claude: ... |
+| CLI → Telegram | Session starts | New Forum Topic created |
+| Telegram → CLI | User sends message | Injected via tmux |
 
 ## Technical Details
 
-### Session Tracking
-
-- Uses Claude's native `session_id` (UUID) for consistent tracking
-- Sessions stored in SQLite (`~/.config/claude-telegram-mirror/sessions.db`)
-- Each session maps to a Telegram Forum Topic
-
-### Hook Events
-
-The bridge captures these Claude Code hook events:
-
-- `PreToolUse` - Tool starting (shows "Running: Bash", etc.)
-- `PostToolUse` - Tool completed (shows output for significant results)
-- `Stop` - Claude finished responding (extracts response from transcript)
-- `Notification` - System notifications (filtered to reduce noise)
-- `UserPromptSubmit` - User entered a prompt
-
-### Response Extraction
-
-Since Claude Code doesn't have an "AssistantResponse" hook, we extract responses by:
-1. Reading the transcript file (`.jsonl`) on `Stop` event
-2. Parsing the last assistant message with text content
-3. Forwarding to Telegram
-
-### Deduplication
-
-Messages sent from Telegram are tracked to prevent echo:
-1. Input text + session ID stored in a Set
-2. When hook fires `UserPromptSubmit`, check against Set
-3. Skip mirroring if match found (was from Telegram)
-4. Auto-expire tracking after 10 seconds
+- **Session storage**: SQLite at `~/.config/claude-telegram-mirror/sessions.db`
+- **Response extraction**: Reads Claude's transcript `.jsonl` on Stop event
+- **Deduplication**: Telegram-originated messages tracked to prevent echo
+- **Topic routing**: Each daemon only processes topics it created (multi-bot safe)
 
 ## Troubleshooting
 
-### Hooks not firing (project has custom settings)
+**Hooks not firing?**
+- Check if project has local `.claude/settings.json` overriding globals
+- Run `node dist/cli.js install-hooks --project` from project directory
+- Restart Claude Code after installing hooks
 
-If your project has `.claude/settings.json` with custom hooks, those override global hooks:
+**409 Conflict error?**
+- Only one polling connection per bot token is allowed
+- If running multiple systems, each needs its own bot (see Multi-System Architecture)
+- Kill duplicate daemons: `pkill -f "node.*dist/cli"`
 
-```bash
-# Check if project has local settings
-ls -la .claude/settings.json
+**Bridge not receiving events?**
+- Check socket: `ls -la /tmp/claude-telegram-bridge.sock`
+- Check debug log: `cat /tmp/telegram-hook-debug.log`
 
-# Install hooks to project (from project directory)
-node /path/to/claude-telegram-mirror/dist/cli.js install-hooks --project
+**tmux injection not working?**
+- Verify tmux session: `tmux list-sessions`
+- Check daemon logs for "Session tmux target stored"
 
-# Restart Claude Code after installing
-```
-
-### Bridge not receiving events
-
-```bash
-# Check if socket exists
-ls -la /tmp/claude-telegram-bridge.sock
-
-# Check hook debug log
-cat /tmp/telegram-hook-debug.log
-
-# Verify hooks are installed (global)
-node dist/cli.js hooks
-```
-
-### Messages going to wrong topic
-
-```bash
-# Clear session tracking
-rm ~/.config/claude-telegram-mirror/sessions.db
-rm ~/.config/claude-telegram-mirror/.session_active_*
-```
-
-### Bot not responding
-
-```bash
-# Test Telegram connection
-claude-telegram-mirror config --test
-
-# Check for multiple bot instances (409 error)
-pkill -f "node.*dist/cli"
-```
-
-### tmux injection not working
-
-```bash
-# Verify tmux session detection
-tmux list-sessions
-
-# Check bridge logs for tmux target
-# Should show: "Session tmux target stored"
-```
+**Messages going to wrong topic?**
+- Clear session DB: `rm ~/.config/claude-telegram-mirror/sessions.db`
 
 ## License
 
