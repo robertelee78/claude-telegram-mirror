@@ -4,13 +4,17 @@
  */
 
 import { createServer, connect, Server, Socket } from 'net';
-import { unlinkSync, existsSync, writeFileSync, readFileSync } from 'fs';
+import { unlinkSync, existsSync, writeFileSync, readFileSync, mkdirSync, chmodSync } from 'fs';
 import { EventEmitter } from 'events';
+import { join } from 'path';
+import { homedir } from 'os';
 import logger from '../utils/logger.js';
 import type { BridgeMessage } from './types.js';
 
-const DEFAULT_SOCKET_PATH = '/tmp/claude-telegram-bridge.sock';
-const DEFAULT_PID_PATH = '/tmp/claude-telegram-bridge.pid';
+// Use secure user-specific directory instead of world-writable /tmp
+const SOCKET_DIR = join(homedir(), '.config', 'claude-telegram-mirror');
+const DEFAULT_SOCKET_PATH = join(SOCKET_DIR, 'bridge.sock');
+const DEFAULT_PID_PATH = join(SOCKET_DIR, 'bridge.pid');
 
 /**
  * Check if a socket is stale (file exists but no daemon listening)
@@ -121,6 +125,20 @@ export class SocketServer extends EventEmitter {
    * Includes stale socket detection and PID file locking
    */
   async listen(): Promise<void> {
+    // Step 0: Ensure socket directory exists with secure permissions (0o700)
+    const socketDir = join(this.socketPath, '..');
+    if (!existsSync(socketDir)) {
+      mkdirSync(socketDir, { recursive: true, mode: 0o700 });
+      logger.debug('Created socket directory', { path: socketDir, mode: '0700' });
+    } else {
+      // Ensure existing directory has correct permissions
+      try {
+        chmodSync(socketDir, 0o700);
+      } catch (error) {
+        logger.warn('Could not set socket directory permissions', { error });
+      }
+    }
+
     // Step 1: Acquire PID lock (prevents multiple daemon instances)
     if (!acquirePidLock(this.pidPath)) {
       throw new Error('Another daemon instance is already running. Kill it first or check the PID file.');
@@ -165,6 +183,13 @@ export class SocketServer extends EventEmitter {
       });
 
       this.server.listen(this.socketPath, () => {
+        // Set socket file permissions to owner-only (0o600)
+        try {
+          chmodSync(this.socketPath, 0o600);
+          logger.debug('Set socket permissions', { path: this.socketPath, mode: '0600' });
+        } catch (error) {
+          logger.warn('Could not set socket file permissions', { error });
+        }
         logger.info(`Socket server listening on ${this.socketPath}`, { pid: process.pid });
         resolve();
       });
@@ -451,4 +476,4 @@ export class SocketClient extends EventEmitter {
   }
 }
 
-export { DEFAULT_SOCKET_PATH, DEFAULT_PID_PATH, checkSocketStatus, isPidRunning };
+export { SOCKET_DIR, DEFAULT_SOCKET_PATH, DEFAULT_PID_PATH, checkSocketStatus, isPidRunning };

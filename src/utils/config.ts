@@ -47,7 +47,7 @@ interface ConfigFile {
 
 const CONFIG_DIR = join(homedir(), '.config', 'claude-telegram-mirror');
 const CONFIG_FILE = join(CONFIG_DIR, 'config.json');
-const DEFAULT_SOCKET_PATH = '/tmp/claude-telegram-bridge.sock';
+const DEFAULT_SOCKET_PATH = join(CONFIG_DIR, 'bridge.sock');
 
 class ConfigurationError extends Error {
   constructor(message: string) {

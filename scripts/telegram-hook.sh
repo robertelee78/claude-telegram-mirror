@@ -10,11 +10,8 @@
 # No environment variable needed - just start the bridge!
 #
 
-# Always log that hook was called (for debugging)
-touch /tmp/telegram-hook-was-called
-
-# Enable debug logging temporarily
-TELEGRAM_HOOK_DEBUG=1
+# Debug logging disabled by default - set TELEGRAM_HOOK_DEBUG=1 to enable
+TELEGRAM_HOOK_DEBUG="${TELEGRAM_HOOK_DEBUG:-0}"
 
 set -e
 
@@ -26,13 +23,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PACKAGE_DIR="$(dirname "$SCRIPT_DIR")"
 CONFIG_DIR="$HOME/.config/claude-telegram-mirror"
 
-# Socket path for bridge communication
-SOCKET_PATH="${TELEGRAM_BRIDGE_SOCKET:-/tmp/claude-telegram-bridge.sock}"
+# Socket path for bridge communication (now in user config dir, not /tmp)
+SOCKET_PATH="${TELEGRAM_BRIDGE_SOCKET:-$CONFIG_DIR/bridge.sock}"
 
 # Debug logging (set TELEGRAM_HOOK_DEBUG=1 to enable)
 debug_log() {
   if [[ "${TELEGRAM_HOOK_DEBUG}" == "1" ]]; then
-    echo "[telegram-hook] $1" >> /tmp/telegram-hook-debug.log
+    # Log to config dir instead of world-readable /tmp
+    mkdir -p "$CONFIG_DIR" 2>/dev/null || true
+    echo "[telegram-hook] $(date '+%Y-%m-%d %H:%M:%S') $1" >> "$CONFIG_DIR/hook-debug.log"
   fi
 }
 
