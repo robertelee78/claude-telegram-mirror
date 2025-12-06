@@ -7,7 +7,7 @@ Bidirectional communication between Claude Code CLI and Telegram. Control your C
 - **CLI → Telegram**: Mirror Claude's responses to a Telegram chat
 - **Telegram → CLI**: Send prompts from Telegram directly to Claude Code
 - **Session Threading**: Each Claude session gets its own Forum Topic
-- **Real-time Sync**: See what Claude is doing as it happens
+- **Tool Visibility**: See tools Claude is running (Bash, Read, Write, etc.)
 - **tmux Integration**: Works with Claude Code running in tmux sessions
 
 ## How It Works
@@ -181,25 +181,34 @@ Add this to your project's `.claude/settings.json` hooks section:
 ```json
 {
   "hooks": {
-    "UserPromptSubmit": [
+    "PreToolUse": [
       {
-        "type": "command",
-        "command": "/opt/claude-telegram-mirror/scripts/telegram-hook.sh",
-        "timeout": 300000
+        "matcher": "",
+        "hooks": [{ "type": "command", "command": "/opt/claude-telegram-mirror/scripts/telegram-hook.sh" }]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "",
+        "hooks": [{ "type": "command", "command": "/opt/claude-telegram-mirror/scripts/telegram-hook.sh" }]
       }
     ],
     "Stop": [
       {
-        "type": "command",
-        "command": "/opt/claude-telegram-mirror/scripts/telegram-hook.sh",
-        "timeout": 300000
+        "matcher": "",
+        "hooks": [{ "type": "command", "command": "/opt/claude-telegram-mirror/scripts/telegram-hook.sh" }]
       }
     ],
     "Notification": [
       {
-        "type": "command",
-        "command": "/opt/claude-telegram-mirror/scripts/telegram-hook.sh",
-        "timeout": 300000
+        "matcher": "",
+        "hooks": [{ "type": "command", "command": "/opt/claude-telegram-mirror/scripts/telegram-hook.sh" }]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "matcher": "",
+        "hooks": [{ "type": "command", "command": "/opt/claude-telegram-mirror/scripts/telegram-hook.sh" }]
       }
     ]
   }
@@ -266,10 +275,11 @@ node dist/cli.js config --test            # Test Telegram connection
 | Event | What's Mirrored |
 |-------|-----------------|
 | User types in CLI | "👤 User (cli): ..." |
-| Claude responds | "🤖 Claude: ..." |
-| Tool execution | Tool name and output (verbose mode) |
+| Tool starts | "🔧 Running: Bash" with Details button |
+| Tool completes | Tool output (for significant results) |
+| Claude responds | "🤖 Claude: ..." (at end of turn) |
 | Session start | Creates new Forum Topic |
-| Session end | Closes the topic |
+| Session end | Topic remains (can be manually closed) |
 
 ### Telegram → CLI
 
@@ -319,10 +329,11 @@ claude-telegram-mirror/
 
 The bridge captures these Claude Code hook events:
 
-- `UserPromptSubmit` - User entered a prompt
+- `PreToolUse` - Tool starting (shows "Running: Bash", etc.)
+- `PostToolUse` - Tool completed (shows output for significant results)
 - `Stop` - Claude finished responding (extracts response from transcript)
 - `Notification` - System notifications (filtered to reduce noise)
-- `PreToolUse` / `PostToolUse` - Tool execution (verbose mode only)
+- `UserPromptSubmit` - User entered a prompt
 
 ### Response Extraction
 

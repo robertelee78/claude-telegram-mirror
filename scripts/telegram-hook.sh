@@ -134,11 +134,86 @@ send_to_bridge() {
   debug_log "Sending to bridge: ${message:0:100}..."
 
   if command -v nc &> /dev/null; then
-    echo "$message" | nc -U -q0 "$SOCKET_PATH" 2>/dev/null || true
+    local nc_stderr
+    nc_stderr=$(echo "$message" | nc -U -q0 "$SOCKET_PATH" 2>&1)
+    local nc_exit=$?
+    debug_log "nc result: exit=$nc_exit, stderr=$nc_stderr"
+    if [[ $nc_exit -ne 0 ]]; then
+      debug_log "nc FAILED! socket=$SOCKET_PATH"
+    fi
   elif [[ -S "$SOCKET_PATH" ]]; then
     echo "$message" > "$SOCKET_PATH" 2>/dev/null || true
+    debug_log "Used direct write to socket"
+  else
+    debug_log "No nc and no socket!"
   fi
 }
+
+# ============================================
+# REAL-TIME TRANSCRIPT SYNC
+# Extract new assistant text on EVERY hook event
+# This provides real-time mirroring of Claude's responses
+# ============================================
+sync_new_assistant_text() {
+  local transcript_path=$(echo "$INPUT" | jq -r '.transcript_path // ""' 2>/dev/null)
+
+  if [[ -z "$transcript_path" || ! -f "$transcript_path" ]]; then
+    return
+  fi
+
+  # Use separate state file for continuous sync (different from Stop hook)
+  local state_file="$CONFIG_DIR/.sync_${SESSION_ID}"
+  local last_line=0
+  if [[ -f "$state_file" ]]; then
+    last_line=$(cat "$state_file" 2>/dev/null || echo 0)
+  fi
+
+  local current_line=$(wc -l < "$transcript_path")
+
+  # No new lines
+  if [[ $current_line -le $last_line ]]; then
+    return
+  fi
+
+  local new_count=$((current_line - last_line))
+  local timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  local found_text=0
+
+  # Process new lines for assistant text messages
+  while IFS= read -r line; do
+    local msg_type=$(echo "$line" | jq -r '.type // empty' 2>/dev/null)
+
+    if [[ "$msg_type" == "assistant" ]]; then
+      # Extract text content (skip tool_use blocks)
+      local text=$(echo "$line" | jq -r '.message.content[]? | select(.type == "text") | .text' 2>/dev/null)
+
+      if [[ -n "$text" && ${#text} -gt 10 ]]; then
+        debug_log "Sync: Found assistant text (${#text} chars)"
+        local msg=$(jq -cn \
+          --arg type "agent_response" \
+          --arg sessionId "$SESSION_ID" \
+          --arg timestamp "$timestamp" \
+          --arg content "$text" \
+          '{type: $type, sessionId: $sessionId, timestamp: $timestamp, content: $content}')
+        send_to_bridge "$msg"
+        found_text=1
+      fi
+    fi
+  done < <(tail -n "$new_count" "$transcript_path")
+
+  # Update state (always, even if no text found - to track line position)
+  echo "$current_line" > "$state_file"
+
+  if [[ $found_text -eq 1 ]]; then
+    debug_log "Sync: Sent new assistant text"
+  fi
+}
+
+# ============================================
+# REAL-TIME SYNC: DISABLED - causing replay issues
+# TODO: Fix race conditions before re-enabling
+# ============================================
+# sync_new_assistant_text &
 
 # Format bridge message based on hook type
 format_message() {
@@ -201,6 +276,8 @@ format_message() {
 
     "Stop")
       local transcript_path=$(echo "$input" | jq -r '.transcript_path // ""')
+      debug_log "Stop: transcript_path='$transcript_path'"
+      debug_log "Stop: file exists=$(test -f "$transcript_path" && echo yes || echo no)"
 
       # Extract NEW text content since last Stop
       # Track what we've sent to avoid duplicates
@@ -237,29 +314,40 @@ ${text}"
           done < <(tail -n "$new_lines" "$transcript_path")
 
           debug_log "New text length: ${#all_text}"
+          debug_log "New text preview: ${all_text:0:200}"
 
           if [[ -n "$all_text" ]]; then
-            jq -cn \
+            local agent_msg=$(jq -cn \
               --arg type "agent_response" \
               --arg sessionId "$SESSION_ID" \
               --arg timestamp "$timestamp" \
               --arg content "$all_text" \
-              '{type: $type, sessionId: $sessionId, timestamp: $timestamp, content: $content}'
+              '{type: $type, sessionId: $sessionId, timestamp: $timestamp, content: $content}')
+            debug_log "Stop: sending agent_response: ${agent_msg:0:150}"
+            echo "$agent_msg"
+          else
+            debug_log "Stop: NO text extracted from new lines"
           fi
 
           # Update state
           echo "$current_line" > "$state_file"
+        else
+          debug_log "Stop: no new lines (current=$current_line, last=$last_line)"
         fi
+      else
+        debug_log "Stop: transcript not accessible (path='$transcript_path', exists=$(test -f "$transcript_path" && echo yes || echo no))"
       fi
 
       # DON'T send session_end on every Stop - Claude fires Stop after every turn!
       # The session is still active. Only send a turn_complete notification.
       # Session end should happen when user explicitly exits or connection drops.
-      jq -cn \
+      local turn_msg=$(jq -cn \
         --arg type "turn_complete" \
         --arg sessionId "$SESSION_ID" \
         --arg timestamp "$timestamp" \
-        '{type: $type, sessionId: $sessionId, timestamp: $timestamp, content: "Turn complete"}'
+        '{type: $type, sessionId: $sessionId, timestamp: $timestamp, content: "Turn complete"}')
+      debug_log "Stop: sending turn_complete: $turn_msg"
+      echo "$turn_msg"
       ;;
 
     "UserPromptSubmit")
