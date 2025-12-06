@@ -238,30 +238,26 @@ export class BridgeDaemon extends EventEmitter {
   private setupBotHandlers(): void {
     // Handle text messages (forward to CLI)
     this.bot.onMessage(async (text, chatId, threadId) => {
-      // Look up session by threadId (precise) or fallback to chatId
-      let session = threadId ? this.sessions.getSessionByThreadId(threadId) : null;
+      let session = null;
 
-      if (!session) {
-        // Fallback to chatId lookup (for General topic or legacy)
+      if (threadId) {
+        // Message is in a specific topic - ONLY process if we own that topic
+        // This is critical for multi-bot architecture: each bot ignores topics it didn't create
+        session = this.sessions.getSessionByThreadId(threadId);
+        if (!session) {
+          // This topic is not in our sessions.db - belongs to another bot/system
+          // Silently ignore - another daemon will handle it
+          logger.debug('Ignoring message for unknown topic (multi-bot)', { threadId, chatId });
+          return;
+        }
+      } else {
+        // Message is in General topic (no threadId) - use chatId fallback
         session = this.sessions.getSessionByChatId(chatId);
-      }
-
-      if (!session) {
-        // No active session - maybe user is just chatting
-        logger.debug('Message received but no session attached', { chatId, threadId });
-        return;
-      }
-
-      // Verify this daemon owns the session (check threadId matches)
-      const sessionThreadId = this.getSessionThreadId(session.id);
-      if (threadId && sessionThreadId && threadId !== sessionThreadId) {
-        // Message is for a different session/daemon
-        logger.debug('Ignoring message for different session', {
-          messageThreadId: threadId,
-          sessionThreadId,
-          sessionId: session.id
-        });
-        return;
+        if (!session) {
+          // No active session - maybe user is just chatting
+          logger.debug('Message received but no session attached', { chatId });
+          return;
+        }
       }
 
       // Get the tmux target for this session if available
