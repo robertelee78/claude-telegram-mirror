@@ -195,7 +195,7 @@ node dist/cli.js hooks              # Show hook status
 
 ## Project-Level Hooks
 
-If your project has `.claude/settings.json` with custom hooks, global hooks are overridden. Install hooks to the project:
+If your project has `.claude/settings.json` with custom hooks, global hooks are ignored. Install hooks to the project:
 
 ```bash
 cd /path/to/your/project
