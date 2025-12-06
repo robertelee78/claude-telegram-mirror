@@ -23,8 +23,10 @@ export TELEGRAM_CHAT_ID="-100your-chat-id"
 export TELEGRAM_MIRROR=true
 EOF
 
-# 6. Install hooks and start
+# 6. Install hooks (global, works unless project has custom hooks)
 node dist/cli.js install-hooks
+
+# 7. Start daemon
 ./scripts/start-daemon.sh
 ```
 
