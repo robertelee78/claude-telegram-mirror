@@ -23,8 +23,10 @@ export TELEGRAM_CHAT_ID="-100your-chat-id"
 export TELEGRAM_MIRROR=true
 EOF
 
-# 6. Install hooks (global, works unless project has custom hooks)
-node dist/cli.js install-hooks
+# 6. Install hooks
+node dist/cli.js install-hooks                    # Global install
+# OR for projects with custom .claude/settings.json:
+cd /path/to/project && node /path/to/claude-telegram-mirror/dist/cli.js install-hooks --project
 
 # 7. Start daemon
 ./scripts/start-daemon.sh
