@@ -309,23 +309,17 @@ export class BridgeDaemon extends EventEmitter {
       logger.info('Session tmux target stored', { sessionId, tmuxTarget });
     }
 
-    // Try to create a forum topic for this session (if one doesn't already exist)
+    // Create a forum topic for this session
+    // This is the ONLY code path that creates topics - ensureSessionExists does not
     let threadId: number | null = null;
     if (this.config.useThreads) {
-      // Check if topic already exists (may have been created by ensureSessionExists race)
-      const existingThreadId = this.getSessionThreadId(sessionId);
-      if (existingThreadId) {
-        threadId = existingThreadId;
-        logger.info('Session thread already exists', { sessionId, threadId });
-      } else {
-        const topicName = this.formatTopicName(sessionId, hostname, projectDir);
-        threadId = await this.bot.createForumTopic(topicName, 0); // Blue color (index 0)
+      const topicName = this.formatTopicName(sessionId, hostname, projectDir);
+      threadId = await this.bot.createForumTopic(topicName, 0); // Blue color (index 0)
 
-        if (threadId) {
-          this.sessions.setSessionThread(sessionId, threadId);
-          this.sessionThreads.set(sessionId, threadId);
-          logger.info('Session thread created', { sessionId, threadId });
-        }
+      if (threadId) {
+        this.sessions.setSessionThread(sessionId, threadId);
+        this.sessionThreads.set(sessionId, threadId);
+        logger.info('Session thread created', { sessionId, threadId });
       }
     }
 
@@ -378,40 +372,29 @@ export class BridgeDaemon extends EventEmitter {
 
   /**
    * Ensure a session exists (create on-the-fly if needed)
-   * This handles the race condition where user_input arrives before session_start
-   * Also ensures a forum topic exists for existing sessions that may have lost their topic
+   * This handles the case where events arrive before session_start.
+   *
+   * IMPORTANT: This function ONLY creates the session entry in the database.
+   * Topic creation is the responsibility of handleSessionStart() alone.
+   * Messages arriving before the topic is created will go to General.
    */
   private async ensureSessionExists(msg: BridgeMessage): Promise<void> {
     const existing = this.sessions.getSession(msg.sessionId);
     if (existing) {
-      // Session exists, but ensure we have a valid threadId
-      const existingThreadId = this.getSessionThreadId(msg.sessionId);
-      if (!existingThreadId && this.config.useThreads) {
-        // No threadId - create a topic for this existing session
-        logger.info('Creating missing topic for existing session', { sessionId: msg.sessionId });
-        const topicName = this.formatTopicName(msg.sessionId, existing.hostname, existing.projectDir);
-        const newThreadId = await this.bot.createForumTopic(topicName, 0);
-        if (newThreadId) {
-          this.sessions.setSessionThread(msg.sessionId, newThreadId);
-          this.sessionThreads.set(msg.sessionId, newThreadId);
-          logger.info('Session thread created (recovery)', { sessionId: msg.sessionId, threadId: newThreadId });
-
-          // Send session info in the new thread
-          const sessionInfo = formatSessionStart(msg.sessionId, existing.projectDir, existing.hostname);
-          await this.bot.sendMessage(sessionInfo, { parseMode: 'Markdown' }, newThreadId);
-        }
-      }
+      // Session already exists - nothing to do
+      // Topic creation is handleSessionStart's responsibility
       return;
     }
 
     // Create session on-the-fly with Claude's session_id
-    logger.info('Creating session on-the-fly', { sessionId: msg.sessionId });
+    // The topic will be created when session_start arrives
+    logger.info('Creating session on-the-fly (no topic yet)', { sessionId: msg.sessionId });
 
     const hostname = msg.metadata?.hostname as string | undefined;
     const projectDir = msg.metadata?.projectDir as string | undefined;
     const tmuxTarget = msg.metadata?.tmuxTarget as string | undefined;
 
-    const sessionId = this.sessions.createSession(
+    this.sessions.createSession(
       this.config.chatId,
       projectDir,
       undefined,
@@ -421,27 +404,10 @@ export class BridgeDaemon extends EventEmitter {
 
     // Store tmux target if available
     if (tmuxTarget) {
-      this.sessionTmuxTargets.set(sessionId, tmuxTarget);
+      this.sessionTmuxTargets.set(msg.sessionId, tmuxTarget);
     }
 
-    // Create forum topic for this session
-    if (this.config.useThreads) {
-      const topicName = this.formatTopicName(sessionId, hostname, projectDir);
-      const threadId = await this.bot.createForumTopic(topicName, 0);
-
-      if (threadId) {
-        this.sessions.setSessionThread(sessionId, threadId);
-        this.sessionThreads.set(sessionId, threadId);
-        logger.info('Session thread created on-the-fly', { sessionId, threadId });
-
-        // Send session start notification in the new thread
-        let sessionInfo = formatSessionStart(sessionId, projectDir, hostname);
-        if (tmuxTarget) {
-          sessionInfo += `\n📺 tmux: \`${tmuxTarget}\``;
-        }
-        await this.bot.sendMessage(sessionInfo, { parseMode: 'Markdown' }, threadId);
-      }
-    }
+    // NOTE: No topic creation here - that's handleSessionStart's job
   }
 
   /**
