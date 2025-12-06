@@ -131,14 +131,24 @@ get_tmux_info() {
 }
 
 # Send message to bridge via netcat (fast)
+# Works on both Linux (GNU netcat) and macOS (BSD netcat)
 send_to_bridge() {
   local message="$1"
   debug_log "Sending to bridge: ${message:0:100}..."
 
   if command -v nc &> /dev/null; then
     local nc_stderr
-    nc_stderr=$(echo "$message" | nc -U -q0 "$SOCKET_PATH" 2>&1)
-    local nc_exit=$?
+    local nc_exit
+    # Try GNU netcat first (-q0 = quit after EOF), fall back to BSD netcat (no -q flag)
+    if nc -h 2>&1 | grep -q '\-q'; then
+      # GNU netcat - supports -q flag
+      nc_stderr=$(echo "$message" | nc -U -q0 "$SOCKET_PATH" 2>&1)
+      nc_exit=$?
+    else
+      # BSD netcat (macOS) - no -q flag needed, closes on EOF
+      nc_stderr=$(echo "$message" | nc -U "$SOCKET_PATH" 2>&1)
+      nc_exit=$?
+    fi
     debug_log "nc result: exit=$nc_exit, stderr=$nc_stderr"
     if [[ $nc_exit -ne 0 ]]; then
       debug_log "nc FAILED! socket=$SOCKET_PATH"
