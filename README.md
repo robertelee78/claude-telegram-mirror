@@ -110,14 +110,13 @@ When running Claude Code on multiple machines, each system needs its own bot to 
 ### 2. Create Supergroup with Topics
 
 1. Create a new group in Telegram
-2. Add another member temporarily (required to upgrade)
+2. Add your bot to the group
 3. Group Settings → Enable **Topics**
 
-### 3. Add Bot as Admin
+### 3. Make Bot an Admin
 
-1. Add bot to group
-2. Group Settings → Administrators → Add your bot
-3. Enable: **Manage Topics**, **Post Messages**
+1. Group Settings → Administrators → Add your bot
+2. Enable: **Manage Topics**, **Post Messages**
 
 ### 4. Get Chat ID
 
