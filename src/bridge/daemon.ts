@@ -323,10 +323,15 @@ export class BridgeDaemon extends EventEmitter {
       logger.info('Session tmux target stored', { sessionId, tmuxTarget });
     }
 
-    // Create a forum topic for this session
-    // This is the ONLY code path that creates topics - ensureSessionExists does not
-    let threadId: number | null = null;
-    if (this.config.useThreads) {
+    // Check if session already has a thread (e.g., daemon restarted but session continues)
+    let threadId: number | null = this.sessions.getSessionThread(sessionId);
+
+    if (threadId) {
+      // Reuse existing thread - don't create a new topic
+      this.sessionThreads.set(sessionId, threadId);
+      logger.info('Reusing existing session thread', { sessionId, threadId });
+    } else if (this.config.useThreads) {
+      // Create a new forum topic only if none exists
       const topicName = this.formatTopicName(sessionId, hostname, projectDir);
       threadId = await this.bot.createForumTopic(topicName, 0); // Blue color (index 0)
 
