@@ -4,12 +4,100 @@
  */
 
 import { createServer, connect, Server, Socket } from 'net';
-import { unlinkSync, existsSync } from 'fs';
+import { unlinkSync, existsSync, writeFileSync, readFileSync } from 'fs';
 import { EventEmitter } from 'events';
 import logger from '../utils/logger.js';
 import type { BridgeMessage } from './types.js';
 
 const DEFAULT_SOCKET_PATH = '/tmp/claude-telegram-bridge.sock';
+const DEFAULT_PID_PATH = '/tmp/claude-telegram-bridge.pid';
+
+/**
+ * Check if a socket is stale (file exists but no daemon listening)
+ * Returns: 'stale' | 'active' | 'none'
+ */
+async function checkSocketStatus(socketPath: string): Promise<'stale' | 'active' | 'none'> {
+  if (!existsSync(socketPath)) {
+    return 'none';
+  }
+
+  return new Promise((resolve) => {
+    const testSocket = connect(socketPath);
+    const timeout = setTimeout(() => {
+      testSocket.destroy();
+      resolve('stale'); // Timeout = no response = stale
+    }, 1000);
+
+    testSocket.on('connect', () => {
+      clearTimeout(timeout);
+      testSocket.destroy();
+      resolve('active'); // Connection succeeded = daemon alive
+    });
+
+    testSocket.on('error', (err: NodeJS.ErrnoException) => {
+      clearTimeout(timeout);
+      testSocket.destroy();
+      if (err.code === 'ECONNREFUSED') {
+        resolve('stale'); // Connection refused = daemon dead
+      } else {
+        resolve('stale'); // Other error = assume stale
+      }
+    });
+  });
+}
+
+/**
+ * Check if a PID is still running
+ */
+function isPidRunning(pid: number): boolean {
+  try {
+    process.kill(pid, 0); // Signal 0 = check if process exists
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Acquire PID lock, returns true if lock acquired
+ */
+function acquirePidLock(pidPath: string): boolean {
+  if (existsSync(pidPath)) {
+    try {
+      const existingPid = parseInt(readFileSync(pidPath, 'utf-8').trim(), 10);
+      if (!isNaN(existingPid) && isPidRunning(existingPid)) {
+        logger.warn('Another daemon instance is running', { pid: existingPid });
+        return false;
+      }
+      // Stale PID file - process not running
+      logger.info('Removing stale PID file', { stalePid: existingPid });
+    } catch {
+      // Can't read PID file - remove it
+    }
+  }
+
+  // Write our PID
+  writeFileSync(pidPath, process.pid.toString());
+  logger.debug('PID lock acquired', { pid: process.pid });
+  return true;
+}
+
+/**
+ * Release PID lock
+ */
+function releasePidLock(pidPath: string): void {
+  if (existsSync(pidPath)) {
+    try {
+      const storedPid = parseInt(readFileSync(pidPath, 'utf-8').trim(), 10);
+      if (storedPid === process.pid) {
+        unlinkSync(pidPath);
+        logger.debug('PID lock released');
+      }
+    } catch {
+      // Ignore errors during cleanup
+    }
+  }
+}
 
 /**
  * Unix Socket Server
@@ -19,40 +107,65 @@ export class SocketServer extends EventEmitter {
   private server: Server | null = null;
   private clients: Map<string, Socket> = new Map();
   private socketPath: string;
+  private pidPath: string;
   private buffer: Map<string, string> = new Map();
 
-  constructor(socketPath: string = DEFAULT_SOCKET_PATH) {
+  constructor(socketPath: string = DEFAULT_SOCKET_PATH, pidPath: string = DEFAULT_PID_PATH) {
     super();
     this.socketPath = socketPath;
+    this.pidPath = pidPath;
   }
 
   /**
    * Start listening for connections
+   * Includes stale socket detection and PID file locking
    */
-  listen(): Promise<void> {
-    return new Promise((resolve, reject) => {
-      // Clean up stale socket file
-      if (existsSync(this.socketPath)) {
-        try {
-          unlinkSync(this.socketPath);
-          logger.debug('Removed stale socket file');
-        } catch (error) {
-          logger.error('Failed to remove stale socket', { error });
-        }
-      }
+  async listen(): Promise<void> {
+    // Step 1: Acquire PID lock (prevents multiple daemon instances)
+    if (!acquirePidLock(this.pidPath)) {
+      throw new Error('Another daemon instance is already running. Kill it first or check the PID file.');
+    }
 
+    // Register cleanup on process exit
+    const cleanup = () => {
+      releasePidLock(this.pidPath);
+    };
+    process.on('exit', cleanup);
+    process.on('SIGINT', cleanup);
+    process.on('SIGTERM', cleanup);
+
+    // Step 2: Check for stale socket
+    const socketStatus = await checkSocketStatus(this.socketPath);
+
+    if (socketStatus === 'active') {
+      releasePidLock(this.pidPath);
+      throw new Error(`Socket ${this.socketPath} is already in use by another process`);
+    }
+
+    if (socketStatus === 'stale') {
+      try {
+        unlinkSync(this.socketPath);
+        logger.info('Removed stale socket file', { path: this.socketPath });
+      } catch (error) {
+        logger.error('Failed to remove stale socket', { error });
+      }
+    }
+
+    // Step 3: Start the server
+    return new Promise((resolve, reject) => {
       this.server = createServer((socket) => {
         this.handleConnection(socket);
       });
 
       this.server.on('error', (error) => {
         logger.error('Socket server error', { error });
+        releasePidLock(this.pidPath);
         this.emit('error', error);
         reject(error);
       });
 
       this.server.listen(this.socketPath, () => {
-        logger.info(`Socket server listening on ${this.socketPath}`);
+        logger.info(`Socket server listening on ${this.socketPath}`, { pid: process.pid });
         resolve();
       });
     });
@@ -153,7 +266,7 @@ export class SocketServer extends EventEmitter {
   }
 
   /**
-   * Close the server
+   * Close the server and release all locks
    */
   close(): Promise<void> {
     return new Promise((resolve) => {
@@ -174,10 +287,16 @@ export class SocketServer extends EventEmitter {
               logger.error('Failed to clean up socket file', { error });
             }
           }
+
+          // Release PID lock
+          releasePidLock(this.pidPath);
+
           logger.info('Socket server closed');
           resolve();
         });
       } else {
+        // Still release PID lock even if server wasn't created
+        releasePidLock(this.pidPath);
         resolve();
       }
     });
@@ -332,4 +451,4 @@ export class SocketClient extends EventEmitter {
   }
 }
 
-export { DEFAULT_SOCKET_PATH };
+export { DEFAULT_SOCKET_PATH, DEFAULT_PID_PATH, checkSocketStatus, isPidRunning };
