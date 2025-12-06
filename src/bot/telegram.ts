@@ -90,7 +90,7 @@ export class TelegramBot {
   private config: TelegramMirrorConfig;
   private messageQueue: MessageQueue;
   private running = false;
-  private messageHandlers: Array<(text: string, chatId: number) => void> = [];
+  private messageHandlers: Array<(text: string, chatId: number, threadId?: number) => void> = [];
   private callbackHandlers: Array<(data: string, chatId: number) => void> = [];
 
   constructor(config?: TelegramMirrorConfig) {
@@ -342,7 +342,7 @@ export class TelegramBot {
   /**
    * Register text message handler
    */
-  onMessage(handler: (text: string, chatId: number) => void): void {
+  onMessage(handler: (text: string, chatId: number, threadId?: number) => void): void {
     this.messageHandlers.push(handler);
 
     // Only register once
@@ -350,11 +350,12 @@ export class TelegramBot {
       this.bot.on('message:text', (ctx) => {
         const text = ctx.message.text;
         const chatId = ctx.chat.id;
+        const threadId = ctx.message.message_thread_id;
 
         // Skip commands
         if (text.startsWith('/')) return;
 
-        this.messageHandlers.forEach(h => h(text, chatId));
+        this.messageHandlers.forEach(h => h(text, chatId, threadId));
       });
     }
   }

@@ -158,6 +158,19 @@ export class SessionManager {
   }
 
   /**
+   * Get session by thread ID (for routing Telegram replies)
+   */
+  getSessionByThreadId(threadId: number): Session | null {
+    const row = this.db.prepare(`
+      SELECT * FROM sessions
+      WHERE thread_id = ? AND status = 'active'
+      LIMIT 1
+    `).get(threadId) as SessionRow | undefined;
+
+    return row ? this.rowToSession(row) : null;
+  }
+
+  /**
    * Get all active sessions
    */
   getActiveSessions(): Session[] {
