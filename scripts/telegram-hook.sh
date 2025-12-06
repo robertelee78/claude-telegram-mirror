@@ -189,12 +189,12 @@ sync_new_assistant_text() {
 
       if [[ -n "$text" && ${#text} -gt 10 ]]; then
         debug_log "Sync: Found assistant text (${#text} chars)"
-        local msg=$(jq -cn \
+        # Use printf + pipe to handle large content (avoids "Argument list too long")
+        local msg=$(printf '%s' "$text" | jq -Rsc \
           --arg type "agent_response" \
           --arg sessionId "$SESSION_ID" \
           --arg timestamp "$timestamp" \
-          --arg content "$text" \
-          '{type: $type, sessionId: $sessionId, timestamp: $timestamp, content: $content}')
+          '{type: $type, sessionId: $sessionId, timestamp: $timestamp, content: .}')
         send_to_bridge "$msg"
         found_text=1
       fi
@@ -317,12 +317,12 @@ ${text}"
           debug_log "New text preview: ${all_text:0:200}"
 
           if [[ -n "$all_text" ]]; then
-            local agent_msg=$(jq -cn \
+            # Use printf + pipe to handle large content (avoids "Argument list too long")
+            local agent_msg=$(printf '%s' "$all_text" | jq -Rsc \
               --arg type "agent_response" \
               --arg sessionId "$SESSION_ID" \
               --arg timestamp "$timestamp" \
-              --arg content "$all_text" \
-              '{type: $type, sessionId: $sessionId, timestamp: $timestamp, content: $content}')
+              '{type: $type, sessionId: $sessionId, timestamp: $timestamp, content: .}')
             debug_log "Stop: sending agent_response: ${agent_msg:0:150}"
             echo "$agent_msg"
           else
