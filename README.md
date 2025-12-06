@@ -13,7 +13,8 @@ cd claude-telegram-mirror && npm install && npm run build
 
 # 3. Create a supergroup with Topics enabled, add your bot as admin
 
-# 4. Get your chat ID (send message, then check getUpdates API)
+# 4. Get your chat ID
+./scripts/get-chat-id.sh YOUR_BOT_TOKEN
 
 # 5. Configure environment
 cat > ~/.telegram-env << 'EOF'
@@ -117,8 +118,12 @@ When running Claude Code on multiple machines, each system needs its own bot to 
 ### 4. Get Chat ID
 
 1. Send any message in the group
-2. Visit: `https://api.telegram.org/botYOUR_TOKEN/getUpdates`
-3. Copy the chat ID (including `-100` prefix)
+2. Run the helper script:
+   ```bash
+   ./scripts/get-chat-id.sh YOUR_BOT_TOKEN
+   ```
+   Or manually: `https://api.telegram.org/botYOUR_TOKEN/getUpdates`
+3. Copy the chat ID (supergroups start with `-100`)
 
 ### 5. Disable Privacy Mode
 
