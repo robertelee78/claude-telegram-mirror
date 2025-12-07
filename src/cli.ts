@@ -8,6 +8,14 @@ import { Command } from 'commander';
 import { BridgeDaemon } from './bridge/daemon.js';
 import { installHooks, uninstallHooks, printHookStatus } from './hooks/installer.js';
 import { loadConfig, validateConfig } from './utils/config.js';
+import {
+  installService,
+  uninstallService,
+  getServiceStatus,
+  startService,
+  stopService,
+  restartService
+} from './service/manager.js';
 
 const program = new Command();
 
@@ -237,6 +245,92 @@ program
   .description('Show hook installation status')
   .action(() => {
     printHookStatus();
+  });
+
+/**
+ * Service management commands
+ */
+const serviceCmd = program
+  .command('service')
+  .description('Manage systemd/launchd service');
+
+serviceCmd
+  .command('install')
+  .description('Install as a system service (systemd on Linux, launchd on macOS)')
+  .action(() => {
+    console.log('📦 Installing system service...\n');
+    const result = installService();
+    if (result.success) {
+      console.log('✅ ' + result.message);
+    } else {
+      console.error('❌ ' + result.message);
+      process.exit(1);
+    }
+  });
+
+serviceCmd
+  .command('uninstall')
+  .description('Uninstall the system service')
+  .action(() => {
+    console.log('🗑️  Uninstalling system service...\n');
+    const result = uninstallService();
+    if (result.success) {
+      console.log('✅ ' + result.message);
+    } else {
+      console.error('❌ ' + result.message);
+      process.exit(1);
+    }
+  });
+
+serviceCmd
+  .command('start')
+  .description('Start the service')
+  .action(() => {
+    const result = startService();
+    if (result.success) {
+      console.log('✅ ' + result.message);
+    } else {
+      console.error('❌ ' + result.message);
+      process.exit(1);
+    }
+  });
+
+serviceCmd
+  .command('stop')
+  .description('Stop the service')
+  .action(() => {
+    const result = stopService();
+    if (result.success) {
+      console.log('✅ ' + result.message);
+    } else {
+      console.error('❌ ' + result.message);
+      process.exit(1);
+    }
+  });
+
+serviceCmd
+  .command('restart')
+  .description('Restart the service')
+  .action(() => {
+    const result = restartService();
+    if (result.success) {
+      console.log('✅ ' + result.message);
+    } else {
+      console.error('❌ ' + result.message);
+      process.exit(1);
+    }
+  });
+
+serviceCmd
+  .command('status')
+  .description('Show service status')
+  .action(() => {
+    const status = getServiceStatus();
+    console.log('\n🔧 Service Status\n');
+    console.log(`  Running: ${status.running ? '✅ Yes' : '⚪ No'}`);
+    console.log(`  Enabled: ${status.enabled ? '✅ Yes' : '⚪ No'}`);
+    console.log(`  Info:    ${status.info}`);
+    console.log('');
   });
 
 // Parse arguments
