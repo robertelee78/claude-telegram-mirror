@@ -30,8 +30,10 @@ node dist/cli.js install-hooks                    # Global install
 # OR for projects with custom .claude/settings.json:
 cd /path/to/project && node /path/to/claude-telegram-mirror/dist/cli.js install-hooks --project
 
-# 7. Start daemon
-./scripts/start-daemon.sh
+# 7. Start daemon (choose one)
+node dist/cli.js start                            # Foreground (for testing)
+node dist/cli.js service install && \
+node dist/cli.js service start                    # As system service (recommended)
 ```
 
 ## Features
@@ -40,6 +42,7 @@ cd /path/to/project && node /path/to/claude-telegram-mirror/dist/cli.js install-
 - **Telegram → CLI**: Send prompts from Telegram directly to Claude Code
 - **Session Threading**: Each Claude session gets its own Forum Topic
 - **Multi-System Support**: Run separate daemons on multiple machines
+- **Compaction Notifications**: Get notified when Claude summarizes context
 
 ## Architecture
 
@@ -99,6 +102,8 @@ When running Claude Code on multiple machines, each system needs its own bot to 
 - Node.js 18+
 - Claude Code CLI
 - tmux (for bidirectional communication)
+- jq (JSON processing)
+- nc (netcat, for socket communication)
 - Telegram account
 
 ## Telegram Setup
@@ -147,7 +152,7 @@ export TELEGRAM_CHAT_ID="-1001234567890"
 export TELEGRAM_MIRROR=true
 # Optional:
 # export TELEGRAM_MIRROR_VERBOSE=true
-# export TELEGRAM_BRIDGE_SOCKET=/tmp/claude-telegram-bridge.sock
+# export TELEGRAM_BRIDGE_SOCKET=~/.config/claude-telegram-mirror/bridge.sock
 ```
 
 Source in your shell profile (`~/.bashrc` or `~/.zshrc`):
@@ -169,11 +174,12 @@ node dist/cli.js config --test
 ### Start the Bridge
 
 ```bash
-# Foreground (recommended for first run)
-./scripts/start-daemon.sh
+# Foreground (for testing)
+node dist/cli.js start
 
-# Background
-nohup ./scripts/start-daemon.sh > /tmp/telegram-daemon.log 2>&1 &
+# As system service (recommended for production)
+node dist/cli.js service install    # Install systemd/launchd service
+node dist/cli.js service start      # Start the service
 ```
 
 ### Run Claude in tmux
@@ -187,13 +193,27 @@ claude
 ### CLI Commands
 
 ```bash
-node dist/cli.js start              # Start daemon
+# Daemon control
+node dist/cli.js start              # Start daemon in foreground
 node dist/cli.js status             # Show status
 node dist/cli.js config --test      # Test connection
+
+# Hook management
 node dist/cli.js install-hooks      # Install global hooks
-node dist/cli.js install-hooks -p   # Install to current project
+node dist/cli.js install-hooks -p   # Install to current project's .claude/
+node dist/cli.js uninstall-hooks    # Remove hooks
 node dist/cli.js hooks              # Show hook status
+
+# Service management (systemd on Linux, launchd on macOS)
+node dist/cli.js service install    # Install as system service
+node dist/cli.js service uninstall  # Remove system service
+node dist/cli.js service start      # Start service
+node dist/cli.js service stop       # Stop service
+node dist/cli.js service restart    # Restart service
+node dist/cli.js service status     # Show service status
 ```
+
+**Shorthand:** After building, you can also use `ctm` instead of `node dist/cli.js`.
 
 ## Project-Level Hooks
 
@@ -212,14 +232,17 @@ node /path/to/claude-telegram-mirror/dist/cli.js install-hooks --project
 | CLI → Telegram | Tool starts | 🔧 Running: Bash |
 | CLI → Telegram | Claude responds | 🤖 Claude: ... |
 | CLI → Telegram | Session starts | New Forum Topic created |
+| CLI → Telegram | Context compacting | ⏳ Notification sent |
 | Telegram → CLI | User sends message | Injected via tmux |
 
 ## Technical Details
 
 - **Session storage**: SQLite at `~/.config/claude-telegram-mirror/sessions.db`
+- **Socket path**: `~/.config/claude-telegram-mirror/bridge.sock`
 - **Response extraction**: Reads Claude's transcript `.jsonl` on Stop event
 - **Deduplication**: Telegram-originated messages tracked to prevent echo
 - **Topic routing**: Each daemon only processes topics it created (multi-bot safe)
+- **Compaction alerts**: PreCompact hook sends notification before context summarization
 
 ## Troubleshooting
 
@@ -234,8 +257,9 @@ node /path/to/claude-telegram-mirror/dist/cli.js install-hooks --project
 - Kill duplicate daemons: `pkill -f "node.*dist/cli"`
 
 **Bridge not receiving events?**
-- Check socket: `ls -la /tmp/claude-telegram-bridge.sock`
-- Check debug log: `cat /tmp/telegram-hook-debug.log`
+- Check socket: `ls -la ~/.config/claude-telegram-mirror/bridge.sock`
+- Enable debug: `export TELEGRAM_HOOK_DEBUG=1` then retry
+- Check debug log: `cat ~/.config/claude-telegram-mirror/hook-debug.log`
 
 **tmux injection not working?**
 - Verify tmux session: `tmux list-sessions`
@@ -243,6 +267,16 @@ node /path/to/claude-telegram-mirror/dist/cli.js install-hooks --project
 
 **Messages going to wrong topic?**
 - Clear session DB: `rm ~/.config/claude-telegram-mirror/sessions.db`
+
+**Service not starting (Linux)?**
+- Check status: `systemctl --user status claude-telegram-mirror`
+- View logs: `journalctl --user -u claude-telegram-mirror -f`
+- Enable linger: `loginctl enable-linger $USER`
+
+**Service not starting (macOS)?**
+- Check status: `launchctl list | grep claude`
+- View logs: `cat ~/Library/Logs/claude-telegram-mirror.*.log`
+- Check permissions: Ensure Terminal has Accessibility access
 
 ## License
 
