@@ -300,7 +300,15 @@ journalctl --user -u claude-telegram-mirror -f
 # Plist: ~/Library/LaunchAgents/com.claude.claude-telegram-mirror.plist
 launchctl load ~/Library/LaunchAgents/com.claude.claude-telegram-mirror.plist
 launchctl start com.claude.claude-telegram-mirror
+launchctl list | grep claude  # Check status
+tail -f ~/.config/claude-telegram-mirror/daemon.log  # View logs
 ```
+
+**Key launchd configuration:**
+- `HOME` and `PATH` environment variables are explicitly set (launchd has minimal env)
+- `KeepAlive.Crashed=true` restarts on crashes; `SuccessfulExit=false` doesn't restart clean exits
+- `ThrottleInterval=10` prevents rapid restart loops
+- Logs to `~/.config/claude-telegram-mirror/daemon.log`
 
 ---
 
@@ -338,3 +346,5 @@ launchctl start com.claude.claude-telegram-mirror
 | Messages not appearing | Hook not installed | Run `node dist/cli.js install-hooks` |
 | Wrong topic | Session mapping lost | Check `sessions.db` for correct `thread_id` |
 | Duplicate topics | Daemon restarted mid-session | Topics are reused if `thread_id` exists in DB |
+| macOS: "node not found" | launchd minimal PATH | Reinstall service to regenerate plist with full PATH |
+| macOS: Daemon crashes on start | Missing HOME env | Check `daemon.err.log` for details |

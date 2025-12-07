@@ -149,27 +149,71 @@ WantedBy=default.target
 }
 
 /**
+ * Escape a string for XML (plist) content
+ */
+function escapeXml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
+/**
+ * Get the PATH that includes common Node.js install locations
+ */
+function getMacOSPath(): string {
+  const home = homedir();
+  const pathDirs = [
+    '/usr/local/bin',
+    '/usr/bin',
+    '/bin',
+    '/usr/sbin',
+    '/sbin',
+    join(home, '.nvm/versions/node') + '/*/bin',  // nvm
+    '/opt/homebrew/bin',  // Homebrew on Apple Silicon
+    '/usr/local/opt/node/bin',  // Homebrew on Intel
+    join(home, '.local/bin'),
+  ];
+
+  // Try to get current PATH and merge
+  const currentPath = process.env.PATH || '';
+  const allPaths = new Set([...pathDirs, ...currentPath.split(':')]);
+  return Array.from(allPaths).filter(Boolean).join(':');
+}
+
+/**
  * Generate launchd plist content for macOS
  */
 function generateLaunchdPlist(): string {
   const nodePath = getNodePath();
   const packageDir = getPackageDir();
-  const configDir = join(homedir(), '.config', SERVICE_NAME);
+  const home = homedir();
+  const configDir = join(home, '.config', SERVICE_NAME);
   const logFile = join(configDir, 'daemon.log');
   const errFile = join(configDir, 'daemon.err.log');
 
-  // Read environment variables from file if it exists
-  let envVars = '';
-  if (existsSync(ENV_FILE)) {
-    const envContent = readFileSync(ENV_FILE, 'utf-8');
-    const lines = envContent.split('\n').filter(l => l.trim() && !l.startsWith('#'));
+  // Use parseEnvFile for proper env parsing (handles export, quotes, comments)
+  const envVars = parseEnvFile(ENV_FILE);
 
-    envVars = lines.map(line => {
-      const [key, ...valueParts] = line.split('=');
-      const value = valueParts.join('=').replace(/^["']|["']$/g, ''); // Remove quotes
-      return `        <key>${key.replace(/^export\s+/, '')}</key>
-        <string>${value}</string>`;
-    }).join('\n');
+  // Build environment variables section
+  const envLines: string[] = [];
+
+  // Always include essential environment variables
+  envLines.push(`        <key>HOME</key>`);
+  envLines.push(`        <string>${escapeXml(home)}</string>`);
+  envLines.push(`        <key>PATH</key>`);
+  envLines.push(`        <string>${escapeXml(getMacOSPath())}</string>`);
+  envLines.push(`        <key>NODE_ENV</key>`);
+  envLines.push(`        <string>production</string>`);
+
+  // Add user-defined environment variables from ~/.telegram-env
+  for (const [key, value] of envVars) {
+    // Skip if we already set it above
+    if (['HOME', 'PATH', 'NODE_ENV'].includes(key)) continue;
+    envLines.push(`        <key>${escapeXml(key)}</key>`);
+    envLines.push(`        <string>${escapeXml(value)}</string>`);
   }
 
   return `<?xml version="1.0" encoding="UTF-8"?>
@@ -181,19 +225,17 @@ function generateLaunchdPlist(): string {
 
     <key>ProgramArguments</key>
     <array>
-        <string>${nodePath}</string>
-        <string>${join(packageDir, 'dist', 'cli.js')}</string>
+        <string>${escapeXml(nodePath)}</string>
+        <string>${escapeXml(join(packageDir, 'dist', 'cli.js'))}</string>
         <string>start</string>
     </array>
 
     <key>WorkingDirectory</key>
-    <string>${packageDir}</string>
+    <string>${escapeXml(packageDir)}</string>
 
     <key>EnvironmentVariables</key>
     <dict>
-        <key>NODE_ENV</key>
-        <string>production</string>
-${envVars}
+${envLines.join('\n')}
     </dict>
 
     <key>RunAtLoad</key>
@@ -203,13 +245,18 @@ ${envVars}
     <dict>
         <key>SuccessfulExit</key>
         <false/>
+        <key>Crashed</key>
+        <true/>
     </dict>
 
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
     <key>StandardOutPath</key>
-    <string>${logFile}</string>
+    <string>${escapeXml(logFile)}</string>
 
     <key>StandardErrorPath</key>
-    <string>${errFile}</string>
+    <string>${escapeXml(errFile)}</string>
 </dict>
 </plist>
 `;
