@@ -13,7 +13,8 @@ export type MessageType =
   | 'error'
   | 'session_start'
   | 'session_end'
-  | 'turn_complete';  // Claude fires Stop after every turn, not session end
+  | 'turn_complete'   // Claude fires Stop after every turn, not session end
+  | 'pre_compact';    // Fires just before context compaction (manual or auto)
 
 export interface BridgeMessage {
   type: MessageType;

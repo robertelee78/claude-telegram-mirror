@@ -43,6 +43,7 @@ interface ClaudeSettings {
     Notification?: ClaudeHookItem[];
     Stop?: ClaudeHookItem[];
     UserPromptSubmit?: ClaudeHookItem[];
+    PreCompact?: ClaudeHookItem[];
     [key: string]: ClaudeHookItem[] | undefined;
   };
   [key: string]: unknown;
@@ -201,8 +202,8 @@ export function installHooks(options: { force?: boolean; project?: boolean } = {
 
     // Hook types to install (fewer for project - just the essentials)
     const hookTypes = options.project
-      ? ['Notification', 'Stop', 'UserPromptSubmit']
-      : ['PreToolUse', 'PostToolUse', 'Notification', 'Stop', 'UserPromptSubmit'];
+      ? ['Notification', 'Stop', 'UserPromptSubmit', 'PreCompact']
+      : ['PreToolUse', 'PostToolUse', 'Notification', 'Stop', 'UserPromptSubmit', 'PreCompact'];
 
     for (const hookType of hookTypes) {
       const existingHooks = settings.hooks[hookType];

@@ -380,6 +380,22 @@ ${text}"
           '{type: $type, sessionId: $sessionId, timestamp: $timestamp, content: $prompt, metadata: {source: "cli"}}'
       fi
       ;;
+
+    "PreCompact")
+      # Fires just before context compaction (manual or auto)
+      local trigger=$(echo "$input" | jq -r '.trigger // "auto"')
+      local custom_instructions=$(echo "$input" | jq -r '.custom_instructions // ""')
+
+      debug_log "PreCompact: trigger=$trigger"
+
+      jq -cn \
+        --arg type "pre_compact" \
+        --arg sessionId "$SESSION_ID" \
+        --arg timestamp "$timestamp" \
+        --arg trigger "$trigger" \
+        --arg instructions "$custom_instructions" \
+        '{type: $type, sessionId: $sessionId, timestamp: $timestamp, content: "Context compaction starting", metadata: {trigger: $trigger, custom_instructions: $instructions}}'
+      ;;
   esac
 }
 

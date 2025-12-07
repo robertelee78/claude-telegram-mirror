@@ -37,6 +37,7 @@ export class BridgeDaemon extends EventEmitter {
   private sessionTmuxTargets: Map<string, string> = new Map(); // sessionId -> tmux target
   private recentTelegramInputs: Set<string> = new Set(); // Track recent inputs from Telegram to avoid echo
   private toolInputCache: Map<string, { tool: string; input: unknown; timestamp: number }> = new Map(); // Cache tool inputs for details button
+  private compactingSessions: Set<string> = new Set(); // Track sessions currently compacting
 
   constructor(config?: TelegramMirrorConfig) {
     super();
@@ -216,6 +217,15 @@ export class BridgeDaemon extends EventEmitter {
           // Claude fires Stop after every turn, not when session ends
           // Just log it and update activity - don't close the topic
           logger.debug('Turn complete', { sessionId: msg.sessionId });
+          // Check if we were compacting - if so, send completion notification
+          if (this.compactingSessions.has(msg.sessionId)) {
+            await this.handleCompactComplete(msg.sessionId);
+          }
+          break;
+
+        case 'pre_compact':
+          await this.ensureSessionExists(msg);
+          await this.handlePreCompact(msg);
           break;
 
         default:
@@ -652,6 +662,42 @@ export class BridgeDaemon extends EventEmitter {
       { parseMode: 'Markdown' },
       threadId
     );
+  }
+
+  private async handlePreCompact(msg: BridgeMessage): Promise<void> {
+    const trigger = msg.metadata?.trigger as string || 'auto';
+    const threadId = this.getSessionThreadId(msg.sessionId);
+
+    // Mark session as compacting
+    this.compactingSessions.add(msg.sessionId);
+
+    // Send notification based on trigger type
+    const message = trigger === 'manual'
+      ? '🔄 *Compacting session context...*\n\n_User requested /compact_'
+      : '⏳ *Context limit reached*\n\n_Summarizing conversation, please wait..._';
+
+    await this.bot.sendMessage(
+      message,
+      { parseMode: 'Markdown' },
+      threadId
+    );
+
+    logger.info('PreCompact notification sent', { sessionId: msg.sessionId, trigger });
+  }
+
+  private async handleCompactComplete(sessionId: string): Promise<void> {
+    // Clear compacting state
+    this.compactingSessions.delete(sessionId);
+
+    const threadId = this.getSessionThreadId(sessionId);
+
+    await this.bot.sendMessage(
+      '✅ *Compaction complete*\n\n_Resuming session..._',
+      { parseMode: 'Markdown' },
+      threadId
+    );
+
+    logger.info('Compact complete notification sent', { sessionId });
   }
 
   /**
