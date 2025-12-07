@@ -54,12 +54,17 @@ export class SessionManager {
         chat_id INTEGER NOT NULL,
         thread_id INTEGER,
         hostname TEXT,
+        tmux_target TEXT,
+        tmux_socket TEXT,
         started_at TEXT NOT NULL,
         last_activity TEXT NOT NULL,
         status TEXT DEFAULT 'active',
         project_dir TEXT,
         metadata TEXT
       );
+
+      -- Migration: Add tmux columns if they don't exist (for existing DBs)
+      -- SQLite doesn't support IF NOT EXISTS for ALTER TABLE, so we use a pragma check
 
       CREATE TABLE IF NOT EXISTS pending_approvals (
         id TEXT PRIMARY KEY,
@@ -77,6 +82,31 @@ export class SessionManager {
       CREATE INDEX IF NOT EXISTS idx_approvals_session ON pending_approvals(session_id);
       CREATE INDEX IF NOT EXISTS idx_approvals_status ON pending_approvals(status);
     `);
+
+    // Migration: Add tmux_target column to existing databases
+    this.migrateAddTmuxTarget();
+  }
+
+  /**
+   * Migration: Add tmux columns to existing databases
+   */
+  private migrateAddTmuxTarget(): void {
+    try {
+      const tableInfo = this.db.prepare(`PRAGMA table_info(sessions)`).all() as Array<{ name: string }>;
+      const columns = new Set(tableInfo.map(col => col.name));
+
+      if (!columns.has('tmux_target')) {
+        this.db.exec(`ALTER TABLE sessions ADD COLUMN tmux_target TEXT`);
+        logger.info('Migration: Added tmux_target column to sessions table');
+      }
+
+      if (!columns.has('tmux_socket')) {
+        this.db.exec(`ALTER TABLE sessions ADD COLUMN tmux_socket TEXT`);
+        logger.info('Migration: Added tmux_socket column to sessions table');
+      }
+    } catch (error) {
+      logger.debug('Migration check for tmux columns', { error });
+    }
   }
 
   // ============ Session Methods ============
@@ -89,7 +119,9 @@ export class SessionManager {
     projectDir?: string,
     threadId?: number,
     hostname?: string,
-    sessionId?: string
+    sessionId?: string,
+    tmuxTarget?: string,
+    tmuxSocket?: string
   ): string {
     // Use provided sessionId (from Claude) or generate one
     const id = sessionId || generateId('session');
@@ -100,15 +132,19 @@ export class SessionManager {
     if (existing) {
       logger.info('Session already exists, updating activity', { sessionId: id });
       this.updateActivity(id);
+      // Update tmux info if provided and session exists
+      if (tmuxTarget || tmuxSocket) {
+        this.setTmuxInfo(id, tmuxTarget, tmuxSocket);
+      }
       return id;
     }
 
     this.db.prepare(`
-      INSERT INTO sessions (id, chat_id, thread_id, hostname, started_at, last_activity, status, project_dir)
-      VALUES (?, ?, ?, ?, ?, ?, 'active', ?)
-    `).run(id, chatId, threadId || null, hostname || null, now, now, projectDir || null);
+      INSERT INTO sessions (id, chat_id, thread_id, hostname, tmux_target, tmux_socket, started_at, last_activity, status, project_dir)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)
+    `).run(id, chatId, threadId || null, hostname || null, tmuxTarget || null, tmuxSocket || null, now, now, projectDir || null);
 
-    logger.info('Session created', { sessionId: id, chatId, threadId, hostname });
+    logger.info('Session created', { sessionId: id, chatId, threadId, hostname, tmuxTarget, tmuxSocket });
     return id;
   }
 
@@ -130,6 +166,39 @@ export class SessionManager {
       SELECT thread_id FROM sessions WHERE id = ?
     `).get(sessionId) as { thread_id: number | null } | undefined;
     return row?.thread_id || null;
+  }
+
+  /**
+   * Set session tmux info (target and socket for input injection)
+   */
+  setTmuxInfo(sessionId: string, tmuxTarget?: string, tmuxSocket?: string): void {
+    if (tmuxTarget && tmuxSocket) {
+      this.db.prepare(`
+        UPDATE sessions SET tmux_target = ?, tmux_socket = ? WHERE id = ?
+      `).run(tmuxTarget, tmuxSocket, sessionId);
+    } else if (tmuxTarget) {
+      this.db.prepare(`
+        UPDATE sessions SET tmux_target = ? WHERE id = ?
+      `).run(tmuxTarget, sessionId);
+    } else if (tmuxSocket) {
+      this.db.prepare(`
+        UPDATE sessions SET tmux_socket = ? WHERE id = ?
+      `).run(tmuxSocket, sessionId);
+    }
+    logger.info('Session tmux info set', { sessionId, tmuxTarget, tmuxSocket });
+  }
+
+  /**
+   * Get session tmux info (target and socket)
+   */
+  getTmuxInfo(sessionId: string): { target: string | null; socket: string | null } {
+    const row = this.db.prepare(`
+      SELECT tmux_target, tmux_socket FROM sessions WHERE id = ?
+    `).get(sessionId) as { tmux_target: string | null; tmux_socket: string | null } | undefined;
+    return {
+      target: row?.tmux_target || null,
+      socket: row?.tmux_socket || null
+    };
   }
 
   /**
@@ -364,6 +433,8 @@ export class SessionManager {
       threadId: row.thread_id || undefined,
       hostname: row.hostname || undefined,
       projectDir: row.project_dir || undefined,
+      tmuxTarget: row.tmux_target || undefined,
+      tmuxSocket: row.tmux_socket || undefined,
       startedAt: new Date(row.started_at),
       lastActivity: new Date(row.last_activity),
       status: row.status as Session['status'],
@@ -389,6 +460,8 @@ interface SessionRow {
   chat_id: number;
   thread_id: number | null;
   hostname: string | null;
+  tmux_target: string | null;
+  tmux_socket: string | null;
   started_at: string;
   last_activity: string;
   status: string;

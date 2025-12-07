@@ -108,11 +108,16 @@ SESSION_ID="${CLAUDE_SESSION_ID:-$(date +%s)-$$}"
 debug_log "Using session ID: $SESSION_ID"
 
 # Get tmux info if available
+# Extracts socket path from $TMUX env var for explicit targeting
 get_tmux_info() {
   if [[ -z "$TMUX" ]]; then
     echo "{}"
     return
   fi
+
+  # $TMUX format: /path/to/socket,pid,index
+  # Extract socket path (everything before first comma)
+  local socket_path="${TMUX%%,*}"
 
   local session=$(tmux display-message -p "#S" 2>/dev/null || echo "")
   local pane=$(tmux display-message -p "#P" 2>/dev/null || echo "")
@@ -124,7 +129,8 @@ get_tmux_info() {
       --arg session "$session" \
       --arg pane "$pane" \
       --arg target "$target" \
-      '{tmuxSession: $session, tmuxPane: $pane, tmuxTarget: $target}'
+      --arg socket "$socket_path" \
+      '{tmuxSession: $session, tmuxPane: $pane, tmuxTarget: $target, tmuxSocket: $socket}'
   else
     echo "{}"
   fi

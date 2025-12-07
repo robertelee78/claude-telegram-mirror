@@ -19,6 +19,7 @@ type InjectionMethod = 'tmux' | 'pty' | 'fifo' | 'none';
 interface InjectorConfig {
   method: InjectionMethod;
   tmuxSession?: string;
+  tmuxSocket?: string;  // Explicit socket path for tmux -S
   fifoPath?: string;
 }
 
@@ -30,6 +31,7 @@ export class InputInjector extends EventEmitter {
   private config: InjectorConfig;
   private method: InjectionMethod = 'none';
   private tmuxSession: string | null = null;
+  private tmuxSocket: string | null = null;  // Socket path for explicit targeting
 
   constructor(config: Partial<InjectorConfig> = {}) {
     super();
@@ -111,21 +113,42 @@ export class InputInjector extends EventEmitter {
       // Escape special characters for tmux
       const escapedText = this.escapeTmuxText(text);
 
-      // Use -l (literal) flag to send text as-is, then send Enter separately
-      // This is more reliable than quoting with Enter appended
-      execSync(`tmux send-keys -t "${this.tmuxSession}" -l "${escapedText}"`, {
-        stdio: 'ignore'
+      // Build tmux command with explicit socket if available
+      // -S specifies the socket path, -t specifies the target session:window.pane
+      const socketFlag = this.tmuxSocket ? `-S "${this.tmuxSocket}"` : '';
+      const sendKeysCmd = `tmux ${socketFlag} send-keys -t "${this.tmuxSession}" -l "${escapedText}"`;
+      const enterCmd = `tmux ${socketFlag} send-keys -t "${this.tmuxSession}" Enter`;
+
+      logger.debug('Running tmux command', {
+        cmd: sendKeysCmd,
+        session: this.tmuxSession,
+        socket: this.tmuxSocket,
+        textLength: text.length
+      });
+
+      execSync(sendKeysCmd, {
+        stdio: 'pipe',
+        encoding: 'utf8'
       });
 
       // Send Enter key separately to submit
-      execSync(`tmux send-keys -t "${this.tmuxSession}" Enter`, {
-        stdio: 'ignore'
+      execSync(enterCmd, {
+        stdio: 'pipe',
+        encoding: 'utf8'
       });
 
-      logger.debug('Injected via tmux', { session: this.tmuxSession });
+      logger.debug('Injected via tmux', { session: this.tmuxSession, socket: this.tmuxSocket });
       return true;
-    } catch (error) {
-      logger.error('Failed to inject via tmux', { error });
+    } catch (error: unknown) {
+      const execError = error as { stderr?: string; message?: string };
+      logger.error('Failed to inject via tmux', {
+        error,
+        stderr: execError.stderr,
+        message: execError.message,
+        session: this.tmuxSession,
+        socket: this.tmuxSocket,
+        textLength: text.length
+      });
       return false;
     }
   }
@@ -288,13 +311,21 @@ export class InputInjector extends EventEmitter {
   }
 
   /**
-   * Set tmux session explicitly
+   * Set tmux session explicitly (with optional socket path)
    */
-  setTmuxSession(session: string): void {
+  setTmuxSession(session: string, socket?: string): void {
     this.tmuxSession = session;
+    this.tmuxSocket = socket || null;
     if (session) {
       this.method = 'tmux';
     }
+  }
+
+  /**
+   * Get tmux socket path
+   */
+  getTmuxSocket(): string | null {
+    return this.tmuxSocket;
   }
 }
 

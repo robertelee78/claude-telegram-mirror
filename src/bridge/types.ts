@@ -29,6 +29,8 @@ export interface Session {
   threadId?: number;
   hostname?: string;
   projectDir?: string;
+  tmuxTarget?: string;  // Persisted tmux session target (e.g., "1:0.0")
+  tmuxSocket?: string;  // Persisted tmux socket path (e.g., "/tmp/tmux-1000/default")
   startedAt: Date;
   lastActivity: Date;
   status: 'active' | 'ended' | 'aborted';

@@ -260,10 +260,28 @@ export class BridgeDaemon extends EventEmitter {
         }
       }
 
-      // Get the tmux target for this session if available
-      const tmuxTarget = this.sessionTmuxTargets.get(session.id);
+      // Get the tmux info for this session
+      // First check memory cache, then fallback to database (handles daemon restart)
+      let tmuxTarget = this.sessionTmuxTargets.get(session.id);
+      let tmuxSocket: string | undefined;
+
+      if (!tmuxTarget) {
+        // Cache miss - restore from database (e.g., after daemon restart)
+        const tmuxInfo = this.sessions.getTmuxInfo(session.id);
+        tmuxTarget = tmuxInfo.target || undefined;
+        tmuxSocket = tmuxInfo.socket || undefined;
+        if (tmuxTarget) {
+          // Repopulate cache for future requests
+          this.sessionTmuxTargets.set(session.id, tmuxTarget);
+          logger.info('Restored tmux info from database', { sessionId: session.id, tmuxTarget, tmuxSocket });
+        }
+      } else {
+        // Have target in cache, get socket from session data
+        tmuxSocket = session.tmuxSocket;
+      }
+
       if (tmuxTarget) {
-        this.injector.setTmuxSession(tmuxTarget);
+        this.injector.setTmuxSession(tmuxTarget, tmuxSocket);
       }
 
       // Track this input so we don't echo it back when the hook fires
@@ -306,6 +324,7 @@ export class BridgeDaemon extends EventEmitter {
     const hostname = msg.metadata?.hostname as string | undefined;
     const projectDir = msg.metadata?.projectDir as string | undefined;
     const tmuxTarget = msg.metadata?.tmuxTarget as string | undefined;
+    const tmuxSocket = msg.metadata?.tmuxSocket as string | undefined;
 
     // Use Claude's native session_id from the message
     // This ensures all events from the same Claude session map to the same Telegram thread
@@ -314,13 +333,15 @@ export class BridgeDaemon extends EventEmitter {
       projectDir,
       undefined,
       hostname,
-      msg.sessionId  // Use Claude's session_id!
+      msg.sessionId,  // Use Claude's session_id!
+      tmuxTarget,     // Persist tmux target to database
+      tmuxSocket      // Persist tmux socket path to database
     );
 
-    // Store tmux target for input injection
+    // Also cache in memory for fast lookups
     if (tmuxTarget) {
       this.sessionTmuxTargets.set(sessionId, tmuxTarget);
-      logger.info('Session tmux target stored', { sessionId, tmuxTarget });
+      logger.info('Session tmux info stored', { sessionId, tmuxTarget, tmuxSocket });
     }
 
     // Check if session already has a thread (e.g., daemon restarted but session continues)
@@ -412,16 +433,19 @@ export class BridgeDaemon extends EventEmitter {
     const hostname = msg.metadata?.hostname as string | undefined;
     const projectDir = msg.metadata?.projectDir as string | undefined;
     const tmuxTarget = msg.metadata?.tmuxTarget as string | undefined;
+    const tmuxSocket = msg.metadata?.tmuxSocket as string | undefined;
 
     this.sessions.createSession(
       this.config.chatId,
       projectDir,
       undefined,
       hostname,
-      msg.sessionId
+      msg.sessionId,
+      tmuxTarget,  // Persist tmux target to database
+      tmuxSocket   // Persist tmux socket path to database
     );
 
-    // Store tmux target if available
+    // Also cache in memory for fast lookups
     if (tmuxTarget) {
       this.sessionTmuxTargets.set(msg.sessionId, tmuxTarget);
     }
