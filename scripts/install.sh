@@ -304,16 +304,22 @@ configure_privacy_mode() {
 # ============================================
 
 setup_telegram_group() {
-  header "STEP 4: CREATE SUPERGROUP WITH TOPICS"
+  header "STEP 4: SETUP SUPERGROUP WITH TOPICS"
 
-  echo "  Create a Telegram supergroup with Topics enabled."
+  echo "  You need a Telegram supergroup with Topics enabled."
   echo ""
-  echo "  1. In Telegram, create a new group"
-  echo "  2. Add @${BOT_USERNAME} to the group"
-  echo "  3. Go to group settings"
-  echo "  4. Enable 'Topics' (this converts it to a supergroup)"
-  echo "  5. Make the bot an admin with 'Manage Topics' permission"
-  echo "  6. Send any message in the group (so we can detect it)"
+  echo "  ${BOLD}Option A: Use an existing supergroup${NC}"
+  echo "    1. Add @${BOT_USERNAME} to your existing supergroup"
+  echo "    2. Make the bot an admin with 'Manage Topics' permission"
+  echo "    3. Send any message in the group (so we can detect it)"
+  echo ""
+  echo "  ${BOLD}Option B: Create a new group${NC}"
+  echo "    1. In Telegram, create a new group"
+  echo "    2. Add @${BOT_USERNAME} to the group"
+  echo "    3. Go to group settings → Enable 'Topics'"
+  echo "       (This converts it to a supergroup)"
+  echo "    4. Make the bot an admin with 'Manage Topics' permission"
+  echo "    5. Send any message in the group"
   echo ""
 
   prompt_continue "Press Enter when you've completed these steps..."
