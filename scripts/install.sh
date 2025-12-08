@@ -93,8 +93,18 @@ prompt_read() {
   local varname="$2"
   local result
 
-  # Use -r to prevent backslash interpretation
-  read -r -p "$prompt" result < "$TTY_INPUT"
+  # Print prompt to stderr (so it shows regardless of stdin redirection)
+  # Use -n to avoid newline after prompt
+  echo -n "$prompt" >&2
+
+  # Read from TTY - use || true to prevent set -e from killing us
+  # The -r flag prevents backslash interpretation
+  if ! read -r result < "$TTY_INPUT"; then
+    echo "" >&2
+    echo -e "${RED}ERROR: Failed to read input from terminal${NC}" >&2
+    echo "  TTY_INPUT=$TTY_INPUT" >&2
+    exit 1
+  fi
 
   # Assign to the named variable
   eval "$varname=\$result"
@@ -104,7 +114,14 @@ prompt_read() {
 prompt_continue() {
   local prompt="${1:-Press Enter to continue...}"
   local dummy
-  read -r -p "$prompt" dummy < "$TTY_INPUT"
+
+  echo -n "$prompt" >&2
+
+  if ! read -r dummy < "$TTY_INPUT"; then
+    echo "" >&2
+    echo -e "${RED}ERROR: Failed to read input from terminal${NC}" >&2
+    exit 1
+  fi
 }
 
 # ============================================
