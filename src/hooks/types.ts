@@ -49,6 +49,7 @@ export interface PreToolUseHookEvent extends HookEvent {
   type: 'PreToolUse';
   tool_name: string;
   tool_input: Record<string, unknown>;
+  tool_use_id?: string;  // Unique identifier for this tool call
 }
 
 /**

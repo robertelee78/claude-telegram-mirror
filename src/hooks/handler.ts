@@ -172,19 +172,32 @@ export class HookHandler {
 
   /**
    * Handle PreToolUse hook
-   * Returns approval decision if interactive mode enabled
+   * Returns approval decision for Claude Code's permission system
+   *
+   * Output format (Claude Code's hookSpecificOutput):
+   * - permissionDecision: "allow" | "deny" | "ask"
+   * - permissionDecisionReason: string shown to user (allow/ask) or Claude (deny)
    */
-  async handlePreToolUse(event: PreToolUseHookEvent): Promise<{ decision: 'approve' | 'reject' } | null> {
+  async handlePreToolUse(event: PreToolUseHookEvent): Promise<{
+    permissionDecision: 'allow' | 'deny' | 'ask';
+    permissionDecisionReason: string;
+  } | null> {
     if (!this.connected) return null;
 
-    // Check if this tool requires approval
+    // Check if this tool requires approval via Telegram
     const requiresApproval = this.toolRequiresApproval(event.tool_name, event.tool_input);
 
-    if (requiresApproval) {
-      // Format approval request
-      const toolDescription = this.formatToolDescription(event.tool_name, event.tool_input);
+    if (!requiresApproval) {
+      // Let Claude Code handle permission normally
+      return null;
+    }
 
-      this.send({
+    // Format approval request for Telegram
+    const toolDescription = this.formatToolDescription(event.tool_name, event.tool_input);
+
+    // Send approval request and wait for response
+    try {
+      const response = await this.client.sendAndWait({
         type: 'approval_request',
         sessionId: this.sessionId,
         timestamp: event.timestamp,
@@ -192,29 +205,40 @@ export class HookHandler {
         metadata: {
           tool: event.tool_name,
           input: event.tool_input,
-          hookId: event.hook_id
+          hookId: event.hook_id,
+          toolUseId: event.tool_use_id
         }
-      });
+      }, 300000); // 5 minute timeout for user to respond
 
-      // Wait for response from bridge
-      try {
-        const response = await this.client.sendAndWait({
-          type: 'approval_request',
-          sessionId: this.sessionId,
-          timestamp: event.timestamp,
-          content: toolDescription,
-          metadata: { hookId: event.hook_id }
-        }, 300000); // 5 minute timeout
+      if (response.type === 'approval_response') {
+        const action = response.content as string;
 
-        if (response.type === 'approval_response') {
-          return { decision: response.content === 'approve' ? 'approve' : 'reject' };
-        }
-      } catch (error) {
-        // Timeout or error - default to approve
-        if (this.config.verbose) {
-          console.error('[telegram-hook] Approval timeout, defaulting to approve');
+        if (action === 'approve') {
+          return {
+            permissionDecision: 'allow',
+            permissionDecisionReason: 'Approved via Telegram'
+          };
+        } else if (action === 'reject') {
+          return {
+            permissionDecision: 'deny',
+            permissionDecisionReason: 'Rejected via Telegram - user declined this operation'
+          };
+        } else if (action === 'abort') {
+          return {
+            permissionDecision: 'deny',
+            permissionDecisionReason: 'Session aborted via Telegram - user requested to stop all operations'
+          };
         }
       }
+    } catch (error) {
+      // Timeout or error - fall back to CLI prompt
+      if (this.config.verbose) {
+        console.error('[telegram-hook] Telegram approval timeout, falling back to CLI');
+      }
+      return {
+        permissionDecision: 'ask',
+        permissionDecisionReason: 'Telegram approval timed out - please approve in CLI'
+      };
     }
 
     return null;
@@ -371,8 +395,14 @@ export class HookHandler {
       case 'PreToolUse':
         const result = await this.handlePreToolUse(event);
         if (result) {
-          // Return decision as JSON for hook script
-          return JSON.stringify({ decision: result.decision });
+          // Return Claude Code's hookSpecificOutput format
+          return JSON.stringify({
+            hookSpecificOutput: {
+              hookEventName: 'PreToolUse',
+              permissionDecision: result.permissionDecision,
+              permissionDecisionReason: result.permissionDecisionReason
+            }
+          });
         }
         return null;
 

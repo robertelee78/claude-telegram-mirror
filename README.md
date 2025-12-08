@@ -83,10 +83,19 @@ Once connected, you can control Claude from Telegram:
 | Any text | Sends to Claude as input |
 | `stop` | Sends Ctrl+C to interrupt Claude |
 | `/stop`, `cancel`, `abort` | Also interrupt Claude |
-| Tap "Approve" button | Approve tool execution |
-| Tap "Reject" button | Reject tool execution |
-| Tap "Abort" button | Abort the entire session |
-| Tap "Details" button | View full tool input parameters |
+
+### Tool Approval Buttons
+
+When Claude requests to use a tool that requires permission (Write, Edit, Bash with non-safe commands), you'll see approval buttons in Telegram:
+
+| Button | Action |
+|--------|--------|
+| **Approve** | Allow the tool to execute |
+| **Reject** | Deny this specific tool execution |
+| **Abort** | Stop the entire Claude session |
+| **Details** | View full tool input parameters |
+
+**Note:** Approval buttons only appear when running Claude in normal mode. They do not appear when using `--dangerously-skip-permissions` mode. If you don't respond within 5 minutes, Claude will fall back to asking for approval in the CLI terminal.
 
 ## Architecture
 
@@ -99,17 +108,23 @@ Once connected, you can control Claude from Telegram:
         │ hooks                 │ Unix socket
         ▼                       ▼
 ┌─────────────────┐     ┌─────────────────┐
-│  telegram-hook  │────▶│  Socket Server  │
-│     (bash)      │     │                 │
+│  PreToolUse:    │────▶│  Socket Server  │
+│  Node.js handler│◀────│  (bidirectional)│
+│  (with approval)│     │                 │
+├─────────────────┤     │                 │
+│  Other hooks:   │────▶│                 │
+│  Bash script    │     │                 │
+│  (fire & forget)│     │                 │
 └─────────────────┘     └─────────────────┘
 ```
 
 **Flow:**
 1. Claude Code hooks capture events (prompts, responses, tool use)
-2. Hook script sends JSON to bridge daemon via Unix socket
-3. Bridge forwards messages to Telegram Forum Topic
-4. Telegram replies are injected into CLI via `tmux send-keys`
-5. Stop commands send `Ctrl-C` to interrupt Claude
+2. PreToolUse: Node.js handler sends approval request, waits for Telegram response
+3. Other hooks: Bash script sends JSON and exits immediately (faster)
+4. Bridge forwards messages to Telegram Forum Topic
+5. Telegram replies are injected into CLI via `tmux send-keys`
+6. Stop commands send `Ctrl-C` to interrupt Claude
 
 ## Multi-System Architecture
 
