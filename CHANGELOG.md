@@ -2,6 +2,31 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.13] - 2025-12-08
+
+### Fixed
+- **BUG-002: Race condition in topic creation** - Messages no longer leak to General topic when events arrive out-of-order
+  - Added promise-based topic lock with 5-second timeout
+  - All handlers now await topic creation before sending messages
+  - Explicit failure (error log + drop message) on timeout instead of silent misdirection
+
+- **Closed topic auto-reopen** - Bot automatically reopens topics closed by user in Telegram
+  - Detects `TOPIC_CLOSED` error and calls `reopenForumTopic()`
+  - Sends "Topic reopened" notification after recovery
+  - Retries original message after successful reopen
+
+- **PreToolUse regression: Missing tool details** - Restored detailed tool call information in Telegram
+  - PreToolUse now runs BOTH bash script (tool details) AND Node.js handler (approvals) in parallel
+  - Safe tools (ls, cat, pwd, etc.) now appear in Telegram - they were silently skipped before
+  - Rich expandable context restored for all tool invocations
+
+### Changed
+- **Smart hook installer** - Auto-fixes configuration without `--force` flag
+  - Compares existing CTM hooks with expected configuration
+  - Only updates hooks that need changes, preserves user's other hooks
+  - Reports what changed: `added`, `updated`, or `unchanged`
+  - Removed `--force` option (no longer needed)
+
 ## [0.1.11] - 2025-12-08
 
 ### Fixed

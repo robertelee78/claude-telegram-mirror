@@ -548,7 +548,7 @@ export TELEGRAM_MIRROR=true
 
     try {
       const { installHooks: doInstallHooks } = await import('../hooks/installer.js');
-      const result = doInstallHooks({ force: false });
+      const result = doInstallHooks({});
       if (result.success) {
         console.log(green('✓') + ' Global hooks installed to ~/.claude/settings.json');
       } else {
@@ -598,7 +598,7 @@ export TELEGRAM_MIRROR=true
         } else {
           try {
             const { installHooks: doInstallHooks } = await import('../hooks/installer.js');
-            const result = doInstallHooks({ force: false, projectPath: fullPath });
+            const result = doInstallHooks({ projectPath: fullPath });
             if (result.success) {
               console.log(green('✓') + ` Hooks installed to ${projectPath}/.claude/settings.json`);
             } else {

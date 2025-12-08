@@ -189,40 +189,78 @@ export class TelegramBot {
           });
         }
       } catch (error) {
-        // If Markdown parsing failed, retry without parse_mode (plain text)
-        if (error instanceof GrammyError && error.error_code === 400 &&
-            error.description.includes("can't parse entities")) {
-          logger.warn('Markdown parsing failed, retrying as plain text', {
-            error: error.description
-          });
-
-          // Strip markdown formatting for plain text fallback
-          const plainText = item.text
-            .replace(/\*\*/g, '')  // Remove bold **
-            .replace(/\*/g, '')    // Remove italic *
-            .replace(/`/g, "'")    // Replace backticks with quotes
-            .replace(/_/g, '');    // Remove underscores
-
-          if (item.buttons && item.buttons.length > 0) {
-            const keyboard = new InlineKeyboard();
-            item.buttons.forEach((btn, idx) => {
-              keyboard.text(btn.text, btn.callbackData);
-              if ((idx + 1) % 2 === 0) keyboard.row();
-            });
-            await this.bot.api.sendMessage(item.chatId, plainText, {
-              disable_notification: item.options?.disableNotification,
-              message_thread_id: threadId,
-              reply_markup: keyboard
-            });
-          } else {
-            await this.bot.api.sendMessage(item.chatId, plainText, {
-              disable_notification: item.options?.disableNotification,
-              message_thread_id: threadId
-            });
+        if (error instanceof GrammyError && error.error_code === 400) {
+          // Handle closed topic - reopen and retry
+          if (error.description.includes('TOPIC_CLOSED') && threadId) {
+            logger.info('Topic was closed, attempting to reopen...', { threadId });
+            const reopened = await this.reopenForumTopic(threadId);
+            if (reopened) {
+              // Send reopened notification
+              await this.bot.api.sendMessage(item.chatId, '📂 Topic reopened', {
+                message_thread_id: threadId,
+                disable_notification: true
+              });
+              // Retry the original message
+              if (item.buttons && item.buttons.length > 0) {
+                const keyboard = new InlineKeyboard();
+                item.buttons.forEach((btn, idx) => {
+                  keyboard.text(btn.text, btn.callbackData);
+                  if ((idx + 1) % 2 === 0) keyboard.row();
+                });
+                await this.bot.api.sendMessage(item.chatId, item.text, {
+                  parse_mode: parseMode,
+                  disable_notification: item.options?.disableNotification,
+                  message_thread_id: threadId,
+                  reply_markup: keyboard
+                });
+              } else {
+                await this.bot.api.sendMessage(item.chatId, item.text, {
+                  parse_mode: parseMode,
+                  disable_notification: item.options?.disableNotification,
+                  message_thread_id: threadId
+                });
+              }
+              return; // Success after reopen
+            }
+            // If reopen failed, fall through to throw
+            logger.error('Failed to reopen topic, message will be lost', { threadId });
+            throw error;
           }
-        } else {
-          throw error; // Re-throw other errors for retry logic
+
+          // Handle markdown parsing failure - retry as plain text
+          if (error.description.includes("can't parse entities")) {
+            logger.warn('Markdown parsing failed, retrying as plain text', {
+              error: error.description
+            });
+
+            // Strip markdown formatting for plain text fallback
+            const plainText = item.text
+              .replace(/\*\*/g, '')  // Remove bold **
+              .replace(/\*/g, '')    // Remove italic *
+              .replace(/`/g, "'")    // Replace backticks with quotes
+              .replace(/_/g, '');    // Remove underscores
+
+            if (item.buttons && item.buttons.length > 0) {
+              const keyboard = new InlineKeyboard();
+              item.buttons.forEach((btn, idx) => {
+                keyboard.text(btn.text, btn.callbackData);
+                if ((idx + 1) % 2 === 0) keyboard.row();
+              });
+              await this.bot.api.sendMessage(item.chatId, plainText, {
+                disable_notification: item.options?.disableNotification,
+                message_thread_id: threadId,
+                reply_markup: keyboard
+              });
+            } else {
+              await this.bot.api.sendMessage(item.chatId, plainText, {
+                disable_notification: item.options?.disableNotification,
+                message_thread_id: threadId
+              });
+            }
+            return; // Success after plain text fallback
+          }
         }
+        throw error; // Re-throw other errors for retry logic
       }
     });
   }
@@ -335,6 +373,20 @@ export class TelegramBot {
       return true;
     } catch (error) {
       logger.debug('Failed to close forum topic', { threadId, error });
+      return false;
+    }
+  }
+
+  /**
+   * Reopen a closed forum topic
+   */
+  async reopenForumTopic(threadId: number): Promise<boolean> {
+    try {
+      await this.bot.api.reopenForumTopic(this.config.chatId, threadId);
+      logger.info('Reopened forum topic', { threadId });
+      return true;
+    } catch (error) {
+      logger.warn('Failed to reopen forum topic', { threadId, error });
       return false;
     }
   }

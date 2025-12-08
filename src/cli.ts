@@ -191,30 +191,49 @@ program
 program
   .command('install-hooks')
   .description('Install Claude Code hooks')
-  .option('-f, --force', 'Force reinstall hooks')
   .option('-p, --project', 'Install to current project\'s .claude/settings.json (run from project directory)')
   .action((options) => {
     if (options.project) {
       console.log(`📌 Installing hooks to project: ${process.cwd()}\n`);
     } else {
-      console.log('📌 Installing Claude Code hooks (global)...\n');
+      console.log('📌 Configuring Claude Code hooks (global)...\n');
     }
 
-    const result = installHooks({ force: options.force, project: options.project });
+    const result = installHooks({ project: options.project });
 
     if (result.success) {
-      if (result.installed.length > 0) {
-        console.log('✅ Installed hooks:');
-        result.installed.forEach(h => console.log(`   • ${h}`));
-      }
-      if (result.skipped.length > 0) {
-        console.log('\n⚪ Already installed:');
-        result.skipped.forEach(h => console.log(`   • ${h}`));
-      }
-      console.log(`\n✅ Hooks installed to: ${result.settingsPath}\n`);
+      const added = result.changes.filter(c => c.status === 'added');
+      const updated = result.changes.filter(c => c.status === 'updated');
+      const unchanged = result.changes.filter(c => c.status === 'unchanged');
 
-      if (options.project) {
-        console.log('💡 Restart Claude Code in this project to activate hooks.\n');
+      if (added.length > 0) {
+        console.log('✅ Added hooks:');
+        added.forEach(c => {
+          const details = c.details ? ` (${c.details})` : '';
+          console.log(`   • ${c.hookType}${details}`);
+        });
+      }
+
+      if (updated.length > 0) {
+        console.log('\n🔄 Updated hooks:');
+        updated.forEach(c => {
+          const details = c.details ? ` (${c.details})` : '';
+          console.log(`   • ${c.hookType}${details}`);
+        });
+      }
+
+      if (unchanged.length > 0) {
+        console.log('\n✓ Already correct:');
+        unchanged.forEach(c => console.log(`   • ${c.hookType}`));
+      }
+
+      // Summary
+      const changedCount = added.length + updated.length;
+      if (changedCount > 0) {
+        console.log(`\n✅ Configuration updated: ${result.settingsPath}`);
+        console.log('💡 Restart Claude Code to activate changes.\n');
+      } else {
+        console.log(`\n✅ Configuration already correct: ${result.settingsPath}\n`);
       }
     } else {
       console.error('❌ Failed to install hooks:', result.error);

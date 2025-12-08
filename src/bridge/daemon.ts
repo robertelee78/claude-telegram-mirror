@@ -39,6 +39,12 @@ export class BridgeDaemon extends EventEmitter {
   private toolInputCache: Map<string, { tool: string; input: unknown; timestamp: number }> = new Map(); // Cache tool inputs for details button
   private compactingSessions: Set<string> = new Set(); // Track sessions currently compacting
 
+  // BUG-002 fix: Promise-based topic creation lock to prevent race conditions
+  // When ensureSessionExists() creates a session before session_start arrives,
+  // other handlers wait for the topic to be created via these promises
+  private topicCreationPromises: Map<string, Promise<number | undefined>> = new Map();
+  private topicCreationResolvers: Map<string, (threadId: number | undefined) => void> = new Map();
+
   constructor(config?: TelegramMirrorConfig) {
     super();
     this.config = config || loadConfig();
@@ -463,6 +469,16 @@ export class BridgeDaemon extends EventEmitter {
       }
     }
 
+    // BUG-002 FIX: Resolve any pending topic creation promise
+    // This unblocks message handlers that were waiting via waitForTopic()
+    const resolver = this.topicCreationResolvers.get(sessionId);
+    if (resolver) {
+      resolver(threadId || undefined);
+      this.topicCreationPromises.delete(sessionId);
+      this.topicCreationResolvers.delete(sessionId);
+      logger.debug('Topic creation promise resolved', { sessionId, threadId });
+    }
+
     // Broadcast session registered (with Claude's session ID)
     this.socket.broadcast({
       type: 'session_start',
@@ -516,7 +532,10 @@ export class BridgeDaemon extends EventEmitter {
    *
    * IMPORTANT: This function ONLY creates the session entry in the database.
    * Topic creation is the responsibility of handleSessionStart() alone.
-   * Messages arriving before the topic is created will go to General.
+   *
+   * BUG-002 FIX: When creating a session on-the-fly, we create a promise that
+   * message handlers can await. handleSessionStart() will resolve this promise
+   * once the topic is created, preventing messages from going to General.
    */
   private async ensureSessionExists(msg: BridgeMessage): Promise<void> {
     const existing = this.sessions.getSession(msg.sessionId);
@@ -528,7 +547,7 @@ export class BridgeDaemon extends EventEmitter {
 
     // Create session on-the-fly with Claude's session_id
     // The topic will be created when session_start arrives
-    logger.info('Creating session on-the-fly (no topic yet)', { sessionId: msg.sessionId });
+    logger.info('Creating session on-the-fly (topic pending)', { sessionId: msg.sessionId });
 
     const hostname = msg.metadata?.hostname as string | undefined;
     const projectDir = msg.metadata?.projectDir as string | undefined;
@@ -550,7 +569,18 @@ export class BridgeDaemon extends EventEmitter {
       this.sessionTmuxTargets.set(msg.sessionId, tmuxTarget);
     }
 
-    // NOTE: No topic creation here - that's handleSessionStart's job
+    // BUG-002 FIX: Create a promise for topic creation
+    // Other handlers will await this promise via waitForTopic()
+    // handleSessionStart() will resolve it once the topic is created
+    if (this.config.useThreads && !this.topicCreationPromises.has(msg.sessionId)) {
+      let resolver: (threadId: number | undefined) => void;
+      const promise = new Promise<number | undefined>((resolve) => {
+        resolver = resolve;
+      });
+      this.topicCreationPromises.set(msg.sessionId, promise);
+      this.topicCreationResolvers.set(msg.sessionId, resolver!);
+      logger.debug('Topic creation promise created', { sessionId: msg.sessionId });
+    }
   }
 
   /**
@@ -569,6 +599,61 @@ export class BridgeDaemon extends EventEmitter {
     }
 
     return undefined;
+  }
+
+  /**
+   * Wait for topic creation to complete (BUG-002 fix)
+   * If a session was created by ensureSessionExists() before session_start arrived,
+   * this waits for handleSessionStart() to create the topic.
+   *
+   * @param sessionId - The session to wait for
+   * @param timeoutMs - Maximum time to wait (default 5 seconds)
+   * @returns The threadId if topic exists/created, undefined if timeout or no topic
+   */
+  private async waitForTopic(sessionId: string, timeoutMs: number = 5000): Promise<number | undefined> {
+    // Fast path: topic already exists
+    const existing = this.getSessionThreadId(sessionId);
+    if (existing) return existing;
+
+    // Check if there's a pending topic creation promise
+    const promise = this.topicCreationPromises.get(sessionId);
+    if (!promise) {
+      // No pending creation - topic doesn't exist and isn't being created
+      // This can happen if session_start already ran but didn't create a topic (useThreads=false)
+      return undefined;
+    }
+
+    logger.debug('Waiting for topic creation...', { sessionId, timeoutMs });
+
+    // Wait for topic creation with timeout
+    try {
+      const result = await Promise.race([
+        promise,
+        new Promise<undefined>((resolve) =>
+          setTimeout(() => {
+            logger.error('Topic creation timeout - message will be dropped', { sessionId, timeoutMs });
+            resolve(undefined);
+          }, timeoutMs)
+        )
+      ]);
+
+      // If we got a result, check cache again (promise may have resolved and updated cache)
+      if (result !== undefined) {
+        return result;
+      }
+
+      // Timeout occurred - check cache one more time in case it was created
+      const finalCheck = this.getSessionThreadId(sessionId);
+      if (finalCheck) {
+        logger.debug('Topic found after timeout race', { sessionId, threadId: finalCheck });
+        return finalCheck;
+      }
+
+      return undefined;
+    } catch (error) {
+      logger.error('Error waiting for topic creation', { sessionId, error });
+      return undefined;
+    }
   }
 
   private async handleSessionEnd(msg: BridgeMessage): Promise<void> {
@@ -598,7 +683,12 @@ export class BridgeDaemon extends EventEmitter {
   }
 
   private async handleAgentResponse(msg: BridgeMessage): Promise<void> {
-    const threadId = this.getSessionThreadId(msg.sessionId);
+    // BUG-002 FIX: Wait for topic creation if it's pending
+    const threadId = await this.waitForTopic(msg.sessionId);
+    if (threadId === undefined && this.config.useThreads) {
+      logger.error('Topic creation timeout - dropping agent_response', { sessionId: msg.sessionId });
+      return;
+    }
     await this.bot.sendMessage(
       formatAgentResponse(msg.content),
       { parseMode: 'Markdown' },
@@ -612,7 +702,12 @@ export class BridgeDaemon extends EventEmitter {
 
     const toolName = msg.metadata?.tool as string || 'Unknown';
     const toolInput = msg.metadata?.input as Record<string, unknown> | undefined;
-    const threadId = this.getSessionThreadId(msg.sessionId);
+    // BUG-002 FIX: Wait for topic creation if it's pending
+    const threadId = await this.waitForTopic(msg.sessionId);
+    if (threadId === undefined && this.config.useThreads) {
+      logger.error('Topic creation timeout - dropping tool_start', { sessionId: msg.sessionId, toolName });
+      return;
+    }
 
     // Format brief preview based on tool type
     let preview = '';
@@ -682,7 +777,12 @@ export class BridgeDaemon extends EventEmitter {
     const toolName = msg.metadata?.tool as string || 'Unknown';
     const toolInput = msg.metadata?.input;
     const toolOutput = msg.content;
-    const threadId = this.getSessionThreadId(msg.sessionId);
+    // BUG-002 FIX: Wait for topic creation if it's pending
+    const threadId = await this.waitForTopic(msg.sessionId);
+    if (threadId === undefined && this.config.useThreads) {
+      logger.error('Topic creation timeout - dropping tool_result', { sessionId: msg.sessionId, toolName });
+      return;
+    }
 
     await this.bot.sendMessage(
       formatToolExecution(toolName, toolInput, toolOutput, this.config.verbose),
@@ -708,15 +808,11 @@ export class BridgeDaemon extends EventEmitter {
       return;
     }
 
-    // Wait for thread to be available (session_start creates thread async)
-    let threadId = this.getSessionThreadId(msg.sessionId);
-    if (!threadId) {
-      // Retry a few times with small delay - thread might be creating
-      for (let i = 0; i < 5; i++) {
-        await new Promise(resolve => setTimeout(resolve, 200));
-        threadId = this.getSessionThreadId(msg.sessionId);
-        if (threadId) break;
-      }
+    // BUG-002 FIX: Wait for topic creation if it's pending
+    const threadId = await this.waitForTopic(msg.sessionId);
+    if (threadId === undefined && this.config.useThreads) {
+      logger.error('Topic creation timeout - dropping user_input', { sessionId: msg.sessionId });
+      return;
     }
 
     logger.debug('handleUserInput', { sessionId: msg.sessionId, threadId, source, content: msg.content?.substring(0, 50) });
@@ -731,7 +827,12 @@ export class BridgeDaemon extends EventEmitter {
 
   private async handleApprovalRequest(msg: BridgeMessage): Promise<void> {
     const approvalId = this.sessions.createApproval(msg.sessionId, msg.content);
-    const threadId = this.getSessionThreadId(msg.sessionId);
+    // BUG-002 FIX: Wait for topic creation if it's pending
+    const threadId = await this.waitForTopic(msg.sessionId);
+    if (threadId === undefined && this.config.useThreads) {
+      logger.error('Topic creation timeout - dropping approval_request', { sessionId: msg.sessionId });
+      return;
+    }
 
     await this.bot.sendWithButtons(
       formatApprovalRequest(msg.content),
@@ -746,7 +847,12 @@ export class BridgeDaemon extends EventEmitter {
   }
 
   private async handleError(msg: BridgeMessage): Promise<void> {
-    const threadId = this.getSessionThreadId(msg.sessionId);
+    // BUG-002 FIX: Wait for topic creation if it's pending
+    const threadId = await this.waitForTopic(msg.sessionId);
+    if (threadId === undefined && this.config.useThreads) {
+      logger.error('Topic creation timeout - dropping error message', { sessionId: msg.sessionId });
+      return;
+    }
     await this.bot.sendMessage(
       formatError(msg.content),
       { parseMode: 'Markdown' },
@@ -756,7 +862,12 @@ export class BridgeDaemon extends EventEmitter {
 
   private async handlePreCompact(msg: BridgeMessage): Promise<void> {
     const trigger = msg.metadata?.trigger as string || 'auto';
-    const threadId = this.getSessionThreadId(msg.sessionId);
+    // BUG-002 FIX: Wait for topic creation if it's pending
+    const threadId = await this.waitForTopic(msg.sessionId);
+    if (threadId === undefined && this.config.useThreads) {
+      logger.error('Topic creation timeout - dropping pre_compact message', { sessionId: msg.sessionId });
+      return;
+    }
 
     // Mark session as compacting
     this.compactingSessions.add(msg.sessionId);

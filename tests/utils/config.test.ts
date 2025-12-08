@@ -5,14 +5,37 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { loadConfig, validateConfig, isMirrorEnabled, resetConfig } from '../../src/utils/config.js';
 
+// Mock the fs module to avoid reading actual config files during tests
+vi.mock('fs', async () => {
+  const actual = await vi.importActual('fs');
+  return {
+    ...actual,
+    existsSync: vi.fn((path: string) => {
+      // Return false for config file to ensure clean test state
+      if (path.includes('config.json')) return false;
+      return (actual as any).existsSync(path);
+    }),
+    readFileSync: vi.fn((path: string, encoding?: string) => {
+      if (path.includes('config.json')) return '{}';
+      return (actual as any).readFileSync(path, encoding);
+    })
+  };
+});
+
 describe('loadConfig', () => {
   const originalEnv = process.env;
 
   beforeEach(() => {
     // Reset config singleton
     resetConfig();
-    // Save original env
-    process.env = { ...originalEnv };
+    // Create a clean environment without telegram vars
+    const cleanEnv: Record<string, string | undefined> = {};
+    for (const key of Object.keys(originalEnv)) {
+      if (!key.startsWith('TELEGRAM_')) {
+        cleanEnv[key] = originalEnv[key];
+      }
+    }
+    process.env = cleanEnv as NodeJS.ProcessEnv;
   });
 
   afterEach(() => {
