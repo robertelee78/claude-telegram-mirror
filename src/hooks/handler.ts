@@ -109,13 +109,16 @@ export class HookHandler {
   /**
    * Detect current tmux session and pane
    */
-  private detectTmuxSession(): { session: string | null; pane: string | null; target: string | null } {
+  private detectTmuxSession(): { session: string | null; pane: string | null; target: string | null; socket: string | null } {
     // Check if we're inside tmux
     if (!process.env.TMUX) {
-      return { session: null, pane: null, target: null };
+      return { session: null, pane: null, target: null, socket: null };
     }
 
     try {
+      // Extract socket path from $TMUX env var (format: /path/to/socket,pid,index)
+      const socket = process.env.TMUX.split(',')[0] || null;
+
       const session = execSync('tmux display-message -p "#S"', { encoding: 'utf8' }).trim();
       const pane = execSync('tmux display-message -p "#P"', { encoding: 'utf8' }).trim();
       const windowIndex = execSync('tmux display-message -p "#I"', { encoding: 'utf8' }).trim();
@@ -123,9 +126,9 @@ export class HookHandler {
       // Full target for send-keys: session:window.pane
       const target = `${session}:${windowIndex}.${pane}`;
 
-      return { session, pane, target };
+      return { session, pane, target, socket };
     } catch {
-      return { session: null, pane: null, target: null };
+      return { session: null, pane: null, target: null, socket: null };
     }
   }
 
@@ -147,11 +150,13 @@ export class HookHandler {
 
   /**
    * Handle Stop hook
+   * BUG-001 fix: Include current tmux info for auto-refresh
    */
   handleStop(event: StopHookEvent): void {
     if (!this.connected) return;
 
     const timestamp = event.timestamp || new Date().toISOString();
+    const tmuxInfo = this.detectTmuxSession();
 
     // Send final response if available
     if (event.transcript_summary) {
@@ -159,7 +164,11 @@ export class HookHandler {
         type: 'agent_response',
         sessionId: this.sessionId,
         timestamp,
-        content: event.transcript_summary
+        content: event.transcript_summary,
+        metadata: {
+          tmuxTarget: tmuxInfo.target,
+          tmuxSocket: tmuxInfo.socket
+        }
       });
     }
 
@@ -168,7 +177,11 @@ export class HookHandler {
       type: 'session_end',
       sessionId: this.sessionId,
       timestamp,
-      content: 'Session stopped'
+      content: 'Session stopped',
+      metadata: {
+        tmuxTarget: tmuxInfo.target,
+        tmuxSocket: tmuxInfo.socket
+      }
     });
   }
 
@@ -254,12 +267,14 @@ export class HookHandler {
 
   /**
    * Handle PostToolUse hook
+   * BUG-001 fix: Include current tmux info for auto-refresh
    */
   handlePostToolUse(event: PostToolUseHookEvent): void {
     if (!this.connected) return;
 
     // Only send if verbose mode or significant output
     if (this.config.verbose || this.isSignificantOutput(event.tool_output)) {
+      const tmuxInfo = this.detectTmuxSession();
       this.send({
         type: 'tool_result',
         sessionId: this.sessionId,
@@ -268,7 +283,9 @@ export class HookHandler {
         metadata: {
           tool: event.tool_name,
           input: event.tool_input,
-          error: event.tool_error
+          error: event.tool_error,
+          tmuxTarget: tmuxInfo.target,
+          tmuxSocket: tmuxInfo.socket
         }
       });
     }
@@ -276,27 +293,36 @@ export class HookHandler {
 
   /**
    * Handle Notification hook
+   * BUG-001 fix: Include current tmux info for auto-refresh
    */
   handleNotification(event: NotificationHookEvent): void {
     if (!this.connected) return;
 
     // Map notification levels
     const type = event.level === 'error' ? 'error' : 'agent_response';
+    const tmuxInfo = this.detectTmuxSession();
 
     this.send({
       type,
       sessionId: this.sessionId,
       timestamp: event.timestamp || new Date().toISOString(),
       content: event.message,
-      metadata: { level: event.level }
+      metadata: {
+        level: event.level,
+        tmuxTarget: tmuxInfo.target,
+        tmuxSocket: tmuxInfo.socket
+      }
     });
   }
 
   /**
    * Handle UserPromptSubmit hook
+   * BUG-001 fix: Include current tmux info for auto-refresh
    */
   handleUserPromptSubmit(event: UserPromptSubmitHookEvent): void {
     if (!this.connected) return;
+
+    const tmuxInfo = this.detectTmuxSession();
 
     // Mirror user prompts to Telegram
     this.send({
@@ -304,21 +330,32 @@ export class HookHandler {
       sessionId: this.sessionId,
       timestamp: event.timestamp || new Date().toISOString(),
       content: event.prompt,
-      metadata: { source: 'cli' }
+      metadata: {
+        source: 'cli',
+        tmuxTarget: tmuxInfo.target,
+        tmuxSocket: tmuxInfo.socket
+      }
     });
   }
 
   /**
    * Handle agent text response (assistant message)
+   * BUG-001 fix: Include current tmux info for auto-refresh
    */
   handleAgentResponse(text: string): void {
     if (!this.connected) return;
+
+    const tmuxInfo = this.detectTmuxSession();
 
     this.send({
       type: 'agent_response',
       sessionId: this.sessionId,
       timestamp: new Date().toISOString(),
-      content: text
+      content: text,
+      metadata: {
+        tmuxTarget: tmuxInfo.target,
+        tmuxSocket: tmuxInfo.socket
+      }
     });
   }
 

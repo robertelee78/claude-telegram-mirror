@@ -101,11 +101,51 @@ export class InputInjector extends EventEmitter {
   }
 
   /**
+   * Validate that the tmux target pane exists
+   * BUG-001 fix: Check before injection to fail fast with clear error
+   * @returns { valid: true } if pane exists, { valid: false, reason: string } if not
+   */
+  validateTarget(): { valid: boolean; reason?: string } {
+    if (!this.tmuxSession) {
+      return { valid: false, reason: 'No tmux session configured' };
+    }
+
+    try {
+      // Build tmux command with explicit socket if available
+      const socketFlag = this.tmuxSocket ? `-S "${this.tmuxSocket}"` : '';
+      const checkCmd = `tmux ${socketFlag} list-panes -t "${this.tmuxSession}" 2>/dev/null`;
+
+      execSync(checkCmd, {
+        stdio: 'pipe',
+        encoding: 'utf8'
+      });
+
+      return { valid: true };
+    } catch {
+      return {
+        valid: false,
+        reason: `Pane "${this.tmuxSession}" not found. Claude may have moved to a different pane.`
+      };
+    }
+  }
+
+  /**
    * Inject via tmux send-keys
    */
   private injectViaTmux(text: string): boolean {
     if (!this.tmuxSession) {
       logger.warn('No tmux session');
+      return false;
+    }
+
+    // BUG-001 fix: Validate target exists before attempting injection
+    const validation = this.validateTarget();
+    if (!validation.valid) {
+      logger.warn('Target validation failed', {
+        session: this.tmuxSession,
+        socket: this.tmuxSocket,
+        reason: validation.reason
+      });
       return false;
     }
 

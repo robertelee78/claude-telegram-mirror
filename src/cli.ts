@@ -5,6 +5,9 @@
  */
 
 import { Command } from 'commander';
+import { readFileSync } from 'fs';
+import { fileURLToPath } from 'url';
+import { dirname, join } from 'path';
 import { BridgeDaemon } from './bridge/daemon.js';
 import { installHooks, uninstallHooks, printHookStatus } from './hooks/installer.js';
 import { loadConfig, validateConfig } from './utils/config.js';
@@ -19,12 +22,17 @@ import {
 import { runSetup } from './service/setup.js';
 import { runDoctor } from './service/doctor.js';
 
+// Get version from package.json
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+const packageJson = JSON.parse(readFileSync(join(__dirname, '..', 'package.json'), 'utf8'));
+
 const program = new Command();
 
 program
   .name('claude-telegram-mirror')
   .description('Mirror Claude Code sessions to Telegram')
-  .version('1.0.0');
+  .version(packageJson.version);
 
 /**
  * Start command - Run the bridge daemon

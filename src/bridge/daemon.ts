@@ -174,6 +174,10 @@ export class BridgeDaemon extends EventEmitter {
         this.sessions.updateActivity(msg.sessionId);
       }
 
+      // BUG-001 fix: Auto-update tmux target if it changed
+      // Every message from hooks includes current tmux info, so we can detect moves
+      this.checkAndUpdateTmuxTarget(msg);
+
       switch (msg.type) {
         case 'session_start':
           await this.handleSessionStart(msg);
@@ -348,13 +352,26 @@ export class BridgeDaemon extends EventEmitter {
       } else {
         logger.warn('Failed to inject input', { sessionId: session.id });
 
-        // Only notify on failure
+        // BUG-001 fix: Clear, actionable error message
+        // The user needs to know HOW to recover
         const sessionThreadId = this.getSessionThreadId(session.id);
-        await this.bot.sendMessage(
-          `⚠️ *Could not send input to CLI*\n\nNo tmux session found. Make sure Claude Code is running in tmux.`,
-          { parseMode: 'Markdown' },
-          sessionThreadId
-        );
+        const validation = this.injector.validateTarget();
+
+        let errorMessage: string;
+        if (!validation.valid) {
+          // Target pane doesn't exist - give recovery instructions
+          errorMessage =
+            `⚠️ *Could not send input to CLI*\n\n` +
+            `${validation.reason || 'Target pane not found.'}\n\n` +
+            `_Send any command in Claude to refresh the connection._`;
+        } else {
+          // Some other injection error
+          errorMessage =
+            `⚠️ *Could not send input to CLI*\n\n` +
+            `No tmux session found. Make sure Claude Code is running in tmux.`;
+        }
+
+        await this.bot.sendMessage(errorMessage, { parseMode: 'Markdown' }, sessionThreadId);
       }
 
       // Also broadcast to socket for logging/other listeners
@@ -365,6 +382,40 @@ export class BridgeDaemon extends EventEmitter {
         content: text
       });
     });
+  }
+
+  // ============ tmux Target Auto-Refresh (BUG-001 fix) ============
+
+  /**
+   * Check if tmux target has changed and update if necessary
+   * This enables auto-healing when user reorganizes tmux panes
+   */
+  private checkAndUpdateTmuxTarget(msg: BridgeMessage): void {
+    const newTmuxTarget = msg.metadata?.tmuxTarget as string | undefined;
+    const newTmuxSocket = msg.metadata?.tmuxSocket as string | undefined;
+
+    // No tmux info in message, nothing to update
+    if (!newTmuxTarget) return;
+
+    // Get current stored target
+    const currentTarget = this.sessionTmuxTargets.get(msg.sessionId);
+
+    // Target hasn't changed
+    if (currentTarget === newTmuxTarget) return;
+
+    // Target has changed! Update cache and database
+    logger.info('Tmux target changed, auto-updating', {
+      sessionId: msg.sessionId,
+      oldTarget: currentTarget || 'none',
+      newTarget: newTmuxTarget,
+      socket: newTmuxSocket
+    });
+
+    // Update in-memory cache
+    this.sessionTmuxTargets.set(msg.sessionId, newTmuxTarget);
+
+    // Update database for persistence across daemon restarts
+    this.sessions.setTmuxInfo(msg.sessionId, newTmuxTarget, newTmuxSocket || undefined);
   }
 
   // ============ Message Handlers ============

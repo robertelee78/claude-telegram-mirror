@@ -234,10 +234,14 @@ sync_new_assistant_text() {
 # sync_new_assistant_text &
 
 # Format bridge message based on hook type
+# IMPORTANT: Every message includes current tmux info for auto-refresh (BUG-001 fix)
 format_message() {
   local hook_type="$1"
   local input="$2"
   local timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+  # Get current tmux info for EVERY message (enables auto-refresh on pane changes)
+  local tmux_info=$(get_tmux_info)
 
   case "$hook_type" in
     "PreToolUse")
@@ -245,13 +249,15 @@ format_message() {
       local tool_input=$(echo "$input" | jq -c '.tool_input // {}')
 
       # Send tool info (not just dangerous ones - for visibility)
+      # Include tmux info for auto-refresh
       jq -cn \
         --arg type "tool_start" \
         --arg sessionId "$SESSION_ID" \
         --arg timestamp "$timestamp" \
         --arg tool "$tool_name" \
         --argjson input "$tool_input" \
-        '{type: $type, sessionId: $sessionId, timestamp: $timestamp, content: "Tool: \($tool)", metadata: {tool: $tool, input: $input}}'
+        --argjson tmux "$tmux_info" \
+        '{type: $type, sessionId: $sessionId, timestamp: $timestamp, content: "Tool: \($tool)", metadata: ({tool: $tool, input: $input} + $tmux)}'
       ;;
 
     "PostToolUse")
@@ -259,6 +265,7 @@ format_message() {
       local tool_output=$(echo "$input" | jq -r '.tool_output // ""' | head -c 2000)
 
       # Only send significant outputs
+      # Include tmux info for auto-refresh
       if [[ ${#tool_output} -gt 10 ]]; then
         jq -cn \
           --arg type "tool_result" \
@@ -266,7 +273,8 @@ format_message() {
           --arg timestamp "$timestamp" \
           --arg tool "$tool_name" \
           --arg output "$tool_output" \
-          '{type: $type, sessionId: $sessionId, timestamp: $timestamp, content: $output, metadata: {tool: $tool}}'
+          --argjson tmux "$tmux_info" \
+          '{type: $type, sessionId: $sessionId, timestamp: $timestamp, content: $output, metadata: ({tool: $tool} + $tmux)}'
       fi
       ;;
 
@@ -281,6 +289,7 @@ format_message() {
         return
       fi
 
+      # Include tmux info for auto-refresh
       if [[ -n "$message" ]]; then
         jq -cn \
           --arg type "agent_response" \
@@ -288,7 +297,8 @@ format_message() {
           --arg timestamp "$timestamp" \
           --arg message "$message" \
           --arg level "$level" \
-          '{type: $type, sessionId: $sessionId, timestamp: $timestamp, content: $message, metadata: {level: $level}}'
+          --argjson tmux "$tmux_info" \
+          '{type: $type, sessionId: $sessionId, timestamp: $timestamp, content: $message, metadata: ({level: $level} + $tmux)}'
       fi
       ;;
 
@@ -336,11 +346,13 @@ ${text}"
 
           if [[ -n "$all_text" ]]; then
             # Use printf + pipe to handle large content (avoids "Argument list too long")
+            # Include tmux info for auto-refresh
             local agent_msg=$(printf '%s' "$all_text" | jq -Rsc \
               --arg type "agent_response" \
               --arg sessionId "$SESSION_ID" \
               --arg timestamp "$timestamp" \
-              '{type: $type, sessionId: $sessionId, timestamp: $timestamp, content: .}')
+              --argjson tmux "$tmux_info" \
+              '{type: $type, sessionId: $sessionId, timestamp: $timestamp, content: ., metadata: $tmux}')
             debug_log "Stop: sending agent_response: ${agent_msg:0:150}"
             echo "$agent_msg"
           else
@@ -359,11 +371,13 @@ ${text}"
       # DON'T send session_end on every Stop - Claude fires Stop after every turn!
       # The session is still active. Only send a turn_complete notification.
       # Session end should happen when user explicitly exits or connection drops.
+      # Include tmux info for auto-refresh
       local turn_msg=$(jq -cn \
         --arg type "turn_complete" \
         --arg sessionId "$SESSION_ID" \
         --arg timestamp "$timestamp" \
-        '{type: $type, sessionId: $sessionId, timestamp: $timestamp, content: "Turn complete"}')
+        --argjson tmux "$tmux_info" \
+        '{type: $type, sessionId: $sessionId, timestamp: $timestamp, content: "Turn complete", metadata: $tmux}')
       debug_log "Stop: sending turn_complete: $turn_msg"
       echo "$turn_msg"
       ;;
@@ -371,13 +385,15 @@ ${text}"
     "UserPromptSubmit")
       local prompt=$(echo "$input" | jq -r '.prompt // ""')
 
+      # Include tmux info for auto-refresh
       if [[ -n "$prompt" ]]; then
         jq -cn \
           --arg type "user_input" \
           --arg sessionId "$SESSION_ID" \
           --arg timestamp "$timestamp" \
           --arg prompt "$prompt" \
-          '{type: $type, sessionId: $sessionId, timestamp: $timestamp, content: $prompt, metadata: {source: "cli"}}'
+          --argjson tmux "$tmux_info" \
+          '{type: $type, sessionId: $sessionId, timestamp: $timestamp, content: $prompt, metadata: ({source: "cli"} + $tmux)}'
       fi
       ;;
 
@@ -388,13 +404,15 @@ ${text}"
 
       debug_log "PreCompact: trigger=$trigger"
 
+      # Include tmux info for auto-refresh
       jq -cn \
         --arg type "pre_compact" \
         --arg sessionId "$SESSION_ID" \
         --arg timestamp "$timestamp" \
         --arg trigger "$trigger" \
         --arg instructions "$custom_instructions" \
-        '{type: $type, sessionId: $sessionId, timestamp: $timestamp, content: "Context compaction starting", metadata: {trigger: $trigger, custom_instructions: $instructions}}'
+        --argjson tmux "$tmux_info" \
+        '{type: $type, sessionId: $sessionId, timestamp: $timestamp, content: "Context compaction starting", metadata: ({trigger: $trigger, custom_instructions: $instructions} + $tmux)}'
       ;;
   esac
 }
