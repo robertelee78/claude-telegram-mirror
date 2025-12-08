@@ -1,10 +1,22 @@
 # Claude Code Telegram Mirror
 
+[![npm version](https://img.shields.io/npm/v/claude-telegram-mirror.svg)](https://www.npmjs.com/package/claude-telegram-mirror)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 Bidirectional communication between Claude Code CLI and Telegram. Control your Claude Code sessions from your phone.
 
 **Supported platforms:** Linux, macOS
 
-## Quick Install
+## Installation
+
+### Option 1: npm (Recommended)
+
+```bash
+npm install -g claude-telegram-mirror
+ctm setup    # Interactive setup wizard
+```
+
+### Option 2: curl installer
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/robertelee78/claude-telegram-mirror/master/scripts/install.sh | bash
@@ -25,64 +37,72 @@ The interactive installer will guide you through:
 4. Verifying bot permissions
 5. Installing hooks and the system service
 
-### Other Scripts
-
-```bash
-# Diagnose issues
-~/.local/share/claude-telegram-mirror/scripts/doctor.sh
-
-# Uninstall completely
-~/.local/share/claude-telegram-mirror/scripts/uninstall.sh
-```
-
-## Manual Setup (for developers)
-
-<details>
-<summary>Click to expand manual installation steps</summary>
-
-For developers who want to work on the source code:
-
-```bash
-# 1. Clone and build
-git clone https://github.com/robertelee78/claude-telegram-mirror.git
-cd claude-telegram-mirror && npm install && npm run build
-
-# 2. Create a Telegram bot via @BotFather, get the token
-
-# 3. Create a supergroup with Topics enabled, add your bot as admin
-
-# 4. Get your chat ID
-./scripts/get-chat-id.sh YOUR_BOT_TOKEN
-
-# 5. Configure environment
-cat > ~/.telegram-env << 'EOF'
-export TELEGRAM_BOT_TOKEN="your-token-here"
-export TELEGRAM_CHAT_ID="-100your-chat-id"
-export TELEGRAM_MIRROR=true
-EOF
-
-# 6. Install hooks
-node dist/cli.js install-hooks                    # Global install
-# OR for projects with custom .claude/settings.json:
-cd /path/to/project && node dist/cli.js install-hooks --project
-
-# 7. Start daemon (choose one)
-node dist/cli.js start                            # Foreground (for testing)
-node dist/cli.js service install && \
-node dist/cli.js service start                    # As system service (recommended)
-```
-
-**Note:** When using the Quick Install method, use `ctm` instead of `node dist/cli.js`.
-
-</details>
-
 ## Features
 
-- **CLI → Telegram**: Mirror Claude's responses, tool usage, and notifications
-- **Telegram → CLI**: Send prompts from Telegram directly to Claude Code
+- **CLI to Telegram**: Mirror Claude's responses, tool usage, and notifications
+- **Telegram to CLI**: Send prompts from Telegram directly to Claude Code
+- **Stop/Interrupt**: Type `stop` in Telegram to send Ctrl+C and halt Claude mid-process
 - **Session Threading**: Each Claude session gets its own Forum Topic
 - **Multi-System Support**: Run separate daemons on multiple machines
 - **Compaction Notifications**: Get notified when Claude summarizes context
+
+## Quick Start
+
+```bash
+# 1. Install globally
+npm install -g claude-telegram-mirror
+
+# 2. Run interactive setup (creates bot, configures everything)
+ctm setup
+
+# 3. Start the daemon
+ctm start
+
+# 4. Run Claude in tmux
+tmux new -s claude
+claude
+```
+
+## CLI Commands
+
+```bash
+# Setup & diagnostics
+ctm setup              # Interactive setup wizard
+ctm doctor             # Diagnose configuration issues
+
+# Daemon control
+ctm start              # Start daemon in foreground
+ctm status             # Show status
+ctm config --test      # Test connection
+
+# Hook management
+ctm install-hooks      # Install global hooks
+ctm install-hooks -p   # Install to current project's .claude/
+ctm uninstall-hooks    # Remove hooks
+ctm hooks              # Show hook status
+
+# Service management (systemd on Linux, launchd on macOS)
+ctm service install    # Install as system service
+ctm service uninstall  # Remove system service
+ctm service start      # Start service
+ctm service stop       # Stop service
+ctm service restart    # Restart service
+ctm service status     # Show service status
+```
+
+## Telegram Commands
+
+Once connected, you can control Claude from Telegram:
+
+| Command | Action |
+|---------|--------|
+| Any text | Sends to Claude as input |
+| `stop` | Sends Ctrl+C to interrupt Claude |
+| `/stop`, `cancel`, `abort` | Also interrupt Claude |
+| Tap "Approve" button | Approve tool execution |
+| Tap "Reject" button | Reject tool execution |
+| Tap "Abort" button | Abort the entire session |
+| Tap "Details" button | View full tool input parameters |
 
 ## Architecture
 
@@ -105,6 +125,7 @@ node dist/cli.js service start                    # As system service (recommend
 2. Hook script sends JSON to bridge daemon via Unix socket
 3. Bridge forwards messages to Telegram Forum Topic
 4. Telegram replies are injected into CLI via `tmux send-keys`
+5. Stop commands send `Ctrl-C` to interrupt Claude
 
 ## Multi-System Architecture
 
@@ -201,59 +222,27 @@ Source in your shell profile (`~/.bashrc` or `~/.zshrc`):
 [[ -f ~/.telegram-env ]] && source ~/.telegram-env
 ```
 
+### Config File (Alternative)
+
+The `ctm setup` wizard creates `~/.config/claude-telegram-mirror/config.json`:
+
+```json
+{
+  "botToken": "your-token",
+  "chatId": -1001234567890,
+  "enabled": true,
+  "verbose": true
+}
+```
+
+Environment variables take precedence over config file values.
+
 ### Test Connection
 
 ```bash
-ctm config --test
-# ✅ Bot connected: @your_bot_username
-# ✅ Test message sent to chat
+ctm doctor
+# Checks: Node.js, config, hooks, socket, tmux, systemd, Telegram API
 ```
-
-## Usage
-
-### Start the Bridge
-
-```bash
-# Foreground (for testing)
-ctm start
-
-# As system service (recommended for production)
-ctm service install    # Install systemd/launchd service
-ctm service start      # Start the service
-```
-
-### Run Claude in tmux
-
-```bash
-tmux new -s claude
-claude
-# Bridge auto-detects tmux session
-```
-
-### CLI Commands
-
-```bash
-# Daemon control
-ctm start              # Start daemon in foreground
-ctm status             # Show status
-ctm config --test      # Test connection
-
-# Hook management
-ctm install-hooks      # Install global hooks
-ctm install-hooks -p   # Install to current project's .claude/
-ctm uninstall-hooks    # Remove hooks
-ctm hooks              # Show hook status
-
-# Service management (systemd on Linux, launchd on macOS)
-ctm service install    # Install as system service
-ctm service uninstall  # Remove system service
-ctm service start      # Start service
-ctm service stop       # Stop service
-ctm service restart    # Restart service
-ctm service status     # Show service status
-```
-
-**Note:** The `ctm` command is installed to `~/.local/bin/` by the installer. If you cloned the repo manually, use `node dist/cli.js` instead.
 
 ## Project-Level Hooks
 
@@ -278,6 +267,7 @@ The installer will prompt you to set up project-level hooks during installation.
 | CLI → Telegram | Session starts | New Forum Topic created |
 | CLI → Telegram | Context compacting | ⏳ Notification sent |
 | Telegram → CLI | User sends message | Injected via tmux |
+| Telegram → CLI | User types "stop" | Sends Ctrl+C interrupt |
 
 ## Technical Details
 
@@ -289,6 +279,16 @@ The installer will prompt you to set up project-level hooks during installation.
 - **Compaction alerts**: PreCompact hook sends notification before context summarization
 
 ## Troubleshooting
+
+Run the diagnostic tool first:
+
+```bash
+ctm doctor
+```
+
+This checks all common issues and provides fix suggestions.
+
+### Common Issues
 
 **Hooks not firing?**
 - Check if project has local `.claude/settings.json` overriding globals
@@ -322,10 +322,51 @@ The installer will prompt you to set up project-level hooks during installation.
 - View logs: `cat ~/Library/Logs/claude-telegram-mirror.*.log`
 - Check permissions: Ensure Terminal has Accessibility access
 
+## Manual Setup (for developers)
+
+<details>
+<summary>Click to expand manual installation steps</summary>
+
+For developers who want to work on the source code:
+
+```bash
+# 1. Clone and build
+git clone https://github.com/robertelee78/claude-telegram-mirror.git
+cd claude-telegram-mirror && npm install && npm run build
+
+# 2. Create a Telegram bot via @BotFather, get the token
+
+# 3. Create a supergroup with Topics enabled, add your bot as admin
+
+# 4. Get your chat ID
+./scripts/get-chat-id.sh YOUR_BOT_TOKEN
+
+# 5. Configure environment
+cat > ~/.telegram-env << 'EOF'
+export TELEGRAM_BOT_TOKEN="your-token-here"
+export TELEGRAM_CHAT_ID="-100your-chat-id"
+export TELEGRAM_MIRROR=true
+EOF
+
+# 6. Install hooks
+node dist/cli.js install-hooks                    # Global install
+# OR for projects with custom .claude/settings.json:
+cd /path/to/project && node dist/cli.js install-hooks --project
+
+# 7. Start daemon (choose one)
+node dist/cli.js start                            # Foreground (for testing)
+node dist/cli.js service install && \
+node dist/cli.js service start                    # As system service (recommended)
+```
+
+**Note:** When using npm install, use `ctm` instead of `node dist/cli.js`.
+
+</details>
+
 ## License
 
 MIT
 
 ## Credits
 
-Built as part of the claude-mobile project for remote Claude Code interaction.
+Built for remote Claude Code interaction from mobile devices.
