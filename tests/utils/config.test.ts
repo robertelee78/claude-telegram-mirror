@@ -55,13 +55,18 @@ describe('loadConfig', () => {
   it('should use default values for optional config', () => {
     process.env.TELEGRAM_BOT_TOKEN = 'test-token';
     process.env.TELEGRAM_CHAT_ID = '12345';
+    // Explicitly unset optional vars to test defaults
+    delete process.env.TELEGRAM_MIRROR;
+    delete process.env.TELEGRAM_MIRROR_VERBOSE;
+    delete process.env.TELEGRAM_MIRROR_APPROVALS;
 
     const config = loadConfig();
 
     expect(config.enabled).toBe(false);
     expect(config.verbose).toBe(true);
     expect(config.approvals).toBe(true);
-    expect(config.socketPath).toBe('/tmp/claude-telegram-bridge.sock');
+    // Socket path defaults to ~/.config/claude-telegram-mirror/bridge.sock
+    expect(config.socketPath).toContain('bridge.sock');
     expect(config.chunkSize).toBe(4000);
     expect(config.rateLimit).toBe(1);
     expect(config.sessionTimeout).toBe(30);
