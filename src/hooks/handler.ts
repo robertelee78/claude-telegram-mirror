@@ -186,6 +186,11 @@ export class HookHandler {
   } | null> {
     if (!this.connected) return null;
 
+    // Respect Claude Code's permission mode - don't prompt if bypassing permissions
+    if (event.permission_mode === 'bypassPermissions') {
+      return null;
+    }
+
     // Check if this tool requires approval via Telegram
     const requiresApproval = this.toolRequiresApproval(event.tool_name, event.tool_input);
 
