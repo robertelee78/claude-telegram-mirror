@@ -217,3 +217,131 @@ export function wrapInCodeBlock(content: string, language?: string): string {
   const lang = language || detectLanguage(content);
   return `\`\`\`${lang}\n${content}\n\`\`\``;
 }
+
+/**
+ * Truncate text with ellipsis, respecting a max length
+ */
+function truncate(text: string, maxLen: number): string {
+  if (text.length <= maxLen) return text;
+  return text.slice(0, maxLen - 3) + '...';
+}
+
+/**
+ * Get short filename from path
+ */
+function shortPath(path: string): string {
+  const parts = path.split('/');
+  if (parts.length <= 2) return path;
+  return '.../' + parts.slice(-2).join('/');
+}
+
+/**
+ * Format tool details for mobile-friendly Telegram display
+ */
+export function formatToolDetails(tool: string, input: unknown): string {
+  const data = input as Record<string, unknown>;
+
+  switch (tool) {
+    case 'Edit': {
+      const file = shortPath(String(data.file_path || ''));
+      const oldStr = String(data.old_string || '');
+      const newStr = String(data.new_string || '');
+
+      let msg = `✏️ *Edit*\n📄 \`${file}\`\n\n`;
+
+      // Show diff-style view
+      if (oldStr) {
+        msg += `➖ *Remove:*\n\`\`\`\n${truncate(oldStr, 800)}\n\`\`\`\n\n`;
+      }
+      if (newStr) {
+        msg += `➕ *Add:*\n\`\`\`\n${truncate(newStr, 800)}\n\`\`\``;
+      }
+      return msg;
+    }
+
+    case 'Write': {
+      const file = shortPath(String(data.file_path || ''));
+      const content = String(data.content || '');
+      const lines = content.split('\n').length;
+
+      let msg = `📝 *Write*\n📄 \`${file}\`\n📏 ${lines} lines\n\n`;
+      msg += `\`\`\`\n${truncate(content, 1500)}\n\`\`\``;
+      return msg;
+    }
+
+    case 'Read': {
+      const file = shortPath(String(data.file_path || ''));
+      let msg = `👁 *Read*\n📄 \`${file}\``;
+      if (data.offset) msg += `\n📍 Line ${data.offset}`;
+      if (data.limit) msg += ` (+${data.limit} lines)`;
+      return msg;
+    }
+
+    case 'Bash': {
+      const cmd = String(data.command || '');
+      let msg = `💻 *Bash*\n\n\`\`\`bash\n${truncate(cmd, 1500)}\n\`\`\``;
+      if (data.timeout) msg += `\n⏱ Timeout: ${data.timeout}ms`;
+      return msg;
+    }
+
+    case 'Grep': {
+      const pattern = String(data.pattern || '');
+      const path = data.path ? shortPath(String(data.path)) : 'cwd';
+      let msg = `🔍 *Grep*\n🎯 Pattern: \`${truncate(pattern, 100)}\`\n📂 Path: \`${path}\``;
+      if (data.glob) msg += `\n📋 Glob: \`${data.glob}\``;
+      return msg;
+    }
+
+    case 'Glob': {
+      const pattern = String(data.pattern || '');
+      const path = data.path ? shortPath(String(data.path)) : 'cwd';
+      return `📂 *Glob*\n🎯 Pattern: \`${pattern}\`\n📂 Path: \`${path}\``;
+    }
+
+    case 'Task': {
+      const desc = String(data.description || '');
+      const prompt = String(data.prompt || '');
+      let msg = `🤖 *Task*\n📋 ${desc}`;
+      if (prompt) {
+        msg += `\n\n\`\`\`\n${truncate(prompt, 1000)}\n\`\`\``;
+      }
+      return msg;
+    }
+
+    case 'WebFetch': {
+      const url = String(data.url || '');
+      const prompt = String(data.prompt || '');
+      return `🌐 *WebFetch*\n🔗 \`${truncate(url, 100)}\`\n📝 ${truncate(prompt, 200)}`;
+    }
+
+    case 'WebSearch': {
+      const query = String(data.query || '');
+      return `🔎 *WebSearch*\n📝 "${query}"`;
+    }
+
+    case 'TodoWrite': {
+      const todos = data.todos as Array<{content: string; status: string}> | undefined;
+      if (!todos || !Array.isArray(todos)) return `📋 *TodoWrite*`;
+
+      let msg = `📋 *TodoWrite* (${todos.length} items)\n\n`;
+      const statusEmoji: Record<string, string> = {
+        'pending': '⬜',
+        'in_progress': '🔄',
+        'completed': '✅'
+      };
+
+      for (const todo of todos.slice(0, 10)) {
+        const emoji = statusEmoji[todo.status] || '⬜';
+        msg += `${emoji} ${truncate(todo.content, 60)}\n`;
+      }
+      if (todos.length > 10) msg += `... +${todos.length - 10} more`;
+      return msg;
+    }
+
+    default: {
+      // Generic JSON fallback but nicely formatted
+      const jsonStr = JSON.stringify(input, null, 2);
+      return `🔧 *${tool}*\n\n\`\`\`json\n${truncate(jsonStr, 2000)}\n\`\`\``;
+    }
+  }
+}

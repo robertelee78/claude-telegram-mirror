@@ -6,7 +6,8 @@
 import { Bot, Context, SessionFlavor, InlineKeyboard } from 'grammy';
 import {
   formatHelp,
-  formatStatus
+  formatStatus,
+  formatToolDetails
 } from './formatting.js';
 import logger from '../utils/logger.js';
 
@@ -318,19 +319,12 @@ export function registerToolDetailsHandler(
         return;
       }
 
-      // Format the input nicely
-      const inputStr = typeof details.input === 'string'
-        ? details.input
-        : JSON.stringify(details.input, null, 2);
-
-      // Truncate if too long for Telegram
-      const truncatedInput = inputStr.length > 3000
-        ? inputStr.slice(0, 3000) + '\n... (truncated)'
-        : inputStr;
+      // Format the tool details nicely for mobile
+      const formattedDetails = formatToolDetails(details.tool, details.input);
 
       // Reply with full details (don't edit original - keep it clean)
       await ctx.reply(
-        `📋 *Tool Details: ${details.tool}*\n\n\`\`\`json\n${truncatedInput}\n\`\`\``,
+        formattedDetails,
         {
           parse_mode: 'Markdown',
           reply_parameters: { message_id: ctx.callbackQuery.message?.message_id || 0 }
