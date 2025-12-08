@@ -243,6 +243,22 @@ export class BridgeDaemon extends EventEmitter {
   }
 
   /**
+   * Check if text is a stop/interrupt command
+   */
+  private isStopCommand(text: string): boolean {
+    const normalized = text.trim().toLowerCase();
+    return normalized === 'stop' ||
+           normalized === '/stop' ||
+           normalized === 'cancel' ||
+           normalized === '/cancel' ||
+           normalized === 'abort' ||
+           normalized === '/abort' ||
+           normalized === 'ctrl+c' ||
+           normalized === 'ctrl-c' ||
+           normalized === '^c';
+  }
+
+  /**
    * Setup bot message handlers (Telegram → CLI)
    */
   private setupBotHandlers(): void {
@@ -294,6 +310,29 @@ export class BridgeDaemon extends EventEmitter {
         this.injector.setTmuxSession(tmuxTarget, tmuxSocket);
       }
 
+      // Check for stop/interrupt command - send Ctrl+C to tmux
+      if (this.isStopCommand(text)) {
+        const sessionThreadId = this.getSessionThreadId(session.id);
+
+        const stopped = await this.injector.sendKey('Ctrl-C');
+        if (stopped) {
+          logger.info('Sent interrupt signal (Ctrl+C) to CLI', { sessionId: session.id });
+          await this.bot.sendMessage(
+            '🛑 *Interrupt sent* (Ctrl+C)\n\n_Claude should stop the current operation._',
+            { parseMode: 'Markdown' },
+            sessionThreadId
+          );
+        } else {
+          logger.warn('Failed to send interrupt signal', { sessionId: session.id });
+          await this.bot.sendMessage(
+            '⚠️ *Could not send interrupt*\n\nNo tmux session found.',
+            { parseMode: 'Markdown' },
+            sessionThreadId
+          );
+        }
+        return; // Don't inject "stop" as text
+      }
+
       // Track this input so we don't echo it back when the hook fires
       const inputKey = `${session.id}:${text.trim()}`;
       this.recentTelegramInputs.add(inputKey);
@@ -310,11 +349,11 @@ export class BridgeDaemon extends EventEmitter {
         logger.warn('Failed to inject input', { sessionId: session.id });
 
         // Only notify on failure
-        const threadId = this.getSessionThreadId(session.id);
+        const sessionThreadId = this.getSessionThreadId(session.id);
         await this.bot.sendMessage(
           `⚠️ *Could not send input to CLI*\n\nNo tmux session found. Make sure Claude Code is running in tmux.`,
           { parseMode: 'Markdown' },
-          threadId
+          sessionThreadId
         );
       }
 
