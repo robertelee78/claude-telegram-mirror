@@ -4,7 +4,41 @@ Bidirectional communication between Claude Code CLI and Telegram. Control your C
 
 **Supported platforms:** Linux, macOS
 
-## Quick Start
+## Quick Install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/robertelee78/claude-telegram-mirror/master/scripts/install.sh | bash
+```
+
+Or download and review first:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/robertelee78/claude-telegram-mirror/master/scripts/install.sh -o install.sh
+less install.sh  # Review the script
+bash install.sh
+```
+
+The interactive installer will guide you through:
+1. Checking prerequisites (node, npm, git, tmux, jq, nc)
+2. Creating a Telegram bot via @BotFather
+3. Setting up a supergroup with Topics
+4. Verifying bot permissions
+5. Installing hooks and the system service
+
+### Other Scripts
+
+```bash
+# Diagnose issues
+./scripts/doctor.sh
+
+# Uninstall completely
+./scripts/uninstall.sh
+```
+
+## Manual Setup
+
+<details>
+<summary>Click to expand manual installation steps</summary>
 
 ```bash
 # 1. Clone and build
@@ -35,6 +69,8 @@ node dist/cli.js start                            # Foreground (for testing)
 node dist/cli.js service install && \
 node dist/cli.js service start                    # As system service (recommended)
 ```
+
+</details>
 
 ## Features
 
