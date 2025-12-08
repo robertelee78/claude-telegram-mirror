@@ -21,13 +21,13 @@
     "test:coverage": "vitest --coverage",
     "lint": "eslint src/",
     "typecheck": "tsc --noEmit",
-    "postinstall": "node postinstall.js",
-    "prepublishOnly": "npm run build && npm test"
+    "postinstall": "node postinstall.cjs",
+    "prepublishOnly": "npm run build && npm run test"
   },
   "files": [
     "dist/",
     "scripts/",
-    "postinstall.js",
+    "postinstall.cjs",
     "README.md"
   ],
   "keywords": [
@@ -53,6 +53,14 @@
   },
   "bugs": {
     "url": "https://github.com/robertelee78/claude-mobile/issues"
+  },
+  "funding": {
+    "type": "github",
+    "url": "https://github.com/sponsors/robertelee78"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
   },
   "dependencies": {
     "grammy": "^1.21.0",

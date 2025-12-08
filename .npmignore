@@ -1,0 +1,31 @@
+# Source files (use dist/)
+src/
+tests/
+*.ts
+tsconfig.json
+vitest.config.ts
+
+# Development files
+.git/
+.github/
+.gitignore
+.claude-flow/
+.swarm/
+node_modules/
+
+# IDE/editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Build artifacts
+*.log
+*.tgz
+coverage/
+
+# Documentation (README is included)
+docs/
+
+# Systemd template (generated at install time)
+systemd/

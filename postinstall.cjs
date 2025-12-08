@@ -4,20 +4,32 @@
  * Shows helpful guidance after npm install
  */
 
-const chalk = require('chalk');
 const os = require('os');
 const path = require('path');
 const fs = require('fs');
+
+// Try to load chalk, fall back to plain text if not available
+let chalk;
+try {
+  chalk = require('chalk');
+} catch (e) {
+  // Chalk not available, use plain text functions
+  const identity = (s) => s;
+  chalk = {
+    cyan: identity,
+    green: identity,
+    yellow: identity,
+    red: identity,
+    blue: identity,
+    gray: identity,
+    white: { bold: identity },
+  };
+}
 
 // Don't show guidance during CI or if TELEGRAM_BOT_TOKEN is already set
 if (process.env.CI || process.env.TELEGRAM_BOT_TOKEN) {
   process.exit(0);
 }
-
-// Check if this is a global install
-const isGlobal = process.env.npm_config_global === 'true' ||
-                 process.argv.includes('-g') ||
-                 process.argv.includes('--global');
 
 console.log('');
 console.log(chalk.cyan('╔════════════════════════════════════════════════════════════╗'));
@@ -27,10 +39,10 @@ console.log('');
 
 console.log(chalk.yellow('📱 Quick Setup:'));
 console.log('');
-console.log('   ' + chalk.white('1. Run the interactive setup:'));
+console.log('   ' + chalk.white.bold('1. Run the interactive setup:'));
 console.log('      ' + chalk.green('ctm setup'));
 console.log('');
-console.log('   ' + chalk.white('2. Or configure manually:'));
+console.log('   ' + chalk.white.bold('2. Or configure manually:'));
 console.log('      ' + chalk.gray('export TELEGRAM_BOT_TOKEN="your-bot-token"'));
 console.log('      ' + chalk.gray('export TELEGRAM_CHAT_ID="your-chat-id"'));
 console.log('      ' + chalk.gray('export TELEGRAM_MIRROR=true'));
