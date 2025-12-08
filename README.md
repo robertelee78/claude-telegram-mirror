@@ -9,30 +9,14 @@ Bidirectional communication between Claude Code CLI and Telegram. Control your C
 
 ## Installation
 
-### Option 1: npm (Recommended)
-
 ```bash
 npm install -g claude-telegram-mirror
 ctm setup    # Interactive setup wizard
 ```
 
-### Option 2: curl installer
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/robertelee78/claude-telegram-mirror/master/scripts/install.sh | bash
-```
-
-Or download and review first:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/robertelee78/claude-telegram-mirror/master/scripts/install.sh -o install.sh
-less install.sh  # Review the script
-bash install.sh
-```
-
-The interactive installer will guide you through:
-1. Checking prerequisites (node, npm, git, tmux, jq, nc)
-2. Creating a Telegram bot via @BotFather
+The setup wizard guides you through:
+1. Creating a Telegram bot via @BotFather
+2. Disabling privacy mode (critical for group messages)
 3. Setting up a supergroup with Topics
 4. Verifying bot permissions
 5. Installing hooks and the system service
