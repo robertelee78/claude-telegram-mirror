@@ -114,8 +114,7 @@ async function testBotToken(token: string): Promise<{ valid: boolean; username?:
     }
     return { valid: false, error: data.description || 'Invalid token' };
   } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : String(error);
-    return { valid: false, error: `Network error - ${errorMessage}` };
+    return { valid: false, error: 'Network error - check your connection' };
   }
 }
 

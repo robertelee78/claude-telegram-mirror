@@ -427,30 +427,28 @@ export class HookHandler {
   }
 }
 
-// Session tracking file to detect first event
-function getSessionTrackingPath(): string {
+// Session tracking file to detect first event - uses Claude's native session_id
+function getSessionTrackingPath(sessionId: string): string {
   const configDir = join(homedir(), '.config', 'claude-telegram-mirror');
   if (!existsSync(configDir)) {
     mkdirSync(configDir, { recursive: true });
   }
-  // Use a unique file per terminal/PTY to handle multiple sessions
-  const ttyId = process.env.TTY || process.env.SSH_TTY || process.ppid?.toString() || 'default';
-  const safeId = ttyId.replace(/[^a-zA-Z0-9]/g, '_');
-  return join(configDir, `.session_active_${safeId}`);
+  // Use Claude's session_id - this is stable for the entire Claude session
+  return join(configDir, `.session_active_${sessionId}`);
 }
 
-function isFirstEventOfSession(): boolean {
-  const trackingPath = getSessionTrackingPath();
+function isFirstEventOfSession(sessionId: string): boolean {
+  const trackingPath = getSessionTrackingPath(sessionId);
   if (existsSync(trackingPath)) {
     return false;
   }
   // Mark session as started
-  writeFileSync(trackingPath, Date.now().toString());
+  writeFileSync(trackingPath, sessionId);
   return true;
 }
 
-function clearSessionTracking(): void {
-  const trackingPath = getSessionTrackingPath();
+function clearSessionTracking(sessionId: string): void {
+  const trackingPath = getSessionTrackingPath(sessionId);
   try {
     if (existsSync(trackingPath)) {
       unlinkSync(trackingPath);
@@ -464,9 +462,7 @@ function clearSessionTracking(): void {
  * Main CLI entry point for hook processing
  */
 export async function main(): Promise<void> {
-  const handler = new HookHandler();
-
-  // Read event from stdin
+  // Read event from stdin first
   let input = '';
 
   process.stdin.setEncoding('utf8');
@@ -482,8 +478,14 @@ export async function main(): Promise<void> {
   try {
     const event = JSON.parse(input) as AnyHookEvent;
 
-    // Check if this is the first event of the session
-    const isFirstEvent = isFirstEventOfSession();
+    // Create handler with Claude's native session_id from the event
+    // This ensures all events from the same Claude session use the same ID
+    const handler = new HookHandler({
+      sessionId: event.session_id
+    });
+
+    // Check if this is the first event of the session (using Claude's session_id)
+    const isFirstEvent = isFirstEventOfSession(event.session_id);
 
     // Connect to bridge
     const connected = await handler.connect();
@@ -500,7 +502,7 @@ export async function main(): Promise<void> {
 
     // Clean up session tracking on Stop event
     if (event.type === 'Stop') {
-      clearSessionTracking();
+      clearSessionTracking(event.session_id);
     }
 
     // Process event
