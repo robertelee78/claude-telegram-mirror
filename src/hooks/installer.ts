@@ -156,7 +156,7 @@ function isHookInstalled(hooks: (ClaudeHookConfig | ClaudeHookEntry)[] | undefin
 /**
  * Install Telegram hooks
  */
-export function installHooks(options: { force?: boolean; project?: boolean } = {}): {
+export function installHooks(options: { force?: boolean; project?: boolean; projectPath?: string } = {}): {
   success: boolean;
   installed: string[];
   skipped: string[];
@@ -170,10 +170,11 @@ export function installHooks(options: { force?: boolean; project?: boolean } = {
   let settingsPath = CLAUDE_SETTINGS_FILE;
   let configDir = CLAUDE_CONFIG_DIR;
 
-  if (options.project) {
-    // Use current directory's .claude/settings.json
-    const projectSettings = join(process.cwd(), '.claude', 'settings.json');
-    const projectConfigDir = join(process.cwd(), '.claude');
+  if (options.project || options.projectPath) {
+    // Use specified path or current directory's .claude/settings.json
+    const basePath = options.projectPath || process.cwd();
+    const projectSettings = join(basePath, '.claude', 'settings.json');
+    const projectConfigDir = join(basePath, '.claude');
 
     if (!existsSync(projectConfigDir)) {
       return {
@@ -181,7 +182,7 @@ export function installHooks(options: { force?: boolean; project?: boolean } = {
         installed,
         skipped,
         settingsPath: projectSettings,
-        error: `No .claude directory found in ${process.cwd()}. Run from a Claude project directory.`
+        error: `No .claude directory found in ${basePath}. Run from a Claude project directory.`
       };
     }
 
