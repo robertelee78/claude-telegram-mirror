@@ -29,16 +29,18 @@ The interactive installer will guide you through:
 
 ```bash
 # Diagnose issues
-./scripts/doctor.sh
+~/.local/share/claude-telegram-mirror/scripts/doctor.sh
 
 # Uninstall completely
-./scripts/uninstall.sh
+~/.local/share/claude-telegram-mirror/scripts/uninstall.sh
 ```
 
-## Manual Setup
+## Manual Setup (for developers)
 
 <details>
 <summary>Click to expand manual installation steps</summary>
+
+For developers who want to work on the source code:
 
 ```bash
 # 1. Clone and build
@@ -62,13 +64,15 @@ EOF
 # 6. Install hooks
 node dist/cli.js install-hooks                    # Global install
 # OR for projects with custom .claude/settings.json:
-cd /path/to/project && node /path/to/claude-telegram-mirror/dist/cli.js install-hooks --project
+cd /path/to/project && node dist/cli.js install-hooks --project
 
 # 7. Start daemon (choose one)
 node dist/cli.js start                            # Foreground (for testing)
 node dist/cli.js service install && \
 node dist/cli.js service start                    # As system service (recommended)
 ```
+
+**Note:** When using the Quick Install method, use `ctm` instead of `node dist/cli.js`.
 
 </details>
 
@@ -200,7 +204,7 @@ Source in your shell profile (`~/.bashrc` or `~/.zshrc`):
 ### Test Connection
 
 ```bash
-node dist/cli.js config --test
+ctm config --test
 # ✅ Bot connected: @your_bot_username
 # ✅ Test message sent to chat
 ```
@@ -211,11 +215,11 @@ node dist/cli.js config --test
 
 ```bash
 # Foreground (for testing)
-node dist/cli.js start
+ctm start
 
 # As system service (recommended for production)
-node dist/cli.js service install    # Install systemd/launchd service
-node dist/cli.js service start      # Start the service
+ctm service install    # Install systemd/launchd service
+ctm service start      # Start the service
 ```
 
 ### Run Claude in tmux
@@ -230,26 +234,26 @@ claude
 
 ```bash
 # Daemon control
-node dist/cli.js start              # Start daemon in foreground
-node dist/cli.js status             # Show status
-node dist/cli.js config --test      # Test connection
+ctm start              # Start daemon in foreground
+ctm status             # Show status
+ctm config --test      # Test connection
 
 # Hook management
-node dist/cli.js install-hooks      # Install global hooks
-node dist/cli.js install-hooks -p   # Install to current project's .claude/
-node dist/cli.js uninstall-hooks    # Remove hooks
-node dist/cli.js hooks              # Show hook status
+ctm install-hooks      # Install global hooks
+ctm install-hooks -p   # Install to current project's .claude/
+ctm uninstall-hooks    # Remove hooks
+ctm hooks              # Show hook status
 
 # Service management (systemd on Linux, launchd on macOS)
-node dist/cli.js service install    # Install as system service
-node dist/cli.js service uninstall  # Remove system service
-node dist/cli.js service start      # Start service
-node dist/cli.js service stop       # Stop service
-node dist/cli.js service restart    # Restart service
-node dist/cli.js service status     # Show service status
+ctm service install    # Install as system service
+ctm service uninstall  # Remove system service
+ctm service start      # Start service
+ctm service stop       # Stop service
+ctm service restart    # Restart service
+ctm service status     # Show service status
 ```
 
-**Shorthand:** After building, you can also use `ctm` instead of `node dist/cli.js`.
+**Note:** The `ctm` command is installed to `~/.local/bin/` by the installer. If you cloned the repo manually, use `node dist/cli.js` instead.
 
 ## Project-Level Hooks
 
@@ -257,8 +261,12 @@ If your project has `.claude/settings.json` with custom hooks, global hooks are 
 
 ```bash
 cd /path/to/your/project
-node /path/to/claude-telegram-mirror/dist/cli.js install-hooks --project
+ctm install-hooks --project
+# or shorthand:
+ctm install-hooks -p
 ```
+
+The installer will prompt you to set up project-level hooks during installation. You can also add them later to any project.
 
 ## How Messages Flow
 
@@ -284,13 +292,13 @@ node /path/to/claude-telegram-mirror/dist/cli.js install-hooks --project
 
 **Hooks not firing?**
 - Check if project has local `.claude/settings.json` overriding globals
-- Run `node dist/cli.js install-hooks --project` from project directory
+- Run `ctm install-hooks -p` from project directory
 - Restart Claude Code after installing hooks
 
 **409 Conflict error?**
 - Only one polling connection per bot token is allowed
 - If running multiple systems, each needs its own bot (see Multi-System Architecture)
-- Kill duplicate daemons: `pkill -f "node.*dist/cli"`
+- Kill duplicate daemons: `pkill -f "claude-telegram-mirror"`
 
 **Bridge not receiving events?**
 - Check socket: `ls -la ~/.config/claude-telegram-mirror/bridge.sock`
