@@ -6,21 +6,21 @@ A bidirectional bridge that mirrors Claude Code CLI sessions to Telegram, enabli
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                              System Architecture                             │
+│                              System Architecture                            │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                             │
-│  ┌──────────────┐     Unix Socket      ┌──────────────┐     Telegram API   │
-│  │  Claude Code │ ──────────────────▶  │    Bridge    │ ─────────────────▶ │
-│  │     CLI      │                      │    Daemon    │                    │
-│  │   (tmux)     │ ◀────────────────── │              │ ◀───────────────── │
-│  └──────────────┘    tmux send-keys    └──────────────┘                    │
+│  ┌──────────────┐     Unix Socket      ┌──────────────┐     Telegram API    │
+│  │  Claude Code │ ──────────────────▶  │    Bridge    │ ─────────────────▶  │
+│  │     CLI      │                      │    Daemon    │                     │
+│  │   (tmux)     │ ◀────────────────── │              │ ◀─────────────────   │
+│  └──────────────┘    tmux send-keys    └──────────────┘                     │
 │        │                                     │                              │
 │        │ hooks                               │ SQLite                       │
 │        ▼                                     ▼                              │
-│  ┌──────────────┐                      ┌──────────────┐                    │
-│  │ telegram-    │                      │ sessions.db  │                    │
-│  │ hook.sh      │                      │              │                    │
-│  └──────────────┘                      └──────────────┘                    │
+│  ┌──────────────┐                      ┌──────────────┐                     │
+│  │ telegram-    │                      │ sessions.db  │                     │
+│  │ hook.sh      │                      │              │                     │
+│  └──────────────┘                      └──────────────┘                     │
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -104,25 +104,25 @@ The system maintains a **three-way mapping** for each Claude session:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                           Session Mapping Chain                              │
+│                           Session Mapping Chain                             │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                             │
-│   Claude Session ID ◀───────────────────────────────────▶ Telegram Topic   │
-│   "a1b2c3d4-..."                                          thread_id: 123   │
+│   Claude Session ID ◀───────────────────────────────────▶ Telegram Topic    │
+│   "a1b2c3d4-..."                                          thread_id: 123    │
 │         │                                                                   │
 │         │                                                                   │
 │         ▼                                                                   │
-│   ┌─────────────────────────────────────────────────────────────────────┐  │
-│   │                        SQLite: sessions                              │  │
-│   ├─────────────────────────────────────────────────────────────────────┤  │
-│   │  id              │ thread_id │ tmux_target │ tmux_socket            │  │
-│   │  "a1b2c3d4-..."  │ 123       │ "1:0.0"     │ "/tmp/tmux-1000/default│  │
-│   └─────────────────────────────────────────────────────────────────────┘  │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │                        SQLite: sessions                             │   │
+│   ├─────────────────────────────────────────────────────────────────────┤   │
+│   │  id              │ thread_id │ tmux_target │ tmux_socket            │   │
+│   │  "a1b2c3d4-..."  │ 123       │ "1:0.0"     │ "/tmp/tmux-1000/default│   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
 │         │                                                                   │
 │         │                                                                   │
 │         ▼                                                                   │
-│   tmux Session ◀────────────────────────────────────────▶ CLI Pane         │
-│   socket: /tmp/tmux-1000/default                          session 1:0.0    │
+│   tmux Session ◀────────────────────────────────────────▶ CLI Pane          │
+│   socket: /tmp/tmux-1000/default                          session 1:0.0     │
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -151,24 +151,24 @@ tmux_target="session_name:window.pane"  # e.g., "1:0.0"
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                          Daemon Restart Recovery                             │
+│                          Daemon Restart Recovery                            │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                             │
 │  [Before Restart]           [After Restart]                                 │
 │                                                                             │
 │  Memory Cache:              Memory Cache:                                   │
-│  ┌─────────────────┐        ┌─────────────────┐                            │
-│  │ sessionThreads  │        │     (empty)     │                            │
-│  │ sessionTmux     │        │                 │                            │
-│  └─────────────────┘        └────────┬────────┘                            │
+│  ┌─────────────────┐        ┌─────────────────┐                             │
+│  │ sessionThreads  │        │     (empty)     │                             │
+│  │ sessionTmux     │        │                 │                             │
+│  └─────────────────┘        └────────┬────────┘                             │
 │                                      │                                      │
 │                                      │ Cache miss                           │
 │                                      ▼                                      │
 │  SQLite Database:           SQLite Database:                                │
-│  ┌─────────────────┐        ┌─────────────────┐                            │
-│  │ Persisted data  │ ────▶  │ Restore from DB │                            │
-│  │ survives        │        │ on first access │                            │
-│  └─────────────────┘        └─────────────────┘                            │
+│  ┌─────────────────┐        ┌─────────────────┐                             │
+│  │ Persisted data  │ ────▶  │ Restore from DB │                             │
+│  │ survives        │        │ on first access │                             │
+│  └─────────────────┘        └─────────────────┘                             │
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -181,17 +181,17 @@ Multiple hosts can share a single Telegram supergroup:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                         Multi-System Deployment                              │
+│                         Multi-System Deployment                             │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                             │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐                         │
-│  │   Host A    │  │   Host B    │  │   Host C    │                         │
-│  │  (Linux)    │  │  (macOS)    │  │  (Linux)    │                         │
-│  ├─────────────┤  ├─────────────┤  ├─────────────┤                         │
-│  │ Daemon A    │  │ Daemon B    │  │ Daemon C    │                         │
-│  │ sessions.db │  │ sessions.db │  │ sessions.db │                         │
-│  │ Bot Token A │  │ Bot Token B │  │ Bot Token C │                         │
-│  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘                         │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐                          │
+│  │   Host A    │  │   Host B    │  │   Host C    │                          │
+│  │  (Linux)    │  │  (macOS)    │  │  (Linux)    │                          │
+│  ├─────────────┤  ├─────────────┤  ├─────────────┤                          │
+│  │ Daemon A    │  │ Daemon B    │  │ Daemon C    │                          │
+│  │ sessions.db │  │ sessions.db │  │ sessions.db │                          │
+│  │ Bot Token A │  │ Bot Token B │  │ Bot Token C │                          │
+│  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘                          │
 │         │                │                │                                 │
 │         └────────────────┼────────────────┘                                 │
 │                          │                                                  │
@@ -200,10 +200,10 @@ Multiple hosts can share a single Telegram supergroup:
 │               │  Telegram Supergroup │                                      │
 │               │  (shared chat_id)    │                                      │
 │               ├─────────────────────┤                                       │
-│               │ Topic #1 (Host A)   │ ◀── Only Daemon A responds           │
-│               │ Topic #2 (Host B)   │ ◀── Only Daemon B responds           │
-│               │ Topic #3 (Host A)   │ ◀── Only Daemon A responds           │
-│               │ Topic #4 (Host C)   │ ◀── Only Daemon C responds           │
+│               │ Topic #1 (Host A)   │ ◀── Only Daemon A responds            │
+│               │ Topic #2 (Host B)   │ ◀── Only Daemon B responds            │
+│               │ Topic #3 (Host A)   │ ◀── Only Daemon A responds            │
+│               │ Topic #4 (Host C)   │ ◀── Only Daemon C responds            │
 │               └─────────────────────┘                                       │
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘

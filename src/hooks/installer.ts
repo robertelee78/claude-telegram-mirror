@@ -51,9 +51,20 @@ interface ClaudeSettings {
 
 /**
  * Get the path to the hook script
+ * Priority order:
+ * 1. Standard user install (~/.local/share/claude-telegram-mirror/scripts/)
+ * 2. npm global install
+ * 3. Local development (relative to this file)
+ * 4. Legacy /opt/ path (for backward compatibility)
  */
 function getHookScriptPath(): string {
-  // Check if installed globally via npm
+  // 1. Check standard user install path FIRST (from install.sh)
+  const userInstallPath = join(homedir(), '.local', 'share', 'claude-telegram-mirror', 'scripts', HOOK_SCRIPT_NAME);
+  if (existsSync(userInstallPath)) {
+    return userInstallPath;
+  }
+
+  // 2. Check if installed globally via npm
   try {
     const globalPath = execSync('npm root -g', { encoding: 'utf8' }).trim();
     const globalScript = join(globalPath, 'claude-telegram-mirror', 'scripts', HOOK_SCRIPT_NAME);
@@ -64,23 +75,16 @@ function getHookScriptPath(): string {
     // Not installed globally
   }
 
-  // Check local development path
+  // 3. Check local development path (relative to compiled dist/hooks/installer.js)
   const localScript = join(dirname(dirname(dirname(import.meta.url.replace('file://', '')))), 'scripts', HOOK_SCRIPT_NAME);
   if (existsSync(localScript)) {
     return localScript;
   }
 
-  // Fallback: look in common locations
-  const commonPaths = [
-    '/opt/claude-mobile/packages/claude-telegram-mirror/scripts/telegram-hook.sh',
-    join(homedir(), '.local', 'share', 'claude-telegram-mirror', HOOK_SCRIPT_NAME),
-    join(homedir(), 'bin', HOOK_SCRIPT_NAME)
-  ];
-
-  for (const path of commonPaths) {
-    if (existsSync(path)) {
-      return path;
-    }
+  // 4. Fallback: legacy /opt/ path for backward compatibility
+  const legacyPath = '/opt/claude-mobile/packages/claude-telegram-mirror/scripts/telegram-hook.sh';
+  if (existsSync(legacyPath)) {
+    return legacyPath;
   }
 
   throw new Error('Hook script not found. Please reinstall claude-telegram-mirror.');
