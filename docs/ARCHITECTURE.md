@@ -18,9 +18,14 @@ A bidirectional bridge that mirrors Claude Code CLI sessions to Telegram, enabli
 │        │ hooks                               │ SQLite                       │
 │        ▼                                     ▼                              │
 │  ┌──────────────┐                      ┌──────────────┐                     │
-│  │ telegram-    │                      │ sessions.db  │                     │
-│  │ hook.sh      │                      │              │                     │
-│  └──────────────┘                      └──────────────┘                     │
+│  │ PreToolUse:  │◀──────────────────▶ │ sessions.db  │                     │
+│  │ handler.ts   │  bidirectional      │              │                     │
+│  │ (approval)   │  request/response   └──────────────┘                     │
+│  ├──────────────┤                                                          │
+│  │ Other hooks: │                                                          │
+│  │ telegram-    │──────────────────▶  fire & forget                        │
+│  │ hook.sh      │                                                          │
+│  └──────────────┘                                                          │
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -35,7 +40,8 @@ A bidirectional bridge that mirrors Claude Code CLI sessions to Telegram, enabli
 | **SessionManager** | `src/bridge/session.ts` | SQLite persistence |
 | **InputInjector** | `src/bridge/injector.ts` | tmux input injection |
 | **TelegramBot** | `src/bot/telegram.ts` | Telegram API wrapper |
-| **Hook Script** | `scripts/telegram-hook.sh` | Claude Code integration |
+| **PreToolUse Handler** | `src/hooks/handler.ts` | Approval buttons, async bidirectional |
+| **Hook Script (Bash)** | `scripts/telegram-hook.sh` | Other hooks, fast fire-and-forget |
 
 ---
 
@@ -335,6 +341,89 @@ tail -f ~/.config/claude-telegram-mirror/daemon.log  # View logs
 | `approval_request` | CLI → TG | Permission request |
 | `approval_response` | TG → CLI | User approval/rejection |
 | `turn_complete` | CLI → TG | Claude turn finished (not session end) |
+
+---
+
+## Dual Handler Architecture (v0.1.8+)
+
+The system uses two different handlers for different hook types:
+
+### PreToolUse: Node.js Handler (`handler.ts`)
+
+Used for approval workflows where we need to wait for user response:
+
+```
+┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐
+│ Claude Code │───▶│  handler.ts │───▶│   Bridge    │───▶│  Telegram   │
+│ PreToolUse  │    │   (Node)    │    │   Daemon    │    │  (buttons)  │
+└─────────────┘    └──────┬──────┘    └──────┬──────┘    └──────┬──────┘
+                         │                   │                  │
+                         │◀── approval_response ◀───────────────┘
+                         │     (allow/deny/abort)    User clicks
+                         ▼
+                   Returns to Claude:
+                   hookSpecificOutput: {
+                     permissionDecision: 'allow'|'deny'
+                   }
+```
+
+**Why Node.js?**
+- Requires async `sendAndWait()` for bidirectional response
+- 5-minute timeout for user to respond
+- Returns structured output to Claude's permission system
+
+### Other Hooks: Bash Script (`telegram-hook.sh`)
+
+Used for fire-and-forget notifications (Stop, PostToolUse, Notification, etc.):
+
+```
+┌─────────────┐    ┌─────────────┐    ┌─────────────┐
+│ Claude Code │───▶│ telegram-   │───▶│   Bridge    │───▶ Telegram
+│  Stop/etc   │    │ hook.sh     │    │   Daemon    │
+└─────────────┘    └─────────────┘    └─────────────┘
+                   (exits immediately)
+```
+
+**Why Bash?**
+- Faster startup (~5ms vs ~50ms for Node)
+- No async needed - just send and exit
+- Lower overhead for high-frequency events
+
+---
+
+## Session ID Stability (v0.1.8 Fix)
+
+### The Problem (pre-v0.1.8)
+
+The Node handler generated its own session IDs:
+
+```typescript
+// OLD (broken): Generated random IDs
+this.sessionId = this.config.sessionId || this.generateSessionId();
+// Result: "hook-m1w2x3-abc123" - different each invocation!
+```
+
+This caused multiple Telegram topics per Claude session.
+
+### The Fix (v0.1.8)
+
+Now uses Claude's native `session_id` from hook events:
+
+```typescript
+// NEW (fixed): Uses Claude's session_id
+const event = JSON.parse(input) as AnyHookEvent;
+const handler = new HookHandler({
+  sessionId: event.session_id  // Claude's stable ID
+});
+```
+
+```bash
+# Bash script also uses Claude's session_id
+CLAUDE_SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // empty')
+SESSION_ID="${CLAUDE_SESSION_ID:-$(date +%s)-$$}"
+```
+
+**Result:** All events from the same Claude session route to the same Telegram topic.
 
 ---
 
