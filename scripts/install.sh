@@ -33,6 +33,81 @@ BOT_USERNAME=""
 CHAT_ID=""
 
 # ============================================
+# TTY HANDLING FOR curl | bash
+# ============================================
+# When run via "curl ... | bash", stdin is the curl output (the script itself).
+# We need to read user input from /dev/tty instead.
+#
+# This is the standard pattern used by rustup, nvm, and other installers.
+
+# Check if we have a TTY available for interactive input
+if [ -t 0 ]; then
+  # stdin is a terminal - normal execution
+  TTY_INPUT="/dev/stdin"
+else
+  # stdin is NOT a terminal (likely piped from curl)
+  # Try to use /dev/tty for interactive input
+  # We need to verify /dev/tty actually works, not just exists
+  if [ -e /dev/tty ] && [ -r /dev/tty ] && [ -w /dev/tty ]; then
+    # Test that we can actually read from it
+    if (echo "" > /dev/tty) 2>/dev/null; then
+      TTY_INPUT="/dev/tty"
+    else
+      echo ""
+      echo -e "${RED}ERROR: This installer requires interactive input.${NC}"
+      echo ""
+      echo "  You're running via 'curl | bash' but /dev/tty is not usable."
+      echo ""
+      echo "  Options:"
+      echo "    1. Download and run the script directly:"
+      echo "       curl -fsSL https://raw.githubusercontent.com/robertelee78/claude-telegram-mirror/master/scripts/install.sh -o install.sh"
+      echo "       bash install.sh"
+      echo ""
+      echo "    2. If in a Docker container, run with -it flags:"
+      echo "       docker run -it ..."
+      echo ""
+      exit 1
+    fi
+  else
+    echo ""
+    echo -e "${RED}ERROR: This installer requires interactive input.${NC}"
+    echo ""
+    echo "  You're running via 'curl | bash' but /dev/tty is not available."
+    echo ""
+    echo "  Options:"
+    echo "    1. Download and run the script directly:"
+    echo "       curl -fsSL https://raw.githubusercontent.com/robertelee78/claude-telegram-mirror/master/scripts/install.sh -o install.sh"
+    echo "       bash install.sh"
+    echo ""
+    echo "    2. If in a Docker container, run with -it flags:"
+    echo "       docker run -it ..."
+    echo ""
+    exit 1
+  fi
+fi
+
+# Wrapper function for read that uses the correct input source
+# Usage: prompt_read "prompt text" VARIABLE_NAME
+prompt_read() {
+  local prompt="$1"
+  local varname="$2"
+  local result
+
+  # Use -r to prevent backslash interpretation
+  read -r -p "$prompt" result < "$TTY_INPUT"
+
+  # Assign to the named variable
+  eval "$varname=\$result"
+}
+
+# Wrapper for simple "press enter to continue" prompts
+prompt_continue() {
+  local prompt="${1:-Press Enter to continue...}"
+  local dummy
+  read -r -p "$prompt" dummy < "$TTY_INPUT"
+}
+
+# ============================================
 # UTILITY FUNCTIONS
 # ============================================
 
@@ -139,7 +214,7 @@ get_bot_token() {
   echo ""
 
   while true; do
-    read -p "Enter your bot token: " BOT_TOKEN
+    prompt_read "Enter your bot token: " BOT_TOKEN
 
     if [[ -z "$BOT_TOKEN" ]]; then
       warn "Token cannot be empty"
@@ -149,7 +224,7 @@ get_bot_token() {
     # Validate token format (should be like: 123456789:ABCdefGHIjklMNOpqrsTUVwxyz)
     if [[ ! "$BOT_TOKEN" =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]]; then
       warn "Token format looks incorrect. Expected format: 123456789:ABCdefGHI..."
-      read -p "Try again? [Y/n]: " retry
+      prompt_read "Try again? [Y/n]: " retry
       [[ "$retry" =~ ^[Nn] ]] && exit 1
       continue
     fi
@@ -165,7 +240,7 @@ get_bot_token() {
     else
       local error_msg=$(echo "$response" | jq -r '.description // "Unknown error"')
       error "Token validation failed: $error_msg"
-      read -p "Try again? [Y/n]: " retry
+      prompt_read "Try again? [Y/n]: " retry
       [[ "$retry" =~ ^[Nn] ]] && exit 1
     fi
   done
@@ -191,7 +266,7 @@ configure_privacy_mode() {
   echo ""
 
   while true; do
-    read -p "Have you disabled privacy mode? [y/n]: " confirmed
+    prompt_read "Have you disabled privacy mode? [y/n]: " confirmed
 
     if [[ "$confirmed" =~ ^[Yy] ]]; then
       success "Privacy mode configured"
@@ -199,7 +274,7 @@ configure_privacy_mode() {
     elif [[ "$confirmed" =~ ^[Nn] ]]; then
       warn "Privacy mode MUST be disabled for the bot to work."
       echo "  Please complete this step before continuing."
-      read -p "Try again? [Y/n]: " retry
+      prompt_read "Try again? [Y/n]: " retry
       [[ "$retry" =~ ^[Nn] ]] && exit 1
     else
       warn "Please enter 'y' or 'n'"
@@ -224,7 +299,7 @@ setup_telegram_group() {
   echo "  6. Send any message in the group (so we can detect it)"
   echo ""
 
-  read -p "Press Enter when you've completed these steps..."
+  prompt_continue "Press Enter when you've completed these steps..."
 
   # Try to auto-detect the chat ID
   info "Looking for your group..."
@@ -264,7 +339,7 @@ setup_telegram_group() {
     local group_title=$(echo "$groups" | cut -d'|' -f2)
     success "Found group: $group_title ($CHAT_ID)"
 
-    read -p "Is this the correct group? [Y/n]: " confirm
+    prompt_read "Is this the correct group? [Y/n]: " confirm
     if [[ "$confirm" =~ ^[Nn] ]]; then
       manual_chat_id_entry
       return
@@ -287,7 +362,7 @@ setup_telegram_group() {
     done <<< "$groups"
 
     echo ""
-    read -p "Select group number (1-$group_count): " selection
+    prompt_read "Select group number (1-$group_count): " selection
 
     if [[ "$selection" =~ ^[0-9]+$ ]] && [[ $selection -ge 1 ]] && [[ $selection -le $group_count ]]; then
       CHAT_ID="${group_ids[$((selection-1))]}"
@@ -310,14 +385,14 @@ manual_chat_id_entry() {
   echo ""
 
   while true; do
-    read -p "Enter chat ID (starts with -100): " CHAT_ID
+    prompt_read "Enter chat ID (starts with -100): " CHAT_ID
 
     if [[ "$CHAT_ID" =~ ^-100[0-9]+$ ]]; then
       success "Chat ID format valid"
       break
     else
       warn "Chat ID should start with -100 (supergroup format)"
-      read -p "Try again? [Y/n]: " retry
+      prompt_read "Try again? [Y/n]: " retry
       [[ "$retry" =~ ^[Nn] ]] && exit 1
     fi
   done
@@ -340,7 +415,7 @@ verify_bot_permissions() {
     success "Bot can post to the group!"
     echo ""
     echo "  Check your Telegram group - you should see a test message."
-    read -p "Press Enter to continue..."
+    prompt_continue "Press Enter to continue..."
   else
     local error_msg=$(echo "$response" | jq -r '.description // "Unknown error"')
     error "Bot cannot post: $error_msg"
@@ -350,7 +425,7 @@ verify_bot_permissions() {
     echo "  - Ensure 'Post Messages' permission is enabled"
     echo "  - Check that 'Manage Topics' permission is enabled"
     echo ""
-    read -p "Fix the issue and press Enter to retry, or Ctrl+C to exit..."
+    prompt_continue "Fix the issue and press Enter to retry, or Ctrl+C to exit..."
     verify_bot_permissions
   fi
 }
@@ -365,7 +440,7 @@ install_package() {
   # Check if already installed
   if [[ -d "$INSTALL_DIR" ]]; then
     warn "Installation directory already exists: $INSTALL_DIR"
-    read -p "Remove and reinstall? [y/N]: " reinstall
+    prompt_read "Remove and reinstall? [y/N]: " reinstall
     if [[ "$reinstall" =~ ^[Yy] ]]; then
       info "Removing existing installation..."
       rm -rf "$INSTALL_DIR"
@@ -502,7 +577,7 @@ install_hooks() {
   echo ""
 
   # Ask if they want to install to a project now
-  read -p "Do you have a project with .claude/settings.json that needs hooks? [y/N]: " HAS_PROJECT
+  prompt_read "Do you have a project with .claude/settings.json that needs hooks? [y/N]: " HAS_PROJECT
 
   if [[ "$HAS_PROJECT" =~ ^[Yy] ]]; then
     install_project_hooks
@@ -512,7 +587,7 @@ install_hooks() {
 install_project_hooks() {
   while true; do
     echo ""
-    read -p "Enter project path (or 'done' to finish): " PROJECT_PATH
+    prompt_read "Enter project path (or 'done' to finish): " PROJECT_PATH
 
     [[ "$PROJECT_PATH" == "done" || -z "$PROJECT_PATH" ]] && break
 
@@ -537,7 +612,7 @@ install_project_hooks() {
       warn "Directory not found: $PROJECT_PATH"
     fi
 
-    read -p "Add another project? [y/N]: " ANOTHER
+    prompt_read "Add another project? [y/N]: " ANOTHER
     [[ "$ANOTHER" =~ ^[Yy] ]] || break
   done
 }
@@ -668,7 +743,7 @@ check_existing_config() {
         echo "  Chat: ${CHAT_ID}"
         echo ""
 
-        read -p "Use existing configuration? [Y/n]: " use_existing
+        prompt_read "Use existing configuration? [Y/n]: " use_existing
         if [[ ! "$use_existing" =~ ^[Nn] ]]; then
           return 0  # Use existing
         fi
