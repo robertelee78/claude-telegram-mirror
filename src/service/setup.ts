@@ -114,7 +114,8 @@ async function testBotToken(token: string): Promise<{ valid: boolean; username?:
     }
     return { valid: false, error: data.description || 'Invalid token' };
   } catch (error) {
-    return { valid: false, error: 'Network error - check your connection' };
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    return { valid: false, error: `Network error - ${errorMessage}` };
   }
 }
 
@@ -547,10 +548,24 @@ export TELEGRAM_MIRROR=true
     console.log('');
 
     try {
-      const { installHooks: doInstallHooks } = await import('../hooks/installer.js');
-      const result = doInstallHooks({ force: false });
+      const { installHooks: doInstallHooks, hooksNeedUpdate, checkHookStatus } = await import('../hooks/installer.js');
+
+      // Check if hooks exist and need updating
+      const status = checkHookStatus();
+      const needsUpdate = hooksNeedUpdate();
+      const forceInstall = needsUpdate || !status.installed;
+
+      if (needsUpdate && status.installed) {
+        console.log(yellow('⚠') + ' Existing hooks need updating for new approval features');
+      }
+
+      const result = doInstallHooks({ force: forceInstall });
       if (result.success) {
-        console.log(green('✓') + ' Global hooks installed to ~/.claude/settings.json');
+        if (needsUpdate) {
+          console.log(green('✓') + ' Global hooks updated with approval support');
+        } else {
+          console.log(green('✓') + ' Global hooks installed to ~/.claude/settings.json');
+        }
       } else {
         console.log(yellow('⚠') + ' Hook installation: ' + result.error);
       }

@@ -450,6 +450,55 @@ export function checkHookStatus(): {
 }
 
 /**
+ * Check if hooks need updating (e.g., PreToolUse missing Node handler for approval)
+ */
+export function hooksNeedUpdate(): boolean {
+  try {
+    const settings = loadSettings();
+
+    if (!settings.hooks?.PreToolUse) {
+      return false; // No hooks installed at all
+    }
+
+    const preToolHooks = settings.hooks.PreToolUse as ClaudeHookItem[];
+
+    // Check if any telegram hook exists for PreToolUse
+    const hasTelegramHook = preToolHooks.some(h => {
+      if ('hooks' in h && Array.isArray(h.hooks)) {
+        return h.hooks.some(hh =>
+          hh.command?.includes('telegram-hook') ||
+          hh.command?.includes('hooks/handler')
+        );
+      }
+      if ('command' in h) {
+        return h.command?.includes('telegram-hook') || h.command?.includes('hooks/handler');
+      }
+      return false;
+    });
+
+    if (!hasTelegramHook) {
+      return false; // Not our hooks
+    }
+
+    // Check if PreToolUse uses the Node handler (for approval support)
+    const hasNodeHandler = preToolHooks.some(h => {
+      if ('hooks' in h && Array.isArray(h.hooks)) {
+        return h.hooks.some(hh => hh.command?.includes('hooks/handler'));
+      }
+      if ('command' in h) {
+        return h.command?.includes('hooks/handler');
+      }
+      return false;
+    });
+
+    // If PreToolUse doesn't have Node handler, it needs updating
+    return !hasNodeHandler;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Print hook status
  */
 export function printHookStatus(): void {
@@ -481,5 +530,6 @@ export default {
   installHooks,
   uninstallHooks,
   checkHookStatus,
+  hooksNeedUpdate,
   printHookStatus
 };
