@@ -548,24 +548,10 @@ export TELEGRAM_MIRROR=true
     console.log('');
 
     try {
-      const { installHooks: doInstallHooks, hooksNeedUpdate, checkHookStatus } = await import('../hooks/installer.js');
-
-      // Check if hooks exist and need updating
-      const status = checkHookStatus();
-      const needsUpdate = hooksNeedUpdate();
-      const forceInstall = needsUpdate || !status.installed;
-
-      if (needsUpdate && status.installed) {
-        console.log(yellow('⚠') + ' Existing hooks need updating for new approval features');
-      }
-
-      const result = doInstallHooks({ force: forceInstall });
+      const { installHooks: doInstallHooks } = await import('../hooks/installer.js');
+      const result = doInstallHooks({ force: false });
       if (result.success) {
-        if (needsUpdate) {
-          console.log(green('✓') + ' Global hooks updated with approval support');
-        } else {
-          console.log(green('✓') + ' Global hooks installed to ~/.claude/settings.json');
-        }
+        console.log(green('✓') + ' Global hooks installed to ~/.claude/settings.json');
       } else {
         console.log(yellow('⚠') + ' Hook installation: ' + result.error);
       }

@@ -15,7 +15,6 @@ import logger from '../utils/logger.js';
 const CLAUDE_CONFIG_DIR = join(homedir(), '.claude');
 const CLAUDE_SETTINGS_FILE = join(CLAUDE_CONFIG_DIR, 'settings.json');
 const HOOK_SCRIPT_NAME = 'telegram-hook.sh';
-const NODE_HANDLER_NAME = 'dist/hooks/handler.js';
 
 /**
  * Hook configuration for Claude Code (old format)
@@ -92,37 +91,6 @@ function getHookScriptPath(): string {
 }
 
 /**
- * Get the path to the Node.js hook handler for PreToolUse (used for Telegram approvals)
- * Returns a command string like: "node /path/to/dist/hooks/handler.js"
- */
-function getNodeHandlerCommand(): string {
-  // 1. Check if installed globally via npm
-  try {
-    const globalPath = execSync('npm root -g', { encoding: 'utf8' }).trim();
-    const globalHandler = join(globalPath, 'claude-telegram-mirror', NODE_HANDLER_NAME);
-    if (existsSync(globalHandler)) {
-      return `node "${globalHandler}"`;
-    }
-  } catch {
-    // Not installed globally
-  }
-
-  // 2. Check local development path (relative to compiled dist/hooks/installer.js)
-  const localHandler = join(dirname(dirname(dirname(import.meta.url.replace('file://', '')))), NODE_HANDLER_NAME);
-  if (existsSync(localHandler)) {
-    return `node "${localHandler}"`;
-  }
-
-  // 3. Fallback: legacy /opt/ path for backward compatibility
-  const legacyPath = '/opt/claude-mobile/packages/claude-telegram-mirror/' + NODE_HANDLER_NAME;
-  if (existsSync(legacyPath)) {
-    return `node "${legacyPath}"`;
-  }
-
-  throw new Error('Node.js hook handler not found. Please reinstall claude-telegram-mirror.');
-}
-
-/**
  * Load Claude settings
  */
 function loadSettings(settingsPath: string = CLAUDE_SETTINGS_FILE): ClaudeSettings {
@@ -168,23 +136,22 @@ function createHookEntry(scriptPath: string): ClaudeHookEntry {
 }
 
 /**
- * Create hook configuration for PreToolUse with Telegram approval support
- * Uses Node.js handler which can do bidirectional socket communication
- * Timeout is set to 310 seconds (5 min for user + 10s buffer) since approvals may wait for user input
+ * Check if hook is already installed (handles both old and new format)
  */
-function createApprovalHookEntry(nodeHandlerCommand: string): ClaudeHookEntry {
-  return {
-    matcher: '',
-    hooks: [
-      {
-        type: 'command',
-        command: nodeHandlerCommand,
-        timeout: 310  // 5 minutes + 10s buffer for Telegram approval
-      }
-    ]
-  };
+function isHookInstalled(hooks: (ClaudeHookConfig | ClaudeHookEntry)[] | undefined, scriptPath: string): boolean {
+  if (!hooks) return false;
+  return hooks.some(h => {
+    // New format: { matcher, hooks: [...] }
+    if ('hooks' in h && Array.isArray(h.hooks)) {
+      return h.hooks.some(hh => hh.command?.includes('telegram-hook'));
+    }
+    // Old format: { type, command }
+    if ('command' in h) {
+      return h.command === scriptPath || h.command.includes('telegram-hook');
+    }
+    return false;
+  });
 }
-
 
 /**
  * Install Telegram hooks
@@ -231,15 +198,6 @@ export function installHooks(options: { force?: boolean; project?: boolean; proj
     // Ensure script is executable
     chmodSync(scriptPath, 0o755);
 
-    // Get Node.js handler for PreToolUse (supports Telegram approvals)
-    let nodeHandlerCommand: string | null = null;
-    try {
-      nodeHandlerCommand = getNodeHandlerCommand();
-      logger.info('Found Node.js handler', { command: nodeHandlerCommand });
-    } catch (error) {
-      logger.warn('Node.js handler not found, PreToolUse will use bash script (no approval support)', { error });
-    }
-
     const settings = loadSettings(settingsPath);
 
     // Initialize hooks object if needed
@@ -248,7 +206,6 @@ export function installHooks(options: { force?: boolean; project?: boolean; proj
     }
 
     // Hook types to install (fewer for project - just the essentials)
-    // PreToolUse only makes sense for global hooks (approval workflow)
     const hookTypes = options.project
       ? ['Notification', 'Stop', 'UserPromptSubmit', 'PreCompact']
       : ['PreToolUse', 'PostToolUse', 'Notification', 'Stop', 'UserPromptSubmit', 'PreCompact'];
@@ -256,21 +213,7 @@ export function installHooks(options: { force?: boolean; project?: boolean; proj
     for (const hookType of hookTypes) {
       const existingHooks = settings.hooks[hookType];
 
-      // Check for existing telegram hooks (both bash script and node handler)
-      const isInstalled = existingHooks?.some(h => {
-        if ('hooks' in h && Array.isArray(h.hooks)) {
-          return h.hooks.some(hh =>
-            hh.command?.includes('telegram-hook') ||
-            hh.command?.includes('hooks/handler')
-          );
-        }
-        if ('command' in h) {
-          return h.command?.includes('telegram-hook') || h.command?.includes('hooks/handler');
-        }
-        return false;
-      });
-
-      if (!options.force && isInstalled) {
+      if (!options.force && isHookInstalled(existingHooks, scriptPath)) {
         skipped.push(hookType);
         continue;
       }
@@ -280,35 +223,22 @@ export function installHooks(options: { force?: boolean; project?: boolean; proj
         // Remove old telegram hooks if present (handles both formats)
         const filteredHooks = existingHooks.filter(h => {
           if ('hooks' in h && Array.isArray(h.hooks)) {
-            return !h.hooks.some(hh =>
-              hh.command?.includes('telegram-hook') ||
-              hh.command?.includes('hooks/handler')
-            );
+            return !h.hooks.some(hh => hh.command?.includes('telegram-hook'));
           }
           if ('command' in h) {
-            return !h.command?.includes('telegram-hook') && !h.command?.includes('hooks/handler');
+            return !h.command?.includes('telegram-hook');
           }
           return true;
         });
 
-        // Add new hook at the beginning (runs first)
-        // PreToolUse uses Node.js handler (supports Telegram approval flow)
-        // Other hooks use bash script (faster, fire-and-forget)
-        if (hookType === 'PreToolUse' && nodeHandlerCommand) {
-          filteredHooks.unshift(createApprovalHookEntry(nodeHandlerCommand));
-        } else {
-          filteredHooks.unshift(createHookEntry(scriptPath));
-        }
+        // Add new hook at the beginning (runs first) - use correct format
+        filteredHooks.unshift(createHookEntry(scriptPath));
 
         settings.hooks[hookType] = filteredHooks;
         installed.push(hookType);
       } else {
         // No existing hooks, create new array with correct format
-        if (hookType === 'PreToolUse' && nodeHandlerCommand) {
-          settings.hooks[hookType] = [createApprovalHookEntry(nodeHandlerCommand)];
-        } else {
-          settings.hooks[hookType] = [createHookEntry(scriptPath)];
-        }
+        settings.hooks[hookType] = [createHookEntry(scriptPath)];
         installed.push(hookType);
       }
     }
@@ -350,14 +280,11 @@ export function uninstallHooks(): {
       const filteredHooks = hooks.filter(h => {
         // New format: { matcher, hooks: [...] }
         if ('hooks' in h && Array.isArray(h.hooks)) {
-          return !h.hooks.some(hh =>
-            hh.command?.includes('telegram-hook') ||
-            hh.command?.includes('hooks/handler')
-          );
+          return !h.hooks.some(hh => hh.command?.includes('telegram-hook'));
         }
         // Old format: { type, command }
         if ('command' in h) {
-          return !h.command?.includes('telegram-hook') && !h.command?.includes('hooks/handler');
+          return !h.command?.includes('telegram-hook');
         }
         return true;
       });
@@ -410,14 +337,11 @@ export function checkHookStatus(): {
         if (configs?.some(h => {
           // New format: { matcher, hooks: [...] }
           if ('hooks' in h && Array.isArray(h.hooks)) {
-            return h.hooks.some(hh =>
-              hh.command?.includes('telegram-hook') ||
-              hh.command?.includes('hooks/handler')
-            );
+            return h.hooks.some(hh => hh.command?.includes('telegram-hook'));
           }
           // Old format: { type, command }
           if ('command' in h) {
-            return h.command?.includes('telegram-hook') || h.command?.includes('hooks/handler');
+            return h.command?.includes('telegram-hook');
           }
           return false;
         })) {
@@ -446,55 +370,6 @@ export function checkHookStatus(): {
       hooks: [],
       error: errorMessage
     };
-  }
-}
-
-/**
- * Check if hooks need updating (e.g., PreToolUse missing Node handler for approval)
- */
-export function hooksNeedUpdate(): boolean {
-  try {
-    const settings = loadSettings();
-
-    if (!settings.hooks?.PreToolUse) {
-      return false; // No hooks installed at all
-    }
-
-    const preToolHooks = settings.hooks.PreToolUse as ClaudeHookItem[];
-
-    // Check if any telegram hook exists for PreToolUse
-    const hasTelegramHook = preToolHooks.some(h => {
-      if ('hooks' in h && Array.isArray(h.hooks)) {
-        return h.hooks.some(hh =>
-          hh.command?.includes('telegram-hook') ||
-          hh.command?.includes('hooks/handler')
-        );
-      }
-      if ('command' in h) {
-        return h.command?.includes('telegram-hook') || h.command?.includes('hooks/handler');
-      }
-      return false;
-    });
-
-    if (!hasTelegramHook) {
-      return false; // Not our hooks
-    }
-
-    // Check if PreToolUse uses the Node handler (for approval support)
-    const hasNodeHandler = preToolHooks.some(h => {
-      if ('hooks' in h && Array.isArray(h.hooks)) {
-        return h.hooks.some(hh => hh.command?.includes('hooks/handler'));
-      }
-      if ('command' in h) {
-        return h.command?.includes('hooks/handler');
-      }
-      return false;
-    });
-
-    // If PreToolUse doesn't have Node handler, it needs updating
-    return !hasNodeHandler;
-  } catch {
-    return false;
   }
 }
 
@@ -530,6 +405,5 @@ export default {
   installHooks,
   uninstallHooks,
   checkHookStatus,
-  hooksNeedUpdate,
   printHookStatus
 };
