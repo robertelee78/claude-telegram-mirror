@@ -45,14 +45,13 @@
   ],
   "author": "Robert E. Lee <robert@agidreams.us>",
   "license": "MIT",
-  "homepage": "https://github.com/robertelee78/claude-mobile",
+  "homepage": "https://github.com/robertelee78/claude-telegram-mirror",
   "repository": {
     "type": "git",
-    "url": "https://github.com/robertelee78/claude-mobile.git",
-    "directory": "packages/claude-telegram-mirror"
+    "url": "https://github.com/robertelee78/claude-telegram-mirror.git"
   },
   "bugs": {
-    "url": "https://github.com/robertelee78/claude-mobile/issues"
+    "url": "https://github.com/robertelee78/claude-telegram-mirror/issues"
   },
   "funding": {
     "type": "github",
