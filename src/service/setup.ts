@@ -10,6 +10,7 @@ import { createInterface } from 'readline';
 
 const CONFIG_DIR = join(homedir(), '.config', 'claude-telegram-mirror');
 const CONFIG_FILE = join(CONFIG_DIR, 'config.json');
+const ENV_FILE = join(homedir(), '.telegram-env');
 
 // ANSI color codes (works in Node.js terminal)
 const colors = {
@@ -30,6 +31,39 @@ function yellow(text: string): string { return `${colors.yellow}${text}${colors.
 function red(text: string): string { return `${colors.red}${text}${colors.reset}`; }
 function gray(text: string): string { return `${colors.gray}${text}${colors.reset}`; }
 function bold(text: string): string { return `${colors.bold}${text}${colors.reset}`; }
+
+/**
+ * Parse ~/.telegram-env file for existing configuration
+ */
+function parseEnvFile(): { botToken?: string; chatId?: string } {
+  const result: { botToken?: string; chatId?: string } = {};
+
+  if (!existsSync(ENV_FILE)) {
+    return result;
+  }
+
+  try {
+    const content = readFileSync(ENV_FILE, 'utf-8');
+    const lines = content.split('\n');
+
+    for (const line of lines) {
+      // Match export VAR="value" or export VAR=value or VAR=value
+      const match = line.match(/^(?:export\s+)?(\w+)=["']?([^"'\n]*)["']?/);
+      if (!match) continue;
+
+      const [, key, value] = match;
+      if (key === 'TELEGRAM_BOT_TOKEN' && value) {
+        result.botToken = value;
+      } else if (key === 'TELEGRAM_CHAT_ID' && value) {
+        result.chatId = value;
+      }
+    }
+  } catch {
+    // Ignore parse errors
+  }
+
+  return result;
+}
 
 /**
  * Simple readline prompt
@@ -113,16 +147,44 @@ export async function runSetup(): Promise<void> {
   console.log(cyan('╚════════════════════════════════════════════════════════════╝'));
   console.log('');
 
-  // Load existing config if present
+  // Load existing config from multiple sources
   let existingConfig: Record<string, unknown> = {};
+
+  // Check ~/.telegram-env first
+  const envConfig = parseEnvFile();
+  if (envConfig.botToken || envConfig.chatId) {
+    console.log(green('✓') + ' Found existing ~/.telegram-env');
+    if (envConfig.botToken) {
+      existingConfig.botToken = envConfig.botToken;
+    }
+    if (envConfig.chatId) {
+      existingConfig.chatId = parseInt(envConfig.chatId, 10);
+    }
+  }
+
+  // Check config.json (takes precedence)
   if (existsSync(CONFIG_FILE)) {
     try {
-      existingConfig = JSON.parse(readFileSync(CONFIG_FILE, 'utf-8'));
-      console.log(green('✓') + ' Found existing configuration');
-      console.log('');
+      const fileConfig = JSON.parse(readFileSync(CONFIG_FILE, 'utf-8'));
+      existingConfig = { ...existingConfig, ...fileConfig };
+      console.log(green('✓') + ' Found existing config.json');
     } catch {
-      // Ignore
+      // Ignore parse errors
     }
+  }
+
+  // Also check environment variables (highest precedence)
+  if (process.env.TELEGRAM_BOT_TOKEN) {
+    existingConfig.botToken = process.env.TELEGRAM_BOT_TOKEN;
+    console.log(green('✓') + ' Found TELEGRAM_BOT_TOKEN in environment');
+  }
+  if (process.env.TELEGRAM_CHAT_ID) {
+    existingConfig.chatId = parseInt(process.env.TELEGRAM_CHAT_ID, 10);
+    console.log(green('✓') + ' Found TELEGRAM_CHAT_ID in environment');
+  }
+
+  if (Object.keys(existingConfig).length > 0) {
+    console.log('');
   }
 
   // Step 1: Bot Token
