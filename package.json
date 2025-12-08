@@ -1,7 +1,7 @@
 {
   "name": "claude-telegram-mirror",
   "version": "1.0.0",
-  "description": "Bidirectional Telegram integration for Claude Code CLI",
+  "description": "Bidirectional Telegram integration for Claude Code CLI - monitor and control your Claude Code sessions from Telegram",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
@@ -21,23 +21,46 @@
     "test:coverage": "vitest --coverage",
     "lint": "eslint src/",
     "typecheck": "tsc --noEmit",
+    "postinstall": "node postinstall.js",
     "prepublishOnly": "npm run build && npm test"
   },
+  "files": [
+    "dist/",
+    "scripts/",
+    "postinstall.js",
+    "README.md"
+  ],
   "keywords": [
     "claude",
     "telegram",
     "cli",
     "mirror",
     "bot",
-    "claude-code"
+    "claude-code",
+    "anthropic",
+    "ai",
+    "automation",
+    "remote-control",
+    "mobile"
   ],
-  "author": "",
+  "author": "Robert E. Lee <robert@agidreams.us>",
   "license": "MIT",
+  "homepage": "https://github.com/robertelee78/claude-mobile",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/robertelee78/claude-mobile.git",
+    "directory": "packages/claude-telegram-mirror"
+  },
+  "bugs": {
+    "url": "https://github.com/robertelee78/claude-mobile/issues"
+  },
   "dependencies": {
     "grammy": "^1.21.0",
     "better-sqlite3": "^11.0.0",
     "commander": "^12.0.0",
-    "winston": "^3.11.0"
+    "winston": "^3.11.0",
+    "chalk": "^4.1.2",
+    "inquirer": "^8.2.5"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.8",
@@ -50,5 +73,9 @@
   },
   "engines": {
     "node": ">=18.0.0"
-  }
+  },
+  "os": [
+    "linux",
+    "darwin"
+  ]
 }

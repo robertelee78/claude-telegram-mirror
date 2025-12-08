@@ -16,6 +16,8 @@ import {
   stopService,
   restartService
 } from './service/manager.js';
+import { runSetup } from './service/setup.js';
+import { runDoctor } from './service/doctor.js';
 
 const program = new Command();
 
@@ -245,6 +247,36 @@ program
   .description('Show hook installation status')
   .action(() => {
     printHookStatus();
+  });
+
+/**
+ * Setup command - Interactive configuration wizard
+ */
+program
+  .command('setup')
+  .description('Interactive setup wizard for configuring claude-telegram-mirror')
+  .action(async () => {
+    try {
+      await runSetup();
+    } catch (error) {
+      console.error('Setup failed:', error);
+      process.exit(1);
+    }
+  });
+
+/**
+ * Doctor command - Diagnostic tool
+ */
+program
+  .command('doctor')
+  .description('Diagnose configuration and connectivity issues')
+  .action(async () => {
+    try {
+      await runDoctor();
+    } catch (error) {
+      console.error('Doctor failed:', error);
+      process.exit(1);
+    }
   });
 
 /**
