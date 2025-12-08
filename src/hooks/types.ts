@@ -16,19 +16,23 @@ export type HookEventType =
 
 /**
  * Base hook event structure
+ * Note: Claude Code sends 'hook_event_name' not 'type' in the JSON payload
  */
 export interface HookEvent {
-  type: HookEventType;
+  hook_event_name: HookEventType;
   session_id: string;
-  timestamp: string;
+  timestamp?: string;
   hook_id?: string;
+  transcript_path?: string;
+  cwd?: string;
+  permission_mode?: string;
 }
 
 /**
  * Stop hook - Called when the main agent stops
  */
 export interface StopHookEvent extends HookEvent {
-  type: 'Stop';
+  hook_event_name: 'Stop';
   stop_hook_active: boolean;
   transcript_summary?: string;
 }
@@ -37,7 +41,7 @@ export interface StopHookEvent extends HookEvent {
  * SubagentStop hook - Called when a subagent (Task tool) stops
  */
 export interface SubagentStopHookEvent extends HookEvent {
-  type: 'SubagentStop';
+  hook_event_name: 'SubagentStop';
   subagent_id: string;
   result?: string;
 }
@@ -46,7 +50,7 @@ export interface SubagentStopHookEvent extends HookEvent {
  * PreToolUse hook - Called before a tool is executed
  */
 export interface PreToolUseHookEvent extends HookEvent {
-  type: 'PreToolUse';
+  hook_event_name: 'PreToolUse';
   tool_name: string;
   tool_input: Record<string, unknown>;
   tool_use_id?: string;  // Unique identifier for this tool call
@@ -56,7 +60,7 @@ export interface PreToolUseHookEvent extends HookEvent {
  * PostToolUse hook - Called after a tool is executed
  */
 export interface PostToolUseHookEvent extends HookEvent {
-  type: 'PostToolUse';
+  hook_event_name: 'PostToolUse';
   tool_name: string;
   tool_input: Record<string, unknown>;
   tool_output?: string;
@@ -67,16 +71,17 @@ export interface PostToolUseHookEvent extends HookEvent {
  * Notification hook - Called for status notifications
  */
 export interface NotificationHookEvent extends HookEvent {
-  type: 'Notification';
+  hook_event_name: 'Notification';
   message: string;
-  level: 'info' | 'warning' | 'error';
+  level?: 'info' | 'warning' | 'error';
+  notification_type?: string;
 }
 
 /**
  * UserPromptSubmit hook - Called when user submits a prompt
  */
 export interface UserPromptSubmitHookEvent extends HookEvent {
-  type: 'UserPromptSubmit';
+  hook_event_name: 'UserPromptSubmit';
   prompt: string;
 }
 

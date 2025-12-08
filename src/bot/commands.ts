@@ -287,10 +287,18 @@ export function registerApprovalHandlers(
       }[action];
 
       const originalText = ctx.callbackQuery.message?.text || '';
-      await ctx.editMessageText(
-        `${originalText}\n\n*Decision:* ${actionText}`,
-        { parse_mode: 'Markdown' }
-      );
+
+      // Try to update with markdown, fall back to plain text if parsing fails
+      try {
+        await ctx.editMessageText(
+          `${originalText}\n\nDecision: ${actionText}`,
+          { parse_mode: undefined }  // Plain text to avoid markdown conflicts
+        );
+      } catch (editError) {
+        // If edit fails, try without the original text
+        logger.warn('Failed to edit with original text, using simple format', { editError });
+        await ctx.editMessageText(`Decision: ${actionText}`);
+      }
 
       await ctx.answerCallbackQuery({ text: `${actionText}!` });
 

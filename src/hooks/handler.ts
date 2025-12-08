@@ -151,12 +151,14 @@ export class HookHandler {
   handleStop(event: StopHookEvent): void {
     if (!this.connected) return;
 
+    const timestamp = event.timestamp || new Date().toISOString();
+
     // Send final response if available
     if (event.transcript_summary) {
       this.send({
         type: 'agent_response',
         sessionId: this.sessionId,
-        timestamp: event.timestamp,
+        timestamp,
         content: event.transcript_summary
       });
     }
@@ -165,7 +167,7 @@ export class HookHandler {
     this.send({
       type: 'session_end',
       sessionId: this.sessionId,
-      timestamp: event.timestamp,
+      timestamp,
       content: 'Session stopped'
     });
   }
@@ -196,11 +198,12 @@ export class HookHandler {
     const toolDescription = this.formatToolDescription(event.tool_name, event.tool_input);
 
     // Send approval request and wait for response
+    const timestamp = event.timestamp || new Date().toISOString();
     try {
       const response = await this.client.sendAndWait({
         type: 'approval_request',
         sessionId: this.sessionId,
-        timestamp: event.timestamp,
+        timestamp,
         content: toolDescription,
         metadata: {
           tool: event.tool_name,
@@ -255,7 +258,7 @@ export class HookHandler {
       this.send({
         type: 'tool_result',
         sessionId: this.sessionId,
-        timestamp: event.timestamp,
+        timestamp: event.timestamp || new Date().toISOString(),
         content: event.tool_output || event.tool_error || 'No output',
         metadata: {
           tool: event.tool_name,
@@ -278,7 +281,7 @@ export class HookHandler {
     this.send({
       type,
       sessionId: this.sessionId,
-      timestamp: event.timestamp,
+      timestamp: event.timestamp || new Date().toISOString(),
       content: event.message,
       metadata: { level: event.level }
     });
@@ -294,7 +297,7 @@ export class HookHandler {
     this.send({
       type: 'user_input',
       sessionId: this.sessionId,
-      timestamp: event.timestamp,
+      timestamp: event.timestamp || new Date().toISOString(),
       content: event.prompt,
       metadata: { source: 'cli' }
     });
@@ -381,9 +384,10 @@ export class HookHandler {
 
   /**
    * Process raw hook event from stdin
+   * Note: Claude Code sends 'hook_event_name' not 'type' in the JSON payload
    */
   async processEvent(event: AnyHookEvent): Promise<string | null> {
-    switch (event.type) {
+    switch (event.hook_event_name) {
       case 'Stop':
         this.handleStop(event);
         return null;
@@ -420,7 +424,7 @@ export class HookHandler {
 
       default:
         if (this.config.verbose) {
-          console.error('[telegram-hook] Unknown event type:', (event as AnyHookEvent).type);
+          console.error('[telegram-hook] Unknown event type:', (event as AnyHookEvent).hook_event_name);
         }
         return null;
     }
@@ -501,7 +505,7 @@ export async function main(): Promise<void> {
     }
 
     // Clean up session tracking on Stop event
-    if (event.type === 'Stop') {
+    if (event.hook_event_name === 'Stop') {
       clearSessionTracking(event.session_id);
     }
 
