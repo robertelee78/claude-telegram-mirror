@@ -138,7 +138,7 @@ SyslogIdentifier=${SERVICE_NAME}
 
 # Security hardening
 NoNewPrivileges=true
-PrivateTmp=true
+PrivateTmp=false
 
 # Allow writes to config directory
 ReadWritePaths=${configDir}
