@@ -65,10 +65,11 @@ A bidirectional bridge that mirrors Claude Code CLI sessions to Telegram, enabli
 ```
 
 **Hook Events Captured:**
-- `PreToolUse` → `tool_start`
+- `PreToolUse` → `tool_start` (+ approval workflow)
 - `PostToolUse` → `tool_result`
 - `Stop` → `agent_response` + `turn_complete`
 - `UserPromptSubmit` → `user_input`
+- `PreCompact` → `pre_compact` (context compaction warning)
 - First event → `session_start`
 
 **Key Functions:**
@@ -273,8 +274,10 @@ CREATE TABLE pending_approvals (
 | `TELEGRAM_BOT_TOKEN` | Yes | - | Bot token from @BotFather |
 | `TELEGRAM_CHAT_ID` | Yes | - | Supergroup ID (starts with `-100`) |
 | `TELEGRAM_MIRROR` | No | `false` | Enable/disable mirroring |
+| `TELEGRAM_MIRROR_VERBOSE` | No | `false` | Verbose logging |
 | `TELEGRAM_USE_THREADS` | No | `true` | Use forum topics |
 | `TELEGRAM_BRIDGE_SOCKET` | No | `~/.config/.../bridge.sock` | Socket path |
+| `TELEGRAM_STALE_SESSION_TIMEOUT_HOURS` | No | `72` | Auto-cleanup threshold for dead sessions |
 
 ### File Locations
 
@@ -341,6 +344,7 @@ tail -f ~/.config/claude-telegram-mirror/daemon.log  # View logs
 | `approval_request` | CLI → TG | Permission request |
 | `approval_response` | TG → CLI | User approval/rejection |
 | `turn_complete` | CLI → TG | Claude turn finished (not session end) |
+| `pre_compact` | CLI → TG | Context compaction starting |
 
 ---
 
@@ -427,13 +431,96 @@ SESSION_ID="${CLAUDE_SESSION_ID:-$(date +%s)-$$}"
 
 ---
 
+## CLI Lifecycle Commands (v0.1.16+)
+
+The CLI provides commands to manage the daemon lifecycle:
+
+```bash
+ctm start              # Start daemon (foreground mode)
+ctm stop               # Graceful shutdown (SIGTERM, 5s timeout)
+ctm stop --force       # Force kill if graceful fails
+ctm restart            # Stop + start in one command
+ctm status             # Show running state, PID, socket status
+```
+
+**Auto-detection:** Commands detect whether daemon runs directly or via OS service (systemd/launchd) and delegate appropriately.
+
+**Cleanup:** Stale PID and socket files are automatically removed on stop/restart.
+
+---
+
+## Stale Session Cleanup (v0.1.14+)
+
+Sessions with dead tmux panes are automatically cleaned up:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        Stale Session Detection                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  Cleanup triggers when ALL conditions met:                                  │
+│                                                                             │
+│  1. last_activity > TELEGRAM_STALE_SESSION_TIMEOUT_HOURS (default: 72h)     │
+│  2. AND one of:                                                             │
+│     - tmux pane no longer exists                                            │
+│     - tmux pane reassigned to different Claude session                      │
+│                                                                             │
+│  Actions on cleanup:                                                        │
+│  - Send "Session ended (terminal closed)" to Telegram topic                 │
+│  - Close the forum topic                                                    │
+│  - Mark session as 'ended' in database                                      │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+Cleanup runs every 5 minutes while daemon is running.
+
+---
+
+## Topic Creation Race Condition Handling (v0.1.13+)
+
+Events may arrive out-of-order (e.g., `agent_response` before `session_start`). The daemon uses promise-based locking:
+
+```typescript
+// If topic creation is in progress, wait for it
+if (topicCreationPromises.has(sessionId)) {
+  await topicCreationPromises.get(sessionId);  // 5-second timeout
+}
+```
+
+**Behavior:**
+- First event triggers topic creation
+- Subsequent events wait for topic to exist
+- 5-second timeout prevents indefinite blocking
+- On timeout: error logged, message dropped (prevents misdirection to General topic)
+
+---
+
+## Telegram Input Commands
+
+Commands sent from Telegram to control Claude:
+
+| Category | Commands | Key Sent |
+|----------|----------|----------|
+| **Interrupt** | `stop`, `cancel`, `abort`, `esc`, `escape` | Escape |
+| **Kill** | `kill`, `exit`, `quit`, `ctrl+c`, `ctrl-c`, `^c` | Ctrl-C |
+
+Commands work with or without leading `/` (e.g., `stop` or `/stop`).
+
+**Interrupt vs Kill:**
+- **Escape** pauses Claude mid-generation (can resume)
+- **Ctrl-C** exits Claude entirely (session ends)
+
+---
+
 ## Troubleshooting
 
 | Issue | Cause | Solution |
 |-------|-------|----------|
 | "No tmux session found" | Daemon can't access tmux socket | Set `PrivateTmp=false` in systemd |
-| Messages not appearing | Hook not installed | Run `node dist/cli.js install-hooks` |
+| Messages not appearing | Hook not installed | Run `ctm install-hooks` |
 | Wrong topic | Session mapping lost | Check `sessions.db` for correct `thread_id` |
 | Duplicate topics | Daemon restarted mid-session | Topics are reused if `thread_id` exists in DB |
+| Stale sessions | Old sessions not cleaned | Check `TELEGRAM_STALE_SESSION_TIMEOUT_HOURS` |
 | macOS: "node not found" | launchd minimal PATH | Reinstall service to regenerate plist with full PATH |
 | macOS: Daemon crashes on start | Missing HOME env | Check `daemon.err.log` for details |

@@ -86,8 +86,10 @@ Once connected, you can control Claude from Telegram:
 | Command | Action |
 |---------|--------|
 | Any text | Sends to Claude as input |
-| `stop` | Sends Ctrl+C to interrupt Claude |
-| `/stop`, `cancel`, `abort` | Also interrupt Claude |
+| `stop` | Sends Escape to pause Claude |
+| `kill` | Sends Ctrl-C to exit Claude entirely |
+
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for additional command aliases.
 
 ### Tool Approval Buttons
 
@@ -218,6 +220,7 @@ export TELEGRAM_MIRROR=true
 # Optional:
 # export TELEGRAM_MIRROR_VERBOSE=true
 # export TELEGRAM_BRIDGE_SOCKET=~/.config/claude-telegram-mirror/bridge.sock
+# export TELEGRAM_STALE_SESSION_TIMEOUT_HOURS=72  # Auto-cleanup dead sessions (default: 72)
 ```
 
 Source in your shell profile (`~/.bashrc` or `~/.zshrc`):
