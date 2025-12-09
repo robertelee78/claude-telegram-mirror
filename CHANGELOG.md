@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.19] - 2025-12-09
+
+### Fixed
+- **BUG-011: Missing hostname in topic names** - Forum topics now include hostname for all sessions
+  - Root cause: Bash hook script (`telegram-hook.sh`) didn't include hostname in metadata
+  - Node handler (`handler.ts`) included hostname but bash hook handled most events
+  - Fix: `get_tmux_info()` in bash hook now includes hostname in returned JSON
+  - New sessions will have hostname in topic name (e.g., "agidreams | project-name")
+  - Existing sessions need to be closed and recreated to get hostname in topic name
+
 ## [0.1.18] - 2025-12-09
 
 ### Fixed

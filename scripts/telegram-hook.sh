@@ -76,11 +76,19 @@ debug_log "Claude session_id: $CLAUDE_SESSION_ID"
 SESSION_ID="${CLAUDE_SESSION_ID:-$(date +%s)-$$}"
 debug_log "Using session ID: $SESSION_ID"
 
-# Get tmux info if available
+# Get tmux info and hostname for metadata
 # Extracts socket path from $TMUX env var for explicit targeting
+# Always includes hostname for topic naming
 get_tmux_info() {
+  local host=$(hostname 2>/dev/null || echo "")
+
   if [[ -z "$TMUX" ]]; then
-    echo "{}"
+    # No tmux, but still include hostname
+    if [[ -n "$host" ]]; then
+      jq -cn --arg hostname "$host" '{hostname: $hostname}'
+    else
+      echo "{}"
+    fi
     return
   fi
 
@@ -99,9 +107,15 @@ get_tmux_info() {
       --arg pane "$pane" \
       --arg target "$target" \
       --arg socket "$socket_path" \
-      '{tmuxSession: $session, tmuxPane: $pane, tmuxTarget: $target, tmuxSocket: $socket}'
+      --arg hostname "$host" \
+      '{tmuxSession: $session, tmuxPane: $pane, tmuxTarget: $target, tmuxSocket: $socket, hostname: $hostname}'
   else
-    echo "{}"
+    # tmux present but can't get details - still include hostname
+    if [[ -n "$host" ]]; then
+      jq -cn --arg hostname "$host" '{hostname: $hostname}'
+    else
+      echo "{}"
+    fi
   fi
 }
 
