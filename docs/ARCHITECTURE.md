@@ -17,7 +17,7 @@ A bidirectional bridge that mirrors Claude Code CLI sessions to Telegram, enabli
 │        │                                     │                              │
 │        │ hooks                               │ SQLite                       │
 │        ▼                                     ▼                              │
-│  ┌──────────────┐                      ┌──────────────┐                     │
+│  ┌──────────────┐                     ┌──────────────┐                      │
 │  │ PreToolUse:  │◀──────────────────▶ │ sessions.db  │                      │
 │  │ handler.ts   │  bidirectional      │              │                      │
 │  │ (approval)   │  request/response   └──────────────┘                      │
@@ -70,14 +70,16 @@ A bidirectional bridge that mirrors Claude Code CLI sessions to Telegram, enabli
 - `Stop` → `agent_response` + `turn_complete`
 - `UserPromptSubmit` → `user_input`
 - `PreCompact` → `pre_compact` (context compaction warning)
-- First event → `session_start`
+
+**Note:** Hooks are stateless (v0.1.15+). They do NOT track session state or emit `session_start`. The daemon creates sessions on-the-fly when the first event arrives for a new session.
 
 **Key Functions:**
 1. `telegram-hook.sh::format_message()` - Constructs typed messages
 2. `telegram-hook.sh::send_to_bridge()` - Sends via Unix socket
 3. `daemon.ts::setupSocketHandlers()` - Routes by message type
-4. `daemon.ts::handleSessionStart()` - Creates forum topic
-5. `bot.sendMessage()` - Delivers to Telegram
+4. `daemon.ts::ensureSessionExists()` - Creates session + topic on first event
+5. `daemon.ts::handleSessionStart()` - Creates forum topic (called by ensureSessionExists)
+6. `bot.sendMessage()` - Delivers to Telegram
 
 ### Flow 2: Telegram → CLI
 
@@ -138,8 +140,10 @@ The system maintains a **three-way mapping** for each Claude session:
 
 | Mapping | Source | Storage | Purpose |
 |---------|--------|---------|---------|
-| Session → Topic | `handleSessionStart()` | `thread_id` column | Route messages to correct topic |
+| Session → Topic | `ensureSessionExists()` → `handleSessionStart()` | `thread_id` column | Route messages to correct topic |
 | Session → tmux | `$TMUX` env var in hook | `tmux_target`, `tmux_socket` | Inject input to correct pane |
+
+**tmux Auto-Refresh (v0.1.12+):** Every hook event includes current tmux info. If the user moves Claude to a different pane, the daemon auto-updates the mapping when the next event arrives. This self-heals stale targets without user intervention.
 
 ### tmux Target Format
 
@@ -335,7 +339,7 @@ tail -f ~/.config/claude-telegram-mirror/daemon.log  # View logs
 
 | Type | Direction | Description |
 |------|-----------|-------------|
-| `session_start` | CLI → TG | New session, creates topic |
+| `session_start` | Internal | Session created (topic creation, not sent by hooks) |
 | `session_end` | CLI → TG | Session ended |
 | `agent_response` | CLI → TG | Claude's text response |
 | `tool_start` | CLI → TG | Tool execution started |
@@ -477,22 +481,83 @@ Cleanup runs every 5 minutes while daemon is running.
 
 ---
 
-## Topic Creation Race Condition Handling (v0.1.13+)
+## Session Reactivation (v0.1.17+)
 
-Events may arrive out-of-order (e.g., `agent_response` before `session_start`). The daemon uses promise-based locking:
+Sessions may be incorrectly marked as 'ended' while Claude is still running. The daemon auto-reactivates them:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         Session Reactivation Flow                           │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  1. Session exists with status='ended'                                      │
+│  2. New hook event arrives for that session                                 │
+│  3. ensureSessionExists() detects status != 'active'                        │
+│  4. reactivateSession() sets status='active', updates last_activity         │
+│  5. Messages now route correctly to the existing topic                      │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Why needed:** A session may be marked 'ended' when a Stop hook fires, but Claude can continue if the user sends more input. Reactivation ensures Telegram→CLI input works even after premature session end.
+
+---
+
+## General Topic Filtering (v0.1.15+)
+
+Messages in the forum's General topic (no `threadId`) are ignored:
 
 ```typescript
-// If topic creation is in progress, wait for it
-if (topicCreationPromises.has(sessionId)) {
-  await topicCreationPromises.get(sessionId);  // 5-second timeout
+// In setupBotHandlers()
+if (!threadId) {
+  // Message in General topic - ignore
+  // Bot can still WRITE to General (startup/shutdown notifications)
+  return;
+}
+```
+
+**Why:** Prevents confusion when users accidentally post in General instead of a session topic. Only messages in specific forum topics are routed to Claude sessions.
+
+---
+
+## Topic Creation Race Condition Handling (v0.1.13+, updated v0.1.18)
+
+When events arrive for a new session, the daemon creates the topic on-the-fly:
+
+```typescript
+// ensureSessionExists() handles all topic creation
+private async ensureSessionExists(msg: BridgeMessage): Promise<void> {
+  // Check if session exists and is active
+  const existing = this.sessions.getSession(msg.sessionId);
+  if (existing) {
+    if (existing.status !== 'active') {
+      this.sessions.reactivateSession(msg.sessionId);  // BUG-009 fix
+    }
+    return;
+  }
+
+  // Check if another call is already creating this topic
+  if (this.topicCreationPromises.has(sessionId)) {
+    await this.topicCreationPromises.get(sessionId);  // Wait for it
+    return;
+  }
+
+  // Create Promise BEFORE async work (synchronous check-and-set)
+  const promise = new Promise(...);
+  this.topicCreationPromises.set(sessionId, promise);
+
+  // Create session + topic immediately
+  await this.handleSessionStart(msg);
 }
 ```
 
 **Behavior:**
-- First event triggers topic creation
-- Subsequent events wait for topic to exist
+- First event for a new session triggers topic creation immediately
+- Concurrent events wait for the Promise (prevents duplicate topics)
 - 5-second timeout prevents indefinite blocking
 - On timeout: error logged, message dropped (prevents misdirection to General topic)
+
+**Race condition safety:** JavaScript's single-threaded event loop guarantees no interleaving between the synchronous check (`has()`) and set (`set()`) operations.
 
 ---
 
@@ -522,5 +587,7 @@ Commands work with or without leading `/` (e.g., `stop` or `/stop`).
 | Wrong topic | Session mapping lost | Check `sessions.db` for correct `thread_id` |
 | Duplicate topics | Daemon restarted mid-session | Topics are reused if `thread_id` exists in DB |
 | Stale sessions | Old sessions not cleaned | Check `TELEGRAM_STALE_SESSION_TIMEOUT_HOURS` |
+| Topics not created (clean install) | Outdated daemon version | Upgrade to v0.1.18+ (fixed topic creation on first event) |
+| Input from Telegram silently fails | Session was marked 'ended' | Session auto-reactivates on next hook event (v0.1.17+) |
 | macOS: "node not found" | launchd minimal PATH | Reinstall service to regenerate plist with full PATH |
 | macOS: Daemon crashes on start | Missing HOME env | Check `daemon.err.log` for details |
