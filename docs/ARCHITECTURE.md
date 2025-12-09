@@ -12,20 +12,20 @@ A bidirectional bridge that mirrors Claude Code CLI sessions to Telegram, enabli
 │  ┌──────────────┐     Unix Socket      ┌──────────────┐     Telegram API    │
 │  │  Claude Code │ ──────────────────▶  │    Bridge    │ ─────────────────▶  │
 │  │     CLI      │                      │    Daemon    │                     │
-│  │   (tmux)     │ ◀────────────────── │              │ ◀─────────────────   │
+│  │   (tmux)     │ ◀──────────────────  │              │ ◀─────────────────  │
 │  └──────────────┘    tmux send-keys    └──────────────┘                     │
 │        │                                     │                              │
 │        │ hooks                               │ SQLite                       │
 │        ▼                                     ▼                              │
 │  ┌──────────────┐                      ┌──────────────┐                     │
-│  │ PreToolUse:  │◀──────────────────▶ │ sessions.db  │                     │
-│  │ handler.ts   │  bidirectional      │              │                     │
-│  │ (approval)   │  request/response   └──────────────┘                     │
-│  ├──────────────┤                                                          │
-│  │ Other hooks: │                                                          │
-│  │ telegram-    │──────────────────▶  fire & forget                        │
-│  │ hook.sh      │                                                          │
-│  └──────────────┘                                                          │
+│  │ PreToolUse:  │◀──────────────────▶ │ sessions.db  │                      │
+│  │ handler.ts   │  bidirectional      │              │                      │
+│  │ (approval)   │  request/response   └──────────────┘                      │
+│  ├──────────────┤                                                           │
+│  │ Other hooks: │                                                           │
+│  │ telegram-    │──────────────────▶  fire & forget                         │
+│  │ hook.sh      │                                                           │
+│  └──────────────┘                                                           │
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -203,8 +203,8 @@ Multiple hosts can share a single Telegram supergroup:
 │                          │                                                  │
 │                          ▼                                                  │
 │               ┌─────────────────────┐                                       │
-│               │  Telegram Supergroup │                                      │
-│               │  (shared chat_id)    │                                      │
+│               │  Telegram Supergroup│                                       │
+│               │  (shared chat_id)   │                                       │
 │               ├─────────────────────┤                                       │
 │               │ Topic #1 (Host A)   │ ◀── Only Daemon A responds            │
 │               │ Topic #2 (Host B)   │ ◀── Only Daemon B responds            │

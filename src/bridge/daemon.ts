@@ -294,26 +294,24 @@ export class BridgeDaemon extends EventEmitter {
   private setupBotHandlers(): void {
     // Handle text messages (forward to CLI)
     this.bot.onMessage(async (text, chatId, threadId) => {
-      let session = null;
+      // BUG-005 fix: Ignore General topic entirely
+      // Messages without threadId can't be routed to a specific session because:
+      // 1. We don't know which Claude session/tmux target they belong to
+      // 2. If user accidentally types in General, we'd send it to the wrong place
+      // The daemon can still WRITE to General (startup messages), just not READ from it
+      if (!threadId) {
+        logger.debug('Ignoring message in General topic (no threadId)', { chatId, textPreview: text.substring(0, 50) });
+        return;
+      }
 
-      if (threadId) {
-        // Message is in a specific topic - ONLY process if we own that topic
-        // This is critical for multi-bot architecture: each bot ignores topics it didn't create
-        session = this.sessions.getSessionByThreadId(threadId);
-        if (!session) {
-          // This topic is not in our sessions.db - belongs to another bot/system
-          // Silently ignore - another daemon will handle it
-          logger.debug('Ignoring message for unknown topic (multi-bot)', { threadId, chatId });
-          return;
-        }
-      } else {
-        // Message is in General topic (no threadId) - use chatId fallback
-        session = this.sessions.getSessionByChatId(chatId);
-        if (!session) {
-          // No active session - maybe user is just chatting
-          logger.debug('Message received but no session attached', { chatId });
-          return;
-        }
+      // Message is in a specific topic - ONLY process if we own that topic
+      // This is critical for multi-bot architecture: each bot ignores topics it didn't create
+      const session = this.sessions.getSessionByThreadId(threadId);
+      if (!session) {
+        // This topic is not in our sessions.db - belongs to another bot/system
+        // Silently ignore - another daemon will handle it
+        logger.debug('Ignoring message for unknown topic (multi-bot)', { threadId, chatId });
+        return;
       }
 
       // Get the tmux info for this session

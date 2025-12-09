@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.15] - 2025-12-09
+
+### Fixed
+- **BUG-005: Ignore General topic messages** - Messages in the forum's General topic are now ignored
+  - Only messages in specific forum topics (with threadId) are routed to Claude sessions
+  - Daemon can still write to General topic (startup/shutdown notifications)
+  - Prevents confusion when user accidentally posts in General instead of session topic
+
 ## [0.1.14] - 2025-12-09
 
 ### Fixed
