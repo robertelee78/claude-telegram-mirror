@@ -5,7 +5,7 @@
 
 Bidirectional communication between Claude Code CLI and Telegram. Control your Claude Code sessions from your phone.
 
-**Supported platforms:** Linux, macOS
+**Supported platforms:** Linux (verified), macOS (untested)
 
 ## Installation
 
