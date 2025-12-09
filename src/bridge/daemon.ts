@@ -255,9 +255,10 @@ export class BridgeDaemon extends EventEmitter {
   }
 
   /**
-   * Check if text is a stop/interrupt command
+   * Check if text is an interrupt command (sends Escape to pause Claude)
+   * BUG-004 fix: Escape interrupts operation, Ctrl-C exits entirely
    */
-  private isStopCommand(text: string): boolean {
+  private isInterruptCommand(text: string): boolean {
     const normalized = text.trim().toLowerCase();
     return normalized === 'stop' ||
            normalized === '/stop' ||
@@ -265,6 +266,23 @@ export class BridgeDaemon extends EventEmitter {
            normalized === '/cancel' ||
            normalized === 'abort' ||
            normalized === '/abort' ||
+           normalized === 'esc' ||
+           normalized === '/esc' ||
+           normalized === 'escape' ||
+           normalized === '/escape';
+  }
+
+  /**
+   * Check if text is a kill command (sends Ctrl-C to exit Claude entirely)
+   */
+  private isKillCommand(text: string): boolean {
+    const normalized = text.trim().toLowerCase();
+    return normalized === 'kill' ||
+           normalized === '/kill' ||
+           normalized === 'exit' ||
+           normalized === '/exit' ||
+           normalized === 'quit' ||
+           normalized === '/quit' ||
            normalized === 'ctrl+c' ||
            normalized === 'ctrl-c' ||
            normalized === '^c';
@@ -322,15 +340,15 @@ export class BridgeDaemon extends EventEmitter {
         this.injector.setTmuxSession(tmuxTarget, tmuxSocket);
       }
 
-      // Check for stop/interrupt command - send Ctrl+C to tmux
-      if (this.isStopCommand(text)) {
+      // Check for interrupt command - send Escape to pause Claude (BUG-004 fix)
+      if (this.isInterruptCommand(text)) {
         const sessionThreadId = this.getSessionThreadId(session.id);
 
-        const stopped = await this.injector.sendKey('Ctrl-C');
-        if (stopped) {
-          logger.info('Sent interrupt signal (Ctrl+C) to CLI', { sessionId: session.id });
+        const interrupted = await this.injector.sendKey('Escape');
+        if (interrupted) {
+          logger.info('Sent interrupt signal (Escape) to CLI', { sessionId: session.id });
           await this.bot.sendMessage(
-            '🛑 *Interrupt sent* (Ctrl+C)\n\n_Claude should stop the current operation._',
+            '⏸️ *Interrupt sent* (Escape)\n\n_Claude should pause the current operation._',
             { parseMode: 'Markdown' },
             sessionThreadId
           );
@@ -342,7 +360,30 @@ export class BridgeDaemon extends EventEmitter {
             sessionThreadId
           );
         }
-        return; // Don't inject "stop" as text
+        return; // Don't inject command as text
+      }
+
+      // Check for kill command - send Ctrl-C to exit Claude entirely (BUG-004 fix)
+      if (this.isKillCommand(text)) {
+        const sessionThreadId = this.getSessionThreadId(session.id);
+
+        const killed = await this.injector.sendKey('Ctrl-C');
+        if (killed) {
+          logger.info('Sent kill signal (Ctrl-C) to CLI', { sessionId: session.id });
+          await this.bot.sendMessage(
+            '🛑 *Kill sent* (Ctrl-C)\n\n_Claude should exit entirely._',
+            { parseMode: 'Markdown' },
+            sessionThreadId
+          );
+        } else {
+          logger.warn('Failed to send kill signal', { sessionId: session.id });
+          await this.bot.sendMessage(
+            '⚠️ *Could not send kill*\n\nNo tmux session found.',
+            { parseMode: 'Markdown' },
+            sessionThreadId
+          );
+        }
+        return; // Don't inject command as text
       }
 
       // Track this input so we don't echo it back when the hook fires

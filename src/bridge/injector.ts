@@ -312,6 +312,7 @@ export class InputInjector extends EventEmitter {
 
   /**
    * Send special key
+   * BUG-004 fix: Include socket flag for correct tmux server targeting
    */
   async sendKey(key: 'Enter' | 'Escape' | 'Tab' | 'Ctrl-C'): Promise<boolean> {
     if (this.method !== 'tmux' || !this.tmuxSession) {
@@ -326,7 +327,9 @@ export class InputInjector extends EventEmitter {
         'Ctrl-C': 'C-c'
       };
 
-      execSync(`tmux send-keys -t "${this.tmuxSession}" ${keyMap[key]}`, {
+      // BUG-004 fix: Include socket flag to target correct tmux server
+      const socketFlag = this.tmuxSocket ? `-S "${this.tmuxSocket}"` : '';
+      execSync(`tmux ${socketFlag} send-keys -t "${this.tmuxSession}" ${keyMap[key]}`, {
         stdio: 'ignore'
       });
       return true;
