@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.18] - 2025-12-09
+
+### Fixed
+- **BUG-010: Topic creation on clean install** - Forum topics are now created correctly on fresh installations
+  - Root cause: BUG-006 removed `session_start` emission from hooks, but daemon still waited for it to create topics
+  - Fix: `ensureSessionExists()` now calls `handleSessionStart()` directly instead of waiting
+  - Topics are created immediately when the first hook event arrives for a new session
+  - Race condition safety preserved: Promise-based locking prevents duplicate topics when concurrent events arrive
+  - Verified no regressions to BUG-001 through BUG-009 fixes
+
 ## [0.1.17] - 2025-12-09
 
 ### Fixed

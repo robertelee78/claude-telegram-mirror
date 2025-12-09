@@ -668,14 +668,20 @@ export class BridgeDaemon extends EventEmitter {
 
   /**
    * Ensure a session exists (create on-the-fly if needed)
-   * This handles the case where events arrive before session_start.
    *
-   * IMPORTANT: This function ONLY creates the session entry in the database.
-   * Topic creation is the responsibility of handleSessionStart() alone.
+   * BUG-010 FIX: Now calls handleSessionStart() directly to create both session
+   * AND topic immediately. Previously only created the session and waited for
+   * a session_start message to create the topic, but that message is never sent
+   * (removed in BUG-006 when hooks became stateless).
    *
-   * BUG-002 FIX: When creating a session on-the-fly, we create a promise that
-   * message handlers can await. handleSessionStart() will resolve this promise
-   * once the topic is created, preventing messages from going to General.
+   * BUG-009 FIX: Also reactivates sessions that were incorrectly marked as ended.
+   *
+   * Race condition safety (BUG-002 pattern preserved):
+   * - First caller creates Promise synchronously, then calls handleSessionStart()
+   * - Concurrent callers see Promise exists, wait on it
+   * - handleSessionStart() creates topic and resolves Promise
+   * - JavaScript's single-threaded event loop guarantees no interleaving between
+   *   the synchronous check and set operations
    */
   private async ensureSessionExists(msg: BridgeMessage): Promise<void> {
     const existing = this.sessions.getSession(msg.sessionId);
@@ -689,38 +695,23 @@ export class BridgeDaemon extends EventEmitter {
         });
         this.sessions.reactivateSession(msg.sessionId);
       }
-      // Topic creation is handleSessionStart's responsibility
       return;
     }
 
-    // Create session on-the-fly with Claude's session_id
-    // The topic will be created when session_start arrives
-    logger.info('Creating session on-the-fly (topic pending)', { sessionId: msg.sessionId });
-
-    const hostname = msg.metadata?.hostname as string | undefined;
-    const projectDir = msg.metadata?.projectDir as string | undefined;
-    const tmuxTarget = msg.metadata?.tmuxTarget as string | undefined;
-    const tmuxSocket = msg.metadata?.tmuxSocket as string | undefined;
-
-    this.sessions.createSession(
-      this.config.chatId,
-      projectDir,
-      undefined,
-      hostname,
-      msg.sessionId,
-      tmuxTarget,  // Persist tmux target to database
-      tmuxSocket   // Persist tmux socket path to database
-    );
-
-    // Also cache in memory for fast lookups
-    if (tmuxTarget) {
-      this.sessionTmuxTargets.set(msg.sessionId, tmuxTarget);
+    // BUG-010 FIX: Check if another call is already creating this session's topic
+    // This prevents duplicate topics when concurrent events arrive for a new session
+    const existingPromise = this.topicCreationPromises.get(msg.sessionId);
+    if (existingPromise) {
+      logger.debug('Topic creation already in progress, waiting...', { sessionId: msg.sessionId });
+      await existingPromise;
+      return;
     }
 
-    // BUG-002 FIX: Create a promise for topic creation
-    // Other handlers will await this promise via waitForTopic()
-    // handleSessionStart() will resolve it once the topic is created
-    if (this.config.useThreads && !this.topicCreationPromises.has(msg.sessionId)) {
+    // BUG-010 FIX: Create Promise BEFORE any async work (synchronous check-and-set)
+    // This is safe because JavaScript's event loop guarantees no interleaving
+    // between synchronous operations. The Promise must be in the map before we
+    // await handleSessionStart(), so concurrent callers will see it and wait.
+    if (this.config.useThreads) {
       let resolver: (threadId: number | undefined) => void;
       const promise = new Promise<number | undefined>((resolve) => {
         resolver = resolve;
@@ -729,6 +720,12 @@ export class BridgeDaemon extends EventEmitter {
       this.topicCreationResolvers.set(msg.sessionId, resolver!);
       logger.debug('Topic creation promise created', { sessionId: msg.sessionId });
     }
+
+    // BUG-010 FIX: Call handleSessionStart() directly to create session AND topic
+    // Previously we only created the session here and waited for session_start
+    // to create the topic, but session_start is never sent (removed in BUG-006)
+    logger.info('Creating session on-the-fly', { sessionId: msg.sessionId });
+    await this.handleSessionStart(msg);
   }
 
   /**
@@ -750,9 +747,11 @@ export class BridgeDaemon extends EventEmitter {
   }
 
   /**
-   * Wait for topic creation to complete (BUG-002 fix)
-   * If a session was created by ensureSessionExists() before session_start arrived,
-   * this waits for handleSessionStart() to create the topic.
+   * Wait for topic creation to complete (BUG-002 fix, updated for BUG-010)
+   *
+   * When ensureSessionExists() creates a new session, it creates a Promise and
+   * then calls handleSessionStart() to create the topic. Other message handlers
+   * call this function to wait for that topic creation to complete.
    *
    * @param sessionId - The session to wait for
    * @param timeoutMs - Maximum time to wait (default 5 seconds)
