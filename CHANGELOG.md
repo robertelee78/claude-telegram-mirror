@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.17] - 2025-12-09
+
+### Fixed
+- **BUG-009: Reactivate ended sessions on new hook events** - Sessions marked as 'ended' are now automatically reactivated when new hook events arrive
+  - Fixes issue where Telegram → CLI input silently failed after session was incorrectly marked ended
+  - Added `reactivateSession()` method to SessionManager
+  - `ensureSessionExists()` now checks session status and reactivates if needed
+
 ## [0.1.16] - 2025-12-09
 
 ### Added

@@ -278,6 +278,19 @@ export class SessionManager {
     logger.info('Session ended', { sessionId, status });
   }
 
+  /**
+   * Reactivate an ended/aborted session back to active status.
+   * BUG-009 fix: When hook events arrive for an ended session,
+   * it means Claude is still running - reactivate the session.
+   */
+  reactivateSession(sessionId: string): void {
+    this.db.prepare(`
+      UPDATE sessions SET status = 'active', last_activity = ? WHERE id = ?
+    `).run(new Date().toISOString(), sessionId);
+
+    logger.info('Session reactivated', { sessionId });
+  }
+
   // ============ Approval Methods ============
 
   /**

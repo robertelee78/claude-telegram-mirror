@@ -680,7 +680,15 @@ export class BridgeDaemon extends EventEmitter {
   private async ensureSessionExists(msg: BridgeMessage): Promise<void> {
     const existing = this.sessions.getSession(msg.sessionId);
     if (existing) {
-      // Session already exists - nothing to do
+      // BUG-009 fix: If session was ended/aborted but we're receiving hook events,
+      // Claude is still running - reactivate the session
+      if (existing.status !== 'active') {
+        logger.info('Reactivating ended session (hook event received)', {
+          sessionId: msg.sessionId,
+          previousStatus: existing.status
+        });
+        this.sessions.reactivateSession(msg.sessionId);
+      }
       // Topic creation is handleSessionStart's responsibility
       return;
     }
