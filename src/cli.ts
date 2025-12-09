@@ -5,9 +5,10 @@
  */
 
 import { Command } from 'commander';
-import { readFileSync } from 'fs';
+import { readFileSync, existsSync, unlinkSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
+import { homedir } from 'os';
 import { BridgeDaemon } from './bridge/daemon.js';
 import { installHooks, uninstallHooks, printHookStatus } from './hooks/installer.js';
 import { loadConfig, validateConfig } from './utils/config.js';
@@ -17,7 +18,8 @@ import {
   getServiceStatus,
   startService,
   stopService,
-  restartService
+  restartService,
+  isServiceInstalled
 } from './service/manager.js';
 import { runSetup } from './service/setup.js';
 import { runDoctor } from './service/doctor.js';
@@ -100,8 +102,55 @@ program
   .description('Show bridge daemon status')
   .action(() => {
     const config = loadConfig();
+    const configDirPath = join(homedir(), '.config', 'claude-telegram-mirror');
+    const pidFilePath = join(configDirPath, 'bridge.pid');  // Must match socket.ts DEFAULT_PID_PATH
+    const socketPath = join(configDirPath, 'bridge.sock');
 
     console.log('\n📊 Claude Telegram Mirror Status\n');
+
+    // Check daemon running state
+    console.log('Daemon:');
+    let daemonRunning = false;
+    let daemonPid: number | null = null;
+
+    // Check if running as OS service
+    if (isServiceInstalled()) {
+      const serviceStatus = getServiceStatus();
+      if (serviceStatus.running) {
+        console.log('  Status: ✅ Running (via system service)');
+        daemonRunning = true;
+      } else if (existsSync(pidFilePath)) {
+        daemonPid = parseInt(readFileSync(pidFilePath, 'utf8').trim());
+        if (isProcessRunning(daemonPid)) {
+          console.log(`  Status: ✅ Running (PID ${daemonPid})`);
+          daemonRunning = true;
+        } else {
+          console.log('  Status: ⚪ Not running (stale PID file)');
+        }
+      } else {
+        console.log('  Status: ⚪ Not running');
+      }
+    } else if (existsSync(pidFilePath)) {
+      daemonPid = parseInt(readFileSync(pidFilePath, 'utf8').trim());
+      if (isProcessRunning(daemonPid)) {
+        console.log(`  Status: ✅ Running (PID ${daemonPid})`);
+        daemonRunning = true;
+      } else {
+        console.log('  Status: ⚪ Not running (stale PID file)');
+      }
+    } else {
+      console.log('  Status: ⚪ Not running');
+    }
+
+    // Check socket
+    if (existsSync(socketPath)) {
+      console.log(`  Socket: ✅ ${socketPath}`);
+    } else if (daemonRunning) {
+      console.log(`  Socket: ⚠️  Missing (expected: ${socketPath})`);
+    } else {
+      console.log(`  Socket: ⚪ Not created`);
+    }
+    console.log('');
 
     // Check configuration
     console.log('Configuration:');
@@ -109,7 +158,6 @@ program
     console.log(`  Chat ID: ${config.chatId ? `✅ ${config.chatId}` : '❌ Not set'}`);
     console.log(`  Enabled: ${config.enabled ? '✅ Yes' : '⚪ No'}`);
     console.log(`  Verbose: ${config.verbose ? '✅ Yes' : '⚪ No'}`);
-    console.log(`  Socket: ${config.socketPath}`);
     console.log('');
 
     // Check hooks
@@ -302,6 +350,187 @@ program
       await runDoctor();
     } catch (error) {
       console.error('Doctor failed:', error);
+      process.exit(1);
+    }
+  });
+
+// Helper: Config directory and paths
+const configDir = join(homedir(), '.config', 'claude-telegram-mirror');
+const pidFile = join(configDir, 'bridge.pid');  // Must match socket.ts DEFAULT_PID_PATH
+const socketFile = join(configDir, 'bridge.sock');
+
+/**
+ * Check if a process is running by PID
+ */
+function isProcessRunning(pid: number): boolean {
+  try {
+    process.kill(pid, 0); // Signal 0 = just check if process exists
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Wait for a process to exit with timeout
+ */
+async function waitForProcessExit(pid: number, timeoutMs: number): Promise<boolean> {
+  const startTime = Date.now();
+  while (Date.now() - startTime < timeoutMs) {
+    if (!isProcessRunning(pid)) {
+      return true;
+    }
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  return false;
+}
+
+/**
+ * Stop command - Stop the bridge daemon
+ */
+program
+  .command('stop')
+  .description('Stop the bridge daemon')
+  .option('--force', 'Force kill if graceful shutdown fails')
+  .action(async (options) => {
+    // Check if running as OS service first
+    if (isServiceInstalled()) {
+      const status = getServiceStatus();
+      if (status.running) {
+        console.log('🔄 Stopping via system service...');
+        const result = stopService();
+        if (result.success) {
+          console.log('✅ ' + result.message);
+        } else {
+          console.error('❌ ' + result.message);
+          process.exit(1);
+        }
+        return;
+      }
+    }
+
+    // Direct daemon mode - read PID file
+    if (!existsSync(pidFile)) {
+      console.log('⚪ Daemon is not running (no PID file)');
+      return;
+    }
+
+    const pid = parseInt(readFileSync(pidFile, 'utf8').trim());
+
+    // Check if process exists
+    if (!isProcessRunning(pid)) {
+      console.log('⚪ Daemon is not running (stale PID file), cleaning up...');
+      unlinkSync(pidFile);
+      if (existsSync(socketFile)) {
+        unlinkSync(socketFile);
+      }
+      return;
+    }
+
+    // Send SIGTERM for graceful shutdown
+    console.log(`🔄 Stopping daemon (PID ${pid})...`);
+    process.kill(pid, 'SIGTERM');
+
+    // Wait for process to exit (5 second timeout)
+    const exited = await waitForProcessExit(pid, 5000);
+
+    if (!exited) {
+      if (options.force) {
+        console.log('⚠️  Graceful shutdown timed out, force killing...');
+        try {
+          process.kill(pid, 'SIGKILL');
+          await waitForProcessExit(pid, 1000);
+        } catch {
+          // Process may have exited between check and kill
+        }
+      } else {
+        console.log('⚠️  Daemon did not stop within 5 seconds. Use --force to kill it.');
+        process.exit(1);
+      }
+    }
+
+    // Clean up stale files if process is gone
+    if (!isProcessRunning(pid)) {
+      if (existsSync(pidFile)) {
+        unlinkSync(pidFile);
+      }
+      if (existsSync(socketFile)) {
+        unlinkSync(socketFile);
+      }
+      console.log('✅ Daemon stopped');
+    }
+  });
+
+/**
+ * Restart command - Restart the bridge daemon
+ */
+program
+  .command('restart')
+  .description('Restart the bridge daemon')
+  .option('-v, --verbose', 'Enable verbose logging')
+  .action(async (options) => {
+    // Check if running as OS service
+    if (isServiceInstalled()) {
+      const status = getServiceStatus();
+      if (status.running || status.enabled) {
+        console.log('🔄 Restarting via system service...');
+        const result = restartService();
+        if (result.success) {
+          console.log('✅ ' + result.message);
+        } else {
+          console.error('❌ ' + result.message);
+          process.exit(1);
+        }
+        return;
+      }
+    }
+
+    // Stop existing daemon if running
+    if (existsSync(pidFile)) {
+      const pid = parseInt(readFileSync(pidFile, 'utf8').trim());
+      if (isProcessRunning(pid)) {
+        console.log(`🔄 Stopping existing daemon (PID ${pid})...`);
+        process.kill(pid, 'SIGTERM');
+        await waitForProcessExit(pid, 5000);
+      }
+      // Clean up
+      if (existsSync(pidFile)) unlinkSync(pidFile);
+      if (existsSync(socketFile)) unlinkSync(socketFile);
+    }
+
+    // Now start fresh
+    console.log('🚀 Starting Claude Code Telegram Mirror...\n');
+
+    const config = loadConfig();
+    const validation = validateConfig(config);
+
+    if (!validation.valid) {
+      console.error('❌ Configuration errors:');
+      validation.errors.forEach((err: string) => console.error(`   • ${err}`));
+      process.exit(1);
+    }
+
+    if (options.verbose) {
+      config.verbose = true;
+    }
+
+    const daemon = new BridgeDaemon(config);
+
+    const shutdown = async (signal: string) => {
+      console.log(`\n📴 Received ${signal}, shutting down...`);
+      await daemon.stop();
+      process.exit(0);
+    };
+
+    process.on('SIGINT', () => shutdown('SIGINT'));
+    process.on('SIGTERM', () => shutdown('SIGTERM'));
+
+    try {
+      await daemon.start();
+      console.log('✅ Bridge daemon running\n');
+      console.log('Press Ctrl+C to stop\n');
+    } catch (error) {
+      console.error('❌ Failed to start daemon:', error);
       process.exit(1);
     }
   });

@@ -609,3 +609,15 @@ export function restartService(): { success: boolean; message: string } {
   }
   return { success: false, message: 'Unsupported platform.' };
 }
+
+/**
+ * Check if service is installed (service file exists)
+ */
+export function isServiceInstalled(): boolean {
+  if (hasSystemd()) {
+    return existsSync(SYSTEMD_SERVICE_FILE);
+  } else if (isMacOS()) {
+    return existsSync(LAUNCHD_PLIST);
+  }
+  return false;
+}

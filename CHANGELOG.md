@@ -2,6 +2,26 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.16] - 2025-12-09
+
+### Added
+- **FEAT-001: CLI lifecycle commands** - New `ctm stop` and `ctm restart` commands
+  - `ctm stop` - Gracefully stop the running daemon (sends SIGTERM, waits up to 5s)
+  - `ctm stop --force` - Force kill if graceful shutdown fails
+  - `ctm restart` - Stop and restart the daemon in one command
+  - Commands auto-detect if running as OS service and delegate appropriately
+  - Cleans up stale PID and socket files automatically
+
+- **Enhanced `ctm status` command** - Now shows daemon running state
+  - Shows PID when daemon is running directly
+  - Shows "(via system service)" when running under systemd/launchd
+  - Shows socket file status
+  - Detects stale PID files
+
+### Changed
+- `isServiceInstalled()` function exported from service manager for CLI use
+- README.md updated with complete CLI command documentation
+
 ## [0.1.15] - 2025-12-09
 
 ### Fixed

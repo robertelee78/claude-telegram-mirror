@@ -55,9 +55,12 @@ ctm setup              # Interactive setup wizard
 ctm doctor             # Diagnose configuration issues
 
 # Daemon control
-ctm start              # Start daemon in foreground
-ctm status             # Show status
-ctm config --test      # Test connection
+ctm start              # Start daemon (foreground mode)
+ctm stop               # Stop running daemon
+ctm stop --force       # Force stop if graceful shutdown fails
+ctm restart            # Restart daemon
+ctm status             # Show daemon status, config, and hooks
+ctm config --test      # Test Telegram connection
 
 # Hook management
 ctm install-hooks      # Install global hooks
@@ -65,14 +68,16 @@ ctm install-hooks -p   # Install to current project's .claude/
 ctm uninstall-hooks    # Remove hooks
 ctm hooks              # Show hook status
 
-# Service management (systemd on Linux, launchd on macOS)
-ctm service install    # Install as system service
+# OS service management (optional, for auto-start on boot)
+ctm service install    # Install as systemd/launchd service
 ctm service uninstall  # Remove system service
-ctm service start      # Start service
-ctm service stop       # Stop service
-ctm service restart    # Restart service
+ctm service start      # Start via service manager
+ctm service stop       # Stop via service manager
+ctm service restart    # Restart via service manager
 ctm service status     # Show service status
 ```
+
+**Note:** The top-level `ctm stop` and `ctm restart` commands work for both direct daemon mode and OS service mode. They automatically detect how the daemon is running and use the appropriate method.
 
 ## Telegram Commands
 
