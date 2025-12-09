@@ -338,11 +338,12 @@ export function installHooks(options: { project?: boolean; projectPath?: string 
       settings.hooks = {};
     }
 
-    // Hook types to install (fewer for project - just the essentials)
-    // PreToolUse only makes sense for global hooks (approval workflow)
-    const hookTypes = options.project
-      ? ['Notification', 'Stop', 'UserPromptSubmit', 'PreCompact']
-      : ['PreToolUse', 'PostToolUse', 'Notification', 'Stop', 'UserPromptSubmit', 'PreCompact'];
+    // Hook types to install - same for both global and project
+    // BUG-012 FIX: Project installs need PreToolUse too, because Claude Code's
+    // project hooks override global hooks (they don't merge). If a project has
+    // its own PreToolUse hooks (e.g., claude-flow), the global telegram hooks
+    // won't run unless they're also in the project settings.
+    const hookTypes = ['PreToolUse', 'PostToolUse', 'Notification', 'Stop', 'UserPromptSubmit', 'PreCompact'];
 
     let configChanged = false;
 

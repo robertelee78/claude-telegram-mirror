@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.20] - 2025-12-09
+
+### Fixed
+- **BUG-012: Project hook installs missing PreToolUse** - `ctm install-hooks -p` now installs PreToolUse and PostToolUse hooks
+  - Root cause: Installer intentionally skipped these for project installs, assuming global hooks would handle them
+  - Problem: Claude Code's project hooks override global hooks (they don't merge)
+  - If a project has its own PreToolUse hooks (e.g., claude-flow), the global telegram hooks never run
+  - Fix: Project installs now include all hook types, same as global installs
+  - After upgrading, run `ctm install-hooks -p` in affected projects to add the missing hooks
+
 ## [0.1.19] - 2025-12-09
 
 ### Fixed
