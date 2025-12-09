@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.14] - 2025-12-09
+
+### Fixed
+- **BUG-003: Stale session cleanup** - Sessions with dead tmux panes are now automatically cleaned up
+  - New `staleSessionTimeoutHours` config (default 72 hours, configurable via env or config file)
+  - Cleanup only triggers when: `lastActivity > 72h` AND (pane gone OR pane reassigned to another session)
+  - Sends "Session ended (terminal closed)" message before closing forum topic
+  - Prevents stale "active" sessions from accumulating indefinitely
+
+- **BUG-004: Stop command sends wrong key** - Fixed interrupt behavior for Claude Code
+  - `sendKey` method now includes `-S socket` flag for correct tmux server targeting
+  - **Interrupt commands** (`stop`, `cancel`, `abort`, `esc`, `escape`) now send **Escape** to pause Claude
+  - **Kill commands** (`kill`, `exit`, `quit`, `ctrl+c`, `ctrl-c`, `^c`) send **Ctrl-C** to exit Claude entirely
+  - All commands work with or without leading `/` (e.g., `stop` or `/stop`)
+
+### Added
+- `TELEGRAM_STALE_SESSION_TIMEOUT_HOURS` environment variable for configuring stale session cleanup
+- New kill command category for exiting Claude entirely (vs just interrupting)
+
 ## [0.1.13] - 2025-12-08
 
 ### Fixed
