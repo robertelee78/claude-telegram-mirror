@@ -4,10 +4,8 @@
  * Captures hook events and sends to bridge daemon
  */
 
-import { hostname as getHostname, homedir } from 'os';
+import { hostname as getHostname } from 'os';
 import { execSync } from 'child_process';
-import { existsSync, writeFileSync, unlinkSync, mkdirSync } from 'fs';
-import { join } from 'path';
 import { SocketClient, DEFAULT_SOCKET_PATH } from '../bridge/socket.js';
 import type { BridgeMessage } from '../bridge/types.js';
 import type {
@@ -473,39 +471,9 @@ export class HookHandler {
   }
 }
 
-// Session tracking file to detect first event - uses Claude's native session_id
-function getSessionTrackingPath(sessionId: string): string {
-  const configDir = join(homedir(), '.config', 'claude-telegram-mirror');
-  if (!existsSync(configDir)) {
-    mkdirSync(configDir, { recursive: true });
-  }
-  // Use Claude's session_id - this is stable for the entire Claude session
-  return join(configDir, `.session_active_${sessionId}`);
-}
-
-function isFirstEventOfSession(sessionId: string): boolean {
-  const trackingPath = getSessionTrackingPath(sessionId);
-  if (existsSync(trackingPath)) {
-    return false;
-  }
-  // Mark session as started
-  writeFileSync(trackingPath, sessionId);
-  return true;
-}
-
-function clearSessionTracking(sessionId: string): void {
-  const trackingPath = getSessionTrackingPath(sessionId);
-  try {
-    if (existsSync(trackingPath)) {
-      unlinkSync(trackingPath);
-    }
-  } catch {
-    // Ignore cleanup errors
-  }
-}
-
 /**
  * Main CLI entry point for hook processing
+ * BUG-006 fix: Hooks are now stateless - daemon SQLite is single source of truth
  */
 export async function main(): Promise<void> {
   // Read event from stdin first
@@ -530,9 +498,6 @@ export async function main(): Promise<void> {
       sessionId: event.session_id
     });
 
-    // Check if this is the first event of the session (using Claude's session_id)
-    const isFirstEvent = isFirstEventOfSession(event.session_id);
-
     // Connect to bridge
     const connected = await handler.connect();
 
@@ -541,17 +506,8 @@ export async function main(): Promise<void> {
       process.exit(0);
     }
 
-    // On first event, trigger session start
-    if (isFirstEvent) {
-      await handler.handleSessionStart(process.cwd());
-    }
-
-    // Clean up session tracking on Stop event
-    if (event.hook_event_name === 'Stop') {
-      clearSessionTracking(event.session_id);
-    }
-
-    // Process event
+    // Process event - daemon handles session state via SQLite
+    // No file-based tracking needed (BUG-006 fix)
     const result = await handler.processEvent(event);
 
     // Output result if any

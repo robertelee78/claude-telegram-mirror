@@ -10,6 +10,12 @@ All notable changes to this project will be documented in this file.
   - Daemon can still write to General topic (startup/shutdown notifications)
   - Prevents confusion when user accidentally posts in General instead of session topic
 
+- **BUG-006: Remove file-based session tracking** - Daemon SQLite is now single source of truth
+  - Removed `.session_active_*` file tracking from both bash hook and Node handler
+  - Hooks are now stateless - they just forward events to daemon
+  - Eliminates inconsistency between bash (kept tracking on Stop) and Node (cleared on Stop)
+  - Daemon's `ensureSessionExists()` handles all session creation via SQLite
+
 ## [0.1.14] - 2025-12-09
 
 ### Fixed

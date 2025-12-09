@@ -68,40 +68,9 @@ debug_log "Hook type: $HOOK_TYPE"
 CLAUDE_SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // empty' 2>/dev/null || echo "")
 debug_log "Claude session_id: $CLAUDE_SESSION_ID"
 
-# Session tracking - detect first event per Claude session
-get_session_tracking_path() {
-  mkdir -p "$CONFIG_DIR" 2>/dev/null || true
-  # Use Claude's session_id as the key - this is stable for the entire session
-  if [[ -n "$CLAUDE_SESSION_ID" ]]; then
-    echo "$CONFIG_DIR/.session_active_${CLAUDE_SESSION_ID}"
-  else
-    # Fallback to tmux pane if no Claude session_id
-    local session_key=""
-    if [[ -n "$TMUX" ]]; then
-      session_key=$(tmux display-message -p '#{session_id}_#{window_id}_#{pane_id}' 2>/dev/null || echo "")
-    fi
-    if [[ -z "$session_key" ]]; then
-      session_key=$(tty 2>/dev/null | tr '/' '_' || echo "default")
-    fi
-    local safe_id=$(echo "$session_key" | tr -cd '[:alnum:]_')
-    echo "$CONFIG_DIR/.session_active_${safe_id}"
-  fi
-}
-
-is_first_event() {
-  local tracking_path=$(get_session_tracking_path)
-  if [[ -f "$tracking_path" ]]; then
-    return 1  # Not first event
-  fi
-  # Mark session as started
-  echo "$SESSION_ID" > "$tracking_path"
-  return 0  # First event
-}
-
-clear_session_tracking() {
-  local tracking_path=$(get_session_tracking_path)
-  rm -f "$tracking_path" 2>/dev/null || true
-}
+# BUG-006 fix: Removed file-based session tracking
+# Daemon SQLite is now the single source of truth for session state
+# Hooks are stateless - they just forward events to the daemon
 
 # Use Claude's native session_id, or generate one as fallback
 SESSION_ID="${CLAUDE_SESSION_ID:-$(date +%s)-$$}"
@@ -417,36 +386,9 @@ ${text}"
   esac
 }
 
-# Check if this is the first event of this session
-if is_first_event; then
-  debug_log "First event of session - sending session_start"
-
-  # Get tmux info and hostname
-  TMUX_INFO=$(get_tmux_info)
-  HOSTNAME=$(hostname)
-  PROJECT_DIR=$(pwd)
-  TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-
-  # Send session_start message (compact JSON for NDJSON protocol)
-  SESSION_START=$(jq -cn \
-    --arg type "session_start" \
-    --arg sessionId "$SESSION_ID" \
-    --arg timestamp "$TIMESTAMP" \
-    --arg hostname "$HOSTNAME" \
-    --arg projectDir "$PROJECT_DIR" \
-    --argjson tmux "$TMUX_INFO" \
-    '{type: $type, sessionId: $sessionId, timestamp: $timestamp, content: "Claude Code session started", metadata: ({hostname: $hostname, projectDir: $projectDir} + $tmux)}')
-
-  send_to_bridge "$SESSION_START"
-fi
-
-# Clear session tracking on Stop event
-# Note: We keep the session active even after Stop because Notification events
-# may come after Stop and should still go to the same session thread
-if [[ "$HOOK_TYPE" == "Stop" ]]; then
-  debug_log "Stop event received (keeping session for potential follow-up events)"
-  # Don't clear immediately - let the session timeout naturally or clear on next UserPromptSubmit
-fi
+# BUG-006 fix: Removed first-event detection and session_start sending from hook
+# The daemon's ensureSessionExists() handles session creation via SQLite
+# This makes hooks stateless - they just forward events
 
 # Format and send message(s)
 if [[ -n "$HOOK_TYPE" ]]; then
