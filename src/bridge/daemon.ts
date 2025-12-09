@@ -19,7 +19,8 @@ import {
   formatSessionEnd
 } from '../bot/formatting.js';
 import logger from '../utils/logger.js';
-import type { BridgeMessage } from './types.js';
+import type { BridgeMessage, Session } from './types.js';
+import { execSync } from 'child_process';
 
 /**
  * Bridge Daemon Class
@@ -154,6 +155,7 @@ export class BridgeDaemon extends EventEmitter {
     // Start cleanup interval (every 5 minutes)
     this.cleanupInterval = setInterval(() => {
       this.sessions.expireOldApprovals();
+      this.cleanupStaleSessions();  // BUG-003: Check for stale sessions
     }, 5 * 60 * 1000);
 
     this.running = true;
@@ -388,6 +390,105 @@ export class BridgeDaemon extends EventEmitter {
         content: text
       });
     });
+  }
+
+  // ============ Stale Session Cleanup (BUG-003 fix) ============
+
+  /**
+   * Check if a tmux pane exists
+   */
+  private isTmuxPaneAlive(tmuxTarget: string, tmuxSocket?: string): boolean {
+    try {
+      const socketFlag = tmuxSocket ? `-S "${tmuxSocket}"` : '';
+      execSync(`tmux ${socketFlag} list-panes -t "${tmuxTarget}" 2>/dev/null`, {
+        stdio: 'pipe',
+        encoding: 'utf8'
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Clean up stale sessions (BUG-003)
+   * Conditions for cleanup:
+   * 1. lastActivity > staleSessionTimeoutHours (default 72h)
+   * 2. AND (tmux pane doesn't exist OR tmux pane belongs to different session)
+   */
+  private async cleanupStaleSessions(): Promise<void> {
+    const candidates = this.sessions.getStaleSessionCandidates(this.config.staleSessionTimeoutHours);
+
+    if (candidates.length === 0) return;
+
+    logger.debug('Checking stale session candidates', { count: candidates.length });
+
+    for (const session of candidates) {
+      const tmuxTarget = session.tmuxTarget;
+      const tmuxSocket = session.tmuxSocket;
+
+      // Skip sessions without tmux info (can't verify)
+      if (!tmuxTarget) {
+        logger.debug('Skipping stale candidate without tmux target', { sessionId: session.id });
+        continue;
+      }
+
+      // Check condition 2a: Does the tmux pane still exist?
+      const paneExists = this.isTmuxPaneAlive(tmuxTarget, tmuxSocket);
+
+      // Check condition 2b: Is the pane owned by a different active session?
+      const paneReassigned = this.sessions.isTmuxTargetOwnedByOtherSession(tmuxTarget, session.id);
+
+      // Only clean up if pane is gone OR reassigned
+      if (!paneExists || paneReassigned) {
+        const reason = !paneExists ? 'pane no longer exists' : 'pane reassigned to another session';
+        logger.info('Cleaning up stale session', {
+          sessionId: session.id,
+          tmuxTarget,
+          reason,
+          lastActivity: session.lastActivity.toISOString()
+        });
+
+        await this.handleStaleSessionCleanup(session, reason);
+      } else {
+        logger.debug('Stale candidate still valid (pane exists)', {
+          sessionId: session.id,
+          tmuxTarget
+        });
+      }
+    }
+  }
+
+  /**
+   * Handle cleanup of a stale session
+   */
+  private async handleStaleSessionCleanup(session: Session, reason: string): Promise<void> {
+    const threadId = this.getSessionThreadId(session.id);
+
+    // Send final message to the forum topic
+    if (threadId) {
+      try {
+        await this.bot.sendMessage(
+          `🔌 *Session ended* (terminal closed)\n\n_${reason}_`,
+          { parseMode: 'Markdown' },
+          threadId
+        );
+
+        // Close the forum topic
+        await this.bot.closeForumTopic(threadId);
+      } catch (error) {
+        logger.warn('Failed to send stale session notification', { sessionId: session.id, error });
+      }
+    }
+
+    // Clean up in-memory caches
+    this.sessionThreads.delete(session.id);
+    this.sessionTmuxTargets.delete(session.id);
+
+    // Mark session as ended in database
+    this.sessions.endSession(session.id, 'ended');
+
+    logger.info('Stale session cleaned up', { sessionId: session.id, reason });
   }
 
   // ============ tmux Target Auto-Refresh (BUG-001 fix) ============

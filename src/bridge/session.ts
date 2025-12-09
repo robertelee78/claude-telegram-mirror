@@ -372,6 +372,37 @@ export class SessionManager {
   // ============ Cleanup Methods ============
 
   /**
+   * Get sessions that are candidates for stale cleanup (BUG-003)
+   * Returns sessions where lastActivity > timeoutHours ago AND status is 'active'
+   */
+  getStaleSessionCandidates(timeoutHours: number): Session[] {
+    const cutoff = new Date();
+    cutoff.setHours(cutoff.getHours() - timeoutHours);
+
+    const rows = this.db.prepare(`
+      SELECT * FROM sessions
+      WHERE status = 'active' AND last_activity < ?
+      ORDER BY last_activity ASC
+    `).all(cutoff.toISOString()) as SessionRow[];
+
+    return rows.map(row => this.rowToSession(row));
+  }
+
+  /**
+   * Check if a tmux target belongs to a different active session (BUG-003)
+   * Used to detect if a pane was recycled for a new Claude session
+   */
+  isTmuxTargetOwnedByOtherSession(tmuxTarget: string, excludeSessionId: string): boolean {
+    const row = this.db.prepare(`
+      SELECT id FROM sessions
+      WHERE tmux_target = ? AND status = 'active' AND id != ?
+      LIMIT 1
+    `).get(tmuxTarget, excludeSessionId) as { id: string } | undefined;
+
+    return !!row;
+  }
+
+  /**
    * Clean up old sessions
    */
   cleanupOldSessions(maxAgeDays: number = 7): number {

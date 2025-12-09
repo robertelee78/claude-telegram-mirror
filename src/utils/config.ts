@@ -27,6 +27,7 @@ export interface TelegramMirrorConfig {
   chunkSize: number;
   rateLimit: number;
   sessionTimeout: number;
+  staleSessionTimeoutHours: number;  // BUG-003: Hours before cleaning up stale sessions
 
   // Internal
   configPath: string;
@@ -43,6 +44,7 @@ interface ConfigFile {
   chunkSize?: number;
   rateLimit?: number;
   sessionTimeout?: number;
+  staleSessionTimeoutHours?: number;
 }
 
 const CONFIG_DIR = join(homedir(), '.config', 'claude-telegram-mirror');
@@ -170,6 +172,11 @@ export function loadConfig(requireAuth: boolean = true): TelegramMirrorConfig {
     sessionTimeout: parseEnvNumber(
       process.env.TELEGRAM_SESSION_TIMEOUT,
       fileConfig.sessionTimeout ?? 30
+    ),
+
+    staleSessionTimeoutHours: parseEnvNumber(
+      process.env.TELEGRAM_STALE_SESSION_TIMEOUT_HOURS,
+      fileConfig.staleSessionTimeoutHours ?? 72  // BUG-003: Default 72 hours
     ),
 
     configPath: CONFIG_FILE
