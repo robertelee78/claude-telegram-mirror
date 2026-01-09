@@ -39,7 +39,7 @@ jobs:
         if: ${{ github.event.inputs.version }}
         run: npm version ${{ github.event.inputs.version }} --no-git-tag-version
 
-      - name: Publish to npm with provenance
-        run: npm publish --provenance --access public
+      - name: Publish to npm
+        run: npm publish --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
