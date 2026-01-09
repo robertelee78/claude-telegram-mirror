@@ -35,5 +35,16 @@ Thumbs.db
 # Claude Flow metrics (generated)
 .claude-flow/metrics/
 
+# Claude Flow runtime files
+.claude-flow/daemon-state.json
+.claude-flow/daemon.pid
+.claude-flow/config.yaml
+
+# Claude Code local settings
+.claude/
+
+# MCP local config
+.mcp.json
+
 # npm
 npm-debug.log*

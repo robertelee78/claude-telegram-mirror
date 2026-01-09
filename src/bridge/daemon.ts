@@ -38,6 +38,7 @@ export class BridgeDaemon extends EventEmitter {
   private sessionTmuxTargets: Map<string, string> = new Map(); // sessionId -> tmux target
   private recentTelegramInputs: Set<string> = new Set(); // Track recent inputs from Telegram to avoid echo
   private toolInputCache: Map<string, { tool: string; input: unknown; timestamp: number }> = new Map(); // Cache tool inputs for details button
+  private static readonly TOOL_CACHE_MAX_SIZE = 100; // Limit cache to prevent memory growth
   private compactingSessions: Set<string> = new Set(); // Track sessions currently compacting
 
   // BUG-002 fix: Promise-based topic creation lock to prevent race conditions
@@ -45,6 +46,9 @@ export class BridgeDaemon extends EventEmitter {
   // other handlers wait for the topic to be created via these promises
   private topicCreationPromises: Map<string, Promise<number | undefined>> = new Map();
   private topicCreationResolvers: Map<string, (threadId: number | undefined) => void> = new Map();
+
+  // Topic auto-deletion: track pending deletions so we can cancel if session resumes
+  private pendingTopicDeletions: Map<string, NodeJS.Timeout> = new Map();
 
   constructor(config?: TelegramMirrorConfig) {
     super();
@@ -110,6 +114,63 @@ export class BridgeDaemon extends EventEmitter {
           timestamp: new Date().toISOString(),
           content: text
         }), true;
+      },
+      injectCommand: async (threadId: number, command: string) => {
+        // Look up session by thread ID
+        const session = this.sessions.getSessionByThreadId(threadId);
+        if (!session) {
+          return { success: false, error: 'No session found for this topic.' };
+        }
+
+        // Get tmux target (from cache or database)
+        let tmuxTarget = this.sessionTmuxTargets.get(session.id);
+        let tmuxSocket: string | undefined;
+
+        if (!tmuxTarget) {
+          // Cache miss - restore from database
+          const tmuxInfo = this.sessions.getTmuxInfo(session.id);
+          tmuxTarget = tmuxInfo.target || undefined;
+          tmuxSocket = tmuxInfo.socket || undefined;
+          if (tmuxTarget) {
+            this.sessionTmuxTargets.set(session.id, tmuxTarget);
+            logger.info('Restored tmux info for command injection', { sessionId: session.id, tmuxTarget });
+          }
+        } else {
+          tmuxSocket = session.tmuxSocket;
+        }
+
+        if (!tmuxTarget) {
+          return { success: false, error: 'No tmux target found. Session may have been moved.' };
+        }
+
+        // Set up injector with this session's tmux target
+        this.injector.setTmuxSession(tmuxTarget, tmuxSocket);
+
+        // Track this input to prevent echoing
+        const inputKey = `${session.id}:${command.trim()}`;
+        this.recentTelegramInputs.add(inputKey);
+        setTimeout(() => this.recentTelegramInputs.delete(inputKey), 10000);
+
+        // Inject the command
+        const injected = await this.injector.inject(command);
+
+        if (injected) {
+          logger.info('Injected Claude Code command', { sessionId: session.id, command, method: this.injector.getMethod() });
+          // Broadcast to socket for logging
+          this.socket.broadcast({
+            type: 'user_input',
+            sessionId: session.id,
+            timestamp: new Date().toISOString(),
+            content: command
+          });
+          return { success: true };
+        } else {
+          const validation = this.injector.validateTarget();
+          return {
+            success: false,
+            error: validation.reason || 'Failed to inject command via tmux.'
+          };
+        }
       }
     });
 
@@ -513,8 +574,19 @@ export class BridgeDaemon extends EventEmitter {
           threadId
         );
 
-        // Close the forum topic
-        await this.bot.closeForumTopic(threadId);
+        // Delete or close the topic based on config
+        if (this.config.autoDeleteTopics) {
+          const deleted = await this.bot.deleteForumTopic(threadId);
+          if (deleted) {
+            this.sessions.clearThreadId(session.id);
+            logger.info('Deleted stale session topic', { sessionId: session.id, threadId });
+          } else {
+            // Fallback to close if delete fails
+            await this.bot.closeForumTopic(threadId);
+          }
+        } else {
+          await this.bot.closeForumTopic(threadId);
+        }
       } catch (error) {
         logger.warn('Failed to send stale session notification', { sessionId: session.id, error });
       }
@@ -686,6 +758,9 @@ export class BridgeDaemon extends EventEmitter {
   private async ensureSessionExists(msg: BridgeMessage): Promise<void> {
     const existing = this.sessions.getSession(msg.sessionId);
     if (existing) {
+      // Cancel any pending topic deletion (session is resuming)
+      this.cancelPendingTopicDeletion(msg.sessionId);
+
       // BUG-009 fix: If session was ended/aborted but we're receiving hook events,
       // Claude is still running - reactivate the session
       if (existing.status !== 'active') {
@@ -695,6 +770,14 @@ export class BridgeDaemon extends EventEmitter {
         });
         this.sessions.reactivateSession(msg.sessionId);
       }
+
+      // Check if topic was deleted (thread_id is NULL) - need to create new topic
+      const threadId = this.getSessionThreadId(msg.sessionId);
+      if (!threadId && this.config.useThreads) {
+        logger.info('Session exists but topic was deleted, creating new topic', { sessionId: msg.sessionId });
+        await this.createTopicForSession(msg.sessionId, existing.metadata?.projectDir as string | undefined);
+      }
+
       return;
     }
 
@@ -816,10 +899,27 @@ export class BridgeDaemon extends EventEmitter {
         threadId
       );
 
-      // Close the forum topic if it exists
+      // Handle topic cleanup based on config
       if (threadId) {
-        await this.bot.closeForumTopic(threadId);
-        this.sessionThreads.delete(msg.sessionId);
+        if (this.config.autoDeleteTopics) {
+          // Schedule topic deletion after delay (allows for session resume via claude -c)
+          const delayMs = this.config.topicDeleteDelayMinutes * 60 * 1000;
+          logger.info('Scheduling topic deletion', {
+            sessionId: msg.sessionId,
+            threadId,
+            delayMinutes: this.config.topicDeleteDelayMinutes
+          });
+
+          const timeoutHandle = setTimeout(async () => {
+            await this.executeTopicDeletion(msg.sessionId, threadId);
+          }, delayMs);
+
+          this.pendingTopicDeletions.set(msg.sessionId, timeoutHandle);
+        } else {
+          // Just close the topic (legacy behavior)
+          await this.bot.closeForumTopic(threadId);
+          this.sessionThreads.delete(msg.sessionId);
+        }
       }
 
       // Clean up tmux target
@@ -827,6 +927,70 @@ export class BridgeDaemon extends EventEmitter {
 
       this.sessions.endSession(msg.sessionId);
     }
+  }
+
+  /**
+   * Execute topic deletion after delay timer fires
+   * Clears thread_id so session can be resumed with a new topic
+   */
+  private async executeTopicDeletion(sessionId: string, threadId: number): Promise<void> {
+    // Remove from pending deletions
+    this.pendingTopicDeletions.delete(sessionId);
+
+    // Delete the topic from Telegram
+    const deleted = await this.bot.deleteForumTopic(threadId);
+
+    if (deleted) {
+      logger.info('Auto-deleted forum topic', { sessionId, threadId });
+
+      // Clear thread_id in memory
+      this.sessionThreads.delete(sessionId);
+
+      // Clear thread_id in SQLite (allows topic recreation on session resume)
+      this.sessions.clearThreadId(sessionId);
+    } else {
+      // Deletion failed - fall back to closing
+      logger.warn('Failed to delete topic, falling back to close', { sessionId, threadId });
+      await this.bot.closeForumTopic(threadId);
+      this.sessionThreads.delete(sessionId);
+    }
+  }
+
+  /**
+   * Cancel pending topic deletion (called when session resumes)
+   */
+  private cancelPendingTopicDeletion(sessionId: string): boolean {
+    const timeoutHandle = this.pendingTopicDeletions.get(sessionId);
+    if (timeoutHandle) {
+      clearTimeout(timeoutHandle);
+      this.pendingTopicDeletions.delete(sessionId);
+      logger.info('Cancelled pending topic deletion (session resumed)', { sessionId });
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Create a new topic for an existing session (e.g., after topic was auto-deleted and session resumed)
+   */
+  private async createTopicForSession(sessionId: string, projectDir?: string): Promise<number | null> {
+    // Get session to retrieve hostname
+    const session = this.sessions.getSession(sessionId);
+    const hostname = session?.metadata?.hostname as string | undefined;
+
+    const topicName = this.formatTopicName(sessionId, hostname, projectDir);
+    const threadId = await this.bot.createForumTopic(topicName, 0); // Blue color
+
+    if (threadId) {
+      // Update both SQLite and in-memory cache
+      this.sessions.setSessionThread(sessionId, threadId);
+      this.sessionThreads.set(sessionId, threadId);
+      logger.info('Created new topic for resumed session', { sessionId, threadId, topicName });
+    } else {
+      logger.warn('Failed to create topic for resumed session', { sessionId });
+    }
+
+    return threadId;
   }
 
   private async handleAgentResponse(msg: BridgeMessage): Promise<void> {
@@ -885,6 +1049,16 @@ export class BridgeDaemon extends EventEmitter {
     const toolUseId = `tool_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 
     // Store tool input for detail retrieval (with 5 min expiry)
+    // Prune oldest entries if cache is full to prevent unbounded memory growth
+    if (this.toolInputCache.size >= BridgeDaemon.TOOL_CACHE_MAX_SIZE) {
+      const entries = Array.from(this.toolInputCache.entries());
+      entries.sort((a, b) => a[1].timestamp - b[1].timestamp);
+      // Remove oldest 20% to avoid pruning on every insert
+      const toRemove = Math.ceil(BridgeDaemon.TOOL_CACHE_MAX_SIZE * 0.2);
+      for (let i = 0; i < toRemove && i < entries.length; i++) {
+        this.toolInputCache.delete(entries[i][0]);
+      }
+    }
     this.toolInputCache.set(toolUseId, {
       tool: toolName,
       input: toolInput,

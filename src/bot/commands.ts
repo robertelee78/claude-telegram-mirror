@@ -25,7 +25,31 @@ export interface BridgeCallbacks {
   getActiveSessions(): Promise<Array<{ id: string; startedAt: Date; projectDir?: string }>>;
   abortSession(sessionId: string): Promise<boolean>;
   sendToSession(sessionId: string, text: string): Promise<boolean>;
+  /** Inject a command into Claude Code via tmux (looks up session by threadId) */
+  injectCommand(threadId: number, command: string): Promise<{ success: boolean; error?: string }>;
 }
+
+// Claude Code commands that should be forwarded (non-conflicting with bot commands)
+// Bot commands: /start, /help, /status, /sessions, /attach, /detach, /mute, /unmute, /abort, /ping
+const CLAUDE_CODE_COMMANDS = [
+  'clear',      // Clear conversation history
+  'compact',    // Compress context
+  'config',     // Open config panel
+  'cost',       // Show token usage
+  'context',    // View context usage
+  'memory',     // Edit CLAUDE.md
+  'model',      // Switch model
+  'permissions',// Manage permissions
+  'review',     // Code review
+  'init',       // Initialize project
+  'login',      // Login to Anthropic
+  'logout',     // Logout
+  'doctor',     // Run diagnostics
+  'vim',        // Toggle vim mode
+  'resume',     // Resume conversation
+  'pr',         // Create PR (skill)
+  'commit',     // Create commit (skill)
+] as const;
 
 /**
  * Register all bot commands
@@ -251,6 +275,97 @@ export function registerCommands(
       `🏓 Pong! _${latency}ms_`,
       { parse_mode: 'Markdown' }
     );
+  });
+
+  // ============ Claude Code Command Passthrough ============
+  // These commands are forwarded directly to Claude Code via tmux
+
+  // Register each Claude Code command
+  for (const cmd of CLAUDE_CODE_COMMANDS) {
+    bot.command(cmd, async (ctx) => {
+      const threadId = ctx.message?.message_thread_id;
+
+      if (!threadId) {
+        await ctx.reply(
+          `⚠️ Use \`/${cmd}\` in a session topic, not the General channel.`,
+          { parse_mode: 'Markdown' }
+        );
+        return;
+      }
+
+      if (!bridge?.injectCommand) {
+        await ctx.reply('⚠️ Bridge not connected. Cannot send command to Claude.');
+        return;
+      }
+
+      // Build the full command (with any arguments)
+      const args = ctx.match?.trim();
+      const fullCommand = args ? `/${cmd} ${args}` : `/${cmd}`;
+
+      const result = await bridge.injectCommand(threadId, fullCommand);
+
+      if (result.success) {
+        // Show brief confirmation that disappears into the flow
+        await ctx.reply(`➡️ \`${fullCommand}\``, { parse_mode: 'Markdown' });
+        logger.info('Forwarded Claude Code command', { cmd, args, threadId });
+      } else {
+        await ctx.reply(
+          `⚠️ *Could not send command*\n\n${result.error || 'No session found for this topic.'}`,
+          { parse_mode: 'Markdown' }
+        );
+        logger.warn('Failed to forward Claude Code command', { cmd, threadId, error: result.error });
+      }
+    });
+  }
+
+  // /cc <command> - Catch-all for custom skills and unlisted commands
+  bot.command('cc', async (ctx) => {
+    const threadId = ctx.message?.message_thread_id;
+    const args = ctx.match?.trim();
+
+    if (!args) {
+      await ctx.reply(
+        '📚 *Claude Code Command Passthrough*\n\n' +
+        'Usage: `/cc <command>` - forwards to Claude Code\n\n' +
+        '*Examples:*\n' +
+        '• `/cc clear` → `/clear`\n' +
+        '• `/cc my-skill` → `/my-skill`\n' +
+        '• `/cc review src/` → `/review src/`\n\n' +
+        '*Built-in shortcuts:*\n' +
+        CLAUDE_CODE_COMMANDS.map(c => `/${c}`).join(', '),
+        { parse_mode: 'Markdown' }
+      );
+      return;
+    }
+
+    if (!threadId) {
+      await ctx.reply(
+        '⚠️ Use `/cc` in a session topic, not the General channel.',
+        { parse_mode: 'Markdown' }
+      );
+      return;
+    }
+
+    if (!bridge?.injectCommand) {
+      await ctx.reply('⚠️ Bridge not connected. Cannot send command to Claude.');
+      return;
+    }
+
+    // Convert "cc clear" to "/clear"
+    const fullCommand = args.startsWith('/') ? args : `/${args}`;
+
+    const result = await bridge.injectCommand(threadId, fullCommand);
+
+    if (result.success) {
+      await ctx.reply(`➡️ \`${fullCommand}\``, { parse_mode: 'Markdown' });
+      logger.info('Forwarded Claude Code command via /cc', { command: fullCommand, threadId });
+    } else {
+      await ctx.reply(
+        `⚠️ *Could not send command*\n\n${result.error || 'No session found for this topic.'}`,
+        { parse_mode: 'Markdown' }
+      );
+      logger.warn('Failed to forward command via /cc', { command: fullCommand, threadId, error: result.error });
+    }
   });
 }
 

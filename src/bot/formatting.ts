@@ -151,6 +151,7 @@ export function formatStatus(
 export function formatHelp(): string {
   return `📚 *Claude Code Mirror - Commands*
 
+*Bot Commands:*
 /status - Show current session status
 /sessions - List active sessions
 /attach <id> - Attach to a session
@@ -160,8 +161,17 @@ export function formatHelp(): string {
 /abort - Abort current session
 /help - Show this message
 
+*Claude Code Commands:*
+These are forwarded directly to Claude Code:
+/clear - Clear conversation history
+/compact - Compress context
+/cost - Show token usage
+/review - Code review mode
+/model - Switch model
+/cc <cmd> - Any command (e.g., /cc my-skill)
+
 *Inline Responses:*
-Simply reply with text to send input to the attached session.
+Simply reply with text to send input to the session.
 
 *Approval Buttons:*
 When Claude requests permission, tap:

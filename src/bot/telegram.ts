@@ -392,6 +392,20 @@ export class TelegramBot {
   }
 
   /**
+   * Delete a forum topic entirely (removes from sidebar)
+   */
+  async deleteForumTopic(threadId: number): Promise<boolean> {
+    try {
+      await this.bot.api.deleteForumTopic(this.config.chatId, threadId);
+      logger.info('Deleted forum topic', { threadId });
+      return true;
+    } catch (error) {
+      logger.warn('Failed to delete forum topic', { threadId, error });
+      return false;
+    }
+  }
+
+  /**
    * Register text message handler
    */
   onMessage(handler: (text: string, chatId: number, threadId?: number) => void): void {
