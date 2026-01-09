@@ -40,6 +40,8 @@ jobs:
         run: npm version ${{ github.event.inputs.version }} --no-git-tag-version
 
       - name: Publish to npm
-        run: npm publish --access public
+        run: |
+          # Try to publish, if version exists just update the tag
+          npm publish --access public || npm dist-tag add claude-telegram-mirror@$(node -p "require('./package.json').version") latest
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
