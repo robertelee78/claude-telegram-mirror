@@ -294,6 +294,8 @@ export class BridgeDaemon extends EventEmitter {
   private setupBotHandlers(): void {
     // Handle text messages (forward to CLI)
     this.bot.onMessage(async (text, chatId, threadId) => {
+      logger.info('onMessage received', { text: text.substring(0, 50), chatId, threadId });
+
       // BUG-005 fix: Ignore General topic entirely
       // Messages without threadId can't be routed to a specific session because:
       // 1. We don't know which Claude session/tmux target they belong to
@@ -336,6 +338,22 @@ export class BridgeDaemon extends EventEmitter {
 
       if (tmuxTarget) {
         this.injector.setTmuxSession(tmuxTarget, tmuxSocket);
+      }
+
+      // Check for cc command prefix - transform "cc clear" → "/clear"
+      if (text.toLowerCase().startsWith('cc ')) {
+        const command = '/' + text.slice(3).trim();
+        logger.info('CC command detected, transforming', { original: text, command });
+
+        // Track to prevent echo
+        const inputKey = `${session.id}:${command}`;
+        this.recentTelegramInputs.add(inputKey);
+        setTimeout(() => this.recentTelegramInputs.delete(inputKey), 10000);
+
+        // Send slash command using same method as special keys (no -l flag)
+        const injected = await this.injector.sendSlashCommand(command);
+        logger.info('CC command injection result', { command, injected });
+        return;
       }
 
       // Check for interrupt command - send Escape to pause Claude (BUG-004 fix)

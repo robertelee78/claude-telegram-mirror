@@ -314,7 +314,7 @@ export class InputInjector extends EventEmitter {
    * Send special key
    * BUG-004 fix: Include socket flag for correct tmux server targeting
    */
-  async sendKey(key: 'Enter' | 'Escape' | 'Tab' | 'Ctrl-C'): Promise<boolean> {
+  async sendKey(key: 'Enter' | 'Escape' | 'Tab' | 'Ctrl-C' | 'Ctrl-U'): Promise<boolean> {
     if (this.method !== 'tmux' || !this.tmuxSession) {
       return false;
     }
@@ -324,7 +324,8 @@ export class InputInjector extends EventEmitter {
         'Enter': 'Enter',
         'Escape': 'Escape',
         'Tab': 'Tab',
-        'Ctrl-C': 'C-c'
+        'Ctrl-C': 'C-c',
+        'Ctrl-U': 'C-u'
       };
 
       // BUG-004 fix: Include socket flag to target correct tmux server
@@ -335,6 +336,32 @@ export class InputInjector extends EventEmitter {
       return true;
     } catch (error) {
       logger.error('Failed to send key', { key, error });
+      return false;
+    }
+  }
+
+  /**
+   * Send slash command (like /clear)
+   * Sends command text, then Enter key separately
+   */
+  async sendSlashCommand(command: string): Promise<boolean> {
+    if (this.method !== 'tmux' || !this.tmuxSession) {
+      return false;
+    }
+
+    try {
+      const socketFlag = this.tmuxSocket ? `-S "${this.tmuxSocket}"` : '';
+      // Send command text (no -l, no quotes - just the raw command)
+      execSync(`tmux ${socketFlag} send-keys -t "${this.tmuxSession}" ${command}`, {
+        stdio: 'ignore'
+      });
+      // Send Enter separately
+      execSync(`tmux ${socketFlag} send-keys -t "${this.tmuxSession}" Enter`, {
+        stdio: 'ignore'
+      });
+      return true;
+    } catch (error) {
+      logger.error('Failed to send slash command', { command, error });
       return false;
     }
   }
