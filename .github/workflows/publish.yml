@@ -41,7 +41,10 @@ jobs:
 
       - name: Publish to npm
         run: |
+          VERSION=$(node -p "require('./package.json').version")
           # Try to publish, if version exists just update the tag
-          npm publish --access public || npm dist-tag add claude-telegram-mirror@$(node -p "require('./package.json').version") latest
+          npm publish --access public || npm dist-tag add claude-telegram-mirror@$VERSION latest
+          # Remove any deprecation warning
+          npm deprecate claude-telegram-mirror@$VERSION "" || true
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
