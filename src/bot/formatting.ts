@@ -162,13 +162,15 @@ export function formatHelp(): string {
 /help - Show this message
 
 *Claude Code Commands:*
-These are forwarded directly to Claude Code:
-/clear - Clear conversation history
-/compact - Compress context
-/cost - Show token usage
-/review - Code review mode
-/model - Switch model
-/cc <cmd> - Any command (e.g., /cc my-skill)
+Use \`cc <command>\` to forward to Claude:
+• \`cc clear\` - Clear conversation history
+• \`cc compact\` - Compress context
+• \`cc cost\` - Show token usage
+• \`cc review\` - Code review mode
+• \`cc model\` - Switch model
+• \`cc <any>\` - Any command or skill
+
+_Type \`cc\` for full command list_
 
 *Inline Responses:*
 Simply reply with text to send input to the session.

@@ -318,32 +318,44 @@ export class BridgeDaemon extends EventEmitter {
   /**
    * Check if text is an interrupt command (sends Escape to pause Claude)
    * BUG-004 fix: Escape interrupts operation, Ctrl-C exits entirely
+   * Supports: stop, /stop, cc stop (and variants)
    */
   private isInterruptCommand(text: string): boolean {
     const normalized = text.trim().toLowerCase();
+    // Support bare command, /command, and cc command patterns
     return normalized === 'stop' ||
            normalized === '/stop' ||
+           normalized === 'cc stop' ||
            normalized === 'cancel' ||
            normalized === '/cancel' ||
+           normalized === 'cc cancel' ||
            normalized === 'abort' ||
            normalized === '/abort' ||
+           normalized === 'cc abort' ||
            normalized === 'esc' ||
            normalized === '/esc' ||
+           normalized === 'cc esc' ||
            normalized === 'escape' ||
-           normalized === '/escape';
+           normalized === '/escape' ||
+           normalized === 'cc escape';
   }
 
   /**
    * Check if text is a kill command (sends Ctrl-C to exit Claude entirely)
+   * Supports: kill, /kill, cc kill (and variants)
    */
   private isKillCommand(text: string): boolean {
     const normalized = text.trim().toLowerCase();
+    // Support bare command, /command, and cc command patterns
     return normalized === 'kill' ||
            normalized === '/kill' ||
+           normalized === 'cc kill' ||
            normalized === 'exit' ||
            normalized === '/exit' ||
+           normalized === 'cc exit' ||
            normalized === 'quit' ||
            normalized === '/quit' ||
+           normalized === 'cc quit' ||
            normalized === 'ctrl+c' ||
            normalized === 'ctrl-c' ||
            normalized === '^c';

@@ -86,8 +86,24 @@ Once connected, you can control Claude from Telegram:
 | Command | Action |
 |---------|--------|
 | Any text | Sends to Claude as input |
+| `cc <command>` | Forwards Claude Code command (e.g., `cc clear`, `cc compact`) |
 | `stop` | Sends Escape to pause Claude |
 | `kill` | Sends Ctrl-C to exit Claude entirely |
+
+### Claude Code Commands
+
+Use `cc <command>` to send Claude Code slash commands:
+
+```
+cc clear      → Clears conversation history
+cc compact    → Compresses context
+cc cost       → Shows token usage
+cc review     → Code review mode
+cc model      → Switch model
+cc <skill>    → Run any custom skill
+```
+
+**Why `cc` instead of `/`?** Telegram's slash commands cannot be passed correctly inside topics/threads. The `cc` prefix works reliably as plain text.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for additional command aliases.
 

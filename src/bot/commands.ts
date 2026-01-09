@@ -29,8 +29,9 @@ export interface BridgeCallbacks {
   injectCommand(threadId: number, command: string): Promise<{ success: boolean; error?: string }>;
 }
 
-// Claude Code commands that should be forwarded (non-conflicting with bot commands)
-// Bot commands: /start, /help, /status, /sessions, /attach, /detach, /mute, /unmute, /abort, /ping
+// Claude Code commands that can be forwarded via "cc <command>" pattern
+// Bot commands (still use /): /start, /help, /status, /sessions, /attach, /detach, /mute, /unmute, /abort, /ping
+// Claude Code commands use "cc" prefix: cc clear, cc compact, cc config, etc.
 const CLAUDE_CODE_COMMANDS = [
   'clear',      // Clear conversation history
   'compact',    // Compress context
@@ -278,61 +279,27 @@ export function registerCommands(
   });
 
   // ============ Claude Code Command Passthrough ============
-  // These commands are forwarded directly to Claude Code via tmux
+  // Use "cc <command>" pattern instead of "/command" because slash commands
+  // cannot be passed correctly inside Telegram topics/threads.
+  // Examples: "cc clear", "cc compact", "cc my-skill"
 
-  // Register each Claude Code command
-  for (const cmd of CLAUDE_CODE_COMMANDS) {
-    bot.command(cmd, async (ctx) => {
-      const threadId = ctx.message?.message_thread_id;
-
-      if (!threadId) {
-        await ctx.reply(
-          `⚠️ Use \`/${cmd}\` in a session topic, not the General channel.`,
-          { parse_mode: 'Markdown' }
-        );
-        return;
-      }
-
-      if (!bridge?.injectCommand) {
-        await ctx.reply('⚠️ Bridge not connected. Cannot send command to Claude.');
-        return;
-      }
-
-      // Build the full command (with any arguments)
-      const args = ctx.match?.trim();
-      const fullCommand = args ? `/${cmd} ${args}` : `/${cmd}`;
-
-      const result = await bridge.injectCommand(threadId, fullCommand);
-
-      if (result.success) {
-        // Show brief confirmation that disappears into the flow
-        await ctx.reply(`➡️ \`${fullCommand}\``, { parse_mode: 'Markdown' });
-        logger.info('Forwarded Claude Code command', { cmd, args, threadId });
-      } else {
-        await ctx.reply(
-          `⚠️ *Could not send command*\n\n${result.error || 'No session found for this topic.'}`,
-          { parse_mode: 'Markdown' }
-        );
-        logger.warn('Failed to forward Claude Code command', { cmd, threadId, error: result.error });
-      }
-    });
-  }
-
-  // /cc <command> - Catch-all for custom skills and unlisted commands
-  bot.command('cc', async (ctx) => {
+  // Match "cc <command>" as plain text (case insensitive)
+  // This uses hears() instead of command() so it works as regular text in topics
+  bot.hears(/^cc\s+(.+)$/i, async (ctx) => {
     const threadId = ctx.message?.message_thread_id;
-    const args = ctx.match?.trim();
+    const args = ctx.match![1].trim();
 
     if (!args) {
       await ctx.reply(
         '📚 *Claude Code Command Passthrough*\n\n' +
-        'Usage: `/cc <command>` - forwards to Claude Code\n\n' +
+        'Usage: `cc <command>` - forwards to Claude Code\n\n' +
         '*Examples:*\n' +
-        '• `/cc clear` → `/clear`\n' +
-        '• `/cc my-skill` → `/my-skill`\n' +
-        '• `/cc review src/` → `/review src/`\n\n' +
-        '*Built-in shortcuts:*\n' +
-        CLAUDE_CODE_COMMANDS.map(c => `/${c}`).join(', '),
+        '• `cc clear` → clears conversation\n' +
+        '• `cc compact` → compresses context\n' +
+        '• `cc my-skill` → runs custom skill\n' +
+        '• `cc review src/` → code review\n\n' +
+        '*Available commands:*\n' +
+        CLAUDE_CODE_COMMANDS.map(c => `cc ${c}`).join(', '),
         { parse_mode: 'Markdown' }
       );
       return;
@@ -340,7 +307,7 @@ export function registerCommands(
 
     if (!threadId) {
       await ctx.reply(
-        '⚠️ Use `/cc` in a session topic, not the General channel.',
+        '⚠️ Use `cc` in a session topic, not the General channel.',
         { parse_mode: 'Markdown' }
       );
       return;
@@ -351,21 +318,37 @@ export function registerCommands(
       return;
     }
 
-    // Convert "cc clear" to "/clear"
+    // Convert "cc clear" to "/clear" for Claude Code
+    // Claude Code CLI still requires the slash prefix
     const fullCommand = args.startsWith('/') ? args : `/${args}`;
 
     const result = await bridge.injectCommand(threadId, fullCommand);
 
     if (result.success) {
       await ctx.reply(`➡️ \`${fullCommand}\``, { parse_mode: 'Markdown' });
-      logger.info('Forwarded Claude Code command via /cc', { command: fullCommand, threadId });
+      logger.info('Forwarded Claude Code command via cc', { command: fullCommand, threadId });
     } else {
       await ctx.reply(
         `⚠️ *Could not send command*\n\n${result.error || 'No session found for this topic.'}`,
         { parse_mode: 'Markdown' }
       );
-      logger.warn('Failed to forward command via /cc', { command: fullCommand, threadId, error: result.error });
+      logger.warn('Failed to forward command via cc', { command: fullCommand, threadId, error: result.error });
     }
+  });
+
+  // Also support bare "cc" to show help
+  bot.hears(/^cc$/i, async (ctx) => {
+    await ctx.reply(
+      '📚 *Claude Code Command Passthrough*\n\n' +
+      'Usage: `cc <command>` - forwards to Claude Code\n\n' +
+      '*Examples:*\n' +
+      '• `cc clear` → clears conversation\n' +
+      '• `cc compact` → compresses context\n' +
+      '• `cc my-skill` → runs custom skill\n\n' +
+      '*Available commands:*\n' +
+      CLAUDE_CODE_COMMANDS.map(c => `cc ${c}`).join(', '),
+      { parse_mode: 'Markdown' }
+    );
   });
 }
 

@@ -126,11 +126,18 @@ describe('formatSessionEnd', () => {
 });
 
 describe('formatHelp', () => {
-  it('should include command list', () => {
+  it('should include bot command list', () => {
     const result = formatHelp();
     expect(result).toContain('/status');
     expect(result).toContain('/help');
     expect(result).toContain('/sessions');
+  });
+
+  it('should include Claude Code commands with cc prefix', () => {
+    const result = formatHelp();
+    expect(result).toContain('cc clear');
+    expect(result).toContain('cc compact');
+    expect(result).toContain('cc cost');
   });
 
   it('should include title', () => {

@@ -418,8 +418,9 @@ export class TelegramBot {
         const chatId = ctx.chat.id;
         const threadId = ctx.message.message_thread_id;
 
-        // Skip commands
+        // Skip bot commands and "cc" Claude Code commands
         if (text.startsWith('/')) return;
+        if (/^cc(\s|$)/i.test(text)) return;
 
         this.messageHandlers.forEach(h => h(text, chatId, threadId));
       });

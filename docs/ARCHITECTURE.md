@@ -565,12 +565,29 @@ private async ensureSessionExists(msg: BridgeMessage): Promise<void> {
 
 Commands sent from Telegram to control Claude:
 
+### Claude Code Commands (cc prefix)
+
+Use `cc <command>` to forward commands to Claude Code:
+
+| Command | Description |
+|---------|-------------|
+| `cc clear` | Clear conversation history |
+| `cc compact` | Compress context |
+| `cc cost` | Show token usage |
+| `cc review` | Code review mode |
+| `cc model` | Switch model |
+| `cc <skill>` | Run any custom skill |
+
+**Why `cc` instead of `/`?** Telegram's slash commands cannot be passed correctly inside topics/threads. The `cc` prefix works reliably as plain text.
+
+### Control Commands (sends special keys)
+
 | Category | Commands | Key Sent |
 |----------|----------|----------|
 | **Interrupt** | `stop`, `cancel`, `abort`, `esc`, `escape` | Escape |
 | **Kill** | `kill`, `exit`, `quit`, `ctrl+c`, `ctrl-c`, `^c` | Ctrl-C |
 
-Commands work with or without leading `/` (e.g., `stop` or `/stop`).
+Control commands work with or without prefix: `stop`, `/stop`, or `cc stop` all work.
 
 **Interrupt vs Kill:**
 - **Escape** pauses Claude mid-generation (can resume)
