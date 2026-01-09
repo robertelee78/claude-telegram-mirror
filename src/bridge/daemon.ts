@@ -46,6 +46,9 @@ export class BridgeDaemon extends EventEmitter {
   private topicCreationPromises: Map<string, Promise<number | undefined>> = new Map();
   private topicCreationResolvers: Map<string, (threadId: number | undefined) => void> = new Map();
 
+  // Topic auto-deletion: track pending deletions so we can cancel if session resumes
+  private pendingTopicDeletions: Map<string, NodeJS.Timeout> = new Map();
+
   constructor(config?: TelegramMirrorConfig) {
     super();
     this.config = config || loadConfig();
@@ -531,8 +534,19 @@ export class BridgeDaemon extends EventEmitter {
           threadId
         );
 
-        // Close the forum topic
-        await this.bot.closeForumTopic(threadId);
+        // Delete or close the topic based on config
+        if (this.config.autoDeleteTopics) {
+          const deleted = await this.bot.deleteForumTopic(threadId);
+          if (deleted) {
+            this.sessions.clearThreadId(session.id);
+            logger.info('Deleted stale session topic', { sessionId: session.id, threadId });
+          } else {
+            // Fallback to close if delete fails
+            await this.bot.closeForumTopic(threadId);
+          }
+        } else {
+          await this.bot.closeForumTopic(threadId);
+        }
       } catch (error) {
         logger.warn('Failed to send stale session notification', { sessionId: session.id, error });
       }
@@ -685,6 +699,36 @@ export class BridgeDaemon extends EventEmitter {
   }
 
   /**
+   * Create a new topic for an existing session (e.g., after topic was auto-deleted and session resumed)
+   */
+  private async createTopicForSession(sessionId: string, projectDir?: string): Promise<number | null> {
+    // Get session to retrieve hostname
+    const session = this.sessions.getSession(sessionId);
+    const hostname = session?.hostname;
+
+    const topicName = this.formatTopicName(sessionId, hostname, projectDir);
+    const threadId = await this.bot.createForumTopic(topicName, 0); // Blue color
+
+    if (threadId) {
+      // Update both SQLite and in-memory cache
+      this.sessions.setSessionThread(sessionId, threadId);
+      this.sessionThreads.set(sessionId, threadId);
+      logger.info('Created new topic for resumed session', { sessionId, threadId, topicName });
+
+      // Send notification that session resumed with new topic
+      await this.bot.sendMessage(
+        '🔄 *Session resumed*\n\n_Previous topic was auto-deleted. New topic created._',
+        { parseMode: 'Markdown' },
+        threadId
+      );
+    } else {
+      logger.warn('Failed to create topic for resumed session', { sessionId });
+    }
+
+    return threadId;
+  }
+
+  /**
    * Ensure a session exists (create on-the-fly if needed)
    *
    * BUG-010 FIX: Now calls handleSessionStart() directly to create both session
@@ -712,6 +756,16 @@ export class BridgeDaemon extends EventEmitter {
           previousStatus: existing.status
         });
         this.sessions.reactivateSession(msg.sessionId);
+
+        // Cancel any pending topic deletion since session is resuming
+        this.cancelPendingTopicDeletion(msg.sessionId);
+      }
+
+      // Check if topic was deleted (thread_id is NULL) - need to create new topic
+      const threadId = this.getSessionThreadId(msg.sessionId);
+      if (!threadId && this.config.useThreads) {
+        logger.info('Session exists but topic was deleted, creating new topic', { sessionId: msg.sessionId });
+        await this.createTopicForSession(msg.sessionId, existing.projectDir);
       }
       return;
     }
@@ -834,10 +888,27 @@ export class BridgeDaemon extends EventEmitter {
         threadId
       );
 
-      // Close the forum topic if it exists
+      // Handle topic cleanup based on config
       if (threadId) {
-        await this.bot.closeForumTopic(threadId);
-        this.sessionThreads.delete(msg.sessionId);
+        if (this.config.autoDeleteTopics) {
+          // Schedule topic deletion after delay (allows for session resume via claude -c)
+          const delayMs = this.config.topicDeleteDelayMinutes * 60 * 1000;
+          logger.info('Scheduling topic deletion', {
+            sessionId: msg.sessionId,
+            threadId,
+            delayMinutes: this.config.topicDeleteDelayMinutes
+          });
+
+          const timeoutHandle = setTimeout(async () => {
+            await this.executeTopicDeletion(msg.sessionId, threadId);
+          }, delayMs);
+
+          this.pendingTopicDeletions.set(msg.sessionId, timeoutHandle);
+        } else {
+          // Just close the topic (legacy behavior)
+          await this.bot.closeForumTopic(threadId);
+          this.sessionThreads.delete(msg.sessionId);
+        }
       }
 
       // Clean up tmux target
@@ -845,6 +916,47 @@ export class BridgeDaemon extends EventEmitter {
 
       this.sessions.endSession(msg.sessionId);
     }
+  }
+
+  /**
+   * Execute topic deletion after delay timer fires
+   * Clears thread_id so session can be resumed with a new topic
+   */
+  private async executeTopicDeletion(sessionId: string, threadId: number): Promise<void> {
+    // Remove from pending deletions
+    this.pendingTopicDeletions.delete(sessionId);
+
+    // Delete the topic from Telegram
+    const deleted = await this.bot.deleteForumTopic(threadId);
+
+    if (deleted) {
+      logger.info('Auto-deleted forum topic', { sessionId, threadId });
+
+      // Clear thread_id in memory
+      this.sessionThreads.delete(sessionId);
+
+      // Clear thread_id in SQLite (allows topic recreation on session resume)
+      this.sessions.clearThreadId(sessionId);
+    } else {
+      // Deletion failed - fall back to closing
+      logger.warn('Failed to delete topic, falling back to close', { sessionId, threadId });
+      await this.bot.closeForumTopic(threadId);
+      this.sessionThreads.delete(sessionId);
+    }
+  }
+
+  /**
+   * Cancel pending topic deletion (called when session resumes)
+   */
+  private cancelPendingTopicDeletion(sessionId: string): boolean {
+    const timeoutHandle = this.pendingTopicDeletions.get(sessionId);
+    if (timeoutHandle) {
+      clearTimeout(timeoutHandle);
+      this.pendingTopicDeletions.delete(sessionId);
+      logger.info('Cancelled pending topic deletion (session resumed)', { sessionId });
+      return true;
+    }
+    return false;
   }
 
   private async handleAgentResponse(msg: BridgeMessage): Promise<void> {

@@ -29,6 +29,10 @@ export interface TelegramMirrorConfig {
   sessionTimeout: number;
   staleSessionTimeoutHours: number;  // BUG-003: Hours before cleaning up stale sessions
 
+  // Topic auto-cleanup
+  autoDeleteTopics: boolean;         // Delete topics after session ends (vs just close)
+  topicDeleteDelayMinutes: number;   // Minutes to wait before deleting topic
+
   // Internal
   configPath: string;
 }
@@ -45,6 +49,8 @@ interface ConfigFile {
   rateLimit?: number;
   sessionTimeout?: number;
   staleSessionTimeoutHours?: number;
+  autoDeleteTopics?: boolean;
+  topicDeleteDelayMinutes?: number;
 }
 
 const CONFIG_DIR = join(homedir(), '.config', 'claude-telegram-mirror');
@@ -177,6 +183,16 @@ export function loadConfig(requireAuth: boolean = true): TelegramMirrorConfig {
     staleSessionTimeoutHours: parseEnvNumber(
       process.env.TELEGRAM_STALE_SESSION_TIMEOUT_HOURS,
       fileConfig.staleSessionTimeoutHours ?? 72  // BUG-003: Default 72 hours
+    ),
+
+    autoDeleteTopics: parseEnvBool(
+      process.env.TELEGRAM_AUTO_DELETE_TOPICS,
+      fileConfig.autoDeleteTopics ?? true  // Default: auto-delete topics after session ends
+    ),
+
+    topicDeleteDelayMinutes: parseEnvNumber(
+      process.env.TELEGRAM_TOPIC_DELETE_DELAY_MINUTES,
+      fileConfig.topicDeleteDelayMinutes ?? 1440  // Default: 24 hours (1440 minutes) after session ends
     ),
 
     configPath: CONFIG_FILE

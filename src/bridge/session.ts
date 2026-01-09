@@ -169,6 +169,17 @@ export class SessionManager {
   }
 
   /**
+   * Clear thread_id for a session (called when topic is auto-deleted)
+   * This allows the session to be resumed with a new topic
+   */
+  clearThreadId(sessionId: string): void {
+    this.db.prepare(`
+      UPDATE sessions SET thread_id = NULL WHERE id = ?
+    `).run(sessionId);
+    logger.info('Session thread_id cleared', { sessionId });
+  }
+
+  /**
    * Set session tmux info (target and socket for input injection)
    */
   setTmuxInfo(sessionId: string, tmuxTarget?: string, tmuxSocket?: string): void {
