@@ -1,13 +1,13 @@
 {
   "name": "claude-telegram-mirror",
-  "version": "0.1.22",
+  "version": "0.1.23",
   "description": "Bidirectional Telegram integration for Claude Code CLI - monitor and control your Claude Code sessions from Telegram",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
-    "claude-telegram-mirror": "./dist/cli.js",
-    "ctm": "./dist/cli.js",
-    "telegram-hook": "./scripts/telegram-hook.sh"
+    "claude-telegram-mirror": "dist/cli.js",
+    "ctm": "dist/cli.js",
+    "telegram-hook": "scripts/telegram-hook.sh"
   },
   "scripts": {
     "build": "tsc",
@@ -48,7 +48,7 @@
   "homepage": "https://github.com/robertelee78/claude-telegram-mirror",
   "repository": {
     "type": "git",
-    "url": "https://github.com/robertelee78/claude-telegram-mirror.git"
+    "url": "git+https://github.com/robertelee78/claude-telegram-mirror.git"
   },
   "bugs": {
     "url": "https://github.com/robertelee78/claude-telegram-mirror/issues"
