@@ -1,6 +1,6 @@
 {
   "name": "claude-telegram-mirror",
-  "version": "0.1.20",
+  "version": "0.1.24",
   "description": "Bidirectional Telegram integration for Claude Code CLI - monitor and control your Claude Code sessions from Telegram",
   "type": "module",
   "main": "dist/index.js",
