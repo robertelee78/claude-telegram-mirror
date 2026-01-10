@@ -406,6 +406,20 @@ export class TelegramBot {
   }
 
   /**
+   * Unpin all messages in a forum topic
+   */
+  async unpinAllTopicMessages(threadId: number): Promise<boolean> {
+    try {
+      await this.bot.api.unpinAllForumTopicMessages(this.config.chatId, threadId);
+      logger.debug('Unpinned all messages in topic', { threadId });
+      return true;
+    } catch (error) {
+      logger.debug('Failed to unpin topic messages', { threadId, error });
+      return false;
+    }
+  }
+
+  /**
    * Register text message handler
    */
   onMessage(handler: (text: string, chatId: number, threadId?: number) => void): void {

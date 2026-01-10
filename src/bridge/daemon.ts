@@ -672,6 +672,11 @@ export class BridgeDaemon extends EventEmitter {
       { parseMode: 'Markdown' },
       threadId || undefined
     );
+
+    // Remove Telegram's auto-pin of the first message (it's redundant with topic name)
+    if (threadId) {
+      await this.bot.unpinAllTopicMessages(threadId);
+    }
   }
 
   /**
@@ -721,6 +726,9 @@ export class BridgeDaemon extends EventEmitter {
         { parseMode: 'Markdown' },
         threadId
       );
+
+      // Remove Telegram's auto-pin
+      await this.bot.unpinAllTopicMessages(threadId);
     } else {
       logger.warn('Failed to create topic for resumed session', { sessionId });
     }
