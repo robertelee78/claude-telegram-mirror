@@ -473,49 +473,117 @@ export class BridgeDaemon extends EventEmitter {
   /**
    * Clean up stale sessions (BUG-003)
    * Conditions for cleanup:
-   * 1. lastActivity > staleSessionTimeoutHours (default 72h)
-   * 2. For sessions WITH tmux info: pane must be dead OR reassigned
-   * 3. For sessions WITHOUT tmux info: cleanup based purely on inactivity
+   * 1. Sessions WITH tmux info: 24h timeout + pane must be dead OR reassigned
+   * 2. Sessions WITHOUT tmux info: 1h timeout (can't verify if still active)
    */
   private async cleanupStaleSessions(): Promise<void> {
-    const candidates = this.sessions.getStaleSessionCandidates(this.config.staleSessionTimeoutHours);
+    // Different timeouts based on whether we can verify session is alive
+    const TMUX_SESSION_TIMEOUT_HOURS = 24;  // With tmux: 24h + pane check
+    const NO_TMUX_SESSION_TIMEOUT_HOURS = 1; // Without tmux: 1h (can't verify, clean up fast)
 
-    if (candidates.length === 0) return;
+    // Get candidates with the shorter timeout first (1h)
+    const allCandidates = this.sessions.getStaleSessionCandidates(NO_TMUX_SESSION_TIMEOUT_HOURS);
 
-    logger.debug('Checking stale session candidates', { count: candidates.length });
+    if (allCandidates.length === 0) {
+      // Still check orphaned threads even if no stale candidates
+    } else {
+      logger.debug('Checking stale session candidates', { count: allCandidates.length });
 
-    for (const session of candidates) {
-      const tmuxTarget = session.tmuxTarget;
-      const tmuxSocket = session.tmuxSocket;
+      const now = new Date();
+      const tmuxCutoff = new Date(now.getTime() - TMUX_SESSION_TIMEOUT_HOURS * 60 * 60 * 1000);
 
-      // Sessions without tmux info: clean up based purely on inactivity
-      if (!tmuxTarget) {
-        logger.info('Cleaning up stale session (no tmux info)', {
-          sessionId: session.id,
-          lastActivity: session.lastActivity.toISOString()
-        });
-        await this.handleStaleSessionCleanup(session, 'inactivity timeout (no tmux info)');
-        continue;
+      for (const session of allCandidates) {
+        const tmuxTarget = session.tmuxTarget;
+        const tmuxSocket = session.tmuxSocket;
+
+        // Sessions WITHOUT tmux info: clean up after 1h (already filtered by query)
+        if (!tmuxTarget) {
+          logger.info('Cleaning up stale session (no tmux info, >1h inactive)', {
+            sessionId: session.id,
+            lastActivity: session.lastActivity.toISOString()
+          });
+          await this.handleStaleSessionCleanup(session, 'inactivity timeout (no tmux info)');
+          continue;
+        }
+
+        // Sessions WITH tmux info: only process if older than 24h
+        if (session.lastActivity >= tmuxCutoff) {
+          logger.debug('Session with tmux info not old enough for cleanup', {
+            sessionId: session.id,
+            lastActivity: session.lastActivity.toISOString(),
+            cutoff: tmuxCutoff.toISOString()
+          });
+          continue;
+        }
+
+        // Sessions WITH tmux info (24h timeout): check if pane is still alive
+        const paneExists = this.isTmuxPaneAlive(tmuxTarget, tmuxSocket);
+        const paneReassigned = this.sessions.isTmuxTargetOwnedByOtherSession(tmuxTarget, session.id);
+
+        if (!paneExists || paneReassigned) {
+          const reason = !paneExists ? 'pane no longer exists' : 'pane reassigned to another session';
+          logger.info('Cleaning up stale session (tmux)', {
+            sessionId: session.id,
+            tmuxTarget,
+            reason,
+            lastActivity: session.lastActivity.toISOString()
+          });
+          await this.handleStaleSessionCleanup(session, reason);
+        } else {
+          logger.debug('Stale candidate still valid (pane exists)', {
+            sessionId: session.id,
+            tmuxTarget
+          });
+        }
+      }
+    }
+
+    // Also clean up orphaned threads (ended sessions with topics that weren't deleted)
+    await this.cleanupOrphanedThreads();
+  }
+
+  /**
+   * Clean up ended sessions that still have thread_ids (topic deletion failed earlier)
+   */
+  private async cleanupOrphanedThreads(): Promise<void> {
+    const orphaned = this.sessions.getOrphanedThreadSessions();
+
+    if (orphaned.length === 0) return;
+
+    logger.info('Cleaning up orphaned threads', { count: orphaned.length });
+
+    // Process in batches to avoid rate limiting
+    let cleaned = 0;
+    for (const session of orphaned) {
+      const threadId = session.threadId;
+      if (!threadId) continue;
+
+      try {
+        // Try to delete the topic
+        const deleted = await this.bot.deleteForumTopic(threadId);
+        if (deleted) {
+          this.sessions.clearThreadId(session.id);
+          cleaned++;
+          logger.info('Deleted orphaned topic', { sessionId: session.id, threadId });
+        } else {
+          // Topic might already be deleted, clear the reference anyway
+          this.sessions.clearThreadId(session.id);
+          cleaned++;
+          logger.debug('Cleared orphaned thread reference (topic may not exist)', { sessionId: session.id, threadId });
+        }
+
+        // Rate limit: wait 200ms between deletions
+        await new Promise(resolve => setTimeout(resolve, 200));
+      } catch (error) {
+        logger.warn('Failed to delete orphaned topic', { sessionId: session.id, threadId, error });
+        // Still clear the thread_id to avoid retrying forever on invalid topics
+        this.sessions.clearThreadId(session.id);
       }
 
-      // Sessions WITH tmux info: check if pane is still alive
-      const paneExists = this.isTmuxPaneAlive(tmuxTarget, tmuxSocket);
-      const paneReassigned = this.sessions.isTmuxTargetOwnedByOtherSession(tmuxTarget, session.id);
-
-      if (!paneExists || paneReassigned) {
-        const reason = !paneExists ? 'pane no longer exists' : 'pane reassigned to another session';
-        logger.info('Cleaning up stale session', {
-          sessionId: session.id,
-          tmuxTarget,
-          reason,
-          lastActivity: session.lastActivity.toISOString()
-        });
-        await this.handleStaleSessionCleanup(session, reason);
-      } else {
-        logger.debug('Stale candidate still valid (pane exists)', {
-          sessionId: session.id,
-          tmuxTarget
-        });
+      // Stop after 50 per cycle to avoid rate limiting
+      if (cleaned >= 50) {
+        logger.info('Orphan cleanup batch complete, will continue next cycle', { cleaned, remaining: orphaned.length - cleaned });
+        break;
       }
     }
   }

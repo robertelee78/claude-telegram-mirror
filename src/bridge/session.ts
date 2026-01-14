@@ -413,6 +413,20 @@ export class SessionManager {
   }
 
   /**
+   * Get ended sessions with orphaned thread_ids (topic deletion failed)
+   * These need their topics cleaned up
+   */
+  getOrphanedThreadSessions(): Session[] {
+    const rows = this.db.prepare(`
+      SELECT * FROM sessions
+      WHERE status = 'ended' AND thread_id IS NOT NULL
+      ORDER BY last_activity ASC
+    `).all() as SessionRow[];
+
+    return rows.map(row => this.rowToSession(row));
+  }
+
+  /**
    * Check if a tmux target belongs to a different active session (BUG-003)
    * Used to detect if a pane was recycled for a new Claude session
    */
