@@ -474,7 +474,8 @@ export class BridgeDaemon extends EventEmitter {
    * Clean up stale sessions (BUG-003)
    * Conditions for cleanup:
    * 1. lastActivity > staleSessionTimeoutHours (default 72h)
-   * 2. AND (tmux pane doesn't exist OR tmux pane belongs to different session)
+   * 2. For sessions WITH tmux info: pane must be dead OR reassigned
+   * 3. For sessions WITHOUT tmux info: cleanup based purely on inactivity
    */
   private async cleanupStaleSessions(): Promise<void> {
     const candidates = this.sessions.getStaleSessionCandidates(this.config.staleSessionTimeoutHours);
@@ -487,19 +488,20 @@ export class BridgeDaemon extends EventEmitter {
       const tmuxTarget = session.tmuxTarget;
       const tmuxSocket = session.tmuxSocket;
 
-      // Skip sessions without tmux info (can't verify)
+      // Sessions without tmux info: clean up based purely on inactivity
       if (!tmuxTarget) {
-        logger.debug('Skipping stale candidate without tmux target', { sessionId: session.id });
+        logger.info('Cleaning up stale session (no tmux info)', {
+          sessionId: session.id,
+          lastActivity: session.lastActivity.toISOString()
+        });
+        await this.handleStaleSessionCleanup(session, 'inactivity timeout (no tmux info)');
         continue;
       }
 
-      // Check condition 2a: Does the tmux pane still exist?
+      // Sessions WITH tmux info: check if pane is still alive
       const paneExists = this.isTmuxPaneAlive(tmuxTarget, tmuxSocket);
-
-      // Check condition 2b: Is the pane owned by a different active session?
       const paneReassigned = this.sessions.isTmuxTargetOwnedByOtherSession(tmuxTarget, session.id);
 
-      // Only clean up if pane is gone OR reassigned
       if (!paneExists || paneReassigned) {
         const reason = !paneExists ? 'pane no longer exists' : 'pane reassigned to another session';
         logger.info('Cleaning up stale session', {
@@ -508,7 +510,6 @@ export class BridgeDaemon extends EventEmitter {
           reason,
           lastActivity: session.lastActivity.toISOString()
         });
-
         await this.handleStaleSessionCleanup(session, reason);
       } else {
         logger.debug('Stale candidate still valid (pane exists)', {
