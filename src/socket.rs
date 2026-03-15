@@ -1,9 +1,11 @@
 use crate::error::{AppError, Result};
 use crate::types::BridgeMessage;
 use nix::fcntl::{Flock, FlockArg};
+use nix::sys::stat::{umask, Mode};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, mpsc};
@@ -131,13 +133,16 @@ impl SocketServer {
             fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
         }
 
-        // Step 4: Bind the listener
+        // Step 4: Bind the listener with restrictive umask (MED-05: prevent brief 0755 window)
+        let old_mask = umask(Mode::from_bits_truncate(0o177));
         let listener = UnixListener::bind(&self.socket_path).map_err(|e| {
+            umask(old_mask);
             self.release_pid_lock();
             AppError::Io(e)
         })?;
+        umask(old_mask);
 
-        // Security fix #3: Set socket file permissions to 0o600
+        // Ensure socket file permissions are 0o600 (belt-and-suspenders with umask)
         fs::set_permissions(&self.socket_path, fs::Permissions::from_mode(0o600))?;
 
         tracing::info!(
@@ -151,6 +156,9 @@ impl SocketServer {
         let (broadcast_tx, _) = broadcast::channel::<BridgeMessage>(256);
         let broadcast_tx_clone = broadcast_tx.clone();
 
+        // HIGH-05: Limit concurrent connections to prevent DoS
+        let conn_semaphore = Arc::new(tokio::sync::Semaphore::new(64));
+
         // Accept connections in background
         tokio::spawn(async move {
             loop {
@@ -158,7 +166,16 @@ impl SocketServer {
                     Ok((stream, _addr)) => {
                         let tx = msg_tx.clone();
                         let btx = broadcast_tx_clone.clone();
+                        let permit = match conn_semaphore.clone().try_acquire_owned() {
+                            Ok(p) => p,
+                            Err(_) => {
+                                tracing::warn!("Max connections reached, rejecting");
+                                drop(stream);
+                                continue;
+                            }
+                        };
                         tokio::spawn(async move {
+                            let _permit = permit; // released when task ends
                             if let Err(e) = handle_client_connection(stream, tx, btx).await {
                                 tracing::debug!("Client connection ended: {}", e);
                             }
@@ -213,9 +230,14 @@ async fn handle_client_connection(
     });
 
     // Read NDJSON lines from client
+    const MAX_LINE_BYTES: usize = 1_048_576; // HIGH-04: 1 MiB per-line limit
     while let Ok(Some(line)) = lines.next_line().await {
         let line = line.trim().to_string();
         if line.is_empty() {
+            continue;
+        }
+        if line.len() > MAX_LINE_BYTES {
+            tracing::warn!(len = line.len(), "Oversized NDJSON line, dropping");
             continue;
         }
 

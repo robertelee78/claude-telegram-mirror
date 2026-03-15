@@ -8,6 +8,18 @@ use teloxide::types::{
     ChatId, InlineKeyboardButton, InlineKeyboardMarkup, MessageId, ParseMode, ThreadId,
 };
 
+/// Scrub bot token from error messages to prevent credential leakage.
+/// Teloxide wraps reqwest errors that include the full API URL with token.
+fn scrub_telegram_error(err: &teloxide::RequestError) -> String {
+    let raw = err.to_string();
+    // Telegram API URLs contain the token: /bot<TOKEN>/method
+    // Scrub anything that looks like a bot token (numeric:alphanumeric)
+    let re = regex::Regex::new(r"bot\d+:[A-Za-z0-9_-]+/").unwrap_or_else(|_| {
+        regex::Regex::new(r"$^").unwrap() // fallback: match nothing
+    });
+    re.replace_all(&raw, "bot<REDACTED>/").to_string()
+}
+
 /// Telegram Bot wrapper with rate limiting and forum topic support
 pub struct TelegramBot {
     bot: Bot,
@@ -71,7 +83,8 @@ impl TelegramBot {
             req = req.message_thread_id(ThreadId(MessageId(tid)));
         }
 
-        req.await.map_err(|e| AppError::Telegram(e.to_string()))
+        req.await
+            .map_err(|e| AppError::Telegram(scrub_telegram_error(&e)))
     }
 
     /// Send a message with inline keyboard buttons
@@ -115,7 +128,8 @@ impl TelegramBot {
             req = req.message_thread_id(ThreadId(MessageId(tid)));
         }
 
-        req.await.map_err(|e| AppError::Telegram(e.to_string()))
+        req.await
+            .map_err(|e| AppError::Telegram(scrub_telegram_error(&e)))
     }
 
     /// Create a forum topic
@@ -210,7 +224,8 @@ impl TelegramBot {
             req = req.parse_mode(pm);
         }
 
-        req.await.map_err(|e| AppError::Telegram(e.to_string()))?;
+        req.await
+            .map_err(|e| AppError::Telegram(scrub_telegram_error(&e)))?;
         Ok(())
     }
 
@@ -223,19 +238,20 @@ impl TelegramBot {
             req = req.text(t);
         }
 
-        req.await.map_err(|e| AppError::Telegram(e.to_string()))?;
+        req.await
+            .map_err(|e| AppError::Telegram(scrub_telegram_error(&e)))?;
         Ok(())
     }
 
     /// Poll for updates (long polling)
-    pub async fn get_updates(&self, offset: i32) -> Result<Vec<Update>> {
+    pub async fn get_updates(&self, offset: i64) -> Result<Vec<Update>> {
         let updates = self
             .bot
             .get_updates()
-            .offset(offset)
+            .offset(offset as i32)
             .timeout(30)
             .await
-            .map_err(|e| AppError::Telegram(e.to_string()))?;
+            .map_err(|e| AppError::Telegram(scrub_telegram_error(&e)))?;
 
         Ok(updates)
     }

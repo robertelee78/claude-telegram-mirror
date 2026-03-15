@@ -174,6 +174,21 @@ impl BridgeShared {
         msg: BridgeMessage,
         _broadcast_tx: &broadcast::Sender<BridgeMessage>,
     ) -> Result<()> {
+        // CRIT-02: Validate session_id to prevent unbounded memory growth
+        const MAX_SESSION_ID_LEN: usize = 128;
+        if msg.session_id.len() > MAX_SESSION_ID_LEN
+            || !msg
+                .session_id
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+        {
+            tracing::warn!(
+                len = msg.session_id.len(),
+                "Rejecting message with invalid session_id"
+            );
+            return Ok(());
+        }
+
         tracing::debug!(msg_type = ?msg.msg_type, session_id = %msg.session_id, "Socket message");
 
         // Update session activity
@@ -577,13 +592,14 @@ impl BridgeShared {
     // ============ Telegram Update Handling (Telegram -> CLI) ============
 
     async fn poll_telegram_updates(&self) {
-        let mut offset = 0i32;
+        let mut offset = 0i64;
 
         loop {
             match self.bot.get_updates(offset).await {
                 Ok(updates) => {
                     for update in &updates {
-                        offset = update.id.0 as i32 + 1;
+                        // HIGH-06: Use i64 to prevent u32->i32 overflow at i32::MAX
+                        offset = (update.id.0 as i64) + 1;
 
                         // Security fix #5: Chat ID filter on ALL updates
                         if !bot::is_authorized_chat(update, self.config.chat_id) {
@@ -826,6 +842,21 @@ impl BridgeShared {
                 let approval = sessions.get_approval(id);
 
                 if let Some(approval) = approval {
+                    // HIGH-03: Verify approval belongs to this chat (prevent IDOR)
+                    if let Some(session) = sessions.get_session(&approval.session_id) {
+                        if session.chat_id != self.config.chat_id {
+                            tracing::warn!(
+                                approval_id = %id,
+                                "Approval belongs to different chat, rejecting"
+                            );
+                            let _ = self
+                                .bot
+                                .answer_callback_query(&query.id, Some("Unauthorized"))
+                                .await;
+                            return;
+                        }
+                    }
+
                     let status = match action {
                         "approve" => "approved",
                         "reject" | "abort" => "rejected",
