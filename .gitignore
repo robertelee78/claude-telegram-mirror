@@ -1,8 +1,5 @@
-# Dependencies
-node_modules/
-
-# Build output
-dist/
+# Build output (Rust)
+target/
 
 # Environment and secrets
 .env
@@ -34,6 +31,3 @@ Thumbs.db
 
 # Claude Flow metrics (generated)
 .claude-flow/metrics/
-
-# npm
-npm-debug.log*

@@ -1,183 +1,159 @@
-# Claude Code Telegram Mirror
+# Claude Code Rust Telegram
 
-[![npm version](https://img.shields.io/npm/v/claude-telegram-mirror.svg)](https://www.npmjs.com/package/claude-telegram-mirror)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Rust](https://img.shields.io/badge/Rust-1.75%2B-orange.svg)](https://www.rust-lang.org/)
 
-Bidirectional communication between Claude Code CLI and Telegram. Control your Claude Code sessions from your phone.
+Bidirectional communication between Claude Code CLI and Telegram, written in Rust. Control your Claude Code sessions from your phone.
 
 **Supported platforms:** Linux, macOS
 
 ## Installation
 
+### From source
+
 ```bash
-npm install -g claude-telegram-mirror
-ctm setup    # Interactive setup wizard
+git clone https://github.com/DreamLab-AI/Claude-Code-Rust-Telegram.git
+cd Claude-Code-Rust-Telegram
+cargo build --release
+# Binary at target/release/ctm
 ```
 
-The setup wizard guides you through:
-1. Creating a Telegram bot via @BotFather
-2. Disabling privacy mode (critical for group messages)
-3. Setting up a supergroup with Topics
-4. Verifying bot permissions
-5. Installing hooks and the system service
+### Quick start
+
+```bash
+# 1. Build
+cargo build --release
+
+# 2. Run setup wizard
+./target/release/ctm setup
+
+# 3. Start the bridge daemon
+./target/release/ctm start
+
+# 4. Run Claude Code in tmux
+tmux new -s claude
+claude
+```
 
 ## Features
 
 - **CLI to Telegram**: Mirror Claude's responses, tool usage, and notifications
 - **Telegram to CLI**: Send prompts from Telegram directly to Claude Code
-- **Stop/Interrupt**: Type `stop` in Telegram to send Ctrl+C and halt Claude mid-process
+- **Stop/Interrupt**: Type `stop` in Telegram to send Escape and halt Claude mid-process
+- **Kill**: Type `kill` to send Ctrl-C and exit Claude entirely
 - **Session Threading**: Each Claude session gets its own Forum Topic
-- **Multi-System Support**: Run separate daemons on multiple machines
+- **Tool Approval**: Approve/reject tool executions via inline keyboard buttons
 - **Compaction Notifications**: Get notified when Claude summarizes context
+- **Multi-System Support**: Run separate daemons on multiple machines with shared group
+- **Auto-cleanup**: Stale sessions and forum topics are cleaned up automatically
 
-## Quick Start
+## Security
 
-```bash
-# 1. Install globally
-npm install -g claude-telegram-mirror
+This is a complete Rust rewrite that fixes 10 security vulnerabilities (3 CRITICAL, 4 HIGH, 3 MEDIUM) from the original TypeScript implementation:
 
-# 2. Run interactive setup (creates bot, configures everything)
-ctm setup
+| Fix | Description |
+|-----|-------------|
+| No shell interpolation | All tmux commands use `Command::new().arg()` - zero injection surface |
+| Restrictive file permissions | Config: 0o600, directories: 0o700 |
+| Atomic PID locking | `flock(2)` eliminates TOCTOU race conditions |
+| Chat ID validation | Verified on ALL update types including callbacks |
+| Rate limiting | Token-bucket via `governor` crate |
+| Safe JSON parsing | All `serde_json` calls return `Result`, no panics |
 
-# 3. Start the daemon
-ctm start
-
-# 4. Run Claude in tmux
-tmux new -s claude
-claude
-```
+See [docs/PRD.md](docs/PRD.md) for the full vulnerability matrix and [docs/adr/](docs/adr/) for architectural decision records.
 
 ## CLI Commands
 
 ```bash
-# Setup & diagnostics
+ctm start              # Start bridge daemon (foreground)
+ctm hook               # Process hook events from stdin (called by Claude Code)
+ctm status             # Show daemon status and configuration
+ctm doctor             # Run diagnostics and validate configuration
+ctm doctor --fix       # Auto-fix issues where possible
 ctm setup              # Interactive setup wizard
-ctm doctor             # Diagnose configuration issues
-
-# Daemon control
-ctm start              # Start daemon (foreground mode)
-ctm stop               # Stop running daemon
-ctm stop --force       # Force stop if graceful shutdown fails
-ctm restart            # Restart daemon
-ctm status             # Show daemon status, config, and hooks
-ctm config --test      # Test Telegram connection
-
-# Hook management
-ctm install-hooks      # Install global hooks
-ctm install-hooks -p   # Install to current project's .claude/
-ctm uninstall-hooks    # Remove hooks
-ctm hooks              # Show hook status
-
-# OS service management (optional, for auto-start on boot)
-ctm service install    # Install as systemd/launchd service
-ctm service uninstall  # Remove system service
-ctm service start      # Start via service manager
-ctm service stop       # Stop via service manager
-ctm service restart    # Restart via service manager
-ctm service status     # Show service status
 ```
-
-**Note:** The top-level `ctm stop` and `ctm restart` commands work for both direct daemon mode and OS service mode. They automatically detect how the daemon is running and use the appropriate method.
 
 ## Telegram Commands
 
-Once connected, you can control Claude from Telegram:
+Once connected, control Claude from Telegram:
 
-| Command | Action |
-|---------|--------|
+| Input | Action |
+|-------|--------|
 | Any text | Sends to Claude as input |
-| `stop` | Sends Escape to pause Claude |
-| `kill` | Sends Ctrl-C to exit Claude entirely |
-
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for additional command aliases.
+| `stop` / `esc` / `escape` | Sends Escape to pause Claude |
+| `kill` / `exit` / `quit` / `ctrl-c` | Sends Ctrl-C to exit Claude |
+| `cc clear` | Sends `/clear` to Claude |
+| `cc compact` | Sends `/compact` to Claude |
+| `/status` | Show active sessions |
+| `/help` | Show available commands |
+| `/ping` | Health check |
 
 ### Tool Approval Buttons
 
-When Claude requests to use a tool that requires permission (Write, Edit, Bash with non-safe commands), you'll see approval buttons in Telegram:
+When Claude requests tool permission, you'll see inline keyboard buttons:
 
 | Button | Action |
 |--------|--------|
-| **Approve** | Allow the tool to execute |
-| **Reject** | Deny this specific tool execution |
-| **Abort** | Stop the entire Claude session |
-| **Details** | View full tool input parameters |
-
-**Note:** Approval buttons only appear when running Claude in normal mode. They do not appear when using `--dangerously-skip-permissions` mode. If you don't respond within 5 minutes, Claude will fall back to asking for approval in the CLI terminal.
+| Approve | Allow the tool to execute |
+| Reject | Deny this specific tool execution |
+| Abort | Stop the entire Claude session |
+| Details | View full tool input parameters |
 
 ## Architecture
 
 ```
 ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│   Claude Code   │────▶│  Bridge Daemon  │────▶│    Telegram     │
-│      CLI        │◀────│                 │◀────│      Bot        │
+│   Claude Code   │────>│  Bridge Daemon  │────>│    Telegram     │
+│      CLI        │<────│   (Rust/ctm)    │<────│      Bot        │
 └─────────────────┘     └─────────────────┘     └─────────────────┘
         │                       │
-        │ hooks                 │ Unix socket
-        ▼                       ▼
+        │ hooks                 │ Unix socket (NDJSON)
+        v                       v
 ┌─────────────────┐     ┌─────────────────┐
-│  PreToolUse:    │────▶│  Socket Server  │
-│  Node.js handler│◀────│  (bidirectional)│
-│  (with approval)│     │                 │
-├─────────────────┤     │                 │
-│  Other hooks:   │────▶│                 │
-│  Bash script    │     │                 │
+│  Hook handler   │────>│  Socket Server  │
+│  (ctm hook)     │     │  flock PID lock │
+├─────────────────┤     │  0o600 perms    │
+│  Bash script    │────>│                 │
 │  (fire & forget)│     │                 │
 └─────────────────┘     └─────────────────┘
 ```
 
-**Flow:**
+### Components
+
+| Module | Responsibility |
+|--------|---------------|
+| `main.rs` | CLI entrypoint with clap subcommands |
+| `bridge.rs` | Central orchestrator: socket + telegram + sessions |
+| `bot.rs` | Telegram API wrapper with rate limiting (governor) |
+| `socket.rs` | Unix socket server with flock(2) PID locking |
+| `session.rs` | SQLite session management (rusqlite) |
+| `hook.rs` | Claude Code hook event processing |
+| `injector.rs` | tmux command injection (Command::arg, no shell) |
+| `config.rs` | Configuration: env > file > defaults, secure perms |
+| `formatting.rs` | Message formatting, ANSI stripping, chunking |
+| `types.rs` | Shared types: BridgeMessage, HookEvent, Session |
+| `error.rs` | Error types via thiserror |
+
+### Message Flow
+
 1. Claude Code hooks capture events (prompts, responses, tool use)
-2. PreToolUse: Node.js handler sends approval request, waits for Telegram response
-3. Other hooks: Bash script sends JSON and exits immediately (faster)
-4. Bridge forwards messages to Telegram Forum Topic
-5. Telegram replies are injected into CLI via `tmux send-keys`
-6. Stop commands send `Ctrl-C` to interrupt Claude
-
-## Multi-System Architecture
-
-When running Claude Code on multiple machines, each system needs its own bot to avoid Telegram API conflicts (error 409: only one polling connection per bot token is allowed).
-
-**The model:**
-- **One daemon per host** - Each machine runs its own bridge daemon
-- **One bot per daemon** - Each daemon uses a unique Telegram bot
-- **Multiple sessions per host** - One daemon handles all Claude sessions on that machine
-- **Shared supergroup** - All bots post to the same Telegram supergroup
-
-### Setup for Multiple Systems
-
-1. **Create one bot per system** via [@BotFather](https://t.me/botfather)
-   - System A: `@claude_mirror_system_a_bot`
-   - System B: `@claude_mirror_system_b_bot`
-
-2. **Add all bots to the same supergroup** with admin permissions
-
-3. **Configure each system** with its own bot token:
-   ```bash
-   # On System A (~/.telegram-env)
-   export TELEGRAM_BOT_TOKEN="token-for-system-a-bot"
-   export TELEGRAM_CHAT_ID="-100shared-group-id"
-
-   # On System B (~/.telegram-env)
-   export TELEGRAM_BOT_TOKEN="token-for-system-b-bot"
-   export TELEGRAM_CHAT_ID="-100shared-group-id"  # Same group!
-   ```
-
-4. **Each daemon creates topics for its sessions** - Messages route correctly because each daemon only processes topics it created.
+2. `ctm hook` reads stdin JSON, forwards to bridge via unix socket
+3. Bridge routes messages to the correct Telegram Forum Topic
+4. Telegram replies are injected into CLI via `tmux send-keys`
+5. Stop/kill commands send Escape or Ctrl-C to interrupt Claude
 
 ## Prerequisites
 
-- Node.js 18+
+- Rust 1.75+ (for building from source)
 - Claude Code CLI
 - tmux (for bidirectional communication)
-- jq (JSON processing)
-- nc (netcat, for socket communication)
 - Telegram account
 
 ## Telegram Setup
 
 ### 1. Create a Bot
 
-1. Message [@BotFather](https://t.me/botfather) → `/newbot`
+1. Message [@BotFather](https://t.me/botfather) -> `/newbot`
 2. Choose name and username (must end in `bot`)
 3. Save the API token
 
@@ -185,195 +161,179 @@ When running Claude Code on multiple machines, each system needs its own bot to 
 
 1. Create a new group in Telegram
 2. Add your bot to the group
-3. Group Settings → Enable **Topics**
+3. Group Settings -> Enable **Topics**
 
 ### 3. Make Bot an Admin
 
-1. Group Settings → Administrators → Add your bot
+1. Group Settings -> Administrators -> Add your bot
 2. Enable: **Manage Topics**, **Post Messages**
 
-### 4. Get Chat ID
+### 4. Disable Privacy Mode
 
-1. Send any message in the group
-2. Run the helper script:
-   ```bash
-   ./scripts/get-chat-id.sh YOUR_BOT_TOKEN
-   ```
-   Or manually: `https://api.telegram.org/botYOUR_TOKEN/getUpdates`
-3. Copy the chat ID (supergroups start with `-100`)
+1. [@BotFather](https://t.me/botfather) -> `/mybots` -> Select bot
+2. Bot Settings -> Group Privacy -> **Turn off**
 
-### 5. Disable Privacy Mode
+### 5. Get Chat ID
 
-1. [@BotFather](https://t.me/botfather) → `/mybots` → Select bot
-2. Bot Settings → Group Privacy → **Turn off**
+```bash
+./scripts/get-chat-id.sh YOUR_BOT_TOKEN
+```
+
+Or manually visit: `https://api.telegram.org/botYOUR_TOKEN/getUpdates`
+
+Supergroup chat IDs start with `-100`.
 
 ## Configuration
 
 ### Environment Variables
 
-Create `~/.telegram-env`:
-
 ```bash
 export TELEGRAM_BOT_TOKEN="123456789:ABCdefGHIjklMNOpqrsTUVwxyz"
 export TELEGRAM_CHAT_ID="-1001234567890"
 export TELEGRAM_MIRROR=true
+
 # Optional:
-# export TELEGRAM_MIRROR_VERBOSE=true
+# export TELEGRAM_MIRROR_VERBOSE=true       # Show tool start/result messages
+# export TELEGRAM_USE_THREADS=true          # Use forum topics (default: true)
+# export TELEGRAM_AUTO_DELETE_TOPICS=true   # Delete topics on session end
+# export TELEGRAM_TOPIC_DELETE_DELAY=5      # Minutes before topic deletion
 # export TELEGRAM_BRIDGE_SOCKET=~/.config/claude-telegram-mirror/bridge.sock
-# export TELEGRAM_STALE_SESSION_TIMEOUT_HOURS=72  # Auto-cleanup dead sessions (default: 72)
-```
-
-Source in your shell profile (`~/.bashrc` or `~/.zshrc`):
-
-```bash
-[[ -f ~/.telegram-env ]] && source ~/.telegram-env
 ```
 
 ### Config File (Alternative)
 
-The `ctm setup` wizard creates `~/.config/claude-telegram-mirror/config.json`:
+`~/.config/claude-telegram-mirror/config.json`:
 
 ```json
 {
   "botToken": "your-token",
   "chatId": -1001234567890,
   "enabled": true,
-  "verbose": true
+  "verbose": true,
+  "useThreads": true,
+  "autoDeleteTopics": false
 }
 ```
 
 Environment variables take precedence over config file values.
 
-### Test Connection
+### Claude Code Hook Installation
 
-```bash
-ctm doctor
-# Checks: Node.js, config, hooks, socket, tmux, systemd, Telegram API
+Add to `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [{ "command": "ctm hook" }],
+    "PostToolUse": [{ "command": "ctm hook" }],
+    "Notification": [{ "command": "ctm hook" }],
+    "Stop": [{ "command": "ctm hook" }],
+    "UserPromptSubmit": [{ "command": "ctm hook" }]
+  }
+}
 ```
 
-## Project-Level Hooks
+Or use the fire-and-forget bash script for non-approval hooks:
 
-If your project has `.claude/settings.json` with custom hooks, global hooks are ignored. Install hooks to the project:
-
-```bash
-cd /path/to/your/project
-ctm install-hooks --project
-# or shorthand:
-ctm install-hooks -p
+```json
+{
+  "hooks": {
+    "PreToolUse": [{ "command": "ctm hook" }],
+    "PostToolUse": [{ "command": "scripts/telegram-hook.sh" }],
+    "Notification": [{ "command": "scripts/telegram-hook.sh" }],
+    "Stop": [{ "command": "scripts/telegram-hook.sh" }],
+    "UserPromptSubmit": [{ "command": "scripts/telegram-hook.sh" }]
+  }
+}
 ```
 
-The installer will prompt you to set up project-level hooks during installation. You can also add them later to any project.
+## Multi-System Architecture
 
-## How Messages Flow
+When running Claude Code on multiple machines:
 
-| Direction | Event | Display |
-|-----------|-------|---------|
-| CLI → Telegram | User types | 👤 User (cli): ... |
-| CLI → Telegram | Tool starts | 🔧 Running: Bash |
-| CLI → Telegram | Claude responds | 🤖 Claude: ... |
-| CLI → Telegram | Session starts | New Forum Topic created |
-| CLI → Telegram | Context compacting | ⏳ Notification sent |
-| Telegram → CLI | User sends message | Injected via tmux |
-| Telegram → CLI | User types "stop" | Sends Ctrl+C interrupt |
+- **One daemon per host** - Each machine runs its own bridge daemon
+- **One bot per daemon** - Each daemon uses a unique Telegram bot token
+- **Shared supergroup** - All bots post to the same Telegram supergroup
+- **Isolated topics** - Each daemon only processes topics it created
+
+Create one bot per system via [@BotFather](https://t.me/botfather) and add all bots to the same supergroup with admin permissions.
 
 ## Technical Details
 
 - **Session storage**: SQLite at `~/.config/claude-telegram-mirror/sessions.db`
 - **Socket path**: `~/.config/claude-telegram-mirror/bridge.sock`
-- **Response extraction**: Reads Claude's transcript `.jsonl` on Stop event
+- **PID lock**: `~/.config/claude-telegram-mirror/bridge.pid` (flock-based)
+- **Protocol**: NDJSON over Unix domain socket
+- **Rate limiting**: 25 requests/second via governor token-bucket
 - **Deduplication**: Telegram-originated messages tracked to prevent echo
-- **Topic routing**: Each daemon only processes topics it created (multi-bot safe)
-- **Compaction alerts**: PreCompact hook sends notification before context summarization
+- **Stale cleanup**: Sessions without tmux after 1h, dead panes after 24h
 
 ## Troubleshooting
 
-Run the diagnostic tool first:
-
 ```bash
-ctm doctor
+ctm doctor       # Run all diagnostics
+ctm doctor --fix # Auto-fix permissions and config issues
 ```
-
-This checks all common issues and provides fix suggestions.
 
 ### Common Issues
 
-**Hooks not firing?**
-- Check if project has local `.claude/settings.json` overriding globals
-- Run `ctm install-hooks -p` from project directory
-- Restart Claude Code after installing hooks
+**Bridge not starting?**
+- Check for existing instance: another daemon may hold the flock
+- Run `ctm doctor` to diagnose
 
-**409 Conflict error?**
-- Only one polling connection per bot token is allowed
-- If running multiple systems, each needs its own bot (see Multi-System Architecture)
-- Kill duplicate daemons: `pkill -f "claude-telegram-mirror"`
-
-**Bridge not receiving events?**
-- Check socket: `ls -la ~/.config/claude-telegram-mirror/bridge.sock`
-- Enable debug: `export TELEGRAM_HOOK_DEBUG=1` then retry
-- Check debug log: `cat ~/.config/claude-telegram-mirror/hook-debug.log`
+**Messages not appearing in Telegram?**
+- Verify bot token and chat ID: `ctm doctor`
+- Check bot has admin permissions in the supergroup
+- Ensure Topics are enabled in group settings
 
 **tmux injection not working?**
 - Verify tmux session: `tmux list-sessions`
-- Check daemon logs for "Session tmux target stored"
+- Ensure Claude Code is running inside tmux
 
-**Messages going to wrong topic?**
-- Clear session DB: `rm ~/.config/claude-telegram-mirror/sessions.db`
+**409 Conflict error?**
+- Only one polling connection per bot token is allowed
+- Each machine needs its own bot token
 
-**Service not starting (Linux)?**
-- Check status: `systemctl --user status claude-telegram-mirror`
-- View logs: `journalctl --user -u claude-telegram-mirror -f`
-- Enable linger: `loginctl enable-linger $USER`
-
-**Service not starting (macOS)?**
-- Check status: `launchctl list | grep claude`
-- View logs: `cat ~/Library/Logs/claude-telegram-mirror.*.log`
-- Check permissions: Ensure Terminal has Accessibility access
-
-## Manual Setup (for developers)
-
-<details>
-<summary>Click to expand manual installation steps</summary>
-
-For developers who want to work on the source code:
+## Development
 
 ```bash
-# 1. Clone and build
-git clone https://github.com/robertelee78/claude-telegram-mirror.git
-cd claude-telegram-mirror && npm install && npm run build
+# Build
+cargo build
 
-# 2. Create a Telegram bot via @BotFather, get the token
+# Build release
+cargo build --release
 
-# 3. Create a supergroup with Topics enabled, add your bot as admin
+# Run tests
+cargo test
 
-# 4. Get your chat ID
-./scripts/get-chat-id.sh YOUR_BOT_TOKEN
+# Run clippy
+cargo clippy
 
-# 5. Configure environment
-cat > ~/.telegram-env << 'EOF'
-export TELEGRAM_BOT_TOKEN="your-token-here"
-export TELEGRAM_CHAT_ID="-100your-chat-id"
-export TELEGRAM_MIRROR=true
-EOF
-
-# 6. Install hooks
-node dist/cli.js install-hooks                    # Global install
-# OR for projects with custom .claude/settings.json:
-cd /path/to/project && node dist/cli.js install-hooks --project
-
-# 7. Start daemon (choose one)
-node dist/cli.js start                            # Foreground (for testing)
-node dist/cli.js service install && \
-node dist/cli.js service start                    # As system service (recommended)
+# Format
+cargo fmt
 ```
 
-**Note:** When using npm install, use `ctm` instead of `node dist/cli.js`.
+## Documentation
 
-</details>
+| Document | Description |
+|----------|-------------|
+| [Architecture](docs/ARCHITECTURE.md) | System diagrams, message flows, concurrency model |
+| [Setup Guide](docs/SETUP.md) | Step-by-step installation and configuration |
+| [Development](docs/DEVELOPMENT.md) | Building, testing, module deep dives |
+| [Security](docs/SECURITY.md) | Threat model, vulnerability fixes, audit checklist |
+| [Product Requirements](docs/PRD.md) | Full PRD with security vulnerability matrix |
+
+### Architecture Decision Records
+
+| ADR | Decision |
+|-----|----------|
+| [ADR-001](docs/adr/ADR-001-rust-rewrite.md) | Rust over TypeScript |
+| [ADR-002](docs/adr/ADR-002-teloxide.md) | teloxide for Telegram API |
+| [ADR-003](docs/adr/ADR-003-bash-hook-retention.md) | Bash fire-and-forget hooks |
+| [ADR-004](docs/adr/ADR-004-flock-pid-locking.md) | flock(2) atomic PID locking |
+| [ADR-005](docs/adr/ADR-005-governor-rate-limiting.md) | governor token-bucket rate limiting |
+| [ADR-006](docs/adr/ADR-006-single-binary-clap.md) | Single binary with clap CLI |
 
 ## License
 
 MIT
-
-## Credits
-
-Built for remote Claude Code interaction from mobile devices.

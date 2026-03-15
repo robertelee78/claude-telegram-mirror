@@ -1,593 +1,440 @@
-# Claude Telegram Mirror - Architecture
+# Architecture Guide
 
-A bidirectional bridge that mirrors Claude Code CLI sessions to Telegram, enabling remote monitoring and interaction.
+## System Overview
 
-## Overview
+Claude Code Rust Telegram (CTM) is a bidirectional bridge between Claude Code CLI sessions and Telegram. It captures Claude Code hook events, forwards them to Telegram, and injects Telegram replies back into the CLI via tmux.
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                              System Architecture                            │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│  ┌──────────────┐     Unix Socket      ┌──────────────┐     Telegram API    │
-│  │  Claude Code │ ──────────────────▶  │    Bridge    │ ─────────────────▶  │
-│  │     CLI      │                      │    Daemon    │                     │
-│  │   (tmux)     │ ◀──────────────────  │              │ ◀─────────────────  │
-│  └──────────────┘    tmux send-keys    └──────────────┘                     │
-│        │                                     │                              │
-│        │ hooks                               │ SQLite                       │
-│        ▼                                     ▼                              │
-│  ┌──────────────┐                     ┌──────────────┐                      │
-│  │ PreToolUse:  │◀──────────────────▶ │ sessions.db  │                      │
-│  │ handler.ts   │  bidirectional      │              │                      │
-│  │ (approval)   │  request/response   └──────────────┘                      │
-│  ├──────────────┤                                                           │
-│  │ Other hooks: │                                                           │
-│  │ telegram-    │──────────────────▶  fire & forget                         │
-│  │ hook.sh      │                                                           │
-│  └──────────────┘                                                           │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+```mermaid
+graph TB
+    subgraph "Developer Machine"
+        CC[Claude Code CLI]
+        TMUX[tmux session]
+        CC -->|runs inside| TMUX
+    end
 
-## Components
+    subgraph "CTM Bridge Daemon"
+        HOOK[Hook Handler<br/>ctm hook]
+        SOCK[Socket Server<br/>Unix socket + flock]
+        BRIDGE[Bridge Orchestrator]
+        BOT[Telegram Bot<br/>teloxide + governor]
+        SESSION[Session Manager<br/>SQLite + rusqlite]
+        INJ[Input Injector<br/>Command::arg]
 
-| Component | File | Purpose |
-|-----------|------|---------|
-| **CLI** | `src/cli.ts` | Entry point, commands, daemon lifecycle |
-| **BridgeDaemon** | `src/bridge/daemon.ts` | Central orchestrator |
-| **SocketServer** | `src/bridge/socket.ts` | Unix socket IPC |
-| **SessionManager** | `src/bridge/session.ts` | SQLite persistence |
-| **InputInjector** | `src/bridge/injector.ts` | tmux input injection |
-| **TelegramBot** | `src/bot/telegram.ts` | Telegram API wrapper |
-| **PreToolUse Handler** | `src/hooks/handler.ts` | Approval buttons, async bidirectional |
-| **Hook Script (Bash)** | `scripts/telegram-hook.sh` | Other hooks, fast fire-and-forget |
+        HOOK -->|NDJSON| SOCK
+        SOCK -->|mpsc channel| BRIDGE
+        BRIDGE --> BOT
+        BRIDGE --> SESSION
+        BRIDGE --> INJ
+    end
 
----
+    subgraph "Telegram"
+        TG[Telegram API]
+        GROUP[Supergroup with Topics]
+        PHONE[Mobile App]
 
-## Message Flows
+        TG --> GROUP
+        GROUP --> PHONE
+    end
 
-### Flow 1: CLI → Telegram
+    CC -->|hooks stdin/stdout| HOOK
+    BOT -->|send messages| TG
+    TG -->|long polling| BOT
+    INJ -->|tmux send-keys| TMUX
+    PHONE -->|user replies| TG
 
-```
-┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐
-│ Claude Code │    │    Hook     │    │   Bridge    │    │  Telegram   │
-│    fires    │───▶│   Script    │───▶│   Daemon    │───▶│    API      │
-│    hook     │    │             │    │             │    │             │
-└─────────────┘    └─────────────┘    └─────────────┘    └─────────────┘
-                         │                  │
-                         │ NDJSON           │ Routes to
-                         │ via socket       │ forum topic
-                         ▼                  ▼
-                   ┌─────────────┐    ┌─────────────┐
-                   │ bridge.sock │    │ Topic #123  │
-                   └─────────────┘    └─────────────┘
+    style BRIDGE fill:#f96,stroke:#333,stroke-width:2px
+    style SOCK fill:#69f,stroke:#333,stroke-width:2px
+    style BOT fill:#9f6,stroke:#333,stroke-width:2px
 ```
 
-**Hook Events Captured:**
-- `PreToolUse` → `tool_start` (+ approval workflow)
-- `PostToolUse` → `tool_result`
-- `Stop` → `agent_response` + `turn_complete`
-- `UserPromptSubmit` → `user_input`
-- `PreCompact` → `pre_compact` (context compaction warning)
+## Module Dependency Graph
 
-**Note:** Hooks are stateless (v0.1.15+). They do NOT track session state or emit `session_start`. The daemon creates sessions on-the-fly when the first event arrives for a new session.
+```mermaid
+graph LR
+    MAIN[main.rs] --> BRIDGE[bridge.rs]
+    MAIN --> CONFIG[config.rs]
+    MAIN --> HOOK[hook.rs]
+    MAIN --> SESSION[session.rs]
+    MAIN --> INJ[injector.rs]
 
-**Key Functions:**
-1. `telegram-hook.sh::format_message()` - Constructs typed messages
-2. `telegram-hook.sh::send_to_bridge()` - Sends via Unix socket
-3. `daemon.ts::setupSocketHandlers()` - Routes by message type
-4. `daemon.ts::ensureSessionExists()` - Creates session + topic on first event
-5. `daemon.ts::handleSessionStart()` - Creates forum topic (called by ensureSessionExists)
-6. `bot.sendMessage()` - Delivers to Telegram
+    BRIDGE --> BOT[bot.rs]
+    BRIDGE --> SOCKET[socket.rs]
+    BRIDGE --> SESSION
+    BRIDGE --> INJ
+    BRIDGE --> CONFIG
+    BRIDGE --> FMT[formatting.rs]
 
-### Flow 2: Telegram → CLI
+    HOOK --> TYPES[types.rs]
+    HOOK --> INJ
 
-```
-┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐
-│  Telegram   │    │   Bridge    │    │   Input     │    │ Claude Code │
-│    User     │───▶│   Daemon    │───▶│  Injector   │───▶│    CLI      │
-│   replies   │    │             │    │             │    │  (tmux)     │
-└─────────────┘    └─────────────┘    └─────────────┘    └─────────────┘
-                         │                  │
-                         │ Lookup           │ tmux -S socket
-                         │ session          │ send-keys -t target
-                         ▼                  ▼
-                   ┌─────────────┐    ┌─────────────┐
-                   │ sessions.db │    │ tmux 1:0.0  │
-                   └─────────────┘    └─────────────┘
-```
+    BOT --> TYPES
+    SOCKET --> TYPES
+    SESSION --> TYPES
 
-**Key Functions:**
-1. `bot.onMessage()` - Receives Telegram message
-2. `sessions.getSessionByThreadId()` - Finds session by topic
-3. `sessions.getTmuxInfo()` - Gets tmux target + socket
-4. `injector.setTmuxSession()` - Configures target
-5. `injector.injectViaTmux()` - Executes `tmux send-keys`
+    BRIDGE --> TYPES
+    CONFIG --> ERROR[error.rs]
+    SESSION --> ERROR
+    SOCKET --> ERROR
+    BOT --> ERROR
 
----
-
-## Session Mapping
-
-The system maintains a **three-way mapping** for each Claude session:
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                           Session Mapping Chain                             │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│   Claude Session ID ◀───────────────────────────────────▶ Telegram Topic    │
-│   "a1b2c3d4-..."                                          thread_id: 123    │
-│         │                                                                   │
-│         │                                                                   │
-│         ▼                                                                   │
-│   ┌─────────────────────────────────────────────────────────────────────┐   │
-│   │                        SQLite: sessions                             │   │
-│   ├─────────────────────────────────────────────────────────────────────┤   │
-│   │  id              │ thread_id │ tmux_target │ tmux_socket            │   │
-│   │  "a1b2c3d4-..."  │ 123       │ "1:0.0"     │ "/tmp/tmux-1000/default│   │
-│   └─────────────────────────────────────────────────────────────────────┘   │
-│         │                                                                   │
-│         │                                                                   │
-│         ▼                                                                   │
-│   tmux Session ◀────────────────────────────────────────▶ CLI Pane          │
-│   socket: /tmp/tmux-1000/default                          session 1:0.0     │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
+    style BRIDGE fill:#f96,stroke:#333
+    style TYPES fill:#ff9,stroke:#333
+    style ERROR fill:#f99,stroke:#333
 ```
 
-### Mapping Details
+## Message Flow
 
-| Mapping | Source | Storage | Purpose |
-|---------|--------|---------|---------|
-| Session → Topic | `ensureSessionExists()` → `handleSessionStart()` | `thread_id` column | Route messages to correct topic |
-| Session → tmux | `$TMUX` env var in hook | `tmux_target`, `tmux_socket` | Inject input to correct pane |
+### CLI to Telegram (Outbound)
 
-**tmux Auto-Refresh (v0.1.12+):** Every hook event includes current tmux info. If the user moves Claude to a different pane, the daemon auto-updates the mapping when the next event arrives. This self-heals stale targets without user intervention.
+```mermaid
+sequenceDiagram
+    participant CC as Claude Code
+    participant Hook as ctm hook
+    participant Socket as Socket Server
+    participant Bridge as Bridge
+    participant Bot as Telegram Bot
+    participant TG as Telegram
 
-### tmux Target Format
+    CC->>Hook: Hook event (stdin JSON)
+    Hook->>Hook: Parse HookEvent
+    Hook->>Hook: Add tmux metadata
+    Hook->>Socket: Connect + send NDJSON
+    Hook->>CC: Pass through (stdout)
 
-The hook extracts tmux info from the `$TMUX` environment variable:
+    Socket->>Bridge: mpsc::Receiver<BridgeMessage>
+    Bridge->>Bridge: Route by MessageType
 
-```bash
-# $TMUX format: /path/to/socket,pid,window_index
-TMUX="/tmp/tmux-1000/default,12345,1"
+    alt SessionStart
+        Bridge->>Bridge: Create/reactivate session
+        Bridge->>Bot: Create forum topic
+        Bot->>TG: createForumTopic
+        TG-->>Bot: topic_id
+        Bridge->>Bot: Send start notification
+    else AgentResponse
+        Bridge->>Bot: Send formatted response
+    else ToolStart
+        Bridge->>Bot: Send tool preview + Details button
+    else TurnComplete
+        Bridge->>Bridge: Check compaction state
+    end
 
-# Extracted:
-tmux_socket="/tmp/tmux-1000/default"
-tmux_target="session_name:window.pane"  # e.g., "1:0.0"
+    Bot->>TG: sendMessage (thread_id)
 ```
 
-### Persistence & Recovery
+### Telegram to CLI (Inbound)
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                          Daemon Restart Recovery                            │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│  [Before Restart]           [After Restart]                                 │
-│                                                                             │
-│  Memory Cache:              Memory Cache:                                   │
-│  ┌─────────────────┐        ┌─────────────────┐                             │
-│  │ sessionThreads  │        │     (empty)     │                             │
-│  │ sessionTmux     │        │                 │                             │
-│  └─────────────────┘        └────────┬────────┘                             │
-│                                      │                                      │
-│                                      │ Cache miss                           │
-│                                      ▼                                      │
-│  SQLite Database:           SQLite Database:                                │
-│  ┌─────────────────┐        ┌─────────────────┐                             │
-│  │ Persisted data  │ ────▶  │ Restore from DB │                             │
-│  │ survives        │        │ on first access │                             │
-│  └─────────────────┘        └─────────────────┘                             │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+```mermaid
+sequenceDiagram
+    participant User as User (Phone)
+    participant TG as Telegram
+    participant Bot as Telegram Bot
+    participant Bridge as Bridge
+    participant INJ as InputInjector
+    participant TMUX as tmux
 
----
+    User->>TG: Send message in topic
+    TG->>Bot: getUpdates (long poll)
+    Bot->>Bridge: Update event
 
-## Multi-System Architecture
+    Bridge->>Bridge: Validate chat_id (Security #5)
+    Bridge->>Bridge: Find session by thread_id
 
-Multiple hosts can share a single Telegram supergroup:
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                         Multi-System Deployment                             │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐                          │
-│  │   Host A    │  │   Host B    │  │   Host C    │                          │
-│  │  (Linux)    │  │  (macOS)    │  │  (Linux)    │                          │
-│  ├─────────────┤  ├─────────────┤  ├─────────────┤                          │
-│  │ Daemon A    │  │ Daemon B    │  │ Daemon C    │                          │
-│  │ sessions.db │  │ sessions.db │  │ sessions.db │                          │
-│  │ Bot Token A │  │ Bot Token B │  │ Bot Token C │                          │
-│  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘                          │
-│         │                │                │                                 │
-│         └────────────────┼────────────────┘                                 │
-│                          │                                                  │
-│                          ▼                                                  │
-│               ┌─────────────────────┐                                       │
-│               │  Telegram Supergroup│                                       │
-│               │  (shared chat_id)   │                                       │
-│               ├─────────────────────┤                                       │
-│               │ Topic #1 (Host A)   │ ◀── Only Daemon A responds            │
-│               │ Topic #2 (Host B)   │ ◀── Only Daemon B responds            │
-│               │ Topic #3 (Host A)   │ ◀── Only Daemon A responds            │
-│               │ Topic #4 (Host C)   │ ◀── Only Daemon C responds            │
-│               └─────────────────────┘                                       │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
+    alt Regular text
+        Bridge->>Bridge: Dedup check
+        Bridge->>INJ: inject(text)
+        INJ->>TMUX: send-keys -l "text"
+        INJ->>TMUX: send-keys Enter
+    else "stop" / "esc"
+        Bridge->>INJ: send_key("Escape")
+        INJ->>TMUX: send-keys Escape
+    else "kill" / "ctrl-c"
+        Bridge->>INJ: send_key("Ctrl-C")
+        INJ->>TMUX: send-keys C-c
+    else "cc clear"
+        Bridge->>INJ: send_slash_command("/clear")
+        INJ->>TMUX: send-keys -l "/clear" Enter
+    end
 ```
 
-### Topic Ownership
+### Tool Approval Flow
 
-Each daemon only processes topics it created:
+```mermaid
+sequenceDiagram
+    participant CC as Claude Code
+    participant Hook as ctm hook
+    participant Bridge as Bridge
+    participant DB as SQLite
+    participant Bot as Telegram Bot
+    participant User as User (Phone)
 
-```typescript
-// In setupBotHandlers():
-session = this.sessions.getSessionByThreadId(threadId);
-if (!session) {
-  // Topic not in our database = belongs to another daemon
-  // Silently ignore
-  return;
+    CC->>Hook: PreToolUse (stdin)
+    Hook->>Bridge: ToolStart message
+    Bridge->>DB: create_approval()
+    Bridge->>Bot: Send with inline keyboard
+    Bot->>User: [Approve] [Reject] [Abort]
+
+    User->>Bot: Click "Approve"
+    Bot->>Bridge: CallbackQuery
+    Bridge->>DB: resolve_approval("approved")
+    Bridge->>Bot: Edit message + answer query
+
+    Note over CC: Approval is non-blocking.<br/>Claude falls back to CLI<br/>if no response in 5 min.
+```
+
+## Session Lifecycle
+
+```mermaid
+stateDiagram-v2
+    [*] --> Active: First hook event<br/>(auto-created)
+
+    Active --> Active: Hook events<br/>update activity
+
+    Active --> Ended: Stop event<br/>(turn complete)
+
+    Ended --> Active: New hook event<br/>(reactivate)
+
+    Ended --> TopicClosed: auto_delete=false
+    Ended --> PendingDeletion: auto_delete=true
+
+    PendingDeletion --> TopicDeleted: delay expires
+    PendingDeletion --> Active: New event<br/>(cancel deletion)
+
+    Active --> StaleCleanup: No tmux: 1h idle<br/>With tmux: 24h + pane dead
+
+    StaleCleanup --> TopicDeleted: auto_delete=true
+    StaleCleanup --> TopicClosed: auto_delete=false
+
+    TopicClosed --> [*]
+    TopicDeleted --> [*]
+```
+
+## Socket Protocol
+
+CTM uses **NDJSON** (Newline-Delimited JSON) over a Unix domain socket:
+
+```mermaid
+graph LR
+    subgraph "Client (ctm hook)"
+        C1[Connect to socket]
+        C2[Write JSON lines]
+        C3[Shutdown write]
+    end
+
+    subgraph "Server (bridge)"
+        S1[Accept connection]
+        S2[Read lines via BufReader]
+        S3[Parse BridgeMessage]
+        S4[Route to handler]
+    end
+
+    C1 --> S1
+    C2 -->|"NDJSON\n"| S2
+    S2 --> S3
+    S3 --> S4
+```
+
+### BridgeMessage Format
+
+```json
+{
+  "msgType": "tool_start",
+  "sessionId": "session-abc123",
+  "timestamp": "2025-01-15T10:30:00Z",
+  "content": "Tool: Bash",
+  "metadata": {
+    "tool": "Bash",
+    "input": { "command": "cargo test" },
+    "tmuxTarget": "workspace:0.0",
+    "hostname": "dev-machine"
+  }
 }
 ```
 
----
-
-## Database Schema
-
-```sql
--- sessions table
-CREATE TABLE sessions (
-  id TEXT PRIMARY KEY,           -- Claude's session_id
-  chat_id INTEGER NOT NULL,      -- Telegram chat
-  thread_id INTEGER,             -- Telegram topic
-  hostname TEXT,                 -- Machine name
-  tmux_target TEXT,              -- "session:window.pane"
-  tmux_socket TEXT,              -- "/path/to/socket"
-  started_at TEXT NOT NULL,
-  last_activity TEXT NOT NULL,
-  status TEXT DEFAULT 'active',  -- active|ended|aborted
-  project_dir TEXT,
-  metadata TEXT                  -- JSON blob
-);
-
--- pending_approvals table
-CREATE TABLE pending_approvals (
-  id TEXT PRIMARY KEY,
-  session_id TEXT NOT NULL,
-  prompt TEXT NOT NULL,
-  created_at TEXT NOT NULL,
-  expires_at TEXT NOT NULL,
-  status TEXT DEFAULT 'pending', -- pending|approved|rejected|expired
-  message_id INTEGER,
-  FOREIGN KEY (session_id) REFERENCES sessions(id)
-);
-```
-
----
-
-## Configuration
-
-### Environment Variables
-
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `TELEGRAM_BOT_TOKEN` | Yes | - | Bot token from @BotFather |
-| `TELEGRAM_CHAT_ID` | Yes | - | Supergroup ID (starts with `-100`) |
-| `TELEGRAM_MIRROR` | No | `false` | Enable/disable mirroring |
-| `TELEGRAM_MIRROR_VERBOSE` | No | `false` | Verbose logging |
-| `TELEGRAM_USE_THREADS` | No | `true` | Use forum topics |
-| `TELEGRAM_BRIDGE_SOCKET` | No | `~/.config/.../bridge.sock` | Socket path |
-| `TELEGRAM_STALE_SESSION_TIMEOUT_HOURS` | No | `72` | Auto-cleanup threshold for dead sessions |
-
-### File Locations
-
-| File | Purpose |
-|------|---------|
-| `~/.telegram-env` | Environment variables |
-| `~/.config/claude-telegram-mirror/bridge.sock` | Unix socket |
-| `~/.config/claude-telegram-mirror/sessions.db` | SQLite database |
-| `~/.config/claude-telegram-mirror/bridge.pid` | PID lock file |
-
----
-
-## Service Management
-
-### systemd (Linux)
-
-```bash
-# Service file: ~/.config/systemd/user/claude-telegram-mirror.service
-systemctl --user start claude-telegram-mirror
-systemctl --user status claude-telegram-mirror
-journalctl --user -u claude-telegram-mirror -f
-```
-
-**Important:** `PrivateTmp=false` is required so the daemon can access tmux sockets in `/tmp/tmux-$UID/`.
-
-### launchd (macOS)
-
-```bash
-# Plist: ~/Library/LaunchAgents/com.claude.claude-telegram-mirror.plist
-launchctl load ~/Library/LaunchAgents/com.claude.claude-telegram-mirror.plist
-launchctl start com.claude.claude-telegram-mirror
-launchctl list | grep claude  # Check status
-tail -f ~/.config/claude-telegram-mirror/daemon.log  # View logs
-```
-
-**Key launchd configuration:**
-- `HOME` and `PATH` environment variables are explicitly set (launchd has minimal env)
-- `KeepAlive.Crashed=true` restarts on crashes; `SuccessfulExit=false` doesn't restart clean exits
-- `ThrottleInterval=10` prevents rapid restart loops
-- Logs to `~/.config/claude-telegram-mirror/daemon.log`
-
----
-
-## Security Considerations
-
-1. **Socket Security**: Unix socket in user config dir with `0600` permissions
-2. **PID Locking**: Prevents multiple daemon instances
-3. **Chat Whitelist**: Only responds to configured `TELEGRAM_CHAT_ID`
-4. **Topic Ownership**: Each daemon only processes its own topics
-5. **No Secrets in Logs**: Tokens and sensitive data not logged
-
----
-
-## Message Types
+### Message Types
 
 | Type | Direction | Description |
 |------|-----------|-------------|
-| `session_start` | Internal | Session created (topic creation, not sent by hooks) |
-| `session_end` | CLI → TG | Session ended |
-| `agent_response` | CLI → TG | Claude's text response |
-| `tool_start` | CLI → TG | Tool execution started |
-| `tool_result` | CLI → TG | Tool execution completed |
-| `user_input` | Both | User prompt/message |
-| `approval_request` | CLI → TG | Permission request |
-| `approval_response` | TG → CLI | User approval/rejection |
-| `turn_complete` | CLI → TG | Claude turn finished (not session end) |
-| `pre_compact` | CLI → TG | Context compaction starting |
+| `session_start` | CLI -> TG | New session detected |
+| `session_end` | CLI -> TG | Session terminated |
+| `agent_response` | CLI -> TG | Claude's text response |
+| `tool_start` | CLI -> TG | Tool execution beginning |
+| `tool_result` | CLI -> TG | Tool output (verbose mode) |
+| `user_input` | CLI -> TG | User typed in CLI |
+| `approval_request` | CLI -> TG | Tool needs approval |
+| `error` | CLI -> TG | Error notification |
+| `turn_complete` | CLI -> TG | Claude finished a turn |
+| `pre_compact` | CLI -> TG | Context compaction starting |
 
----
+## Security Architecture
 
-## Dual Handler Architecture (v0.1.8+)
+```mermaid
+graph TB
+    subgraph "Input Boundary"
+        STDIN[stdin JSON]
+        TGAPI[Telegram Updates]
+    end
 
-The system uses two different handlers for different hook types:
+    subgraph "Validation Layer"
+        PARSE[serde_json::from_str<br/>Result, no panic]
+        CHATID[Chat ID filter<br/>ALL update types]
+        KEYWHITE[Tmux key whitelist<br/>ALLOWED_TMUX_KEYS]
+    end
 
-### PreToolUse: Node.js Handler (`handler.ts`)
+    subgraph "Execution Layer"
+        CMD["Command::new('tmux').arg()<br/>No shell interpolation"]
+        FLOCK["flock(2)<br/>Atomic PID lock"]
+        PERMS["File permissions<br/>0o600 files, 0o700 dirs"]
+        RATE["governor rate limiter<br/>25 req/sec"]
+    end
 
-Used for approval workflows where we need to wait for user response:
+    STDIN --> PARSE
+    TGAPI --> CHATID
+    CHATID --> KEYWHITE
 
-```
-┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐
-│ Claude Code │───▶│  handler.ts │───▶│   Bridge    │───▶│  Telegram   │
-│ PreToolUse  │    │   (Node)    │    │   Daemon    │    │  (buttons)  │
-└─────────────┘    └──────┬──────┘    └──────┬──────┘    └──────┬──────┘
-                         │                   │                  │
-                         │◀── approval_response ◀───────────────┘
-                         │     (allow/deny/abort)    User clicks
-                         ▼
-                   Returns to Claude:
-                   hookSpecificOutput: {
-                     permissionDecision: 'allow'|'deny'
-                   }
-```
+    PARSE --> CMD
+    KEYWHITE --> CMD
+    CMD --> FLOCK
+    FLOCK --> PERMS
+    PERMS --> RATE
 
-**Why Node.js?**
-- Requires async `sendAndWait()` for bidirectional response
-- 5-minute timeout for user to respond
-- Returns structured output to Claude's permission system
-
-### Other Hooks: Bash Script (`telegram-hook.sh`)
-
-Used for fire-and-forget notifications (Stop, PostToolUse, Notification, etc.):
-
-```
-┌─────────────┐    ┌─────────────┐    ┌─────────────┐
-│ Claude Code │───▶│ telegram-   │───▶│   Bridge    │───▶ Telegram
-│  Stop/etc   │    │ hook.sh     │    │   Daemon    │
-└─────────────┘    └─────────────┘    └─────────────┘
-                   (exits immediately)
+    style PARSE fill:#faa,stroke:#333
+    style CHATID fill:#faa,stroke:#333
+    style KEYWHITE fill:#faa,stroke:#333
+    style CMD fill:#afa,stroke:#333
+    style FLOCK fill:#afa,stroke:#333
 ```
 
-**Why Bash?**
-- Faster startup (~5ms vs ~50ms for Node)
-- No async needed - just send and exit
-- Lower overhead for high-frequency events
+### Vulnerability Matrix
 
----
+| # | Severity | Vulnerability | Fix |
+|---|----------|--------------|-----|
+| 1 | CRITICAL | Command injection in tmux slash commands | `Command::new("tmux").arg()` |
+| 2 | CRITICAL | FIFO path shell interpolation | Eliminated entirely |
+| 3 | CRITICAL | World-readable config/secrets | `OpenOptions::mode(0o600)` |
+| 4 | HIGH | Logs in world-readable /tmp | Logs in config dir with 0o600 |
+| 5 | HIGH | Chat ID bypass on callbacks | Filter on ALL update types |
+| 6 | HIGH | Config dir insecure permissions | `mkdir` + `chmod 0o700` |
+| 7 | HIGH | tmux target interpolation | Passed as `.arg()` only |
+| 8 | MEDIUM | TOCTOU race in PID locking | `flock(2)` atomic lock |
+| 9 | MEDIUM | No input rate limiting | `governor` token-bucket |
+| 10 | MEDIUM | Panic on malformed JSON | `serde_json` returns `Result` |
 
-## Session ID Stability (v0.1.8 Fix)
+## Concurrency Model
 
-### The Problem (pre-v0.1.8)
+```mermaid
+graph TB
+    subgraph "Main Thread"
+        START[bridge.start()]
+        START --> SPAWN
+    end
 
-The Node handler generated its own session IDs:
+    subgraph "Spawned Tasks (tokio::spawn)"
+        SPAWN --> SOCKET_TASK[Socket Handler<br/>while msg_rx.recv()]
+        SPAWN --> POLL_TASK[Telegram Poller<br/>get_updates loop]
+        SPAWN --> CLEANUP_TASK[Cleanup Timer<br/>every 5 minutes]
+    end
 
-```typescript
-// OLD (broken): Generated random IDs
-this.sessionId = this.config.sessionId || this.generateSessionId();
-// Result: "hook-m1w2x3-abc123" - different each invocation!
+    subgraph "Shared State (Arc)"
+        SESSIONS["Arc&lt;Mutex&lt;SessionManager&gt;&gt;"]
+        INJECTOR["Arc&lt;Mutex&lt;InputInjector&gt;&gt;"]
+        THREADS["Arc&lt;RwLock&lt;HashMap&gt;&gt;<br/>session -> thread_id"]
+        TARGETS["Arc&lt;RwLock&lt;HashMap&gt;&gt;<br/>session -> tmux_target"]
+        CACHE["Arc&lt;RwLock&lt;HashMap&gt;&gt;<br/>tool input cache"]
+    end
+
+    SOCKET_TASK --> SESSIONS
+    SOCKET_TASK --> THREADS
+    SOCKET_TASK --> TARGETS
+    SOCKET_TASK --> CACHE
+    POLL_TASK --> SESSIONS
+    POLL_TASK --> INJECTOR
+    POLL_TASK --> THREADS
+    CLEANUP_TASK --> SESSIONS
+    CLEANUP_TASK --> THREADS
+
+    style SESSIONS fill:#69f,stroke:#333
+    style INJECTOR fill:#69f,stroke:#333
 ```
 
-This caused multiple Telegram topics per Claude session.
+### Task Communication
 
-### The Fix (v0.1.8)
+| Channel | Type | Purpose |
+|---------|------|---------|
+| `msg_rx` | `mpsc::Receiver<BridgeMessage>` | Socket -> Bridge (incoming hook events) |
+| `broadcast_tx` | `broadcast::Sender<BridgeMessage>` | Bridge -> Socket clients (outgoing) |
 
-Now uses Claude's native `session_id` from hook events:
+## Database Schema
 
-```typescript
-// NEW (fixed): Uses Claude's session_id
-const event = JSON.parse(input) as AnyHookEvent;
-const handler = new HookHandler({
-  sessionId: event.session_id  // Claude's stable ID
-});
-```
-
-```bash
-# Bash script also uses Claude's session_id
-CLAUDE_SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // empty')
-SESSION_ID="${CLAUDE_SESSION_ID:-$(date +%s)-$$}"
-```
-
-**Result:** All events from the same Claude session route to the same Telegram topic.
-
----
-
-## CLI Lifecycle Commands (v0.1.16+)
-
-The CLI provides commands to manage the daemon lifecycle:
-
-```bash
-ctm start              # Start daemon (foreground mode)
-ctm stop               # Graceful shutdown (SIGTERM, 5s timeout)
-ctm stop --force       # Force kill if graceful fails
-ctm restart            # Stop + start in one command
-ctm status             # Show running state, PID, socket status
-```
-
-**Auto-detection:** Commands detect whether daemon runs directly or via OS service (systemd/launchd) and delegate appropriately.
-
-**Cleanup:** Stale PID and socket files are automatically removed on stop/restart.
-
----
-
-## Stale Session Cleanup (v0.1.14+)
-
-Sessions with dead tmux panes are automatically cleaned up:
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                        Stale Session Detection                              │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│  Cleanup triggers when ALL conditions met:                                  │
-│                                                                             │
-│  1. last_activity > TELEGRAM_STALE_SESSION_TIMEOUT_HOURS (default: 72h)     │
-│  2. AND one of:                                                             │
-│     - tmux pane no longer exists                                            │
-│     - tmux pane reassigned to different Claude session                      │
-│                                                                             │
-│  Actions on cleanup:                                                        │
-│  - Send "Session ended (terminal closed)" to Telegram topic                 │
-│  - Close the forum topic                                                    │
-│  - Mark session as 'ended' in database                                      │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
-
-Cleanup runs every 5 minutes while daemon is running.
-
----
-
-## Session Reactivation (v0.1.17+)
-
-Sessions may be incorrectly marked as 'ended' while Claude is still running. The daemon auto-reactivates them:
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                         Session Reactivation Flow                           │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│  1. Session exists with status='ended'                                      │
-│  2. New hook event arrives for that session                                 │
-│  3. ensureSessionExists() detects status != 'active'                        │
-│  4. reactivateSession() sets status='active', updates last_activity         │
-│  5. Messages now route correctly to the existing topic                      │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
-
-**Why needed:** A session may be marked 'ended' when a Stop hook fires, but Claude can continue if the user sends more input. Reactivation ensures Telegram→CLI input works even after premature session end.
-
----
-
-## General Topic Filtering (v0.1.15+)
-
-Messages in the forum's General topic (no `threadId`) are ignored:
-
-```typescript
-// In setupBotHandlers()
-if (!threadId) {
-  // Message in General topic - ignore
-  // Bot can still WRITE to General (startup/shutdown notifications)
-  return;
-}
-```
-
-**Why:** Prevents confusion when users accidentally post in General instead of a session topic. Only messages in specific forum topics are routed to Claude sessions.
-
----
-
-## Topic Creation Race Condition Handling (v0.1.13+, updated v0.1.18)
-
-When events arrive for a new session, the daemon creates the topic on-the-fly:
-
-```typescript
-// ensureSessionExists() handles all topic creation
-private async ensureSessionExists(msg: BridgeMessage): Promise<void> {
-  // Check if session exists and is active
-  const existing = this.sessions.getSession(msg.sessionId);
-  if (existing) {
-    if (existing.status !== 'active') {
-      this.sessions.reactivateSession(msg.sessionId);  // BUG-009 fix
+```mermaid
+erDiagram
+    sessions {
+        TEXT id PK
+        INTEGER chat_id
+        INTEGER thread_id
+        TEXT status
+        TEXT hostname
+        TEXT project_dir
+        TEXT tmux_target
+        TEXT tmux_socket
+        TEXT started_at
+        TEXT last_activity
+        TEXT ended_at
     }
-    return;
-  }
 
-  // Check if another call is already creating this topic
-  if (this.topicCreationPromises.has(sessionId)) {
-    await this.topicCreationPromises.get(sessionId);  // Wait for it
-    return;
-  }
+    pending_approvals {
+        TEXT id PK
+        TEXT session_id FK
+        TEXT prompt
+        TEXT status
+        TEXT created_at
+        TEXT expires_at
+        TEXT resolved_at
+    }
 
-  // Create Promise BEFORE async work (synchronous check-and-set)
-  const promise = new Promise(...);
-  this.topicCreationPromises.set(sessionId, promise);
-
-  // Create session + topic immediately
-  await this.handleSessionStart(msg);
-}
+    sessions ||--o{ pending_approvals : "has"
 ```
 
-**Behavior:**
-- First event for a new session triggers topic creation immediately
-- Concurrent events wait for the Promise (prevents duplicate topics)
-- 5-second timeout prevents indefinite blocking
-- On timeout: error logged, message dropped (prevents misdirection to General topic)
+## Configuration Priority
 
-**Race condition safety:** JavaScript's single-threaded event loop guarantees no interleaving between the synchronous check (`has()`) and set (`set()`) operations.
+```mermaid
+graph TD
+    ENV[Environment Variables<br/>TELEGRAM_BOT_TOKEN etc.] --> MERGE
+    FILE[Config File<br/>~/.config/ctm/config.json] --> MERGE
+    DEFAULTS[Defaults<br/>verbose=false, threads=true] --> MERGE
 
----
+    MERGE[Merge with Priority] --> CONFIG[Final Config]
 
-## Telegram Input Commands
+    ENV -.->|highest priority| MERGE
+    FILE -.->|medium| MERGE
+    DEFAULTS -.->|lowest| MERGE
 
-Commands sent from Telegram to control Claude:
+    style ENV fill:#9f9,stroke:#333
+    style CONFIG fill:#f96,stroke:#333
+```
 
-| Category | Commands | Key Sent |
-|----------|----------|----------|
-| **Interrupt** | `stop`, `cancel`, `abort`, `esc`, `escape` | Escape |
-| **Kill** | `kill`, `exit`, `quit`, `ctrl+c`, `ctrl-c`, `^c` | Ctrl-C |
+## Forum Topic Management
 
-Commands work with or without leading `/` (e.g., `stop` or `/stop`).
+```mermaid
+graph TB
+    NEW_SESSION[New Session Event] --> CHECK_THREAD{Thread exists<br/>in DB?}
 
-**Interrupt vs Kill:**
-- **Escape** pauses Claude mid-generation (can resume)
-- **Ctrl-C** exits Claude entirely (session ends)
+    CHECK_THREAD -->|Yes| REUSE[Reuse existing topic]
+    CHECK_THREAD -->|No| CHECK_THREADS{use_threads<br/>enabled?}
 
----
+    CHECK_THREADS -->|Yes| CREATE[Create forum topic]
+    CHECK_THREADS -->|No| GENERAL[Use General topic]
 
-## Troubleshooting
+    CREATE --> UNPIN[Unpin auto-pinned<br/>first message]
+    UNPIN --> CACHE[Cache thread_id<br/>in memory + DB]
 
-| Issue | Cause | Solution |
-|-------|-------|----------|
-| "No tmux session found" | Daemon can't access tmux socket | Set `PrivateTmp=false` in systemd |
-| Messages not appearing | Hook not installed | Run `ctm install-hooks` |
-| Wrong topic | Session mapping lost | Check `sessions.db` for correct `thread_id` |
-| Duplicate topics | Daemon restarted mid-session | Topics are reused if `thread_id` exists in DB |
-| Stale sessions | Old sessions not cleaned | Check `TELEGRAM_STALE_SESSION_TIMEOUT_HOURS` |
-| Topics not created (clean install) | Outdated daemon version | Upgrade to v0.1.18+ (fixed topic creation on first event) |
-| Input from Telegram silently fails | Session was marked 'ended' | Session auto-reactivates on next hook event (v0.1.17+) |
-| macOS: "node not found" | launchd minimal PATH | Reinstall service to regenerate plist with full PATH |
-| macOS: Daemon crashes on start | Missing HOME env | Check `daemon.err.log` for details |
+    REUSE --> CACHE
+    CACHE --> SEND[Send messages<br/>to thread]
+
+    SEND --> SESSION_END{Session ends?}
+
+    SESSION_END -->|auto_delete=true| DELAY[Wait delete_delay minutes]
+    SESSION_END -->|auto_delete=false| CLOSE[Close topic]
+
+    DELAY --> DELETE[Delete topic]
+    DELAY -->|new event arrives| CANCEL[Cancel deletion<br/>reactivate session]
+```
