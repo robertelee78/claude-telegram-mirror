@@ -227,17 +227,19 @@ impl SessionManager {
         );
     }
 
-    pub fn end_session(&self, session_id: &str, status: &str) {
+    /// MED-03: Accept SessionStatus enum instead of raw &str to prevent invalid states
+    pub fn end_session(&self, session_id: &str, status: SessionStatus) {
         let now = Utc::now().to_rfc3339();
+        let status_str = status.as_str();
         let _ = self.db.execute(
             "UPDATE sessions SET status = ?1, last_activity = ?2 WHERE id = ?3",
-            params![status, now, session_id],
+            params![status_str, now, session_id],
         );
         let _ = self.db.execute(
             "UPDATE pending_approvals SET status = 'expired' WHERE session_id = ?1 AND status = 'pending'",
             params![session_id],
         );
-        tracing::info!(%session_id, %status, "Session ended");
+        tracing::info!(%session_id, %status_str, "Session ended");
     }
 
     pub fn reactivate_session(&self, session_id: &str) {
@@ -440,7 +442,7 @@ mod tests {
             .create_session(None, 12345, None, None, None, None)
             .unwrap();
 
-        mgr.end_session(&id, "ended");
+        mgr.end_session(&id, SessionStatus::Ended);
         let session = mgr.get_session(&id).unwrap();
         assert_eq!(session.status, SessionStatus::Ended);
 

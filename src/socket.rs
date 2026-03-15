@@ -86,21 +86,28 @@ impl SocketServer {
     }
 
     /// Clean up stale socket file if no daemon is listening
+    /// MED-01: Add connect timeout to prevent hanging on unresponsive sockets
     async fn cleanup_stale_socket(&self) -> Result<()> {
         if !self.socket_path.exists() {
             return Ok(());
         }
 
-        // Try connecting to check if socket is active
-        match UnixStream::connect(&self.socket_path).await {
-            Ok(_) => {
+        // Try connecting with a timeout to check if socket is active
+        let connect_result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            UnixStream::connect(&self.socket_path),
+        )
+        .await;
+
+        match connect_result {
+            Ok(Ok(_)) => {
                 return Err(AppError::Socket(format!(
                     "Socket {} is already in use by another process",
                     self.socket_path.display()
                 )));
             }
-            Err(_) => {
-                // Connection failed = stale socket
+            Ok(Err(_)) | Err(_) => {
+                // Connection failed or timed out = stale socket
                 fs::remove_file(&self.socket_path)?;
                 tracing::info!(path = %self.socket_path.display(), "Removed stale socket file");
             }

@@ -5,7 +5,7 @@ use crate::formatting;
 use crate::injector::InputInjector;
 use crate::session::SessionManager;
 use crate::socket::SocketServer;
-use crate::types::{BridgeMessage, InlineButton, MessageType, SendOptions};
+use crate::types::{BridgeMessage, InlineButton, MessageType, SendOptions, SessionStatus};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex, RwLock};
@@ -387,7 +387,7 @@ impl BridgeShared {
                 .remove(&msg.session_id);
 
             let sessions = self.sessions.lock().await;
-            sessions.end_session(&msg.session_id, "ended");
+            sessions.end_session(&msg.session_id, SessionStatus::Ended);
         }
 
         Ok(())
@@ -865,7 +865,7 @@ impl BridgeShared {
                     sessions.resolve_approval(id, status);
 
                     if action == "abort" {
-                        sessions.end_session(&approval.session_id, "aborted");
+                        sessions.end_session(&approval.session_id, SessionStatus::Aborted);
                     }
                 }
 
@@ -1084,7 +1084,7 @@ impl BridgeShared {
         self.session_tmux_targets.write().await.remove(&session.id);
 
         let sessions = self.sessions.lock().await;
-        sessions.end_session(&session.id, "ended");
+        sessions.end_session(&session.id, SessionStatus::Ended);
     }
 }
 

@@ -21,9 +21,28 @@ impl InputInjector {
     }
 
     /// Set the tmux target and optional socket path
+    /// HIGH-01: Validate socket path to prevent arbitrary socket targeting
     pub fn set_target(&mut self, target: &str, socket: Option<&str>) {
         self.tmux_target = Some(target.to_string());
-        self.tmux_socket = socket.map(|s| s.to_string());
+        self.tmux_socket = socket.and_then(|s| {
+            let path = std::path::Path::new(s);
+            // Reject paths with traversal components
+            if s.contains("..") {
+                tracing::warn!(path = %s, "Rejecting tmux socket path with '..' traversal");
+                return None;
+            }
+            // Must be an absolute path
+            if !path.is_absolute() {
+                tracing::warn!(path = %s, "Rejecting non-absolute tmux socket path");
+                return None;
+            }
+            // Reasonable length limit
+            if s.len() > 256 {
+                tracing::warn!(len = s.len(), "Rejecting oversized tmux socket path");
+                return None;
+            }
+            Some(s.to_string())
+        });
     }
 
     /// Get current tmux target

@@ -177,10 +177,22 @@ pub fn load_config(require_auth: bool) -> Result<Config> {
         }
     }
 
+    // MED-02: Validate socket path from env var to prevent path traversal
     let socket_path = env::var("TELEGRAM_BRIDGE_SOCKET")
         .ok()
-        .map(PathBuf::from)
-        .or_else(|| file.socket_path.map(PathBuf::from))
+        .or(file.socket_path)
+        .map(|s| {
+            if s.contains("..") {
+                tracing::warn!(path = %s, "Socket path contains '..', using default");
+                return default_socket.clone();
+            }
+            let p = PathBuf::from(&s);
+            if !p.is_absolute() {
+                tracing::warn!(path = %s, "Socket path is not absolute, using default");
+                return default_socket.clone();
+            }
+            p
+        })
         .unwrap_or(default_socket);
 
     Ok(Config {
