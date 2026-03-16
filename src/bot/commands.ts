@@ -360,4 +360,130 @@ export function registerToolDetailsHandler(
   });
 }
 
+/**
+ * Register answer handlers for AskUserQuestion inline buttons
+ */
+export function registerAnswerHandlers(
+  bot: Bot<BotContext>,
+  onAnswer: (sessionId: string, questionIndex: number, optionIndex: number) => string | undefined,
+  onToggle: (sessionId: string, questionIndex: number, optionIndex: number) => { error?: string; labels?: string[] },
+  onSubmit: (sessionId: string, questionIndex: number) => string | undefined,
+  configChatId?: number
+): void {
+  // Handle single-select: answer:{shortSessionId}:{questionIndex}:{optionIndex}
+  bot.callbackQuery(/^answer:([^:]+):(\d+):(\d+)$/, async (ctx) => {
+    const sessionId = ctx.match![1];
+    const questionIndex = parseInt(ctx.match![2], 10);
+    const optionIndex = parseInt(ctx.match![3], 10);
+
+    // IDOR defense
+    if (configChatId && ctx.chat?.id !== configChatId) {
+      logger.warn('IDOR: Answer callback from unauthorized chat', {
+        sessionId,
+        chatId: ctx.chat?.id,
+        expectedChatId: configChatId
+      });
+      await ctx.answerCallbackQuery({ text: 'Unauthorized' });
+      return;
+    }
+
+    const error = onAnswer(sessionId, questionIndex, optionIndex);
+    if (error) {
+      await ctx.answerCallbackQuery({ text: error });
+      return;
+    }
+
+    // Update message to show selection
+    const originalText = ctx.callbackQuery.message?.text || '';
+    try {
+      await ctx.editMessageText(
+        `${originalText}\n\n✅ Selected`,
+        { parse_mode: undefined }
+      );
+    } catch (editError) {
+      logger.warn('Failed to edit answer message', { editError });
+      try {
+        await ctx.editMessageText('✅ Answer sent');
+      } catch {
+        // ignore double-edit failures
+      }
+    }
+
+    await ctx.answerCallbackQuery({ text: 'Answer sent' });
+  });
+
+  // Handle multi-select toggle: toggle:{shortSessionId}:{questionIndex}:{optionIndex}
+  bot.callbackQuery(/^toggle:([^:]+):(\d+):(\d+)$/, async (ctx) => {
+    const sessionId = ctx.match![1];
+    const questionIndex = parseInt(ctx.match![2], 10);
+    const optionIndex = parseInt(ctx.match![3], 10);
+
+    // IDOR defense
+    if (configChatId && ctx.chat?.id !== configChatId) {
+      await ctx.answerCallbackQuery({ text: 'Unauthorized' });
+      return;
+    }
+
+    const result = onToggle(sessionId, questionIndex, optionIndex);
+    if (result.error) {
+      await ctx.answerCallbackQuery({ text: result.error });
+      return;
+    }
+
+    // Re-render keyboard with updated checkmarks
+    if (result.labels) {
+      try {
+        const keyboard = new InlineKeyboard();
+        result.labels.forEach((label, idx) => {
+          keyboard.text(label, `toggle:${sessionId}:${questionIndex}:${idx}`);
+          keyboard.row();
+        });
+        keyboard.text('✅ Submit', `submit:${sessionId}:${questionIndex}`);
+
+        await ctx.editMessageReplyMarkup({ reply_markup: keyboard });
+      } catch (editError) {
+        logger.warn('Failed to update toggle keyboard', { editError });
+      }
+    }
+
+    await ctx.answerCallbackQuery({ text: 'Toggled' });
+  });
+
+  // Handle multi-select submit: submit:{shortSessionId}:{questionIndex}
+  bot.callbackQuery(/^submit:([^:]+):(\d+)$/, async (ctx) => {
+    const sessionId = ctx.match![1];
+    const questionIndex = parseInt(ctx.match![2], 10);
+
+    // IDOR defense
+    if (configChatId && ctx.chat?.id !== configChatId) {
+      await ctx.answerCallbackQuery({ text: 'Unauthorized' });
+      return;
+    }
+
+    const error = onSubmit(sessionId, questionIndex);
+    if (error) {
+      await ctx.answerCallbackQuery({ text: error });
+      return;
+    }
+
+    // Update message to show submission
+    const originalText = ctx.callbackQuery.message?.text || '';
+    try {
+      await ctx.editMessageText(
+        `${originalText}\n\n✅ Submitted`,
+        { parse_mode: undefined }
+      );
+    } catch (editError) {
+      logger.warn('Failed to edit submit message', { editError });
+      try {
+        await ctx.editMessageText('✅ Submitted');
+      } catch {
+        // ignore double-edit failures
+      }
+    }
+
+    await ctx.answerCallbackQuery({ text: 'Submitted' });
+  });
+}
+
 export default registerCommands;

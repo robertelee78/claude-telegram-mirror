@@ -5,7 +5,7 @@
 
 import { EventEmitter } from 'events';
 import { TelegramBot } from '../bot/telegram.js';
-import { registerCommands, registerApprovalHandlers, registerToolDetailsHandler } from '../bot/commands.js';
+import { registerCommands, registerApprovalHandlers, registerToolDetailsHandler, registerAnswerHandlers } from '../bot/commands.js';
 import { SocketServer } from './socket.js';
 import { SessionManager } from './session.js';
 import { InputInjector } from './injector.js';
@@ -62,6 +62,21 @@ export class BridgeDaemon extends EventEmitter {
 
   // Topic auto-deletion: track pending deletions so we can cancel if session resumes
   private pendingTopicDeletions: Map<string, NodeJS.Timeout> = new Map();
+
+  // AskUserQuestion: track pending questions awaiting user response
+  private pendingQuestions: Map<string, {
+    sessionId: string;
+    questions: Array<{
+      question: string;
+      header: string;
+      options: Array<{ label: string; description: string }>;
+      multiSelect: boolean;
+    }>;
+    messageIds: number[];
+    answered: boolean[];
+    selectedOptions: Map<number, Set<number>>;  // questionIndex -> selected option indices
+    timestamp: number;
+  }> = new Map();
 
   constructor(config?: TelegramMirrorConfig) {
     super();
@@ -165,6 +180,21 @@ export class BridgeDaemon extends EventEmitter {
         });
       }
     });
+
+    // Register answer handlers (AskUserQuestion inline buttons)
+    registerAnswerHandlers(
+      this.bot.getBot(),
+      (sessionId, questionIndex, optionIndex) => {
+        return this.handleAnswerCallback(sessionId, questionIndex, optionIndex);
+      },
+      (sessionId, questionIndex, optionIndex) => {
+        return this.handleToggleCallback(sessionId, questionIndex, optionIndex);
+      },
+      (sessionId, questionIndex) => {
+        return this.handleSubmitCallback(sessionId, questionIndex);
+      },
+      this.config.chatId
+    );
 
     // Start bot
     await this.bot.start();
@@ -427,6 +457,13 @@ export class BridgeDaemon extends EventEmitter {
           );
         }
         return; // Don't inject command as text
+      }
+
+      // Check if there's a pending AskUserQuestion for this session
+      // If so, treat the text as a free-text "Other" response
+      if (this.handleFreeTextAnswer(session.id, text)) {
+        logger.info('Free-text answer consumed for AskUserQuestion', { sessionId: session.id });
+        return;
       }
 
       // Track this input so we don't echo it back when the hook fires
@@ -1015,6 +1052,9 @@ export class BridgeDaemon extends EventEmitter {
       // Clean up tmux target
       this.sessionTmuxTargets.delete(msg.sessionId);
 
+      // Clean up pending questions
+      this.cleanupPendingQuestions(msg.sessionId);
+
       this.sessions.endSession(msg.sessionId);
     }
   }
@@ -1075,10 +1115,17 @@ export class BridgeDaemon extends EventEmitter {
   }
 
   private async handleToolStart(msg: BridgeMessage): Promise<void> {
+    const toolName = msg.metadata?.tool as string || 'Unknown';
+
+    // Intercept AskUserQuestion tool - always handle regardless of verbose mode
+    if (toolName === 'AskUserQuestion') {
+      await this.handleAskUserQuestion(msg);
+      return;
+    }
+
     // Only show tool starts in verbose mode to avoid noise
     if (!this.config.verbose) return;
 
-    const toolName = msg.metadata?.tool as string || 'Unknown';
     const toolInput = msg.metadata?.input as Record<string, unknown> | undefined;
     // BUG-002 FIX: Wait for topic creation if it's pending
     const threadId = await this.waitForTopic(msg.sessionId);
@@ -1288,6 +1335,318 @@ export class BridgeDaemon extends EventEmitter {
     );
 
     logger.info('Compact complete notification sent', { sessionId });
+  }
+
+  // ============ AskUserQuestion Handling (Epic 3) ============
+
+  /**
+   * Handle AskUserQuestion tool - render questions as Telegram inline buttons
+   */
+  private async handleAskUserQuestion(msg: BridgeMessage): Promise<void> {
+    const threadId = await this.waitForTopic(msg.sessionId);
+    if (threadId === undefined && this.config.useThreads) {
+      logger.error('Topic creation timeout - dropping AskUserQuestion', { sessionId: msg.sessionId });
+      return;
+    }
+
+    const toolInput = msg.metadata?.input as Record<string, unknown> | undefined;
+    if (!toolInput) {
+      logger.warn('AskUserQuestion with no input', { sessionId: msg.sessionId });
+      return;
+    }
+
+    // Parse questions from tool input
+    const questions = toolInput.questions as Array<{
+      question: string;
+      header: string;
+      options: Array<{ label: string; description: string }>;
+      multiSelect: boolean;
+    }> | undefined;
+
+    if (!questions || questions.length === 0) {
+      logger.warn('AskUserQuestion with no questions', { sessionId: msg.sessionId });
+      return;
+    }
+
+    // Truncate sessionId for callback data (Telegram 64-byte limit)
+    const shortSessionId = msg.sessionId.slice(0, 20);
+
+    // Create pending question entry
+    const pendingKey = shortSessionId;
+    this.pendingQuestions.set(pendingKey, {
+      sessionId: msg.sessionId,
+      questions,
+      messageIds: [],
+      answered: new Array(questions.length).fill(false),
+      selectedOptions: new Map(),
+      timestamp: Date.now(),
+    });
+
+    // Set 10-minute expiry
+    setTimeout(() => {
+      const pending = this.pendingQuestions.get(pendingKey);
+      if (pending && Date.now() - pending.timestamp >= 10 * 60 * 1000) {
+        this.pendingQuestions.delete(pendingKey);
+        logger.debug('Expired pending question', { sessionId: msg.sessionId });
+      }
+    }, 10 * 60 * 1000);
+
+    // Render each question as a separate message
+    for (let qIdx = 0; qIdx < questions.length; qIdx++) {
+      const q = questions[qIdx];
+
+      // Build message text
+      let text = `❓ *${this.escapeMarkdown(q.header)}*\n\n${this.escapeMarkdown(q.question)}\n`;
+      for (const opt of q.options) {
+        text += `\n• *${this.escapeMarkdown(opt.label)}* — ${this.escapeMarkdown(opt.description)}`;
+      }
+      text += '\n\n_Or type your answer in this topic_';
+
+      // Build inline keyboard buttons - one per row for mobile readability
+      const buttons: Array<{ text: string; callbackData: string }> = [];
+
+      if (q.multiSelect) {
+        // Initialize selected options set for this question
+        const pending = this.pendingQuestions.get(pendingKey)!;
+        pending.selectedOptions.set(qIdx, new Set());
+
+        for (let oIdx = 0; oIdx < q.options.length; oIdx++) {
+          const opt = q.options[oIdx];
+          const callbackData = `toggle:${shortSessionId}:${qIdx}:${oIdx}`;
+          buttons.push({ text: opt.label, callbackData });
+        }
+        // Submit button
+        buttons.push({ text: '✅ Submit', callbackData: `submit:${shortSessionId}:${qIdx}` });
+      } else {
+        // Single-select: answer buttons
+        for (let oIdx = 0; oIdx < q.options.length; oIdx++) {
+          const opt = q.options[oIdx];
+          const callbackData = `answer:${shortSessionId}:${qIdx}:${oIdx}`;
+          buttons.push({ text: opt.label, callbackData });
+        }
+      }
+
+      await this.bot.sendWithButtons(text, buttons, { parseMode: 'Markdown' }, threadId);
+    }
+
+    logger.info('AskUserQuestion rendered', {
+      sessionId: msg.sessionId,
+      questionCount: questions.length,
+    });
+  }
+
+  /**
+   * Escape markdown special characters for Telegram Markdown mode
+   */
+  private escapeMarkdown(text: string): string {
+    // In Telegram Markdown (v1) mode, backticks are special
+    // Replace them to avoid breaking formatting
+    return text.replace(/([`])/g, "'");
+  }
+
+  /**
+   * Handle single-select answer callback
+   */
+  private handleAnswerCallback(sessionId: string, questionIndex: number, optionIndex: number): string | undefined {
+    const pending = this.pendingQuestions.get(sessionId);
+    if (!pending) {
+      return 'Question expired';
+    }
+    if (pending.answered[questionIndex]) {
+      return 'Already answered';
+    }
+
+    pending.answered[questionIndex] = true;
+
+    const question = pending.questions[questionIndex];
+    const option = question?.options[optionIndex];
+    const answerText = option?.label || String(optionIndex + 1);
+
+    // Inject into tmux
+    const tmuxTarget = this.sessionTmuxTargets.get(pending.sessionId);
+    if (tmuxTarget) {
+      const session = this.sessions.getSession(pending.sessionId);
+      const tmuxSocket = session?.tmuxSocket;
+      this.injector.setTmuxSession(tmuxTarget, tmuxSocket);
+      this.injector.inject(answerText);
+    } else {
+      logger.warn('No tmux target for answer injection', { sessionId: pending.sessionId });
+    }
+
+    // Clean up if all questions answered
+    if (pending.answered.every(a => a)) {
+      this.pendingQuestions.delete(sessionId);
+    }
+
+    logger.info('AskUserQuestion answered (single-select)', {
+      sessionId: pending.sessionId,
+      questionIndex,
+      optionIndex,
+      answer: answerText,
+    });
+
+    return undefined;
+  }
+
+  /**
+   * Handle multi-select toggle callback
+   */
+  private handleToggleCallback(
+    sessionId: string,
+    questionIndex: number,
+    optionIndex: number
+  ): { error?: string; labels?: string[] } {
+    const pending = this.pendingQuestions.get(sessionId);
+    if (!pending) {
+      return { error: 'Question expired' };
+    }
+    if (pending.answered[questionIndex]) {
+      return { error: 'Already submitted' };
+    }
+
+    let selected = pending.selectedOptions.get(questionIndex);
+    if (!selected) {
+      selected = new Set();
+      pending.selectedOptions.set(questionIndex, selected);
+    }
+
+    // Toggle the option
+    if (selected.has(optionIndex)) {
+      selected.delete(optionIndex);
+    } else {
+      selected.add(optionIndex);
+    }
+
+    // Build updated labels with checkmarks
+    const question = pending.questions[questionIndex];
+    const labels = question.options.map((opt, idx) => {
+      return selected!.has(idx) ? `✓ ${opt.label}` : opt.label;
+    });
+
+    logger.debug('AskUserQuestion toggle', {
+      sessionId: pending.sessionId,
+      questionIndex,
+      optionIndex,
+      selected: Array.from(selected),
+    });
+
+    return { labels };
+  }
+
+  /**
+   * Handle multi-select submit callback
+   */
+  private handleSubmitCallback(sessionId: string, questionIndex: number): string | undefined {
+    const pending = this.pendingQuestions.get(sessionId);
+    if (!pending) {
+      return 'Question expired';
+    }
+    if (pending.answered[questionIndex]) {
+      return 'Already submitted';
+    }
+
+    pending.answered[questionIndex] = true;
+
+    const question = pending.questions[questionIndex];
+    const selected = pending.selectedOptions.get(questionIndex) || new Set<number>();
+
+    // Build answer text from selected option labels
+    const selectedLabels = Array.from(selected)
+      .sort((a, b) => a - b)
+      .map(idx => question.options[idx]?.label)
+      .filter(Boolean);
+
+    const answerText = selectedLabels.length > 0
+      ? selectedLabels.join(', ')
+      : 'none';
+
+    // Inject into tmux
+    const tmuxTarget = this.sessionTmuxTargets.get(pending.sessionId);
+    if (tmuxTarget) {
+      const session = this.sessions.getSession(pending.sessionId);
+      const tmuxSocket = session?.tmuxSocket;
+      this.injector.setTmuxSession(tmuxTarget, tmuxSocket);
+      this.injector.inject(answerText);
+    } else {
+      logger.warn('No tmux target for answer injection', { sessionId: pending.sessionId });
+    }
+
+    // Clean up if all questions answered
+    if (pending.answered.every(a => a)) {
+      this.pendingQuestions.delete(sessionId);
+    }
+
+    logger.info('AskUserQuestion submitted (multi-select)', {
+      sessionId: pending.sessionId,
+      questionIndex,
+      selected: selectedLabels,
+    });
+
+    return undefined;
+  }
+
+  /**
+   * Find pending question for a session by full sessionId
+   * Used for free-text "Other" responses from the text message handler
+   */
+  private findPendingQuestionBySessionId(sessionId: string): string | undefined {
+    for (const [key, pending] of this.pendingQuestions) {
+      if (pending.sessionId === sessionId && !pending.answered.every(a => a)) {
+        return key;
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * Handle free-text response to a pending AskUserQuestion
+   * Returns true if the text was consumed as an answer
+   */
+  private handleFreeTextAnswer(sessionId: string, text: string): boolean {
+    const pendingKey = this.findPendingQuestionBySessionId(sessionId);
+    if (!pendingKey) return false;
+
+    const pending = this.pendingQuestions.get(pendingKey);
+    if (!pending) return false;
+
+    // Find first unanswered question
+    const qIdx = pending.answered.findIndex(a => !a);
+    if (qIdx === -1) return false;
+
+    pending.answered[qIdx] = true;
+
+    // Inject the free-text answer into tmux
+    const tmuxTarget = this.sessionTmuxTargets.get(pending.sessionId);
+    if (tmuxTarget) {
+      const session = this.sessions.getSession(pending.sessionId);
+      const tmuxSocket = session?.tmuxSocket;
+      this.injector.setTmuxSession(tmuxTarget, tmuxSocket);
+      this.injector.inject(text);
+    }
+
+    // Clean up if all questions answered
+    if (pending.answered.every(a => a)) {
+      this.pendingQuestions.delete(pendingKey);
+    }
+
+    logger.info('AskUserQuestion answered (free-text)', {
+      sessionId: pending.sessionId,
+      questionIndex: qIdx,
+      answer: text.substring(0, 50),
+    });
+
+    return true;
+  }
+
+  /**
+   * Clean up pending questions for a session (called on session end)
+   */
+  private cleanupPendingQuestions(sessionId: string): void {
+    for (const [key, pending] of this.pendingQuestions) {
+      if (pending.sessionId === sessionId) {
+        this.pendingQuestions.delete(key);
+      }
+    }
   }
 
   /**
