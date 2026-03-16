@@ -5,6 +5,7 @@
 
 import { Bot, Context, session, SessionFlavor, GrammyError, HttpError } from 'grammy';
 import { InlineKeyboard } from 'grammy';
+import { writeFileSync } from 'fs';
 import { loadConfig, TelegramMirrorConfig } from '../utils/config.js';
 import { chunkMessage } from '../utils/chunker.js';
 import logger, { scrubBotToken } from '../utils/logger.js';
@@ -441,6 +442,42 @@ export class TelegramBot {
   }
 
   /**
+   * Register photo message handler
+   */
+  onPhoto(handler: (photo: { fileId: string; fileUniqueId: string; fileSize?: number }, caption: string | undefined, chatId: number, threadId?: number) => void): void {
+    this.bot.on('message:photo', (ctx) => {
+      const chatId = ctx.chat.id;
+      const threadId = ctx.message.message_thread_id;
+      const photos = ctx.message.photo;
+      // Highest resolution is last in array
+      const photo = photos[photos.length - 1];
+      handler(
+        { fileId: photo.file_id, fileUniqueId: photo.file_unique_id, fileSize: photo.file_size },
+        ctx.message.caption,
+        chatId,
+        threadId
+      );
+    });
+  }
+
+  /**
+   * Register document message handler
+   */
+  onDocument(handler: (doc: { fileId: string; fileUniqueId: string; fileSize?: number; fileName?: string; mimeType?: string }, caption: string | undefined, chatId: number, threadId?: number) => void): void {
+    this.bot.on('message:document', (ctx) => {
+      const chatId = ctx.chat.id;
+      const threadId = ctx.message.message_thread_id;
+      const doc = ctx.message.document;
+      handler(
+        { fileId: doc.file_id, fileUniqueId: doc.file_unique_id, fileSize: doc.file_size, fileName: doc.file_name, mimeType: doc.mime_type },
+        ctx.message.caption,
+        chatId,
+        threadId
+      );
+    });
+  }
+
+  /**
    * Register callback query handler
    */
   onCallback(handler: (data: string, chatId: number) => void): void {
@@ -458,6 +495,35 @@ export class TelegramBot {
 
         await ctx.answerCallbackQuery();
       });
+    }
+  }
+
+  /**
+   * Download a file from Telegram to a local path.
+   * Returns the local file path on success, null on failure.
+   */
+  async downloadFile(fileId: string, destPath: string): Promise<string | null> {
+    try {
+      const file = await this.bot.api.getFile(fileId);
+      if (!file.file_path) {
+        logger.warn('File has no file_path', { fileId });
+        return null;
+      }
+
+      const url = `https://api.telegram.org/file/bot${this.config.botToken}/${file.file_path}`;
+      const response = await fetch(url);
+      if (!response.ok) {
+        logger.warn('File download HTTP error', { fileId, status: response.status });
+        return null;
+      }
+
+      const buffer = Buffer.from(await response.arrayBuffer());
+      writeFileSync(destPath, buffer, { mode: 0o600 });
+      logger.info('File downloaded', { fileId, destPath, size: buffer.length });
+      return destPath;
+    } catch (error) {
+      logger.error('Failed to download file', { fileId, error });
+      return null;
     }
   }
 

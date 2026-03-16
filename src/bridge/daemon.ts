@@ -22,6 +22,10 @@ import logger from '../utils/logger.js';
 import { summarizeToolAction, summarizeToolResult } from '../utils/summarize.js';
 import type { BridgeMessage, Session } from './types.js';
 import { execSync } from 'child_process';
+import { randomUUID } from 'crypto';
+import path from 'path';
+import { existsSync, mkdirSync, readdirSync, statSync, unlinkSync } from 'fs';
+import { getConfigDir } from '../utils/config.js';
 
 const MAX_SESSION_ID_LENGTH = 128;
 const SESSION_ID_PATTERN = /^[a-zA-Z0-9_-]+$/;
@@ -203,6 +207,7 @@ export class BridgeDaemon extends EventEmitter {
     this.cleanupInterval = setInterval(() => {
       this.sessions.expireOldApprovals();
       this.cleanupStaleSessions();  // BUG-003: Check for stale sessions
+      this.cleanupOldDownloads();   // Epic 4: Clean up old downloaded files
     }, 5 * 60 * 1000);
 
     this.running = true;
@@ -511,6 +516,187 @@ export class BridgeDaemon extends EventEmitter {
         content: text
       });
     });
+
+    // Handle photo messages (forward to CLI as file path)
+    this.bot.onPhoto(async (photo, caption, _chatId, threadId) => {
+      // BUG-005 fix: Ignore General topic
+      if (!threadId) return;
+
+      const session = this.sessions.getSessionByThreadId(threadId);
+      if (!session) {
+        logger.debug('Ignoring photo for unknown topic', { threadId });
+        return;
+      }
+
+      // Check file size (20MB limit)
+      if (photo.fileSize && photo.fileSize > 20 * 1024 * 1024) {
+        await this.bot.sendMessage('File too large (max 20MB)', {}, threadId);
+        return;
+      }
+
+      // Download the photo
+      const downloadsDir = this.ensureDownloadsDir();
+      const filename = this.sanitizeFilename(`photo_${photo.fileUniqueId}.jpg`);
+      const destPath = path.join(downloadsDir, filename);
+
+      const localPath = await this.bot.downloadFile(photo.fileId, destPath);
+      if (!localPath) {
+        await this.bot.sendMessage('Failed to download photo', {}, threadId);
+        return;
+      }
+
+      // Build injection text
+      let injectionText = `[Image from Telegram: ${localPath}]`;
+      if (caption) {
+        injectionText += ` Caption: ${caption}`;
+      }
+
+      // Inject into tmux
+      let tmuxTarget = this.sessionTmuxTargets.get(session.id);
+      let tmuxSocket: string | undefined;
+
+      if (!tmuxTarget) {
+        const tmuxInfo = this.sessions.getTmuxInfo(session.id);
+        tmuxTarget = tmuxInfo.target || undefined;
+        tmuxSocket = tmuxInfo.socket || undefined;
+        if (tmuxTarget) {
+          this.sessionTmuxTargets.set(session.id, tmuxTarget);
+        }
+      } else {
+        tmuxSocket = session.tmuxSocket;
+      }
+
+      if (tmuxTarget) {
+        this.injector.setTmuxSession(tmuxTarget, tmuxSocket);
+        const injected = await this.injector.inject(injectionText);
+        if (injected) {
+          await this.bot.sendMessage('Photo sent to Claude', {}, threadId);
+        } else {
+          await this.bot.sendMessage('Failed to inject photo path into session', {}, threadId);
+        }
+      } else {
+        await this.bot.sendMessage('No tmux session found for this topic', {}, threadId);
+      }
+    });
+
+    // Handle document messages (forward to CLI as file path)
+    this.bot.onDocument(async (doc, caption, _chatId, threadId) => {
+      // BUG-005 fix: Ignore General topic
+      if (!threadId) return;
+
+      const session = this.sessions.getSessionByThreadId(threadId);
+      if (!session) {
+        logger.debug('Ignoring document for unknown topic', { threadId });
+        return;
+      }
+
+      // Check file size (20MB limit)
+      if (doc.fileSize && doc.fileSize > 20 * 1024 * 1024) {
+        await this.bot.sendMessage('File too large (max 20MB)', {}, threadId);
+        return;
+      }
+
+      // Determine filename with fallback
+      const originalName = doc.fileName || `unnamed.${doc.mimeType?.split('/')[1] || 'bin'}`;
+      const filename = this.sanitizeFilename(originalName);
+      const destPath = path.join(this.ensureDownloadsDir(), filename);
+
+      const localPath = await this.bot.downloadFile(doc.fileId, destPath);
+      if (!localPath) {
+        await this.bot.sendMessage('Failed to download document', {}, threadId);
+        return;
+      }
+
+      // Build injection text
+      let injectionText = `[Document from Telegram: ${localPath}]`;
+      if (caption) {
+        injectionText += ` Caption: ${caption}`;
+      }
+
+      // Inject into tmux
+      let tmuxTarget = this.sessionTmuxTargets.get(session.id);
+      let tmuxSocket: string | undefined;
+
+      if (!tmuxTarget) {
+        const tmuxInfo = this.sessions.getTmuxInfo(session.id);
+        tmuxTarget = tmuxInfo.target || undefined;
+        tmuxSocket = tmuxInfo.socket || undefined;
+        if (tmuxTarget) {
+          this.sessionTmuxTargets.set(session.id, tmuxTarget);
+        }
+      } else {
+        tmuxSocket = session.tmuxSocket;
+      }
+
+      if (tmuxTarget) {
+        this.injector.setTmuxSession(tmuxTarget, tmuxSocket);
+        const injected = await this.injector.inject(injectionText);
+        if (injected) {
+          await this.bot.sendMessage('Document sent to Claude', {}, threadId);
+        } else {
+          await this.bot.sendMessage('Failed to inject document path into session', {}, threadId);
+        }
+      } else {
+        await this.bot.sendMessage('No tmux session found for this topic', {}, threadId);
+      }
+    });
+  }
+
+  // ============ File Download Helpers (Epic 4) ============
+
+  /**
+   * Ensure the downloads directory exists with restrictive permissions.
+   */
+  private ensureDownloadsDir(): string {
+    const dir = path.join(getConfigDir(), 'downloads');
+    if (!existsSync(dir)) {
+      mkdirSync(dir, { recursive: true, mode: 0o700 });
+    }
+    return dir;
+  }
+
+  /**
+   * Sanitize a filename to prevent path traversal and ensure uniqueness.
+   */
+  private sanitizeFilename(name: string): string {
+    // Replace path separators
+    let safe = name.replace(/[/\\]/g, '_');
+    // Reject directory traversal
+    if (safe.includes('..')) safe = safe.replace(/\.\./g, '_');
+    // Prefix dotfiles to prevent hidden files
+    if (safe.startsWith('.')) safe = '_' + safe;
+    // Limit length (UUID is 36 chars + underscore = 37 prefix)
+    if (safe.length > 200) safe = safe.substring(0, 200);
+    // Prepend UUID for uniqueness
+    return `${randomUUID()}_${safe}`;
+  }
+
+  /**
+   * Clean up downloaded files older than 24 hours.
+   */
+  private cleanupOldDownloads(): void {
+    const dir = path.join(getConfigDir(), 'downloads');
+    if (!existsSync(dir)) return;
+
+    const now = Date.now();
+    const maxAge = 24 * 60 * 60 * 1000; // 24 hours
+
+    try {
+      for (const file of readdirSync(dir)) {
+        const filePath = path.join(dir, file);
+        try {
+          const stat = statSync(filePath);
+          if (now - stat.mtimeMs > maxAge) {
+            unlinkSync(filePath);
+            logger.debug('Cleaned up old download', { filePath });
+          }
+        } catch (error) {
+          logger.debug('Failed to stat/delete download file', { filePath, error });
+        }
+      }
+    } catch (error) {
+      logger.debug('Failed to read downloads directory', { dir, error });
+    }
   }
 
   // ============ Stale Session Cleanup (BUG-003 fix) ============
