@@ -345,9 +345,10 @@ program
 program
   .command('doctor')
   .description('Diagnose configuration and connectivity issues')
-  .action(async () => {
+  .option('--fix', 'Attempt to automatically fix detected issues')
+  .action(async (options) => {
     try {
-      await runDoctor();
+      await runDoctor(options.fix ?? false);
     } catch (error) {
       console.error('Doctor failed:', error);
       process.exit(1);
