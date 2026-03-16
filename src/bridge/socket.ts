@@ -103,6 +103,9 @@ function releasePidLock(pidPath: string): void {
   }
 }
 
+const MAX_CONNECTIONS = 64;
+const MAX_LINE_BYTES = 1_048_576; // 1 MiB
+
 /**
  * Unix Socket Server
  * Accepts connections from hook scripts and routes messages
@@ -200,6 +203,15 @@ export class SocketServer extends EventEmitter {
    * Handle new client connection
    */
   private handleConnection(socket: Socket): void {
+    if (this.clients.size >= MAX_CONNECTIONS) {
+      logger.warn('Connection limit reached, rejecting', {
+        activeConnections: this.clients.size,
+        maxAllowed: MAX_CONNECTIONS
+      });
+      socket.destroy();
+      return;
+    }
+
     const clientId = `client-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     this.clients.set(clientId, socket);
     this.buffer.set(clientId, '');
@@ -238,6 +250,15 @@ export class SocketServer extends EventEmitter {
 
     for (const line of lines) {
       if (!line.trim()) continue;
+
+      if (line.length > MAX_LINE_BYTES) {
+        logger.warn('Oversized NDJSON line dropped', {
+          clientId,
+          lineLength: line.length,
+          maxAllowed: MAX_LINE_BYTES
+        });
+        continue;
+      }
 
       try {
         const message = JSON.parse(line) as BridgeMessage;

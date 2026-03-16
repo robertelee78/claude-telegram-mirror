@@ -22,6 +22,19 @@ import logger from '../utils/logger.js';
 import type { BridgeMessage, Session } from './types.js';
 import { execSync } from 'child_process';
 
+const MAX_SESSION_ID_LENGTH = 128;
+const SESSION_ID_PATTERN = /^[a-zA-Z0-9_-]+$/;
+
+/**
+ * Validate a session ID: must be non-empty, at most 128 chars, and contain
+ * only alphanumeric characters, underscores, or hyphens.
+ */
+export function isValidSessionId(sessionId: string | undefined): boolean {
+  if (!sessionId) return false;
+  if (sessionId.length > MAX_SESSION_ID_LENGTH) return false;
+  return SESSION_ID_PATTERN.test(sessionId);
+}
+
 /**
  * Bridge Daemon Class
  * Orchestrates all components
@@ -177,6 +190,16 @@ export class BridgeDaemon extends EventEmitter {
    */
   private setupSocketHandlers(): void {
     this.socket.on('message', async (msg: BridgeMessage) => {
+      // Validate session ID before any processing
+      if (!isValidSessionId(msg.sessionId)) {
+        logger.warn('Invalid session ID, dropping message', {
+          sessionId: msg.sessionId ? msg.sessionId.slice(0, 20) + '...' : 'undefined',
+          length: msg.sessionId?.length,
+          type: msg.type
+        });
+        return;
+      }
+
       logger.debug('Received socket message', { type: msg.type, sessionId: msg.sessionId });
 
       // Update session activity
