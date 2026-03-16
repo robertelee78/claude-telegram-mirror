@@ -26,28 +26,34 @@ pub struct Config {
 
 #[derive(Debug, Deserialize, Default)]
 struct ConfigFile {
-    #[serde(rename = "botToken")]
+    #[serde(alias = "botToken", alias = "bot_token")]
     bot_token: Option<String>,
-    #[serde(rename = "chatId")]
+    #[serde(alias = "chatId", alias = "chat_id")]
     chat_id: Option<i64>,
     enabled: Option<bool>,
     verbose: Option<bool>,
     approvals: Option<bool>,
-    #[serde(rename = "socketPath")]
+    #[serde(alias = "socketPath", alias = "socket_path")]
     socket_path: Option<String>,
-    #[serde(rename = "useThreads")]
+    #[serde(alias = "useThreads", alias = "use_threads")]
     use_threads: Option<bool>,
-    #[serde(rename = "chunkSize")]
+    #[serde(alias = "chunkSize", alias = "chunk_size")]
     chunk_size: Option<usize>,
-    #[serde(rename = "rateLimit")]
+    #[serde(alias = "rateLimit", alias = "rate_limit")]
     rate_limit: Option<u32>,
-    #[serde(rename = "sessionTimeout")]
+    #[serde(alias = "sessionTimeout", alias = "session_timeout")]
     session_timeout: Option<u64>,
-    #[serde(rename = "staleSessionTimeoutHours")]
+    #[serde(
+        alias = "staleSessionTimeoutHours",
+        alias = "stale_session_timeout_hours"
+    )]
     stale_session_timeout_hours: Option<u64>,
-    #[serde(rename = "autoDeleteTopics")]
+    #[serde(alias = "autoDeleteTopics", alias = "auto_delete_topics")]
     auto_delete_topics: Option<bool>,
-    #[serde(rename = "topicDeleteDelayMinutes")]
+    #[serde(
+        alias = "topicDeleteDelayMinutes",
+        alias = "topic_delete_delay_minutes"
+    )]
     topic_delete_delay_minutes: Option<u64>,
 }
 
