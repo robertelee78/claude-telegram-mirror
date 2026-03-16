@@ -475,6 +475,8 @@ export class HookHandler {
  * Main CLI entry point for hook processing
  * BUG-006 fix: Hooks are now stateless - daemon SQLite is single source of truth
  */
+const MAX_STDIN_BYTES = 1_048_576; // 1 MiB
+
 export async function main(): Promise<void> {
   // Read event from stdin first
   let input = '';
@@ -483,6 +485,13 @@ export async function main(): Promise<void> {
 
   for await (const chunk of process.stdin) {
     input += chunk;
+    if (input.length > MAX_STDIN_BYTES) {
+      console.error('[telegram-hook] Hook stdin exceeded size limit, exiting', {
+        inputLength: input.length,
+        maxAllowed: MAX_STDIN_BYTES
+      });
+      process.exit(0);
+    }
   }
 
   if (!input.trim()) {
