@@ -25,6 +25,7 @@ export interface BridgeCallbacks {
   getActiveSessions(): Promise<Array<{ id: string; startedAt: Date; projectDir?: string }>>;
   abortSession(sessionId: string): Promise<boolean>;
   sendToSession(sessionId: string, text: string): Promise<boolean>;
+  injectSlashCommandToThread?(threadId: number, command: string): Promise<boolean>;
 }
 
 /**
@@ -251,6 +252,36 @@ export function registerCommands(
       `🏓 Pong! _${latency}ms_`,
       { parse_mode: 'Markdown' }
     );
+  });
+
+  // /rename <name> - Rename session via Claude Code (Epic 5)
+  bot.command('rename', async (ctx) => {
+    const threadId = ctx.message?.message_thread_id;
+    if (!threadId) {
+      await ctx.reply('Use /rename in a session topic, not the General chat.');
+      return;
+    }
+
+    const args = ctx.match?.trim();
+    if (!args) {
+      await ctx.reply(
+        'Usage: `/rename <name>`\n\nThis renames the session in Claude Code and updates the topic.',
+        { parse_mode: 'Markdown' }
+      );
+      return;
+    }
+
+    if (!bridge?.injectSlashCommandToThread) {
+      await ctx.reply('Bridge not connected. Cannot rename.');
+      return;
+    }
+
+    const injected = await bridge.injectSlashCommandToThread(threadId, `/rename ${args}`);
+    if (injected) {
+      await ctx.reply(`Sending rename to Claude Code: *${args}*`, { parse_mode: 'Markdown' });
+    } else {
+      await ctx.reply('Failed to send rename to Claude Code. No tmux session found for this topic.');
+    }
   });
 }
 

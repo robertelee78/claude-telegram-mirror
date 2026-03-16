@@ -365,6 +365,20 @@ export class TelegramBot {
   }
 
   /**
+   * Edit a forum topic's name
+   */
+  async editForumTopic(threadId: number, name: string): Promise<boolean> {
+    try {
+      await this.bot.api.editForumTopic(this.config.chatId, threadId, { name });
+      logger.info('Edited forum topic', { threadId, name });
+      return true;
+    } catch (error) {
+      logger.error('Failed to edit forum topic', { threadId, name, error });
+      return false;
+    }
+  }
+
+  /**
    * Close a forum topic
    */
   async closeForumTopic(threadId: number): Promise<boolean> {

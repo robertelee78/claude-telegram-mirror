@@ -351,6 +351,24 @@ ${text}"
         debug_log "Stop: transcript not accessible (path='$transcript_path', exists=$(test -f "$transcript_path" && echo yes || echo no))"
       fi
 
+      # Epic 5: Check for session rename (custom-title record in JSONL)
+      if [[ -n "$transcript_path" && -f "$transcript_path" ]]; then
+        local custom_title
+        custom_title=$(tail -c 8192 "$transcript_path" | grep '"type":"custom-title"' | tail -1 | jq -r '.customTitle // ""' 2>/dev/null || echo "")
+        if [[ -n "$custom_title" ]]; then
+          debug_log "Stop: Found custom-title: $custom_title"
+          local rename_msg
+          rename_msg=$(jq -cn \
+            --arg type "session_rename" \
+            --arg sid "$SESSION_ID" \
+            --arg title "$custom_title" \
+            --arg ts "$timestamp" \
+            --argjson tmux "$tmux_info" \
+            '{type: $type, sessionId: $sid, timestamp: $ts, content: $title, metadata: $tmux}')
+          echo "$rename_msg"
+        fi
+      fi
+
       # DON'T send session_end on every Stop - Claude fires Stop after every turn!
       # The session is still active. Only send a turn_complete notification.
       # Session end should happen when user explicitly exits or connection drops.

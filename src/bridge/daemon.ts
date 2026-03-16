@@ -24,7 +24,7 @@ import type { BridgeMessage, Session } from './types.js';
 import { execSync } from 'child_process';
 import { randomUUID } from 'crypto';
 import path from 'path';
-import { existsSync, mkdirSync, readdirSync, statSync, unlinkSync } from 'fs';
+import { existsSync, mkdirSync, readdirSync, statSync, unlinkSync, openSync, fstatSync, readSync, closeSync } from 'fs';
 import { getConfigDir } from '../utils/config.js';
 
 const MAX_SESSION_ID_LENGTH = 128;
@@ -57,6 +57,7 @@ export class BridgeDaemon extends EventEmitter {
   private recentTelegramInputs: Set<string> = new Set(); // Track recent inputs from Telegram to avoid echo
   private toolInputCache: Map<string, { tool: string; input: unknown; timestamp: number }> = new Map(); // Cache tool inputs for details button
   private compactingSessions: Set<string> = new Set(); // Track sessions currently compacting
+  private sessionCustomTitles: Map<string, string> = new Map(); // Track last known custom title per session (Epic 5)
 
   // BUG-002 fix: Promise-based topic creation lock to prevent race conditions
   // When ensureSessionExists() creates a session before session_start arrives,
@@ -146,6 +147,30 @@ export class BridgeDaemon extends EventEmitter {
           timestamp: new Date().toISOString(),
           content: text
         }), true;
+      },
+      injectSlashCommandToThread: async (threadId: number, command: string) => {
+        // Look up session by threadId, then inject the slash command via tmux
+        const session = this.sessions.getSessionByThreadId(threadId);
+        if (!session) return false;
+
+        let tmuxTarget = this.sessionTmuxTargets.get(session.id);
+        let tmuxSocket: string | undefined;
+
+        if (!tmuxTarget) {
+          const tmuxInfo = this.sessions.getTmuxInfo(session.id);
+          tmuxTarget = tmuxInfo.target || undefined;
+          tmuxSocket = tmuxInfo.socket || undefined;
+          if (tmuxTarget) {
+            this.sessionTmuxTargets.set(session.id, tmuxTarget);
+          }
+        } else {
+          tmuxSocket = session.tmuxSocket;
+        }
+
+        if (!tmuxTarget) return false;
+
+        this.injector.setTmuxSession(tmuxTarget, tmuxSocket);
+        return this.injector.sendSlashCommand(command);
       }
     });
 
@@ -302,8 +327,22 @@ export class BridgeDaemon extends EventEmitter {
           await this.handlePreCompact(msg);
           break;
 
+        case 'session_rename':
+          await this.handleSessionRename(msg.sessionId, msg.content);
+          break;
+
         default:
           logger.debug('Unknown message type', { type: msg.type });
+      }
+
+      // After processing, check for custom-title rename in transcript (Epic 5)
+      // This catches renames even if the bash hook doesn't send session_rename
+      const transcriptPath = msg.metadata?.transcript_path as string | undefined;
+      if (transcriptPath) {
+        const newTitle = this.checkForSessionRename(transcriptPath, msg.sessionId);
+        if (newTitle) {
+          await this.handleSessionRename(msg.sessionId, newTitle);
+        }
       }
     });
 
@@ -871,6 +910,7 @@ export class BridgeDaemon extends EventEmitter {
     // Clean up in-memory caches
     this.sessionThreads.delete(session.id);
     this.sessionTmuxTargets.delete(session.id);
+    this.sessionCustomTitles.delete(session.id);
 
     // Mark session as ended in database
     this.sessions.endSession(session.id, 'ended');
@@ -1199,6 +1239,84 @@ export class BridgeDaemon extends EventEmitter {
     }
   }
 
+  // ============ Session Rename (Epic 5) ============
+
+  /**
+   * Check the session transcript JSONL for a custom-title record.
+   * Returns the customTitle if found and different from last known, null otherwise.
+   * Reads only the last 8KB of the file for efficiency.
+   */
+  private checkForSessionRename(transcriptPath: string, sessionId: string): string | null {
+    if (!transcriptPath || !existsSync(transcriptPath)) return null;
+
+    try {
+      const fd = openSync(transcriptPath, 'r');
+      const stat = fstatSync(fd);
+      const readSize = Math.min(8192, stat.size);
+      const buffer = Buffer.alloc(readSize);
+      readSync(fd, buffer, 0, readSize, Math.max(0, stat.size - readSize));
+      closeSync(fd);
+
+      const tail = buffer.toString('utf8');
+      const lines = tail.split('\n');
+
+      // Search backwards for the most recent custom-title
+      for (let i = lines.length - 1; i >= 0; i--) {
+        const line = lines[i].trim();
+        if (!line) continue;
+        try {
+          const record = JSON.parse(line);
+          if (record.type === 'custom-title' && record.customTitle) {
+            const lastKnown = this.sessionCustomTitles.get(sessionId);
+            if (record.customTitle !== lastKnown) {
+              this.sessionCustomTitles.set(sessionId, record.customTitle);
+              return record.customTitle;
+            }
+            return null; // Same as before, no change
+          }
+        } catch {
+          // Skip unparseable lines (may be partial due to tail read)
+        }
+      }
+      return null;
+    } catch (error) {
+      logger.debug('Failed to check for session rename', { transcriptPath, error });
+      return null;
+    }
+  }
+
+  /**
+   * Handle a session rename: update the Telegram forum topic name.
+   * Prepends the custom title to the original topic suffix.
+   */
+  private async handleSessionRename(sessionId: string, customTitle: string): Promise<void> {
+    const threadId = this.getSessionThreadId(sessionId);
+    if (!threadId) {
+      logger.debug('No thread for session rename', { sessionId, customTitle });
+      return;
+    }
+
+    // Get the original topic name components
+    const session = this.sessions.getSession(sessionId);
+    const hostname = session?.hostname || '';
+    const projectDir = session?.projectDir || '';
+
+    // Build new topic name: "Custom Title | hostname . project (abc123)"
+    const suffix = this.formatTopicName(sessionId, hostname, projectDir);
+    const newName = `${customTitle} | ${suffix}`.slice(0, 128); // Telegram 128-char limit
+
+    logger.info('Renaming forum topic', { sessionId, customTitle, newName });
+
+    const success = await this.bot.editForumTopic(threadId, newName);
+    if (success) {
+      await this.bot.sendMessage(
+        `Topic renamed: *${customTitle}*`,
+        { parseMode: 'Markdown' },
+        threadId
+      );
+    }
+  }
+
   private async handleSessionEnd(msg: BridgeMessage): Promise<void> {
     const session = this.sessions.getSession(msg.sessionId);
     if (session) {
@@ -1237,6 +1355,9 @@ export class BridgeDaemon extends EventEmitter {
 
       // Clean up tmux target
       this.sessionTmuxTargets.delete(msg.sessionId);
+
+      // Clean up custom title tracking (Epic 5)
+      this.sessionCustomTitles.delete(msg.sessionId);
 
       // Clean up pending questions
       this.cleanupPendingQuestions(msg.sessionId);
