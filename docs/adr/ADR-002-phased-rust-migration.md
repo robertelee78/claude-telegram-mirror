@@ -6,7 +6,21 @@
 
 ## Status
 
-**Proposed** (2026-03-16)
+**In Progress** (2026-03-16)
+
+### Phase 1 Progress
+
+| Story | Status | Commit |
+|-------|--------|--------|
+| 1.1 Rust scaffolding + CI | DONE | `d9ba27d` |
+| 1.2 Config loader | DONE | `d9ba27d` |
+| 1.3 Input injector | DONE | `d9ba27d` |
+| 1.4 Hook event processing | DONE | `d9ba27d` |
+| 1.5 PreToolUse approval | DONE | `d9ba27d` |
+| 1.6 Stop transcript extraction | DONE | `d9ba27d` |
+| 1.7 Binary distribution | DONE | `e1bc607` |
+
+**Phase 1: COMPLETE.** Binary: 2.5MB release (stripped, LTO). 13 Rust tests. Clippy clean, fmt clean. 3 platform packages (linux-x64, darwin-arm64, darwin-x64).
 
 ## Date
 
