@@ -19,6 +19,7 @@ import {
   formatSessionEnd
 } from '../bot/formatting.js';
 import logger from '../utils/logger.js';
+import { summarizeToolAction, summarizeToolResult } from '../utils/summarize.js';
 import type { BridgeMessage, Session } from './types.js';
 import { execSync } from 'child_process';
 
@@ -1122,17 +1123,22 @@ export class BridgeDaemon extends EventEmitter {
     });
     setTimeout(() => this.toolInputCache.delete(toolUseId), 5 * 60 * 1000);
 
+    // Generate human-readable summary
+    const summary = toolInput
+      ? summarizeToolAction(toolName, toolInput)
+      : `Using ${toolName}`;
+
     // Send with "Details" button if there's any input to show
     if (toolInput && Object.keys(toolInput).length > 0) {
       await this.bot.sendWithButtons(
-        `🔧 *Running:* \`${toolName}\`${preview}`,
+        `🔧 ${summary}\n    Tool: \`${toolName}\`${preview}`,
         [{ text: '📋 Details', callbackData: `tooldetails:${toolUseId}` }],
         { parseMode: 'Markdown' },
         threadId
       );
     } else {
       await this.bot.sendMessage(
-        `🔧 *Running:* \`${toolName}\`${preview}`,
+        `🔧 ${summary}\n    Tool: \`${toolName}\`${preview}`,
         { parseMode: 'Markdown' },
         threadId
       );
@@ -1161,8 +1167,14 @@ export class BridgeDaemon extends EventEmitter {
       return;
     }
 
+    // Augment with human-readable result summary in verbose mode
+    const resultSummary = toolOutput
+      ? summarizeToolResult(toolName, toolOutput)
+      : 'Completed (no output)';
+    const formatted = formatToolExecution(toolName, toolInput, toolOutput, this.config.verbose);
+
     await this.bot.sendMessage(
-      formatToolExecution(toolName, toolInput, toolOutput, this.config.verbose),
+      `✅ ${resultSummary}\n${formatted}`,
       { parseMode: 'Markdown' },
       threadId
     );
