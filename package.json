@@ -76,6 +76,11 @@
     "@typescript-eslint/eslint-plugin": "^6.0.0",
     "@typescript-eslint/parser": "^6.0.0"
   },
+  "optionalDependencies": {
+    "@agidreams/ctm-linux-x64": "0.1.0",
+    "@agidreams/ctm-darwin-arm64": "0.1.0",
+    "@agidreams/ctm-darwin-x64": "0.1.0"
+  },
   "engines": {
     "node": ">=18.0.0"
   },

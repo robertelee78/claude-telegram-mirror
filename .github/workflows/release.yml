@@ -1,0 +1,145 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  build-linux-x64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust-crates
+
+      - name: Build release binary
+        working-directory: rust-crates
+        run: |
+          cargo build --release --bin ctm
+          strip target/release/ctm
+          ls -lh target/release/ctm
+
+      - name: Package binary
+        run: |
+          cp rust-crates/target/release/ctm npm-packages/ctm-linux-x64/bin/ctm
+          chmod 755 npm-packages/ctm-linux-x64/bin/ctm
+          cd npm-packages/ctm-linux-x64
+          npm pack
+          mv *.tgz ../../
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ctm-linux-x64
+          path: '*.tgz'
+
+  build-darwin-arm64:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust-crates
+
+      - name: Build release binary
+        working-directory: rust-crates
+        run: |
+          cargo build --release --bin ctm
+          strip target/release/ctm
+          ls -lh target/release/ctm
+
+      - name: Package binary
+        run: |
+          cp rust-crates/target/release/ctm npm-packages/ctm-darwin-arm64/bin/ctm
+          chmod 755 npm-packages/ctm-darwin-arm64/bin/ctm
+          cd npm-packages/ctm-darwin-arm64
+          npm pack
+          mv *.tgz ../../
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ctm-darwin-arm64
+          path: '*.tgz'
+
+  build-darwin-x64:
+    runs-on: macos-13
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust-crates
+
+      - name: Build release binary
+        working-directory: rust-crates
+        run: |
+          cargo build --release --bin ctm
+          strip target/release/ctm
+          ls -lh target/release/ctm
+
+      - name: Package binary
+        run: |
+          cp rust-crates/target/release/ctm npm-packages/ctm-darwin-x64/bin/ctm
+          chmod 755 npm-packages/ctm-darwin-x64/bin/ctm
+          cd npm-packages/ctm-darwin-x64
+          npm pack
+          mv *.tgz ../../
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ctm-darwin-x64
+          path: '*.tgz'
+
+  publish:
+    needs: [build-linux-x64, build-darwin-arm64, build-darwin-x64]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Publish platform packages to npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          echo "//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}" > ~/.npmrc
+
+          # Publish platform packages first
+          for pkg in ctm-linux-x64 ctm-darwin-arm64 ctm-darwin-x64; do
+            tgz=$(find artifacts/$pkg -name "*.tgz" | head -1)
+            if [ -n "$tgz" ]; then
+              echo "Publishing $pkg..."
+              npm publish "$tgz" --access public || true
+            fi
+          done
+
+          # Wait for npm registry propagation
+          echo "Waiting for npm registry propagation..."
+          for i in $(seq 1 30); do
+            if npm view @agidreams/ctm-linux-x64@0.1.0 version 2>/dev/null; then
+              echo "Package available on registry"
+              break
+            fi
+            echo "Attempt $i/30 — waiting 5s..."
+            sleep 5
+          done
+
+          # Publish the main package
+          npm publish --access public
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: artifacts/**/*.tgz
+          generate_release_notes: true

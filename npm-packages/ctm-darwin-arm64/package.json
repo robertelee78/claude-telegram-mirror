@@ -1,0 +1,17 @@
+{
+  "name": "@agidreams/ctm-darwin-arm64",
+  "version": "0.1.0",
+  "description": "Claude Telegram Mirror native binary for macOS ARM64 (Apple Silicon)",
+  "license": "MIT",
+  "author": "Robert E. Lee <robert@agidreams.us>",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/robertelee78/claude-telegram-mirror.git"
+  },
+  "os": ["darwin"],
+  "cpu": ["arm64"],
+  "files": ["bin/"],
+  "publishConfig": {
+    "access": "public"
+  }
+}
