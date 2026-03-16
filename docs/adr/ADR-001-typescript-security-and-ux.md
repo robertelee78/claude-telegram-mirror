@@ -25,7 +25,7 @@
 | 6. Drop file logging | DONE | `8e7ff2a` |
 | 7. NDJSON line limit | DONE | `2048371` |
 | 8. Connection limit | DONE | `2048371` |
-| 9. Tool summarizer | IN PROGRESS | |
+| 9. Tool summarizer | DONE | `89be6d4` |
 | 10. Topic augmentation via /rename | TODO | |
 | 11. Photo/document download | TODO | |
 | 12. IDOR approval check | DONE | `d0a8bb3` |
