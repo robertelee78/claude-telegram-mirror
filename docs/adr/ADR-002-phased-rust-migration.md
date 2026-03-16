@@ -6,7 +6,7 @@
 
 ## Status
 
-**In Progress** (2026-03-16)
+**Accepted (Complete)** (2026-03-16)
 
 ### Phase 1 Progress
 
@@ -43,7 +43,24 @@
 | 3.4 Full CLI | DONE | `8ccfc1d` |
 | 3.5 Integration testing | DONE | `8ccfc1d` |
 
-**Phase 3: COMPLETE.** 158 Rust tests. 8.9MB release binary. Daemon (2100 lines) with all 12+ message handlers, BUG-001 through BUG-012 preserved. Bot with governor rate limiting + retry/backoff. Full CLI with all commands. Phase 4 commands delegate to TypeScript (working delegation).
+**Phase 3: COMPLETE.** 158 Rust tests. 8.9MB release binary. Daemon (2100 lines) with all 12+ message handlers, BUG-001 through BUG-012 preserved. Bot with governor rate limiting + retry/backoff. Full CLI with all commands.
+
+### Phase 4 Progress
+
+| Story | Status | Commit |
+|-------|--------|--------|
+| 4.1 Service manager (systemd + launchd) | DONE | Phase 4 commit |
+| 4.2 Interactive setup wizard | DONE | Phase 4 commit |
+| 4.3 Doctor with --fix | DONE | Phase 4 commit |
+| 4.4 Hook installer | DONE | Phase 4 commit |
+
+**Phase 4: COMPLETE.** 184 Rust tests. 9.3MB release binary. Service manager (870 lines), setup wizard (903 lines), doctor (875 lines), installer (564 lines). All TypeScript delegations replaced. Single binary, zero Node.js dependency.
+
+---
+
+## MIGRATION COMPLETE
+
+All 4 phases shipped. The `ctm` binary is a fully self-contained Rust implementation with zero feature loss from the TypeScript codebase. 184 Rust tests + 195 TypeScript tests = 379 total tests across both codebases.
 
 ## Date
 
