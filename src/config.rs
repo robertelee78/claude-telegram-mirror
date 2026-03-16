@@ -22,6 +22,8 @@ pub struct Config {
     pub auto_delete_topics: bool,
     pub topic_delete_delay_minutes: u64,
     pub config_dir: PathBuf,
+    pub llm_summarize_url: Option<String>,
+    pub llm_api_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -55,6 +57,10 @@ struct ConfigFile {
         alias = "topic_delete_delay_minutes"
     )]
     topic_delete_delay_minutes: Option<u64>,
+    #[serde(alias = "llmSummarizeUrl", alias = "llm_summarize_url")]
+    llm_summarize_url: Option<String>,
+    #[serde(alias = "llmApiKey", alias = "llm_api_key")]
+    llm_api_key: Option<String>,
 }
 
 fn config_dir() -> Result<PathBuf> {
@@ -228,6 +234,10 @@ pub fn load_config(require_auth: bool) -> Result<Config> {
             file.topic_delete_delay_minutes.unwrap_or(1440),
         ),
         config_dir: dir,
+        llm_summarize_url: env::var("CTM_LLM_SUMMARIZE_URL")
+            .ok()
+            .or(file.llm_summarize_url),
+        llm_api_key: env::var("CTM_LLM_API_KEY").ok().or(file.llm_api_key),
     })
 }
 

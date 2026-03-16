@@ -7,6 +7,7 @@ mod hook;
 mod injector;
 mod session;
 mod socket;
+mod summarizer;
 mod types;
 
 use clap::{Parser, Subcommand};

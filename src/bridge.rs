@@ -5,6 +5,7 @@ use crate::formatting;
 use crate::injector::InputInjector;
 use crate::session::SessionManager;
 use crate::socket::SocketServer;
+use crate::summarizer::LlmSummarizer;
 use crate::types::{BridgeMessage, InlineButton, MessageType, SendOptions, SessionStatus};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -23,6 +24,7 @@ pub struct Bridge {
     tool_input_cache: Arc<RwLock<HashMap<String, CachedToolInput>>>,
     compacting_sessions: Arc<RwLock<HashSet<String>>>,
     pending_deletions: Arc<RwLock<HashMap<String, tokio::task::JoinHandle<()>>>>,
+    summarizer: Arc<LlmSummarizer>,
 }
 
 struct CachedToolInput {
@@ -36,6 +38,8 @@ impl Bridge {
         let bot = TelegramBot::new(&config.bot_token, config.chat_id);
         let sessions = SessionManager::new(&config.config_dir, 5)?;
         let injector = InputInjector::new();
+        let summarizer =
+            LlmSummarizer::new(config.llm_summarize_url.clone(), config.llm_api_key.clone());
 
         Ok(Self {
             config,
@@ -48,6 +52,7 @@ impl Bridge {
             tool_input_cache: Arc::new(RwLock::new(HashMap::new())),
             compacting_sessions: Arc::new(RwLock::new(HashSet::new())),
             pending_deletions: Arc::new(RwLock::new(HashMap::new())),
+            summarizer: Arc::new(summarizer),
         })
     }
 
@@ -147,6 +152,7 @@ impl Bridge {
             tool_input_cache: self.tool_input_cache.clone(),
             compacting_sessions: self.compacting_sessions.clone(),
             pending_deletions: self.pending_deletions.clone(),
+            summarizer: self.summarizer.clone(),
         }
     }
 }
@@ -164,6 +170,7 @@ struct BridgeShared {
     tool_input_cache: Arc<RwLock<HashMap<String, CachedToolInput>>>,
     compacting_sessions: Arc<RwLock<HashSet<String>>>,
     pending_deletions: Arc<RwLock<HashMap<String, tokio::task::JoinHandle<()>>>>,
+    summarizer: Arc<LlmSummarizer>,
 }
 
 impl BridgeShared {
@@ -418,9 +425,6 @@ impl BridgeShared {
         let tool_input = msg.get_metadata_value("input").cloned();
         let thread_id = self.get_session_thread_id(&msg.session_id).await;
 
-        // Build preview
-        let preview = build_tool_preview(&tool_name, tool_input.as_ref());
-
         // Cache tool input for details button
         let tool_use_id = format!(
             "tool_{}_{}",
@@ -446,7 +450,11 @@ impl BridgeShared {
             });
         }
 
-        let text = format!("\u{1f527} *Running:* `{}`{}", tool_name, preview);
+        let summary = self
+            .summarizer
+            .summarize(&tool_name, tool_input.as_ref())
+            .await;
+        let text = format!("\u{1f527} {}", summary);
 
         if tool_input.is_some() {
             let _ = self
@@ -479,18 +487,12 @@ impl BridgeShared {
         let tool_name = msg.get_metadata_str("tool").unwrap_or("Unknown");
         let thread_id = self.get_session_thread_id(&msg.session_id).await;
 
+        let result_summary = formatting::summarize_tool_result(tool_name, &msg.content);
+        let text = format!("\u{2705} {}", result_summary);
+
         let _ = self
             .bot
-            .send_message(
-                &formatting::format_tool_execution(
-                    tool_name,
-                    None,
-                    &msg.content,
-                    self.config.verbose,
-                ),
-                &SendOptions::default(),
-                thread_id,
-            )
+            .send_message(&text, &SendOptions::default(), thread_id)
             .await;
         Ok(())
     }
@@ -1114,47 +1116,5 @@ fn format_topic_name(
     } else {
         parts.push(short_id);
         parts.join(" \u{2022} ")
-    }
-}
-
-/// Build a tool preview string
-fn build_tool_preview(tool_name: &str, input: Option<&serde_json::Value>) -> String {
-    let input = match input {
-        Some(v) => v,
-        None => return String::new(),
-    };
-    let obj = input.as_object();
-
-    match tool_name {
-        "Read" | "Write" | "Edit" => obj
-            .and_then(|o| o.get("file_path"))
-            .and_then(|v| v.as_str())
-            .map(|p| format!(" `{}`", formatting::truncate_path(p)))
-            .unwrap_or_default(),
-        "Bash" => obj
-            .and_then(|o| o.get("command"))
-            .and_then(|v| v.as_str())
-            .map(|c| {
-                let short: String = c.chars().take(50).collect();
-                let ellipsis = if c.len() > 50 { "..." } else { "" };
-                format!("\n`{}{}`", short, ellipsis)
-            })
-            .unwrap_or_default(),
-        "Grep" => obj
-            .and_then(|o| o.get("pattern"))
-            .and_then(|v| v.as_str())
-            .map(|p| format!(" `{}`", p))
-            .unwrap_or_default(),
-        "Glob" => obj
-            .and_then(|o| o.get("pattern"))
-            .and_then(|v| v.as_str())
-            .map(|p| format!(" `{}`", p))
-            .unwrap_or_default(),
-        "Task" => obj
-            .and_then(|o| o.get("description"))
-            .and_then(|v| v.as_str())
-            .map(|d| format!(" {}", d))
-            .unwrap_or_default(),
-        _ => String::new(),
     }
 }
