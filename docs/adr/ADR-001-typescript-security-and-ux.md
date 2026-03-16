@@ -9,9 +9,31 @@
 > Just pure excellence, done the right way the entire time.
 > Chesterton's fence: always understand the current implementation fully before changing it.
 
-**Status:** Proposed
+**Status:** In Progress
 **Date:** 2026-03-16
 **Authors:** Robert E. Lee
+
+### Progress
+
+| Item | Status | Commit |
+|------|--------|--------|
+| 1. sendSlashCommand spawn + whitelist | DONE | `53fd412` |
+| 2. Bot token scrubbing | DONE | `8e7ff2a` |
+| 3. Session ID validation | DONE | `2048371` |
+| 4. Socket path traversal check | DONE | `2048371` |
+| 5. Config dir permissions | DONE | `dc2c59c` |
+| 6. Drop file logging | DONE | `8e7ff2a` |
+| 7. NDJSON line limit | DONE | `2048371` |
+| 8. Connection limit | DONE | `2048371` |
+| 9. Tool summarizer | IN PROGRESS | |
+| 10. Topic augmentation via /rename | TODO | |
+| 11. Photo/document download | TODO | |
+| 12. IDOR approval check | DONE | `d0a8bb3` |
+| 13. Doctor --fix | TODO | |
+| 14. SECURITY.md + ADRs | TODO | |
+| 15. CI workflow | TODO | |
+| 16. Remove inquirer | TODO | |
+| 17. AskUserQuestion in Telegram | TODO | |
 
 ---
 
