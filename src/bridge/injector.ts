@@ -6,6 +6,7 @@
 import { spawnSync } from 'child_process';
 import { EventEmitter } from 'events';
 import logger from '../utils/logger.js';
+import { validateSocketPath } from '../utils/config.js';
 
 /**
  * Injection method types
@@ -378,7 +379,12 @@ export class InputInjector extends EventEmitter {
    */
   setTmuxSession(session: string, socket?: string): void {
     this.tmuxSession = session;
-    this.tmuxSocket = socket || null;
+    if (socket && !validateSocketPath(socket)) {
+      logger.warn('Rejecting invalid tmux socket path in setTmuxSession', { socket: socket.slice(0, 50) });
+      this.tmuxSocket = null;
+    } else {
+      this.tmuxSocket = socket || null;
+    }
     if (session) {
       this.method = 'tmux';
     }
