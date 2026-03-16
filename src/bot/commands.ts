@@ -270,11 +270,23 @@ export function createApprovalKeyboard(approvalId: string): InlineKeyboard {
  */
 export function registerApprovalHandlers(
   bot: Bot<BotContext>,
-  onApproval: (approvalId: string, action: 'approve' | 'reject' | 'abort') => Promise<void>
+  onApproval: (approvalId: string, action: 'approve' | 'reject' | 'abort') => Promise<void>,
+  configChatId?: number
 ): void {
   bot.callbackQuery(/^(approve|reject|abort):(.+)$/, async (ctx) => {
     const action = ctx.match![1] as 'approve' | 'reject' | 'abort';
     const approvalId = ctx.match![2];
+
+    // IDOR defense: verify the callback originates from the configured chat
+    if (configChatId && ctx.chat?.id !== configChatId) {
+      logger.warn('IDOR: Approval callback from unauthorized chat', {
+        approvalId,
+        chatId: ctx.chat?.id,
+        expectedChatId: configChatId
+      });
+      await ctx.answerCallbackQuery({ text: 'Unauthorized' });
+      return;
+    }
 
     try {
       await onApproval(approvalId, action);
