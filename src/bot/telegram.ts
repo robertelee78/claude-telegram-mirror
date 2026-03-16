@@ -7,7 +7,7 @@ import { Bot, Context, session, SessionFlavor, GrammyError, HttpError } from 'gr
 import { InlineKeyboard } from 'grammy';
 import { loadConfig, TelegramMirrorConfig } from '../utils/config.js';
 import { chunkMessage } from '../utils/chunker.js';
-import logger from '../utils/logger.js';
+import logger, { scrubBotToken } from '../utils/logger.js';
 import type { SendOptions, InlineButton, MessageQueueItem } from './types.js';
 
 // Session data type
@@ -145,16 +145,16 @@ export class TelegramBot {
 
       logger.error('Bot error', {
         updateType: ctx.update.update_id,
-        error: error instanceof Error ? error.message : String(error)
+        error: error instanceof Error ? scrubBotToken(error.message) : scrubBotToken(String(error))
       });
 
       if (error instanceof GrammyError) {
         logger.error('Telegram API error', {
           code: error.error_code,
-          description: error.description
+          description: scrubBotToken(error.description)
         });
       } else if (error instanceof HttpError) {
-        logger.error('Network error', { error: error.message });
+        logger.error('Network error', { error: scrubBotToken(error.message) });
       }
     });
   }
