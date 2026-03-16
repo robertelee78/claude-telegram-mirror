@@ -54,3 +54,4 @@ CLAUDE.md
 
 # npm
 npm-debug.log*
+rust-crates/target/

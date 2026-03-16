@@ -1,0 +1,8 @@
+[workspace]
+resolver = "2"
+members = ["ctm"]
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true

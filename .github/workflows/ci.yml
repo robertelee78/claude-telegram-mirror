@@ -45,3 +45,21 @@ jobs:
           cache: 'npm'
       - run: npm ci
       - run: npx eslint src/
+
+  rust:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rust-crates
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust-crates
+      - run: cargo check
+      - run: cargo clippy -- -D warnings
+      - run: cargo fmt --check
+      - run: cargo test
