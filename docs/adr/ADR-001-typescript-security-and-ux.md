@@ -26,7 +26,7 @@
 | 7. NDJSON line limit | DONE | `2048371` |
 | 8. Connection limit | DONE | `2048371` |
 | 9. Tool summarizer | DONE | `89be6d4` |
-| 10. Topic augmentation via /rename | TODO | Needs research spike |
+| 10. Topic augmentation via /rename | DONE | `f922ccc` |
 | 11. Photo/document download | DONE | `5fcdb18` |
 | 12. IDOR approval check | DONE | `d0a8bb3` |
 | 13. Doctor --fix | DONE | `d505ce0` |
