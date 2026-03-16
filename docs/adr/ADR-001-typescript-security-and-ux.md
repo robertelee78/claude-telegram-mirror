@@ -9,7 +9,7 @@
 > Just pure excellence, done the right way the entire time.
 > Chesterton's fence: always understand the current implementation fully before changing it.
 
-**Status:** In Progress
+**Status:** Accepted (Complete)
 **Date:** 2026-03-16
 **Authors:** Robert E. Lee
 
@@ -30,7 +30,7 @@
 | 11. Photo/document download | DONE | `5fcdb18` |
 | 12. IDOR approval check | DONE | `d0a8bb3` |
 | 13. Doctor --fix | DONE | `d505ce0` |
-| 14. SECURITY.md + ADRs | TODO | |
+| 14. SECURITY.md + ADRs | DONE | `34a9ba6` |
 | 15. CI workflow | DONE | `f35613f` |
 | 16. Remove inquirer | DONE | `0ae6e88` |
 | 17. AskUserQuestion in Telegram | DONE | `eec8b0f` |
