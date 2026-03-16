@@ -3,15 +3,14 @@
  * Injects user input from Telegram into Claude Code CLI
  */
 
-import { execSync } from 'child_process';
-import { existsSync } from 'fs';
+import { spawnSync } from 'child_process';
 import { EventEmitter } from 'events';
 import logger from '../utils/logger.js';
 
 /**
  * Injection method types
  */
-type InjectionMethod = 'tmux' | 'pty' | 'fifo' | 'none';
+type InjectionMethod = 'tmux' | 'none';
 
 /**
  * Input Injector Configuration
@@ -20,7 +19,17 @@ interface InjectorConfig {
   method: InjectionMethod;
   tmuxSession?: string;
   tmuxSocket?: string;  // Explicit socket path for tmux -S
-  fifoPath?: string;
+}
+
+/**
+ * Validate a slash command against the character whitelist.
+ * Only alphanumerics, underscores, hyphens, spaces, and forward slashes are allowed.
+ * Exported for unit testing.
+ */
+export function isValidSlashCommand(command: string): boolean {
+  if (!command || command.length === 0) return false;
+  // Whitelist: letters, digits, underscore, hyphen, space, forward slash
+  return /^[a-zA-Z0-9_\- \/]+$/.test(command);
 }
 
 /**
@@ -28,18 +37,26 @@ interface InjectorConfig {
  * Handles sending user input from Telegram to Claude Code
  */
 export class InputInjector extends EventEmitter {
-  private config: InjectorConfig;
   private method: InjectionMethod = 'none';
   private tmuxSession: string | null = null;
   private tmuxSocket: string | null = null;  // Socket path for explicit targeting
 
   constructor(config: Partial<InjectorConfig> = {}) {
     super();
-    this.config = {
-      method: config.method || 'tmux',
-      tmuxSession: config.tmuxSession,
-      fifoPath: config.fifoPath
-    };
+    if (config.tmuxSession) {
+      this.tmuxSession = config.tmuxSession;
+    }
+    if (config.method) {
+      this.method = config.method;
+    }
+  }
+
+  /**
+   * Returns the socket args array for tmux commands.
+   * Uses -S <path> when a socket path is configured, otherwise empty array.
+   */
+  private get socketArgs(): string[] {
+    return this.tmuxSocket ? ['-S', this.tmuxSocket] : [];
   }
 
   /**
@@ -54,11 +71,6 @@ export class InputInjector extends EventEmitter {
         logger.info('Detected tmux session', { session });
         return 'tmux';
       }
-    }
-
-    // Check for PTY
-    if (process.stdout.isTTY && process.stdin.isTTY) {
-      return 'pty';
     }
 
     logger.warn('No injection method available');
@@ -88,12 +100,6 @@ export class InputInjector extends EventEmitter {
       case 'tmux':
         return this.injectViaTmux(text);
 
-      case 'pty':
-        return this.injectViaPty(text);
-
-      case 'fifo':
-        return this.injectViaFifo(text);
-
       default:
         logger.warn('No injection method configured');
         return false;
@@ -110,23 +116,20 @@ export class InputInjector extends EventEmitter {
       return { valid: false, reason: 'No tmux session configured' };
     }
 
-    try {
-      // Build tmux command with explicit socket if available
-      const socketFlag = this.tmuxSocket ? `-S "${this.tmuxSocket}"` : '';
-      const checkCmd = `tmux ${socketFlag} list-panes -t "${this.tmuxSession}" 2>/dev/null`;
+    const result = spawnSync(
+      'tmux',
+      [...this.socketArgs, 'list-panes', '-t', this.tmuxSession],
+      { stdio: 'pipe', encoding: 'utf8' }
+    );
 
-      execSync(checkCmd, {
-        stdio: 'pipe',
-        encoding: 'utf8'
-      });
-
+    if (result.status === 0) {
       return { valid: true };
-    } catch {
-      return {
-        valid: false,
-        reason: `Pane "${this.tmuxSession}" not found. Claude may have moved to a different pane.`
-      };
     }
+
+    return {
+      valid: false,
+      reason: `Pane "${this.tmuxSession}" not found. Claude may have moved to a different pane.`
+    };
   }
 
   /**
@@ -150,32 +153,34 @@ export class InputInjector extends EventEmitter {
     }
 
     try {
-      // Escape special characters for tmux
-      const escapedText = this.escapeTmuxText(text);
+      // Use spawnSync with argument arrays — no shell interpretation, no escaping needed.
+      // The -l flag tells tmux to treat the string as literal key input.
+      const sendResult = spawnSync(
+        'tmux',
+        [...this.socketArgs, 'send-keys', '-t', this.tmuxSession, '-l', text],
+        { stdio: 'pipe', encoding: 'utf8' }
+      );
 
-      // Build tmux command with explicit socket if available
-      // -S specifies the socket path, -t specifies the target session:window.pane
-      const socketFlag = this.tmuxSocket ? `-S "${this.tmuxSocket}"` : '';
-      const sendKeysCmd = `tmux ${socketFlag} send-keys -t "${this.tmuxSession}" -l "${escapedText}"`;
-      const enterCmd = `tmux ${socketFlag} send-keys -t "${this.tmuxSession}" Enter`;
-
-      logger.debug('Running tmux command', {
-        cmd: sendKeysCmd,
+      logger.debug('Running tmux send-keys', {
         session: this.tmuxSession,
         socket: this.tmuxSocket,
         textLength: text.length
       });
 
-      execSync(sendKeysCmd, {
-        stdio: 'pipe',
-        encoding: 'utf8'
-      });
+      if (sendResult.status !== 0) {
+        throw new Error(sendResult.stderr || 'tmux send-keys failed');
+      }
 
       // Send Enter key separately to submit
-      execSync(enterCmd, {
-        stdio: 'pipe',
-        encoding: 'utf8'
-      });
+      const enterResult = spawnSync(
+        'tmux',
+        [...this.socketArgs, 'send-keys', '-t', this.tmuxSession, 'Enter'],
+        { stdio: 'pipe', encoding: 'utf8' }
+      );
+
+      if (enterResult.status !== 0) {
+        throw new Error(enterResult.stderr || 'tmux send-keys Enter failed');
+      }
 
       logger.debug('Injected via tmux', { session: this.tmuxSession, socket: this.tmuxSocket });
       return true;
@@ -194,48 +199,11 @@ export class InputInjector extends EventEmitter {
   }
 
   /**
-   * Inject via PTY (direct stdin)
-   */
-  private injectViaPty(text: string): boolean {
-    try {
-      process.stdin.push(text + '\n');
-      return true;
-    } catch (error) {
-      logger.error('Failed to inject via PTY', { error });
-      return false;
-    }
-  }
-
-  /**
-   * Inject via FIFO pipe
-   */
-  private injectViaFifo(text: string): boolean {
-    if (!this.config.fifoPath || !existsSync(this.config.fifoPath)) {
-      logger.warn('FIFO path not available');
-      return false;
-    }
-
-    try {
-      execSync(`echo "${text}" > "${this.config.fifoPath}"`, {
-        stdio: 'ignore'
-      });
-      return true;
-    } catch (error) {
-      logger.error('Failed to inject via FIFO', { error });
-      return false;
-    }
-  }
-
-  /**
    * Check if tmux is available
    */
   private isTmuxAvailable(): boolean {
-    try {
-      execSync('which tmux', { stdio: 'ignore' });
-      return true;
-    } catch {
-      return false;
-    }
+    const result = spawnSync('tmux', ['-V'], { stdio: 'ignore' });
+    return result.status === 0;
   }
 
   /**
@@ -248,15 +216,16 @@ export class InputInjector extends EventEmitter {
       return this.findClaudeCodeSession();
     }
 
-    try {
-      // Get current session name
-      const session = execSync('tmux display-message -p "#S"', {
-        encoding: 'utf8'
-      }).trim();
-      return session;
-    } catch {
-      return null;
+    // Get current session name
+    const result = spawnSync('tmux', ['display-message', '-p', '#S'], {
+      encoding: 'utf8'
+    });
+
+    if (result.status === 0 && result.stdout) {
+      return result.stdout.trim();
     }
+
+    return null;
   }
 
   /**
@@ -265,29 +234,37 @@ export class InputInjector extends EventEmitter {
   private findClaudeCodeSession(): string | null {
     try {
       // List all tmux sessions and panes
-      const output = execSync(
-        'tmux list-panes -a -F "#{session_name}:#{pane_current_command}" 2>/dev/null',
+      const panesResult = spawnSync(
+        'tmux',
+        ['list-panes', '-a', '-F', '#{session_name}:#{pane_current_command}'],
         { encoding: 'utf8' }
       );
 
-      const lines = output.trim().split('\n');
+      if (panesResult.status === 0 && panesResult.stdout) {
+        const lines = panesResult.stdout.trim().split('\n');
 
-      for (const line of lines) {
-        const [session, command] = line.split(':');
-        // Look for node/claude processes
-        if (command && (command.includes('claude') || command.includes('node'))) {
-          return session;
+        for (const line of lines) {
+          const [session, command] = line.split(':');
+          // Look for node/claude processes
+          if (command && (command.includes('claude') || command.includes('node'))) {
+            return session;
+          }
         }
       }
 
       // Fallback: look for any session with "claude" in the name
-      const sessions = execSync('tmux list-sessions -F "#{session_name}" 2>/dev/null', {
-        encoding: 'utf8'
-      }).trim().split('\n');
+      const sessionsResult = spawnSync(
+        'tmux',
+        ['list-sessions', '-F', '#{session_name}'],
+        { encoding: 'utf8' }
+      );
 
-      for (const session of sessions) {
-        if (session.toLowerCase().includes('claude') || session.toLowerCase().includes('code')) {
-          return session;
+      if (sessionsResult.status === 0 && sessionsResult.stdout) {
+        const sessions = sessionsResult.stdout.trim().split('\n');
+        for (const session of sessions) {
+          if (session.toLowerCase().includes('claude') || session.toLowerCase().includes('code')) {
+            return session;
+          }
         }
       }
 
@@ -298,13 +275,11 @@ export class InputInjector extends EventEmitter {
   }
 
   /**
-   * Escape text for tmux send-keys with -l flag
-   * With -l (literal), tmux handles most characters, we only need to escape double quotes
-   * since we wrap the text in double quotes for the shell command
+   * Escape text for tmux send-keys.
+   * @deprecated No longer needed with spawnSync argument arrays — tmux receives raw text
+   * without shell interpretation. Kept for any external callers.
    */
-  private escapeTmuxText(text: string): string {
-    // Only escape double quotes and backslashes for the shell
-    // Single quotes, $, ` are all fine with -l flag
+  escapeTmuxText(text: string): string {
     return text
       .replace(/\\/g, '\\\\')
       .replace(/"/g, '\\"');
@@ -328,12 +303,14 @@ export class InputInjector extends EventEmitter {
         'Ctrl-U': 'C-u'
       };
 
-      // BUG-004 fix: Include socket flag to target correct tmux server
-      const socketFlag = this.tmuxSocket ? `-S "${this.tmuxSocket}"` : '';
-      execSync(`tmux ${socketFlag} send-keys -t "${this.tmuxSession}" ${keyMap[key]}`, {
-        stdio: 'ignore'
-      });
-      return true;
+      // BUG-004 fix: Include socket args to target correct tmux server
+      const result = spawnSync(
+        'tmux',
+        [...this.socketArgs, 'send-keys', '-t', this.tmuxSession, keyMap[key]],
+        { stdio: 'ignore' }
+      );
+
+      return result.status === 0;
     } catch (error) {
       logger.error('Failed to send key', { key, error });
       return false;
@@ -342,24 +319,40 @@ export class InputInjector extends EventEmitter {
 
   /**
    * Send slash command (like /clear)
-   * Sends command text, then Enter key separately
+   * Validates against the character whitelist before sending.
+   * Sends command text with -l (literal) flag, then Enter key separately.
    */
   async sendSlashCommand(command: string): Promise<boolean> {
     if (this.method !== 'tmux' || !this.tmuxSession) {
       return false;
     }
 
+    // Whitelist validation — reject commands containing shell-special characters
+    if (!isValidSlashCommand(command)) {
+      logger.warn('Slash command rejected: unsafe characters', { command });
+      return false;
+    }
+
     try {
-      const socketFlag = this.tmuxSocket ? `-S "${this.tmuxSocket}"` : '';
-      // Send command text (no -l, no quotes - just the raw command)
-      execSync(`tmux ${socketFlag} send-keys -t "${this.tmuxSession}" ${command}`, {
-        stdio: 'ignore'
-      });
+      // Send command text using -l (literal) flag — no shell interpretation
+      const sendResult = spawnSync(
+        'tmux',
+        [...this.socketArgs, 'send-keys', '-t', this.tmuxSession, '-l', command],
+        { stdio: 'ignore' }
+      );
+
+      if (sendResult.status !== 0) {
+        throw new Error('tmux send-keys failed for slash command');
+      }
+
       // Send Enter separately
-      execSync(`tmux ${socketFlag} send-keys -t "${this.tmuxSession}" Enter`, {
-        stdio: 'ignore'
-      });
-      return true;
+      const enterResult = spawnSync(
+        'tmux',
+        [...this.socketArgs, 'send-keys', '-t', this.tmuxSession, 'Enter'],
+        { stdio: 'ignore' }
+      );
+
+      return enterResult.status === 0;
     } catch (error) {
       logger.error('Failed to send slash command', { command, error });
       return false;
