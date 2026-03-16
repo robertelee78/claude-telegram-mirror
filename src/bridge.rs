@@ -1029,28 +1029,26 @@ impl BridgeShared {
         let sessions = self.sessions.lock().await;
         sessions.expire_old_approvals();
 
-        // Check for stale sessions (1h without tmux, 24h with tmux)
+        // Get sessions idle for >1h
         let candidates = sessions.get_stale_session_candidates(1);
         drop(sessions);
 
         for session in candidates {
-            if session.tmux_target.is_none() {
-                // No tmux info, clean up after 1h
-                tracing::info!(session_id = %session.id, "Cleaning up stale session (no tmux, >1h)");
-                self.cleanup_stale_session(&session, "inactivity timeout")
-                    .await;
-            } else if let Some(target) = &session.tmux_target {
-                // Check if 24h+ old AND pane is dead
-                let age_hours = (chrono::Utc::now() - session.last_activity).num_hours();
-                if age_hours >= 24 {
-                    let pane_alive =
-                        InputInjector::is_pane_alive(target, session.tmux_socket.as_deref());
-                    if !pane_alive {
-                        tracing::info!(session_id = %session.id, "Cleaning up stale session (pane dead)");
-                        self.cleanup_stale_session(&session, "pane no longer exists")
-                            .await;
-                    }
+            if let Some(target) = &session.tmux_target {
+                // Has tmux target — check if pane is still alive
+                let pane_alive =
+                    InputInjector::is_pane_alive(target, session.tmux_socket.as_deref());
+                if !pane_alive {
+                    tracing::info!(session_id = %session.id, target, "Cleaning up stale session (pane dead)");
+                    self.cleanup_stale_session(&session, "tmux pane no longer exists")
+                        .await;
                 }
+                // Pane alive = keep session, it may just be idle
+            } else {
+                // No tmux info at all — clean up after 1h of inactivity
+                tracing::info!(session_id = %session.id, "Cleaning up stale session (no tmux, >1h idle)");
+                self.cleanup_stale_session(&session, "inactivity timeout (no tmux)")
+                    .await;
             }
         }
     }
@@ -1062,20 +1060,20 @@ impl BridgeShared {
             let _ = self
                 .bot
                 .send_message(
-                    &format!(
-                        "\u{1f50c} *Session ended* (terminal closed)\n\n_{}_",
-                        reason
-                    ),
+                    &format!("\u{1f50c} *Session cleaned up*\n\n_{}_", reason),
                     &SendOptions::default(),
                     Some(tid),
                 )
                 .await;
 
-            if self.config.auto_delete_topics {
-                let _ = self.bot.delete_forum_topic(tid).await;
+            // Stale sessions are truly dead — always delete the topic to keep the group clean.
+            // Normal session ends respect auto_delete_topics config; stale cleanup does not.
+            if self.bot.delete_forum_topic(tid).await.unwrap_or(false) {
+                tracing::info!(session_id = %session.id, %tid, "Deleted stale forum topic");
                 let sessions = self.sessions.lock().await;
                 sessions.clear_thread_id(&session.id);
             } else {
+                // Fallback to close if delete fails (missing permissions)
                 let _ = self.bot.close_forum_topic(tid).await;
             }
         }
