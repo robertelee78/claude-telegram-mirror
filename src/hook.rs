@@ -20,6 +20,15 @@ pub async fn process_hook(socket_path: &std::path::Path) -> Result<()> {
         return Ok(());
     }
 
+    // Fast path: check if mirroring is disabled via status.json (<1ms)
+    if let Some(config_dir) = socket_path.parent() {
+        if !crate::config::read_mirror_status(config_dir) {
+            print!("{}", input);
+            io::stdout().flush()?;
+            return Ok(());
+        }
+    }
+
     // Parse the hook event (Security fix #10: no unwrap/panic)
     let event: HookEvent = match serde_json::from_str(input) {
         Ok(e) => e,

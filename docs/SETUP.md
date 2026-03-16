@@ -219,11 +219,13 @@ Add to `~/.claude/settings.json`:
 ```json
 {
   "hooks": {
-    "PreToolUse": [{ "command": "ctm hook" }],
-    "PostToolUse": [{ "command": "ctm hook" }],
-    "Notification": [{ "command": "ctm hook" }],
-    "Stop": [{ "command": "ctm hook" }],
-    "UserPromptSubmit": [{ "command": "ctm hook" }]
+    "PreToolUse": [{ "hooks": [{ "type": "command", "command": "ctm hook", "timeout": 5000 }] }],
+    "PostToolUse": [{ "hooks": [{ "type": "command", "command": "ctm hook", "timeout": 5000 }] }],
+    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "ctm hook", "timeout": 5000 }] }],
+    "SessionStart": [{ "hooks": [{ "type": "command", "command": "ctm hook", "timeout": 5000 }] }],
+    "SessionEnd": [{ "hooks": [{ "type": "command", "command": "ctm hook", "timeout": 5000 }] }],
+    "Notification": [{ "hooks": [{ "type": "command", "command": "ctm hook", "timeout": 5000 }] }],
+    "Stop": [{ "hooks": [{ "type": "command", "command": "ctm hook", "timeout": 5000 }] }]
   }
 }
 ```
@@ -238,6 +240,8 @@ graph LR
         NOTIF[Notification]
         STOP[Stop]
         USER[UserPromptSubmit]
+        SSTART[SessionStart]
+        SEND[SessionEnd]
     end
 
     subgraph "CTM Handler"
@@ -253,6 +257,8 @@ graph LR
     NOTIF -->|stdin| HOOK
     STOP -->|stdin| HOOK
     USER -->|stdin| HOOK
+    SSTART -->|stdin| HOOK
+    SEND -->|stdin| HOOK
 
     HOOK -->|NDJSON| SOCKET
     HOOK -->|stdout passthrough| PRE

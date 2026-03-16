@@ -120,6 +120,10 @@ sequenceDiagram
         Bridge->>Bot: Send human-readable summary + Details button
     else TurnComplete
         Bridge->>Bridge: Check compaction state
+    else SendImage
+        Bridge->>Bridge: Validate file path
+        Bridge->>Bot: send_photo or send_document
+        Bot->>TG: sendPhoto/sendDocument (thread_id)
     end
 
     Bot->>TG: sendMessage (thread_id)
@@ -148,6 +152,12 @@ sequenceDiagram
         Bridge->>INJ: inject(text)
         INJ->>TMUX: send-keys -l "text"
         INJ->>TMUX: send-keys Enter
+    else Photo / Document
+        Bridge->>Bridge: Download file via Bot API
+        Bridge->>Bridge: Save to /tmp/ctm-images/{uuid}.{ext}
+        Bridge->>Bridge: Set perms 0o600
+        Bridge->>INJ: inject("[Image/File from Telegram: path]")
+        INJ->>TMUX: send-keys -l notification
     else "stop" / "esc"
         Bridge->>INJ: send_key("Escape")
         INJ->>TMUX: send-keys Escape
@@ -268,6 +278,7 @@ graph LR
 | `error` | CLI -> TG | Error notification |
 | `turn_complete` | CLI -> TG | Claude finished a turn |
 | `pre_compact` | CLI -> TG | Context compaction starting |
+| `send_image` | Socket -> TG | Send image/file to Telegram |
 
 ## Security Architecture
 

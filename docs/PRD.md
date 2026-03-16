@@ -45,6 +45,9 @@ The TypeScript implementation has 3 CRITICAL, 4 HIGH, and 3 MEDIUM security vuln
 - All file operations via `OpenOptions::mode()`
 - Zero `unsafe` blocks
 - No shell interpolation anywhere
+- **Bidirectional image/file transfer** — photos/documents from Telegram downloaded and injected into Claude; images/files sent to Telegram via bridge socket
+- **Human-readable tool summaries** — rule-based with optional LLM fallback
+- **Stale topic auto-cleanup** — dead sessions and their forum topics cleaned up automatically
 
 ## Non-Functional Requirements
 

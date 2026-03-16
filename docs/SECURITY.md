@@ -48,6 +48,7 @@ graph TB
 | JSON parsing | Denial of service | `serde_json` Result handling, no panics |
 | PID file | Race condition | `flock(2)` atomic locking |
 | Rate limiting | API abuse | `governor` token-bucket per bot |
+| File downloads | Path traversal, symlinks | UUID filenames, 0o600 perms, absolute path validation |
 
 ## Vulnerability Fixes
 
@@ -210,6 +211,27 @@ match serde_json::from_str::<BridgeMessage>(&line) {
 }
 ```
 
+## File Transfer Security
+
+### Inbound (Telegram -> local disk)
+
+Photos and documents received from Telegram are downloaded securely:
+
+- **Download directory**: `/tmp/ctm-images/` created with `0o700` permissions
+- **UUID filenames**: Files are saved as `{uuid}.{ext}` (photos) or `{uuid}_{sanitized_name}` (documents), preventing predictable paths
+- **Atomic writes**: Files are downloaded to `{uuid}.downloading` then renamed to final path, preventing partial reads
+- **File permissions**: All downloaded files set to `0o600` (owner-only)
+- **Filename sanitization**: Original document filenames have `/` and `\` replaced with `_` to prevent path traversal
+
+### Outbound (local disk -> Telegram)
+
+The `send_image` socket message type validates file paths before sending:
+
+- **Absolute path required**: Relative paths are rejected
+- **No path traversal**: Paths containing `..` are rejected
+- **Existence check**: File must exist before sending
+- **Extension-based routing**: Image extensions (jpg, png, gif, webp, bmp) sent as photos; all others sent as documents
+
 ## tmux Key Whitelist
 
 Only these keys can be sent to tmux via the `send_key()` method:
@@ -253,11 +275,17 @@ graph TB
         LOG[supervisor.log]
     end
 
+    subgraph "Download Dir: 0o700"
+        DLDIR[/tmp/ctm-images/]
+        DLFILES["{uuid}.{ext} — 0o600"]
+    end
+
     DIR --> CONFIG
     DIR --> DB
     DIR --> SOCK
     DIR --> PID
     DIR --> LOG
+    DLDIR --> DLFILES
 
     style DIR fill:#ffa,stroke:#333
     style CONFIG fill:#afa,stroke:#333
@@ -278,3 +306,5 @@ graph TB
 - [x] tmux keys restricted to whitelist
 - [x] NDJSON parsing returns Result
 - [x] No secrets in logs or error messages
+- [x] File downloads use UUID filenames and 0o600 perms
+- [x] Outbound file paths validated (absolute, no traversal, exists)

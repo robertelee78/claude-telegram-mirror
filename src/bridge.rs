@@ -9,6 +9,7 @@ use crate::summarizer::LlmSummarizer;
 use crate::types::{BridgeMessage, InlineButton, MessageType, SendOptions, SessionStatus};
 use std::collections::{HashMap, HashSet};
 use std::os::unix::fs::PermissionsExt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio::time::{self, Duration};
@@ -28,6 +29,8 @@ pub struct Bridge {
     summarizer: Arc<LlmSummarizer>,
     /// Sessions that have already been renamed with a task description
     named_sessions: Arc<RwLock<HashSet<String>>>,
+    /// Runtime toggle for mirroring (read from status.json, flipped by `ctm toggle`)
+    mirroring_enabled: Arc<AtomicBool>,
 }
 
 struct CachedToolInput {
@@ -44,6 +47,10 @@ impl Bridge {
         let summarizer =
             LlmSummarizer::new(config.llm_summarize_url.clone(), config.llm_api_key.clone());
 
+        let mirroring_enabled = Arc::new(AtomicBool::new(crate::config::read_mirror_status(
+            &config.config_dir,
+        )));
+
         Ok(Self {
             config,
             bot,
@@ -57,6 +64,7 @@ impl Bridge {
             pending_deletions: Arc::new(RwLock::new(HashMap::new())),
             summarizer: Arc::new(summarizer),
             named_sessions: Arc::new(RwLock::new(HashSet::new())),
+            mirroring_enabled,
         })
     }
 
@@ -80,6 +88,13 @@ impl Bridge {
                 tracing::warn!("tmux not available - Telegram -> CLI disabled");
             }
         }
+
+        // Write status file with our PID
+        crate::config::write_mirror_status(
+            &self.config.config_dir,
+            self.mirroring_enabled.load(Ordering::Relaxed),
+            Some(std::process::id()),
+        );
 
         // Send startup notification
         let _ = self
@@ -158,6 +173,7 @@ impl Bridge {
             pending_deletions: self.pending_deletions.clone(),
             summarizer: self.summarizer.clone(),
             named_sessions: self.named_sessions.clone(),
+            mirroring_enabled: self.mirroring_enabled.clone(),
         }
     }
 }
@@ -177,6 +193,7 @@ struct BridgeShared {
     pending_deletions: Arc<RwLock<HashMap<String, tokio::task::JoinHandle<()>>>>,
     summarizer: Arc<LlmSummarizer>,
     named_sessions: Arc<RwLock<HashSet<String>>>,
+    mirroring_enabled: Arc<AtomicBool>,
 }
 
 impl BridgeShared {
@@ -214,6 +231,18 @@ impl BridgeShared {
 
         // Auto-update tmux target if changed
         self.check_and_update_tmux_target(&msg).await;
+
+        // Handle system commands (toggle/enable/disable) regardless of mirroring state
+        if msg.msg_type == MessageType::Command {
+            self.handle_command(&msg).await?;
+            return Ok(());
+        }
+
+        // Gate: skip all Telegram sends when mirroring is disabled
+        if !self.mirroring_enabled.load(Ordering::Relaxed) {
+            tracing::debug!(msg_type = ?msg.msg_type, "Mirroring disabled, skipping");
+            return Ok(());
+        }
 
         match msg.msg_type {
             MessageType::SessionStart => self.handle_session_start(&msg).await?,
@@ -268,6 +297,7 @@ impl BridgeShared {
             MessageType::SendImage => {
                 self.handle_send_image(&msg).await?;
             }
+            MessageType::Command => {} // already handled above
             _ => {
                 tracing::debug!(msg_type = ?msg.msg_type, "Unhandled message type");
             }
@@ -1247,6 +1277,44 @@ impl BridgeShared {
                 tracing::debug!(%action, "Unknown callback action");
             }
         }
+    }
+
+    // ============ Command Handling ============
+
+    async fn handle_command(&self, msg: &BridgeMessage) -> Result<()> {
+        let cmd = msg.content.trim().to_lowercase();
+        let new_state = match cmd.as_str() {
+            "toggle" => !self.mirroring_enabled.load(Ordering::Relaxed),
+            "enable" | "on" => true,
+            "disable" | "off" => false,
+            _ => {
+                tracing::debug!(cmd = %cmd, "Unknown command");
+                return Ok(());
+            }
+        };
+
+        self.mirroring_enabled.store(new_state, Ordering::Relaxed);
+        crate::config::write_mirror_status(
+            &self.config.config_dir,
+            new_state,
+            Some(std::process::id()),
+        );
+
+        let status_text = if new_state {
+            "\u{1f7e2} *Telegram mirroring: ON*"
+        } else {
+            "\u{1f534} *Telegram mirroring: OFF*"
+        };
+
+        tracing::info!(enabled = new_state, "Mirroring toggled");
+
+        // Send one confirmation message to Telegram (even when disabling)
+        let _ = self
+            .bot
+            .send_message(status_text, &SendOptions::default(), None)
+            .await;
+
+        Ok(())
     }
 
     // ============ Helper Methods ============

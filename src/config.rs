@@ -1,5 +1,5 @@
 use crate::error::{AppError, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -290,6 +290,46 @@ pub fn validate_config(config: &Config) -> (Vec<String>, Vec<String>) {
     }
 
     (errors, warnings)
+}
+
+// ============ Mirror Status (runtime toggle state) ============
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MirrorStatus {
+    pub enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    pub toggled_at: String,
+}
+
+pub fn status_file_path(config_dir: &Path) -> PathBuf {
+    config_dir.join("status.json")
+}
+
+/// Read the current mirroring enabled state from status.json.
+/// Returns `true` (default) if the file doesn't exist or can't be parsed.
+pub fn read_mirror_status(config_dir: &Path) -> bool {
+    let path = status_file_path(config_dir);
+    match fs::read_to_string(&path) {
+        Ok(content) => serde_json::from_str::<MirrorStatus>(&content)
+            .map(|s| s.enabled)
+            .unwrap_or(true),
+        Err(_) => true,
+    }
+}
+
+/// Write the mirroring status file with secure permissions (0o600).
+pub fn write_mirror_status(config_dir: &Path, enabled: bool, pid: Option<u32>) {
+    let status = MirrorStatus {
+        enabled,
+        pid,
+        toggled_at: chrono::Utc::now().to_rfc3339(),
+    };
+    let path = status_file_path(config_dir);
+    if let Ok(json) = serde_json::to_string_pretty(&status) {
+        let _ = fs::write(&path, &json);
+        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+    }
 }
 
 #[cfg(test)]

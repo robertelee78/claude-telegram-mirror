@@ -49,6 +49,12 @@ enum Commands {
 
     /// Interactive setup wizard
     Setup,
+
+    /// Toggle Telegram mirroring on/off
+    Toggle,
+
+    /// Stop the bridge daemon
+    Stop,
 }
 
 #[tokio::main]
@@ -70,6 +76,8 @@ async fn main() -> anyhow::Result<()> {
         Commands::Status => cmd_status().await,
         Commands::Doctor { fix } => cmd_doctor(fix).await,
         Commands::Setup => cmd_setup().await,
+        Commands::Toggle => cmd_toggle().await,
+        Commands::Stop => cmd_stop().await,
     }
 }
 
@@ -95,11 +103,72 @@ async fn cmd_hook() -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn cmd_toggle() -> anyhow::Result<()> {
+    let cfg = config::load_config(false)?;
+    let current = config::read_mirror_status(&cfg.config_dir);
+    let new_state = !current;
+    config::write_mirror_status(&cfg.config_dir, new_state, None);
+
+    // If bridge is running, send a toggle command through the socket
+    if cfg.socket_path.exists() {
+        let msg = crate::types::BridgeMessage::new(
+            crate::types::MessageType::Command,
+            "_system",
+            "toggle",
+        );
+        if let Ok(mut stream) = tokio::net::UnixStream::connect(&cfg.socket_path).await {
+            if let Ok(json) = serde_json::to_string(&msg) {
+                use tokio::io::AsyncWriteExt;
+                let _ = stream.write_all(format!("{}\n", json).as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        }
+    }
+
+    if new_state {
+        println!("Telegram mirroring: ON");
+    } else {
+        println!("Telegram mirroring: OFF");
+    }
+    Ok(())
+}
+
+async fn cmd_stop() -> anyhow::Result<()> {
+    let cfg = config::load_config(false)?;
+
+    if !cfg.socket_path.exists() {
+        println!("Bridge daemon is not running.");
+        return Ok(());
+    }
+
+    // Read PID from status file and send SIGTERM
+    let status_path = config::status_file_path(&cfg.config_dir);
+    if let Ok(content) = std::fs::read_to_string(&status_path) {
+        if let Ok(status) = serde_json::from_str::<config::MirrorStatus>(&content) {
+            if let Some(pid) = status.pid {
+                use nix::sys::signal::{kill, Signal};
+                use nix::unistd::Pid;
+                let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
+                println!("Sent SIGTERM to bridge daemon (PID {})", pid);
+                return Ok(());
+            }
+        }
+    }
+
+    println!("Could not determine bridge PID. Remove socket manually if needed:");
+    println!("  rm {}", cfg.socket_path.display());
+    Ok(())
+}
+
 async fn cmd_status() -> anyhow::Result<()> {
     let cfg = config::load_config(false)?;
 
     println!("Claude Telegram Mirror - Status");
     println!("================================");
+
+    // Mirroring state
+    let mirroring = config::read_mirror_status(&cfg.config_dir);
+    println!("Mirroring: {}", if mirroring { "ON" } else { "OFF" });
 
     // Check socket
     let socket_exists = cfg.socket_path.exists();

@@ -69,7 +69,7 @@ cargo test session::tests
 |--------|-------|---------------|
 | `session.rs` | 3 | CRUD, lifecycle, approvals |
 | `socket.rs` | 2 | Server lifecycle, flock double-start prevention |
-| `formatting.rs` | 11 | ANSI stripping, truncation, path shortening, tool action summaries (bash/cargo/git, file ops, search, task, unknown), tool result summaries (success, error) |
+| `formatting.rs` | 14 | ANSI stripping, truncation, path shortening, tool action summaries (bash/cargo/git/chained, file ops, search, task, unknown), tool result summaries (success, error), message chunking, meaningful command extraction |
 | `injector.rs` | 2 | Key whitelist validation, no-target safety |
 | `config.rs` | 2 | Environment loading, config file defaults |
 
@@ -173,6 +173,8 @@ Key patterns:
 - Tool input cache auto-expires after 5 minutes
 - Topic deletion is delayed and cancellable
 - Tool actions are summarized in natural language via `summarizer.rs` (rule-based, with optional LLM fallback)
+- Inbound photos/documents from Telegram are downloaded, saved securely, and injected as file paths into tmux
+- Outbound images/files sent via `send_image` socket messages are dispatched as photos or documents to Telegram
 
 ### summarizer.rs - Human-Readable Tool Summaries
 
