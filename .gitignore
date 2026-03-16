@@ -51,8 +51,5 @@ _bmad-output/
 # Claude project instructions
 CLAUDE.md
 
-# Architecture decision records
-docs/adr/
-
 # npm
 npm-debug.log*
