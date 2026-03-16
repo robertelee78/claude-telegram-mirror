@@ -28,6 +28,7 @@ use crate::types::{is_valid_session_id, BridgeMessage};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, RwLock};
 
 // ---------------------------------------------------------------- constants
@@ -136,6 +137,7 @@ impl Daemon {
         let mut socket = SocketServer::new(&self.config.socket_path, &pid_path);
         socket.listen().await?;
         let socket_rx = socket.subscribe();
+        let daemon_socket_clients = socket.clients_ref();
         self.socket = Some(socket);
 
         // Verify bot connectivity
@@ -195,6 +197,7 @@ impl Daemon {
                 daemon_pending_q,
                 daemon_topic_locks,
                 daemon_config,
+                daemon_socket_clients,
             )
             .await;
         });
@@ -247,6 +250,7 @@ async fn run_event_loop(
     pending_q: Arc<RwLock<HashMap<String, PendingQuestion>>>,
     topic_locks: Arc<RwLock<HashMap<String, Arc<TopicCreationState>>>>,
     config: Config,
+    socket_clients: SocketClients,
 ) {
     let mut cleanup_interval =
         tokio::time::interval(tokio::time::Duration::from_secs(CLEANUP_INTERVAL_SECS));
@@ -274,6 +278,7 @@ async fn run_event_loop(
                             pending_q: Arc::clone(&pending_q),
                             topic_locks: Arc::clone(&topic_locks),
                             config: config.clone(),
+                            socket_clients: Arc::clone(&socket_clients),
                         };
                         tokio::spawn(async move {
                             handle_socket_message(ctx, msg).await;
@@ -311,6 +316,7 @@ async fn run_event_loop(
                                 pending_q: Arc::clone(&pending_q),
                                 topic_locks: Arc::clone(&topic_locks),
                                 config: config.clone(),
+                                socket_clients: Arc::clone(&socket_clients),
                             };
                             tokio::spawn(async move {
                                 handle_telegram_update(ctx, update).await;
@@ -340,6 +346,7 @@ async fn run_event_loop(
                     pending_q: Arc::clone(&pending_q),
                     topic_locks: Arc::clone(&topic_locks),
                     config: config.clone(),
+                    socket_clients: Arc::clone(&socket_clients),
                 };
                 tokio::spawn(async move {
                     run_cleanup(ctx).await;
@@ -350,6 +357,9 @@ async fn run_event_loop(
 }
 
 // ====================================================================== context
+
+/// Type alias for the connected-client map shared with `SocketServer`.
+type SocketClients = Arc<Mutex<HashMap<String, Arc<Mutex<tokio::net::unix::OwnedWriteHalf>>>>>;
 
 /// Shared context passed to all handlers.
 #[derive(Clone)]
@@ -367,6 +377,8 @@ struct HandlerContext {
     pending_q: Arc<RwLock<HashMap<String, PendingQuestion>>>,
     topic_locks: Arc<RwLock<HashMap<String, Arc<TopicCreationState>>>>,
     config: Config,
+    /// Shared reference to the socket's connected-client map for outbound broadcasts.
+    socket_clients: SocketClients,
 }
 
 impl HandlerContext {
@@ -2008,6 +2020,26 @@ async fn handle_callback_query(ctx: &HandlerContext, cb: &CallbackQuery) {
     }
 }
 
+/// Broadcast a `BridgeMessage` to all currently-connected socket clients.
+///
+/// Mirrors `SocketServer::broadcast` but uses the shared `SocketClients` reference
+/// so handlers that don't own the `SocketServer` can still send outbound messages.
+async fn broadcast_to_clients(clients: &SocketClients, message: &BridgeMessage) {
+    let json = match serde_json::to_string(message) {
+        Ok(j) => j,
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to serialise broadcast message");
+            return;
+        }
+    };
+    let line = format!("{json}\n");
+    let guard = clients.lock().await;
+    for (_id, writer) in guard.iter() {
+        let mut w = writer.lock().await;
+        let _ = w.write_all(line.as_bytes()).await;
+    }
+}
+
 /// Handle approval/reject/abort callback.
 async fn handle_approval_callback(
     ctx: &HandlerContext,
@@ -2045,15 +2077,27 @@ async fn handle_approval_callback(
     }
     drop(sess);
 
-    // Broadcast response through socket so hook client picks it up
-    if let Some(socket) = &ctx.config.socket_path.to_str() {
-        tracing::debug!(
-            approval_id,
-            action,
-            "Approval resolved via callback, socket at {}",
-            socket
-        );
-    }
+    // ADR-006 C1: Broadcast `approval_response` so the hook client blocked in
+    // `send_and_wait()` receives the decision instead of timing out.
+    let mut metadata = serde_json::Map::new();
+    metadata.insert(
+        "approvalId".to_string(),
+        serde_json::Value::String(approval_id.to_string()),
+    );
+    let response = BridgeMessage {
+        msg_type: "approval_response".to_string(),
+        session_id: approval.session_id.clone(),
+        timestamp: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        content: action.to_string(),
+        metadata: Some(metadata),
+    };
+    broadcast_to_clients(&ctx.socket_clients, &response).await;
+    tracing::info!(
+        approval_id,
+        action,
+        session_id = %approval.session_id,
+        "Approval resolved and broadcast over socket"
+    );
 }
 
 /// Handle tool details callback.
@@ -2653,5 +2697,47 @@ mod tests {
         let bash_input = serde_json::json!({"command": "cargo test"});
         let preview = format_tool_preview("Bash", &bash_input);
         assert!(preview.contains("cargo test"));
+    }
+
+    /// ADR-006 C1: Verify the `approval_response` message is correctly structured
+    /// for each possible action so the hook client's `send_and_wait()` can match it.
+    #[test]
+    fn test_approval_response_message_structure() {
+        for action in &["approve", "reject", "abort"] {
+            let approval_id = "approval-test-123";
+            let session_id = "session-abc12345";
+
+            let mut metadata = serde_json::Map::new();
+            metadata.insert(
+                "approvalId".to_string(),
+                serde_json::Value::String(approval_id.to_string()),
+            );
+
+            let msg = BridgeMessage {
+                msg_type: "approval_response".to_string(),
+                session_id: session_id.to_string(),
+                timestamp: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                content: action.to_string(),
+                metadata: Some(metadata),
+            };
+
+            // Verify type matches what the TypeScript daemon broadcasts.
+            assert_eq!(msg.msg_type, "approval_response");
+            assert_eq!(msg.session_id, session_id);
+            assert_eq!(msg.content, *action);
+
+            let meta = msg.metadata.as_ref().expect("metadata must be present");
+            assert_eq!(
+                meta.get("approvalId").and_then(|v| v.as_str()),
+                Some(approval_id),
+                "metadata.approvalId must equal the approval ID"
+            );
+
+            // Must round-trip through JSON (required for NDJSON framing).
+            let json = serde_json::to_string(&msg).expect("must serialise");
+            let parsed: BridgeMessage = serde_json::from_str(&json).expect("must deserialise");
+            assert_eq!(parsed.msg_type, "approval_response");
+            assert_eq!(parsed.content, *action);
+        }
     }
 }

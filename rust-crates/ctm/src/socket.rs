@@ -67,6 +67,14 @@ impl SocketServer {
         self.clients.lock().await.len()
     }
 
+    /// Return a shared reference to the connected-client map so callers outside
+    /// of `SocketServer` can broadcast without holding the server itself.
+    pub fn clients_ref(
+        &self,
+    ) -> Arc<Mutex<HashMap<String, Arc<Mutex<tokio::net::unix::OwnedWriteHalf>>>>> {
+        Arc::clone(&self.clients)
+    }
+
     /// Start listening.  Returns when the accept loop is running.
     pub async fn listen(&mut self) -> Result<()> {
         // Step 1: Acquire flock on PID file (atomic, no TOCTOU).
