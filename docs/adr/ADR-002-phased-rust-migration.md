@@ -37,11 +37,13 @@
 
 | Story | Status | Commit |
 |-------|--------|--------|
-| 3.1 Bridge daemon | IN PROGRESS | |
-| 3.2 Telegram bot | IN PROGRESS | |
-| 3.3 Bot commands | IN PROGRESS | |
-| 3.4 Full CLI | IN PROGRESS | |
-| 3.5 Integration testing | PENDING | |
+| 3.1 Bridge daemon | DONE | `8ccfc1d` |
+| 3.2 Telegram bot | DONE | `8ccfc1d` |
+| 3.3 Bot commands | DONE | `8ccfc1d` |
+| 3.4 Full CLI | DONE | `8ccfc1d` |
+| 3.5 Integration testing | DONE | `8ccfc1d` |
+
+**Phase 3: COMPLETE.** 158 Rust tests. 8.9MB release binary. Daemon (2100 lines) with all 12+ message handlers, BUG-001 through BUG-012 preserved. Bot with governor rate limiting + retry/backoff. Full CLI with all commands. Phase 4 commands delegate to TypeScript (working delegation).
 
 ## Date
 
