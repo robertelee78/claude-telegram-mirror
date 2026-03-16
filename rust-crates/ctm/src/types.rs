@@ -152,7 +152,7 @@ pub fn is_valid_session_id(id: &str) -> bool {
         && id.len() <= MAX_SESSION_ID_LEN
         && id
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
 }
 
 /// Slash command character whitelist validation
@@ -182,6 +182,12 @@ mod tests {
         assert!(!is_valid_session_id("abc;rm"));
         assert!(!is_valid_session_id("abc def"));
         assert!(!is_valid_session_id("abc/def"));
+    }
+
+    #[test]
+    fn test_session_id_with_dots() {
+        assert!(is_valid_session_id("abc.def.123"));
+        assert!(is_valid_session_id("session.1.2.3"));
     }
 
     #[test]
