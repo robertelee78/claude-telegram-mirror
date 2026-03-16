@@ -4,10 +4,11 @@
  * Matches the comprehensive guidance of install.sh
  */
 
-import { existsSync, mkdirSync, writeFileSync, readFileSync } from 'fs';
+import { existsSync, writeFileSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { homedir, platform } from 'os';
 import { createInterface } from 'readline';
+import { ensureConfigDir } from '../utils/config.js';
 
 const CONFIG_DIR = join(homedir(), '.config', 'claude-telegram-mirror');
 const CONFIG_FILE = join(CONFIG_DIR, 'config.json');
@@ -504,11 +505,9 @@ export async function runSetup(): Promise<void> {
   console.log(gray('─'.repeat(60)));
   console.log('');
 
-  // Create config directory
-  if (!existsSync(CONFIG_DIR)) {
-    mkdirSync(CONFIG_DIR, { recursive: true });
-    console.log(green('✓') + ' Created config directory');
-  }
+  // Create config directory with secure permissions
+  ensureConfigDir(CONFIG_DIR);
+  console.log(green('✓') + ' Created/verified config directory');
 
   // Save config file
   const config = {
@@ -520,7 +519,7 @@ export async function runSetup(): Promise<void> {
     approvals: true,
   };
 
-  writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
+  writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2), { mode: 0o600 });
   console.log(green('✓') + ' Saved config to ' + gray(CONFIG_FILE));
 
   // Also create/update ~/.telegram-env

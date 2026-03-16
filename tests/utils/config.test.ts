@@ -3,7 +3,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { loadConfig, validateConfig, isMirrorEnabled, resetConfig } from '../../src/utils/config.js';
+import { loadConfig, validateConfig, isMirrorEnabled, resetConfig, validateSocketPath, ensureConfigDir } from '../../src/utils/config.js';
 
 // Mock the fs module to avoid reading actual config files during tests
 vi.mock('fs', async () => {
@@ -299,5 +299,47 @@ describe('isMirrorEnabled', () => {
     process.env.TELEGRAM_BOT_TOKEN = 'test-token';
     process.env.TELEGRAM_CHAT_ID = '12345';
     expect(isMirrorEnabled()).toBe(true);
+  });
+});
+
+describe('validateSocketPath', () => {
+  it('accepts valid absolute path', () => {
+    expect(validateSocketPath('/tmp/bridge.sock')).toBe(true);
+  });
+
+  it('rejects path with ..', () => {
+    expect(validateSocketPath('/tmp/../etc/bridge.sock')).toBe(false);
+  });
+
+  it('rejects relative path', () => {
+    expect(validateSocketPath('tmp/bridge.sock')).toBe(false);
+  });
+
+  it('rejects path over 256 chars', () => {
+    expect(validateSocketPath('/' + 'a'.repeat(256))).toBe(false);
+  });
+
+  it('rejects empty string', () => {
+    expect(validateSocketPath('')).toBe(false);
+  });
+});
+
+describe('ensureConfigDir', () => {
+  it('returns the provided directory path', () => {
+    // The fs mock intercepts existsSync; for a path containing 'config.json' it returns false.
+    // For other paths it delegates to real fs. We pass a path that does not exist so the
+    // mkdirSync branch runs rather than chmodSync (avoids permission issues on shared dirs).
+    const nonExistentDir = '/tmp/ctm-test-ensureConfigDir-' + Date.now();
+    const result = ensureConfigDir(nonExistentDir);
+    expect(result).toBe(nonExistentDir);
+    // Clean up
+    const { rmdirSync } = require('fs');
+    try { rmdirSync(nonExistentDir); } catch { /* ignore */ }
+  });
+
+  it('uses getConfigDir() default when no arg provided', () => {
+    const result = ensureConfigDir();
+    expect(typeof result).toBe('string');
+    expect(result.length).toBeGreaterThan(0);
   });
 });

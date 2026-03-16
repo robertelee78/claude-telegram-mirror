@@ -3,7 +3,7 @@
  * Loads configuration from environment variables and optional config file
  */
 
-import { existsSync, readFileSync } from 'fs';
+import { existsSync, readFileSync, mkdirSync, chmodSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
 import logger from './logger.js';
@@ -62,6 +62,33 @@ class ConfigurationError extends Error {
     super(message);
     this.name = 'ConfigurationError';
   }
+}
+
+/**
+ * Ensure the config directory exists with secure permissions (0o700).
+ * All config directory creation MUST go through this function.
+ */
+export function ensureConfigDir(dir?: string): string {
+  const configDir = dir || getConfigDir();
+  if (!existsSync(configDir)) {
+    mkdirSync(configDir, { recursive: true, mode: 0o700 });
+  } else {
+    // Always enforce correct permissions even if directory exists
+    chmodSync(configDir, 0o700);
+  }
+  return configDir;
+}
+
+/**
+ * Validate a socket path for safety.
+ * Rejects paths with directory traversal, non-absolute paths, and oversized paths.
+ */
+export function validateSocketPath(socketPath: string): boolean {
+  if (!socketPath) return false;
+  if (socketPath.includes('..')) return false;
+  if (!socketPath.startsWith('/')) return false;
+  if (socketPath.length > 256) return false;
+  return true;
 }
 
 /**
@@ -153,10 +180,17 @@ export function loadConfig(requireAuth: boolean = true): TelegramMirrorConfig {
       fileConfig.approvals ?? true
     ),
 
-    socketPath:
-      process.env.TELEGRAM_BRIDGE_SOCKET ||
-      fileConfig.socketPath ||
-      DEFAULT_SOCKET_PATH,
+    socketPath: (() => {
+      const raw = process.env.TELEGRAM_BRIDGE_SOCKET || fileConfig.socketPath;
+      if (raw) {
+        if (!validateSocketPath(raw)) {
+          logger.warn(`Invalid socket path "${raw}" — falling back to default`, { socketPath: raw });
+          return DEFAULT_SOCKET_PATH;
+        }
+        return raw;
+      }
+      return DEFAULT_SOCKET_PATH;
+    })(),
 
     useThreads: parseEnvBool(
       process.env.TELEGRAM_USE_THREADS,

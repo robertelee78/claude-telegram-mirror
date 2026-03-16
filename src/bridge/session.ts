@@ -5,10 +5,11 @@
 
 import Database from 'better-sqlite3';
 import { join } from 'path';
-import { mkdirSync, existsSync } from 'fs';
+import { chmodSync } from 'fs';
 import { homedir } from 'os';
 import { randomBytes } from 'crypto';
 import logger from '../utils/logger.js';
+import { ensureConfigDir } from '../utils/config.js';
 import type { Session, PendingApproval } from './types.js';
 
 const CONFIG_DIR = join(homedir(), '.config', 'claude-telegram-mirror');
@@ -32,12 +33,11 @@ export class SessionManager {
   private approvalTimeout: number;
 
   constructor(dbPath: string = DB_PATH, approvalTimeoutMinutes: number = 5) {
-    // Ensure config directory exists
-    if (!existsSync(CONFIG_DIR)) {
-      mkdirSync(CONFIG_DIR, { recursive: true });
-    }
+    // Ensure config directory exists with secure permissions
+    ensureConfigDir(CONFIG_DIR);
 
     this.db = new Database(dbPath);
+    chmodSync(dbPath, 0o600);
     this.approvalTimeout = approvalTimeoutMinutes * 60 * 1000;
     this.initSchema();
 

@@ -3,10 +3,11 @@
  * Handles systemd (Linux) and launchd (macOS) service installation
  */
 
-import { existsSync, mkdirSync, writeFileSync, unlinkSync, readFileSync } from 'fs';
+import { existsSync, writeFileSync, unlinkSync, readFileSync, mkdirSync } from 'fs';
 import { join, dirname } from 'path';
 import { homedir, platform } from 'os';
 import { execSync } from 'child_process';
+import { ensureConfigDir } from '../utils/config.js';
 
 const SERVICE_NAME = 'claude-telegram-mirror';
 
@@ -66,10 +67,8 @@ function createSystemdEnvFile(): string {
   const envVars = parseEnvFile(ENV_FILE);
   const configDir = join(homedir(), '.config', SERVICE_NAME);
 
-  // Ensure config directory exists
-  if (!existsSync(configDir)) {
-    mkdirSync(configDir, { recursive: true, mode: 0o700 });
-  }
+  // Ensure config directory exists with secure permissions
+  ensureConfigDir(configDir);
 
   // Write systemd-compatible env file
   const lines: string[] = ['# Auto-generated from ~/.telegram-env for systemd'];
@@ -316,7 +315,7 @@ function installSystemdService(): { success: boolean; message: string } {
 
     // Create systemd user directory
     if (!existsSync(SYSTEMD_USER_DIR)) {
-      mkdirSync(SYSTEMD_USER_DIR, { recursive: true });
+      mkdirSync(SYSTEMD_USER_DIR, { recursive: true });  // systemd dir, not config dir
     }
 
     // Write service file
@@ -359,14 +358,12 @@ function installLaunchdService(): { success: boolean; message: string } {
   try {
     // Create LaunchAgents directory
     if (!existsSync(LAUNCHD_DIR)) {
-      mkdirSync(LAUNCHD_DIR, { recursive: true });
+      mkdirSync(LAUNCHD_DIR, { recursive: true });  // LaunchAgents dir, not config dir
     }
 
     // Ensure config directory exists for logs
     const configDir = join(homedir(), '.config', SERVICE_NAME);
-    if (!existsSync(configDir)) {
-      mkdirSync(configDir, { recursive: true });
-    }
+    ensureConfigDir(configDir);
 
     // Write plist file
     const plistContent = generateLaunchdPlist();
