@@ -28,6 +28,12 @@ pub enum AppError {
 
     #[error("Lock error: {0}")]
     Lock(String),
+
+    #[error("Telegram API error: {0}")]
+    Telegram(String),
+
+    #[error("Reqwest error: {0}")]
+    Reqwest(#[from] reqwest::Error),
 }
 
 pub type Result<T> = std::result::Result<T, AppError>;

@@ -1,4 +1,4 @@
-use crate::error::{AppError, Result};
+use crate::error::Result;
 use crate::types::{is_valid_slash_command, ALLOWED_TMUX_KEYS};
 use std::process::Command;
 
