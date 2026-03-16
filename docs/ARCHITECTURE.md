@@ -63,6 +63,9 @@ graph LR
     BRIDGE --> INJ
     BRIDGE --> CONFIG
     BRIDGE --> FMT[formatting.rs]
+    BRIDGE --> SUMM[summarizer.rs]
+
+    SUMM --> FMT
 
     HOOK --> TYPES[types.rs]
     HOOK --> INJ
@@ -113,7 +116,8 @@ sequenceDiagram
     else AgentResponse
         Bridge->>Bot: Send formatted response
     else ToolStart
-        Bridge->>Bot: Send tool preview + Details button
+        Bridge->>Bridge: Summarize tool action
+        Bridge->>Bot: Send human-readable summary + Details button
     else TurnComplete
         Bridge->>Bridge: Check compaction state
     end

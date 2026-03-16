@@ -15,7 +15,8 @@
 │   ├── hook.rs             # Claude Code hook processor
 │   ├── injector.rs         # tmux command injection
 │   ├── config.rs           # Configuration loading
-│   ├── formatting.rs       # Message formatting
+│   ├── formatting.rs       # Message formatting + tool summaries
+│   ├── summarizer.rs       # LLM-backed fallback summarizer
 │   ├── types.rs            # Shared type definitions
 │   └── error.rs            # Error types
 ├── scripts/
@@ -68,9 +69,9 @@ cargo test session::tests
 |--------|-------|---------------|
 | `session.rs` | 3 | CRUD, lifecycle, approvals |
 | `socket.rs` | 2 | Server lifecycle, flock double-start prevention |
-| `formatting.rs` | 3 | ANSI stripping, truncation, path shortening |
-| `injector.rs` | 1 | Key whitelist validation |
-| `config.rs` | 2 | Environment loading, validation |
+| `formatting.rs` | 11 | ANSI stripping, truncation, path shortening, tool action summaries (bash/cargo/git, file ops, search, task, unknown), tool result summaries (success, error) |
+| `injector.rs` | 2 | Key whitelist validation, no-target safety |
+| `config.rs` | 2 | Environment loading, config file defaults |
 
 ## Code Quality
 
@@ -98,6 +99,7 @@ graph TB
         RUSQLITE[rusqlite<br/>SQLite bindings]
         GOVERNOR[governor<br/>rate limiting]
         NIX[nix<br/>Unix operations]
+        REQWEST[reqwest<br/>HTTP client for LLM]
     end
 
     subgraph "Serialization"
@@ -170,6 +172,33 @@ Key patterns:
 - Session lookup is cached in-memory with DB fallback
 - Tool input cache auto-expires after 5 minutes
 - Topic deletion is delayed and cancellable
+- Tool actions are summarized in natural language via `summarizer.rs` (rule-based, with optional LLM fallback)
+
+### summarizer.rs - Human-Readable Tool Summaries
+
+The summarizer converts raw tool operations into natural language:
+
+| Tool Action | Summary |
+|------------|---------|
+| `Bash: cargo test` | "Running tests" |
+| `Bash: git push` | "Pushing to remote" |
+| `Edit: /path/to/config.rs` | "Editing config.rs" |
+| `Grep: pattern "auth"` | "Searching for 'auth'" |
+| `Task: {desc: "Explore auth"}` | "Delegating: Explore auth" |
+| `Unknown: CustomTool` | "Using CustomTool" (LLM fallback if configured) |
+
+Two-tier architecture:
+1. **Rule-based** (zero latency): Covers cargo, git, npm, docker, pip, file ops, search, and 15+ system commands
+2. **LLM fallback** (optional): When the rule-based summary is generic ("Using X"), calls a configurable LLM endpoint (Anthropic API or Z.AI proxy) for a better summary. Results are cached (200 entries, 5s timeout)
+
+Configuration:
+```json
+{
+  "llm_summarize_url": "https://api.anthropic.com/v1/messages",
+  "llm_api_key": "sk-ant-..."
+}
+```
+Or via environment: `CTM_LLM_SUMMARIZE_URL`, `CTM_LLM_API_KEY`
 
 ### injector.rs - Shell-Safe Command Execution
 

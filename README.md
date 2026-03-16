@@ -39,6 +39,7 @@ claude
 
 - **CLI to Telegram**: Mirror Claude's responses, tool usage, and notifications
 - **Telegram to CLI**: Send prompts from Telegram directly to Claude Code
+- **Human-Readable Summaries**: Tool actions shown as natural language ("Running tests", "Editing config.rs") instead of raw operations, with optional LLM fallback for unknown tools
 - **Stop/Interrupt**: Type `stop` in Telegram to send Escape and halt Claude mid-process
 - **Kill**: Type `kill` to send Ctrl-C and exit Claude entirely
 - **Session Threading**: Each Claude session gets its own Forum Topic
@@ -130,7 +131,8 @@ When Claude requests tool permission, you'll see inline keyboard buttons:
 | `hook.rs` | Claude Code hook event processing |
 | `injector.rs` | tmux command injection (Command::arg, no shell) |
 | `config.rs` | Configuration: env > file > defaults, secure perms |
-| `formatting.rs` | Message formatting, ANSI stripping, chunking |
+| `formatting.rs` | Message formatting, ANSI stripping, tool summaries |
+| `summarizer.rs` | LLM-backed fallback summarizer (optional, for unknown tools) |
 | `types.rs` | Shared types: BridgeMessage, HookEvent, Session |
 | `error.rs` | Error types via thiserror |
 
@@ -198,6 +200,8 @@ export TELEGRAM_MIRROR=true
 # export TELEGRAM_AUTO_DELETE_TOPICS=true   # Delete topics on session end
 # export TELEGRAM_TOPIC_DELETE_DELAY=5      # Minutes before topic deletion
 # export TELEGRAM_BRIDGE_SOCKET=~/.config/claude-telegram-mirror/bridge.sock
+# export CTM_LLM_SUMMARIZE_URL=https://api.anthropic.com/v1/messages
+# export CTM_LLM_API_KEY=sk-ant-...        # For LLM-powered tool summaries
 ```
 
 ### Config File (Alternative)
@@ -206,14 +210,18 @@ export TELEGRAM_MIRROR=true
 
 ```json
 {
-  "botToken": "your-token",
-  "chatId": -1001234567890,
+  "bot_token": "your-token",
+  "chat_id": -1001234567890,
   "enabled": true,
   "verbose": true,
-  "useThreads": true,
-  "autoDeleteTopics": false
+  "use_threads": true,
+  "auto_delete_topics": false,
+  "llm_summarize_url": "https://api.anthropic.com/v1/messages",
+  "llm_api_key": "sk-ant-..."
 }
 ```
+
+Both `snake_case` and `camelCase` field names are accepted.
 
 Environment variables take precedence over config file values.
 
