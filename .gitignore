@@ -46,7 +46,8 @@ Thumbs.db
 
 # BMad config/output
 _bmad/
-_bmad-output/
+# Keep planning artifacts tracked
+!_bmad-output/planning-artifacts/
 
 # Claude project instructions
 CLAUDE.md
