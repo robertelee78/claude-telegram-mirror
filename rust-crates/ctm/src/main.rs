@@ -1,10 +1,10 @@
 // Public API modules — some exports used in tests and future phases.
-// Many items are prepared for Phase 4+ and intentionally unused now.
 #[allow(dead_code)]
 mod bot;
 #[allow(dead_code)]
 mod config;
 mod daemon;
+mod doctor;
 #[allow(dead_code)]
 mod error;
 #[allow(dead_code)]
@@ -12,8 +12,11 @@ mod formatting;
 mod hook;
 #[allow(dead_code)]
 mod injector;
+mod installer;
+mod service;
 #[allow(dead_code)]
 mod session;
+mod setup;
 #[allow(dead_code)]
 mod socket;
 #[allow(dead_code)]
@@ -23,7 +26,6 @@ mod types;
 
 use clap::{Parser, Subcommand};
 use std::fs;
-use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -77,38 +79,38 @@ enum Commands {
         test: bool,
     },
 
-    /// Install Claude Code hooks (delegates to TypeScript)
+    /// Install Claude Code hooks for Telegram mirroring
     InstallHooks {
         /// Install to current project's .claude/settings.json
         #[arg(short, long)]
         project: bool,
     },
 
-    /// Remove Claude Code hooks (delegates to TypeScript)
+    /// Remove Claude Code hooks
     UninstallHooks,
 
-    /// Show hook installation status (delegates to TypeScript)
+    /// Show hook installation status
     Hooks,
 
-    /// Interactive setup wizard (delegates to TypeScript)
+    /// Interactive setup wizard
     Setup,
 
-    /// Diagnose configuration and connectivity issues (delegates to TypeScript)
+    /// Diagnose configuration and connectivity issues
     Doctor {
         /// Attempt to automatically fix detected issues
         #[arg(long)]
         fix: bool,
     },
 
-    /// Manage systemd/launchd service (delegates to TypeScript)
+    /// Manage systemd/launchd service
     Service {
         #[command(subcommand)]
         action: ServiceAction,
     },
 }
 
-#[derive(Subcommand)]
-enum ServiceAction {
+#[derive(Subcommand, Clone)]
+pub enum ServiceAction {
     /// Install as a system service
     Install,
     /// Uninstall the system service
@@ -146,31 +148,13 @@ async fn main() -> anyhow::Result<()> {
         Commands::Status => cmd_status(),
         Commands::Config { show: _, test } => cmd_config(test).await,
 
-        // Phase 4 commands delegate to TypeScript
-        Commands::InstallHooks { project } => delegate_to_ts(&if project {
-            vec!["install-hooks", "-p"]
-        } else {
-            vec!["install-hooks"]
-        }),
-        Commands::UninstallHooks => delegate_to_ts(&["uninstall-hooks"]),
-        Commands::Hooks => delegate_to_ts(&["hooks"]),
-        Commands::Setup => delegate_to_ts(&["setup"]),
-        Commands::Doctor { fix } => delegate_to_ts(&if fix {
-            vec!["doctor", "--fix"]
-        } else {
-            vec!["doctor"]
-        }),
-        Commands::Service { action } => {
-            let args = match action {
-                ServiceAction::Install => vec!["service", "install"],
-                ServiceAction::Uninstall => vec!["service", "uninstall"],
-                ServiceAction::Start => vec!["service", "start"],
-                ServiceAction::Stop => vec!["service", "stop"],
-                ServiceAction::Restart => vec!["service", "restart"],
-                ServiceAction::Status => vec!["service", "status"],
-            };
-            delegate_to_ts(&args)
-        }
+        // Phase 4: Native Rust implementations — no TypeScript delegation
+        Commands::InstallHooks { project } => installer::install_hooks(project),
+        Commands::UninstallHooks => installer::uninstall_hooks(),
+        Commands::Hooks => installer::print_hook_status(),
+        Commands::Setup => setup::run_setup().await,
+        Commands::Doctor { fix } => doctor::run_doctor(fix).await,
+        Commands::Service { action } => service::handle_service_command(&action),
     }
 }
 
@@ -433,62 +417,6 @@ async fn cmd_config(test: bool) -> anyhow::Result<()> {
     println!();
 
     Ok(())
-}
-
-// ====================================================================== delegation
-
-/// Delegate a command to the TypeScript CLI (working delegation for Phase 4 commands).
-fn delegate_to_ts(args: &[&str]) -> anyhow::Result<()> {
-    // Try to find the TypeScript CLI
-    let ts_cli = find_ts_cli();
-
-    match ts_cli {
-        Some(path) => {
-            let status = std::process::Command::new("node")
-                .arg(&path)
-                .args(args)
-                .status()?;
-
-            if !status.success() {
-                std::process::exit(status.code().unwrap_or(1));
-            }
-            Ok(())
-        }
-        None => {
-            eprintln!(
-                "TypeScript CLI not found. This command requires the Node.js implementation."
-            );
-            eprintln!("Try: npx claude-telegram-mirror {}", args.join(" "));
-            std::process::exit(1);
-        }
-    }
-}
-
-/// Find the TypeScript CLI distribution.
-fn find_ts_cli() -> Option<PathBuf> {
-    // Check standard locations
-    let candidates = [
-        PathBuf::from("/opt/claude-telegram-mirror/dist/cli.js"),
-        PathBuf::from("dist/cli.js"),
-    ];
-
-    for path in &candidates {
-        if path.exists() {
-            return Some(path.clone());
-        }
-    }
-
-    // Check relative to this binary
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let candidate = dir.join("../dist/cli.js");
-            if candidate.exists() {
-                return Some(candidate);
-            }
-        }
-    }
-
-    None
 }
 
 // ====================================================================== helpers
