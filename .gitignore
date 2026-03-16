@@ -32,8 +32,27 @@ Thumbs.db
 *.swp
 *.swo
 
-# Claude Flow metrics (generated)
-.claude-flow/metrics/
+# Claude Flow (generated/local state)
+.claude-flow/
+
+# Claude Code local config
+.claude/
+
+# MCP config (machine-specific)
+.mcp.json
+
+# Swarm state
+.swarm/
+
+# BMad config/output
+_bmad/
+_bmad-output/
+
+# Claude project instructions
+CLAUDE.md
+
+# Architecture decision records
+docs/adr/
 
 # npm
 npm-debug.log*
