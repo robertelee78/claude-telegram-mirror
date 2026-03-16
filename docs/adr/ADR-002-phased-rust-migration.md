@@ -33,6 +33,16 @@
 
 **Phase 2: COMPLETE.** 145 Rust tests (124 new). Session manager with 24 methods. Socket server with flock(2) + umask. Real escapeMarkdownV2 (not no-op). UTF-8 safe chunking. 91 summarizer tests ported.
 
+### Phase 3 Progress
+
+| Story | Status | Commit |
+|-------|--------|--------|
+| 3.1 Bridge daemon | IN PROGRESS | |
+| 3.2 Telegram bot | IN PROGRESS | |
+| 3.3 Bot commands | IN PROGRESS | |
+| 3.4 Full CLI | IN PROGRESS | |
+| 3.5 Integration testing | PENDING | |
+
 ## Date
 
 2026-03-16
