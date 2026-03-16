@@ -22,6 +22,17 @@
 
 **Phase 1: COMPLETE.** Binary: 2.5MB release (stripped, LTO). 13 Rust tests. Clippy clean, fmt clean. 3 platform packages (linux-x64, darwin-arm64, darwin-x64).
 
+### Phase 2 Progress
+
+| Story | Status | Commit |
+|-------|--------|--------|
+| 2.1 SQLite session manager | DONE | `9715f92` |
+| 2.2+2.3 Socket server+client (flock) | DONE | `9715f92` |
+| 2.4+2.5 Formatting + chunker | DONE | `9715f92` |
+| 2.6 Tool summarizer | DONE | `9715f92` |
+
+**Phase 2: COMPLETE.** 145 Rust tests (124 new). Session manager with 24 methods. Socket server with flock(2) + umask. Real escapeMarkdownV2 (not no-op). UTF-8 safe chunking. 91 summarizer tests ported.
+
 ## Date
 
 2026-03-16
