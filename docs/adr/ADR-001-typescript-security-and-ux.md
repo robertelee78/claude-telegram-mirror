@@ -31,9 +31,9 @@
 | 12. IDOR approval check | DONE | `d0a8bb3` |
 | 13. Doctor --fix | TODO | |
 | 14. SECURITY.md + ADRs | TODO | |
-| 15. CI workflow | TODO | |
-| 16. Remove inquirer | TODO | |
-| 17. AskUserQuestion in Telegram | TODO | |
+| 15. CI workflow | DONE | `f35613f` |
+| 16. Remove inquirer | DONE | `0ae6e88` |
+| 17. AskUserQuestion in Telegram | DONE | `eec8b0f` |
 
 ---
 
