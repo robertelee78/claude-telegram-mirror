@@ -2,9 +2,17 @@
 #[allow(unused)]
 mod config;
 mod error;
+#[allow(unused)]
+mod formatting;
 mod hook;
 #[allow(unused)]
 mod injector;
+#[allow(unused)]
+mod session;
+#[allow(unused)]
+mod socket;
+#[allow(unused)]
+mod summarize;
 #[allow(unused)]
 mod types;
 

@@ -22,6 +22,12 @@ pub enum AppError {
 
     #[error("Hook error: {0}")]
     Hook(String),
+
+    #[error("Database error: {0}")]
+    Database(String),
+
+    #[error("Lock error: {0}")]
+    Lock(String),
 }
 
 pub type Result<T> = std::result::Result<T, AppError>;
