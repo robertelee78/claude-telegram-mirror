@@ -541,20 +541,23 @@ impl TelegramBot {
     // -------------------------------------------------------- edit/remove
 
     /// Edit a message's text.
+    ///
+    /// `parse_mode` — pass `Some("Markdown")` to keep formatting, `None` for plain text
+    /// (safer when the edited content may contain underscores or other Markdown special chars).
     pub async fn edit_message(
         &self,
+        chat_id: i64,
         message_id: i64,
         text: &str,
-        thread_id: Option<i64>,
+        parse_mode: Option<&str>,
     ) -> Result<()> {
         let mut body = serde_json::json!({
-            "chat_id": self.chat_id,
+            "chat_id": chat_id,
             "message_id": message_id,
             "text": text,
-            "parse_mode": "Markdown",
         });
-        if let Some(tid) = thread_id {
-            body["message_thread_id"] = serde_json::Value::Number(tid.into());
+        if let Some(pm) = parse_mode {
+            body["parse_mode"] = serde_json::Value::String(pm.to_string());
         }
         let _: TgResponse<TgMessage> = self.api_call("editMessageText", &body).await?;
         Ok(())

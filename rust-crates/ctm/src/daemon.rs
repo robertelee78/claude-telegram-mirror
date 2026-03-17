@@ -1622,10 +1622,21 @@ async fn handle_telegram_message(ctx: &HandlerContext, msg: &TgMessage) {
 
 /// Handle text message from Telegram -> CLI.
 async fn handle_telegram_text(ctx: &HandlerContext, msg: &TgMessage, text: &str) {
-    // BUG-005: Ignore General topic (no threadId)
+    // C2.6: Messages without a thread_id arrive in the General topic.
+    // Instead of silently dropping them, send a helpful guide.
     let thread_id = match msg.message_thread_id {
         Some(tid) => tid,
-        None => return,
+        None => {
+            ctx.bot
+                .send_message(
+                    "Send messages in a session topic, not the General chat.\n\n\
+                     Each Claude Code session gets its own topic. Use /sessions to list them.",
+                    None,
+                    None,
+                )
+                .await;
+            return;
+        }
     };
 
     // Only process messages for sessions we own
@@ -1936,16 +1947,29 @@ async fn handle_bot_command(ctx: &HandlerContext, msg: &TgMessage, text: &str) {
         }
         "/status" => {
             let (active, pending) = ctx.sessions.lock().await.get_stats().unwrap_or((0, 0));
+            // C2.1: Add per-user (per-thread) info from bot_sessions
+            let key = msg.message_thread_id.unwrap_or(msg.chat.id);
+            let (attached_id, muted) = {
+                let bs = ctx.bot_sessions.read().await;
+                if let Some(state) = bs.get(&key) {
+                    (state.attached_session_id.clone(), state.muted)
+                } else {
+                    (None, false)
+                }
+            };
+            let mut status_text = format!(
+                "\u{1F4CA} *Status*\n\n\
+                 Active sessions: {active}\n\
+                 Pending approvals: {pending}"
+            );
+            if let Some(sid) = &attached_id {
+                status_text.push_str(&format!("\nAttached to: `{sid}`"));
+            } else {
+                status_text.push_str("\nAttached to: none");
+            }
+            status_text.push_str(&format!("\nMuted: {}", if muted { "yes" } else { "no" }));
             ctx.bot
-                .send_message(
-                    &format!(
-                        "\u{1F4CA} *Status*\n\n\
-                         Active sessions: {active}\n\
-                         Pending approvals: {pending}"
-                    ),
-                    Some(&opts),
-                    msg.message_thread_id,
-                )
+                .send_message(&status_text, Some(&opts), msg.message_thread_id)
                 .await;
         }
         "/sessions" => {
@@ -2000,9 +2024,10 @@ async fn handle_bot_command(ctx: &HandlerContext, msg: &TgMessage, text: &str) {
                     let _ = ctx
                         .bot
                         .edit_message(
+                            ctx.bot.chat_id(),
                             sent.message_id,
                             &format!("\u{1F3D3} Pong! _{}ms_", latency),
-                            msg.message_thread_id,
+                            Some("Markdown"),
                         )
                         .await;
                 }
@@ -2353,27 +2378,37 @@ async fn handle_confirm_abort_callback(ctx: &HandlerContext, session_id: &str, c
             let _ = ctx
                 .bot
                 .edit_message(
+                    ctx.bot.chat_id(),
                     mid,
                     &format!("\u{1F6D1} Session `{session_id}` aborted."),
-                    thread_id,
+                    Some("Markdown"),
                 )
                 .await;
         }
     } else if let Some(mid) = message_id {
         let _ = ctx
             .bot
-            .edit_message(mid, "\u{274C} Failed to abort session.", thread_id)
+            .edit_message(
+                ctx.bot.chat_id(),
+                mid,
+                "\u{274C} Failed to abort session.",
+                None,
+            )
             .await;
     }
 }
 
 /// Handle /abort cancellation callback.
 async fn handle_cancel_abort_callback(ctx: &HandlerContext, cb: &CallbackQuery) {
-    if let Some(mid) = cb.message.as_ref().map(|m| m.message_id) {
-        let thread_id = cb.message.as_ref().and_then(|m| m.message_thread_id);
+    if let Some(msg) = &cb.message {
         let _ = ctx
             .bot
-            .edit_message(mid, "\u{2705} Abort cancelled.", thread_id)
+            .edit_message(
+                msg.chat.id,
+                msg.message_id,
+                "\u{2705} Abort cancelled.",
+                None,
+            )
             .await;
     }
 }
@@ -2403,7 +2438,7 @@ async fn handle_approval_callback(
     ctx: &HandlerContext,
     approval_id: &str,
     action: &str,
-    _cb: &CallbackQuery,
+    cb: &CallbackQuery,
 ) {
     let approval = ctx
         .sessions
@@ -2456,6 +2491,36 @@ async fn handle_approval_callback(
         session_id = %approval.session_id,
         "Approval resolved and broadcast over socket"
     );
+
+    // C2.2: Edit the original approval message to append the decision and remove keyboard.
+    // Use plain text (parse_mode = None) because approval text may contain tool names
+    // with underscores that break Markdown rendering.
+    if let Some(msg) = &cb.message {
+        let action_text = match action {
+            "approve" => "\u{2705} Approved via Telegram",
+            "reject" => "\u{274C} Rejected via Telegram",
+            _ => "\u{1F6D1} Session Aborted via Telegram",
+        };
+        let original = msg.text.as_deref().unwrap_or("");
+        let updated = format!("{original}\n\nDecision: {action_text}");
+        // Attempt edit with decision appended; fall back to decision-only text on failure.
+        if ctx
+            .bot
+            .edit_message(msg.chat.id, msg.message_id, &updated, None)
+            .await
+            .is_err()
+        {
+            let _ = ctx
+                .bot
+                .edit_message(
+                    msg.chat.id,
+                    msg.message_id,
+                    &format!("Decision: {action_text}"),
+                    None,
+                )
+                .await;
+        }
+    }
 }
 
 /// Handle tool details callback.
