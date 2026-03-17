@@ -28,6 +28,34 @@ use clap::{Parser, Subcommand};
 use std::fs;
 use tracing_subscriber::EnvFilter;
 
+// ---------------------------------------------------------------- token scrubbing
+
+/// A `Write` + `MakeWriter` that forwards all log output through `scrub_bot_token`
+/// before writing to stderr. This ensures that no log message — regardless of
+/// which code path emits it — can leak a raw Telegram bot token.
+struct ScrubWriter;
+
+impl std::io::Write for ScrubWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let text = String::from_utf8_lossy(buf);
+        let scrubbed = bot::scrub_bot_token(&text);
+        std::io::stderr().write_all(scrubbed.as_bytes())?;
+        // Return the original length so callers believe the full buffer was consumed.
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        std::io::stderr().flush()
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for ScrubWriter {
+    type Writer = ScrubWriter;
+    fn make_writer(&'a self) -> Self::Writer {
+        ScrubWriter
+    }
+}
+
 #[derive(Parser)]
 #[command(
     name = "ctm",
@@ -127,13 +155,17 @@ pub enum ServiceAction {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Initialize tracing — all output to stderr
+    // Initialize tracing — all output goes through ScrubWriter which strips
+    // any Telegram bot token (regex bot\d+:[A-Za-z0-9_-]+/) before writing
+    // to stderr. This is a global defence-in-depth layer: even if a code path
+    // interpolates a raw API URL into a log message the token never reaches
+    // the terminal or log files.
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .with_target(false)
-        .with_writer(std::io::stderr)
+        .with_writer(ScrubWriter)
         .compact()
         .init();
 

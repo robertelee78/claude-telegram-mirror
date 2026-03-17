@@ -13,11 +13,15 @@ use crate::config::Config;
 use crate::error::{AppError, Result};
 use crate::formatting::chunk_message;
 use governor::{Quota, RateLimiter};
+use regex::Regex;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::num::NonZeroU32;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use tokio::sync::Mutex;
+
+static BOT_TOKEN_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"bot\d+:[A-Za-z0-9_-]+/").unwrap());
 
 // ---------------------------------------------------------------- types
 
@@ -201,7 +205,7 @@ impl TelegramBot {
 
     /// Scrub the bot token from error messages.
     pub fn scrub_token(&self, text: &str) -> String {
-        scrub_bot_token(text, &self.token)
+        scrub_bot_token(text)
     }
 
     // -------------------------------------------------------------- API
@@ -689,12 +693,15 @@ fn strip_markdown(text: &str) -> String {
         .replace('_', "")
 }
 
-/// Scrub bot token from error messages to prevent leaking.
-pub fn scrub_bot_token(text: &str, token: &str) -> String {
-    if token.is_empty() {
-        return text.to_string();
-    }
-    text.replace(token, "[REDACTED]")
+/// Scrub bot token from log messages to prevent leaking.
+///
+/// Applies a regex `bot\d+:[A-Za-z0-9_-]+/` globally, matching any Telegram
+/// API URL token regardless of whether the runtime token is known. This matches
+/// the TypeScript winston format pipeline behavior.
+pub fn scrub_bot_token(text: &str) -> String {
+    BOT_TOKEN_REGEX
+        .replace_all(text, "bot[REDACTED]/")
+        .into_owned()
 }
 
 // ===================================================================== tests
@@ -715,15 +722,36 @@ mod tests {
     fn test_scrub_bot_token() {
         let token = "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11";
         let msg = format!("Error: bot{}/sendMessage failed", token);
-        let scrubbed = scrub_bot_token(&msg, token);
+        let scrubbed = scrub_bot_token(&msg);
         assert!(!scrubbed.contains(token));
         assert!(scrubbed.contains("[REDACTED]"));
     }
 
     #[test]
-    fn test_scrub_empty_token() {
-        let msg = "some error message";
-        assert_eq!(scrub_bot_token(msg, ""), msg);
+    fn test_scrub_bot_token_regex_no_literal_needed() {
+        // The regex approach scrubs any token pattern without needing the runtime token.
+        let msg = "POST https://api.telegram.org/bot987654321:XyZ-abc_123DEF456/sendMessage";
+        let scrubbed = scrub_bot_token(msg);
+        assert!(!scrubbed.contains("987654321:XyZ-abc_123DEF456"));
+        assert!(scrubbed.contains("bot[REDACTED]/sendMessage"));
+    }
+
+    #[test]
+    fn test_scrub_bot_token_no_token_in_text() {
+        let msg = "some error message without any token";
+        assert_eq!(scrub_bot_token(msg), msg);
+    }
+
+    #[test]
+    fn test_scrub_bot_token_multiple_occurrences() {
+        let msg = "bot111:AAA_bbb-ccc/getMe and bot222:DDD_eee-fff/sendMessage";
+        let scrubbed = scrub_bot_token(msg);
+        assert!(!scrubbed.contains("111:AAA_bbb-ccc"));
+        assert!(!scrubbed.contains("222:DDD_eee-fff"));
+        assert_eq!(
+            scrubbed,
+            "bot[REDACTED]/getMe and bot[REDACTED]/sendMessage"
+        );
     }
 
     #[test]
