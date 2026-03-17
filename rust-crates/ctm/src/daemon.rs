@@ -958,7 +958,15 @@ async fn handle_tool_result(ctx: &HandlerContext, msg: &BridgeMessage) {
         .and_then(|m| m.get("tool"))
         .and_then(|v| v.as_str())
         .unwrap_or("Unknown");
-    let tool_input = meta.and_then(|m| m.get("input")).and_then(|v| v.as_str());
+    // H10: tool_input is stored as a JSON Value (object), not a plain string.
+    // .as_str() always returns None for objects — use to_string() / as_str() on the
+    // owned serialization instead.
+    let tool_input_owned: Option<String> = meta.and_then(|m| m.get("input")).map(|v| {
+        v.as_str()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| v.to_string())
+    });
+    let tool_input = tool_input_owned.as_deref();
 
     let thread_id = ctx.wait_for_topic(&msg.session_id).await;
     if thread_id.is_none() && ctx.config.use_threads {

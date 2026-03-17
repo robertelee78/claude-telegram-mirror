@@ -214,7 +214,13 @@ async fn build_messages(
             ));
         }
         HookEvent::PostToolUse(e) => {
-            let output = e.tool_output.as_deref().unwrap_or("");
+            // H2: fall back to tool_error when tool_output is absent
+            let output = e
+                .tool_output
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .or(e.tool_error.as_deref())
+                .unwrap_or("No output");
             if cfg.verbose || output.len() > 10 {
                 let truncated = if output.len() > 2000 {
                     format!("{}...", &output[..2000])
@@ -226,6 +232,12 @@ async fn build_messages(
                     "tool".into(),
                     serde_json::Value::String(e.tool_name.clone()),
                 );
+                // H3: include tool_input in metadata
+                tool_meta.insert("input".into(), e.tool_input.clone());
+                // H2: include tool_error in metadata under "error" key
+                if let Some(err) = &e.tool_error {
+                    tool_meta.insert("error".into(), serde_json::Value::String(err.clone()));
+                }
                 messages.push(make_message(
                     "tool_result",
                     session_id,
@@ -256,9 +268,29 @@ async fn build_messages(
                 prompt_meta,
             ));
         }
-        HookEvent::Stop(_e) => {
-            // Extract new assistant text from transcript
-            if let Some(path) = transcript_path {
+        HookEvent::Stop(e) => {
+            // H4: check transcript_summary / last_assistant_message before expensive JSONL I/O
+            let summary_text: Option<String> = e
+                .transcript_summary
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .or_else(|| {
+                    e.last_assistant_message
+                        .as_deref()
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.to_string())
+                });
+
+            if let Some(text) = summary_text {
+                messages.push(make_message(
+                    "agent_response",
+                    session_id,
+                    &text,
+                    meta.clone(),
+                ));
+            } else if let Some(path) = transcript_path {
+                // Fall back to JSONL file I/O when no inline summary is provided
                 if let Some(text) = extract_transcript_text(path, session_id, &cfg.config_dir) {
                     if !text.is_empty() {
                         messages.push(make_message(
@@ -339,7 +371,7 @@ async fn get_hook_output(
     );
     approval_meta.insert("input".into(), pre_tool.tool_input.clone());
 
-    let prompt = format!("Allow {} tool?", pre_tool.tool_name);
+    let prompt = format_tool_approval_prompt(&pre_tool.tool_name, &pre_tool.tool_input);
     let msg = make_message("approval_request", session_id, &prompt, approval_meta);
 
     match send_and_wait(&cfg.socket_path, &msg, Duration::from_secs(300)).await {
@@ -374,6 +406,76 @@ async fn get_hook_output(
             )
         }
     }
+}
+
+/// H5: Format a rich approval prompt matching TypeScript's formatToolDescription()
+fn format_tool_approval_prompt(tool_name: &str, tool_input: &serde_json::Value) -> String {
+    let mut desc = format!("\u{1F527} **Tool:** `{tool_name}`\n\n");
+    match tool_name {
+        "Write" => {
+            let file_path = tool_input
+                .get("file_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("<unknown>");
+            let content = tool_input
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let preview = if content.len() > 500 {
+                format!("{}...", &content[..500])
+            } else {
+                content.to_string()
+            };
+            desc.push_str(&format!(
+                "\u{1F4DD} **File:** `{file_path}`\n**Content preview:**\n```\n{preview}\n```"
+            ));
+        }
+        "Edit" | "MultiEdit" => {
+            let file_path = tool_input
+                .get("file_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("<unknown>");
+            desc.push_str(&format!("\u{270F}\u{FE0F} **File:** `{file_path}`"));
+            if let Some(old) = tool_input.get("old_string").and_then(|v| v.as_str()) {
+                let snip = if old.len() > 200 {
+                    format!("{}...", &old[..200])
+                } else {
+                    old.to_string()
+                };
+                desc.push_str(&format!("\n**Old:** ```{snip}```"));
+            }
+            if let Some(new) = tool_input.get("new_string").and_then(|v| v.as_str()) {
+                let snip = if new.len() > 200 {
+                    format!("{}...", &new[..200])
+                } else {
+                    new.to_string()
+                };
+                desc.push_str(&format!("\n**New:** ```{snip}```"));
+            }
+        }
+        "Bash" => {
+            let command = tool_input
+                .get("command")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let cmd = if command.len() > 200 {
+                format!("{}...", &command[..200])
+            } else {
+                command.to_string()
+            };
+            desc.push_str(&format!("\u{1F4BB} **Command:**\n```bash\n{cmd}\n```"));
+        }
+        _ => {
+            let json = serde_json::to_string_pretty(tool_input).unwrap_or_default();
+            let truncated = if json.len() > 500 {
+                format!("{}...", &json[..500])
+            } else {
+                json
+            };
+            desc.push_str(&format!("**Input:**\n```json\n{truncated}\n```"));
+        }
+    }
+    desc
 }
 
 /// Check if a tool requires Telegram approval
