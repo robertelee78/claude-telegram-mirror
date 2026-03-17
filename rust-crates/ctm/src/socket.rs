@@ -310,7 +310,16 @@ async fn handle_client(
                     continue;
                 }
                 match serde_json::from_str::<BridgeMessage>(trimmed) {
-                    Ok(msg) => {
+                    Ok(mut msg) => {
+                        // S-2: Inject the originating client_id into metadata so
+                        // the daemon can route approval responses back to the
+                        // specific client that sent the approval_request, instead
+                        // of broadcasting to all connected clients.
+                        let meta = msg.metadata.get_or_insert_with(serde_json::Map::new);
+                        meta.insert(
+                            "_client_id".to_string(),
+                            serde_json::Value::String(client_id.to_string()),
+                        );
                         let _ = tx.send(msg);
                     }
                     Err(e) => {

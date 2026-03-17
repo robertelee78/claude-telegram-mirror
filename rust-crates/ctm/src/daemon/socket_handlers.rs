@@ -403,7 +403,8 @@ pub(super) async fn handle_user_input(ctx: &HandlerContext, msg: &BridgeMessage)
     }
 
     // BUG-011: Check echo prevention set
-    let input_key = format!("{}:{}", msg.session_id, msg.content.trim());
+    // C-1: Use \0 separator to match add_echo_key's key format (prevents mismatch).
+    let input_key = format!("{}\0{}", msg.session_id, msg.content.trim());
     {
         let mut recent = ctx.recent_inputs.write().await;
         if recent.remove(&input_key) {
@@ -440,6 +441,20 @@ pub(super) async fn handle_approval_request(ctx: &HandlerContext, msg: &BridgeMe
         })
         .await
     };
+
+    // S-2: Record which socket client sent this approval_request so the
+    // response can be routed back to that specific client only.
+    if let Some(client_id) = msg
+        .metadata
+        .as_ref()
+        .and_then(|m| m.get("_client_id"))
+        .and_then(|v| v.as_str())
+    {
+        ctx.pending_approval_clients
+            .write()
+            .await
+            .insert(approval_id.clone(), client_id.to_string());
+    }
 
     let thread_id = ctx.wait_for_topic(&msg.session_id).await;
     if thread_id.is_none() && ctx.config.use_threads {
@@ -572,7 +587,9 @@ pub(super) fn check_for_session_rename(transcript_path: &str) -> Option<String> 
     use std::fs;
     use std::io::{Read, Seek, SeekFrom};
 
-    let mut file = fs::File::open(transcript_path).ok()?;
+    // S-1: Validate path before opening (prevents path traversal)
+    let validated = crate::hook::validate_transcript_path(transcript_path)?;
+    let mut file = fs::File::open(&validated).ok()?;
     let file_size = file.metadata().ok()?.len();
     let read_size = std::cmp::min(8192, file_size) as usize;
     let offset = file_size.saturating_sub(read_size as u64);
@@ -643,11 +660,12 @@ pub(super) async fn handle_session_rename(
     let suffix =
         HandlerContext::format_topic_name(session_id, hostname.as_deref(), project_dir.as_deref());
     let new_name = format!("{custom_title} | {suffix}");
-    let new_name = &new_name[..std::cmp::min(128, new_name.len())]; // Telegram limit
+    // U-2: Char-safe truncation — avoid panicking on multibyte UTF-8 characters.
+    let new_name: String = new_name.chars().take(128).collect();
 
     tracing::info!(session_id, custom_title, new_name, "Renaming forum topic");
 
-    if let Ok(true) = ctx.bot.edit_forum_topic(thread_id, new_name).await {
+    if let Ok(true) = ctx.bot.edit_forum_topic(thread_id, &new_name).await {
         ctx.bot
             .send_message(
                 &format!("Topic renamed: *{custom_title}*"),

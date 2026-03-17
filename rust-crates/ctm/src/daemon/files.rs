@@ -29,8 +29,9 @@ pub(super) fn sanitize_filename(name: &str) -> String {
     if safe.starts_with('.') {
         safe = format!("_{safe}");
     }
-    if safe.len() > 200 {
-        safe.truncate(200);
+    // U-2: Char-safe truncation — avoid panicking on multibyte UTF-8 characters.
+    if safe.chars().count() > 200 {
+        safe = safe.chars().take(200).collect();
     }
     format!("{}_{safe}", uuid::Uuid::new_v4())
 }

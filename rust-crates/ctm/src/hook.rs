@@ -549,6 +549,50 @@ fn tool_requires_approval(tool_name: &str, tool_input: &serde_json::Value) -> bo
     }
 }
 
+/// S-1: Validate a transcript_path before opening it.
+///
+/// Accepts only absolute paths that canonicalize to a location inside the
+/// user's home directory.  This prevents path traversal attacks where a
+/// malicious hook payload crafts a `transcript_path` pointing outside the
+/// expected location (e.g. `/etc/passwd` or `/../sensitive`).
+///
+/// Returns `Some(canonicalized_path)` on success, `None` if validation fails.
+pub(crate) fn validate_transcript_path(raw: &str) -> Option<std::path::PathBuf> {
+    use std::path::Path;
+
+    let p = Path::new(raw);
+
+    // Must be absolute
+    if !p.is_absolute() {
+        tracing::warn!(path = raw, "transcript_path is not absolute, skipping");
+        return None;
+    }
+
+    // Canonicalize — resolves symlinks and removes `..` components.
+    // This also verifies the path exists on disk.
+    let canonical = match std::fs::canonicalize(p) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(path = raw, error = %e, "transcript_path canonicalization failed, skipping");
+            return None;
+        }
+    };
+
+    // Must reside within the user's home directory
+    let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
+    if !canonical.starts_with(&home) {
+        tracing::warn!(
+            path = raw,
+            canonical = %canonical.display(),
+            home = %home.display(),
+            "transcript_path is outside home directory, skipping"
+        );
+        return None;
+    }
+
+    Some(canonical)
+}
+
 /// Extract new assistant text from the transcript JSONL file
 fn extract_transcript_text(
     transcript_path: &str,
@@ -557,9 +601,13 @@ fn extract_transcript_text(
 ) -> Option<String> {
     use std::fs;
     use std::io::BufRead;
-    use std::path::Path;
 
-    let path = Path::new(transcript_path);
+    // S-1: Validate path before opening (prevents path traversal)
+    let path = match validate_transcript_path(transcript_path) {
+        Some(p) => p,
+        None => return None,
+    };
+
     if !path.exists() {
         return None;
     }
@@ -571,7 +619,7 @@ fn extract_transcript_text(
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(0);
 
-    let file = fs::File::open(path).ok()?;
+    let file = fs::File::open(&path).ok()?;
     let reader = std::io::BufReader::new(file);
     let mut current_line = 0;
     let mut text_parts = Vec::new();
@@ -622,7 +670,9 @@ fn check_custom_title(transcript_path: &str) -> Option<String> {
     use std::fs;
     use std::io::{Read, Seek, SeekFrom};
 
-    let mut file = fs::File::open(transcript_path).ok()?;
+    // S-1: Validate path before opening (prevents path traversal)
+    let validated = validate_transcript_path(transcript_path)?;
+    let mut file = fs::File::open(&validated).ok()?;
     let file_size = file.metadata().ok()?.len();
 
     // Read last 8KB

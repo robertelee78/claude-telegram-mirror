@@ -34,6 +34,7 @@ pub(super) async fn run_event_loop(
         mirroring_enabled: Arc::clone(&state.mirroring_enabled),
         config: Arc::clone(&state.config),
         socket_clients,
+        pending_approval_clients: Arc::clone(&state.pending_approval_clients),
     };
 
     loop {

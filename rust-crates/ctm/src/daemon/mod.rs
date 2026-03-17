@@ -137,6 +137,11 @@ pub(super) struct DaemonState {
 
     // L3.2: Track running state
     pub(super) running: Arc<std::sync::atomic::AtomicBool>,
+
+    // S-2: Map approval_id -> client_id so approval responses are routed to
+    // the specific socket client that submitted the approval_request, not
+    // broadcast to all connected clients.
+    pub(super) pending_approval_clients: Arc<RwLock<HashMap<String, String>>>,
 }
 
 /// Bridge Daemon — orchestrates all components.
@@ -182,6 +187,7 @@ impl Daemon {
             mirroring_enabled,
             config: Arc::new(config),
             running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            pending_approval_clients: Arc::new(RwLock::new(HashMap::new())),
         });
 
         Ok(Self {
@@ -392,6 +398,8 @@ struct HandlerContext {
     config: Arc<Config>,
     /// Shared reference to the socket's connected-client map for outbound broadcasts.
     socket_clients: SocketClients,
+    /// S-2: Maps approval_id -> client_id for targeted approval response routing.
+    pending_approval_clients: Arc<RwLock<HashMap<String, String>>>,
 }
 
 impl HandlerContext {
@@ -403,7 +411,7 @@ impl HandlerContext {
     async fn db_op<F, R>(&self, f: F) -> R
     where
         F: FnOnce(&SessionManager) -> R + Send + 'static,
-        R: Send + 'static,
+        R: Send + Default + 'static,
     {
         let sessions = Arc::clone(&self.sessions);
         tokio::task::spawn_blocking(move || {
@@ -412,10 +420,15 @@ impl HandlerContext {
         })
         .await
         .unwrap_or_else(|e| {
-            // Log the JoinError (task panic or runtime shutdown) before propagating.
-            // Cannot gracefully recover because R is generic with no Default bound.
-            tracing::error!(error = %e, "db_op: spawn_blocking task failed");
-            panic!("db_op: spawn_blocking task was cancelled or panicked: {e}");
+            // S-3: Log the JoinError but return a safe default instead of panicking.
+            // JoinError occurs when the spawned task was cancelled (runtime shutdown)
+            // or panicked internally. Returning Default::default() is safe because:
+            // - bool::default() = false (operation "did not succeed")
+            // - Option::default() = None (record "not found")
+            // - ()::default() = () (fire-and-forget operations)
+            // - Vec::default() = [] (empty result set)
+            tracing::error!(error = %e, "db_op: spawn_blocking task failed, returning default");
+            R::default()
         })
     }
 
@@ -888,8 +901,8 @@ async fn get_tmux_target(
     }
     // Fallback to DB
     let sid = session_id.to_string();
-    let tmux_info = ctx.db_op(move |sess| sess.get_tmux_info(&sid)).await;
-    if let Ok(Some((target, _socket))) = tmux_info {
+    let tmux_info = ctx.db_op(move |sess| sess.get_tmux_info(&sid).ok().flatten()).await;
+    if let Some((target, _socket)) = tmux_info {
         ctx.session_tmux
             .write()
             .await

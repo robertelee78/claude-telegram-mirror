@@ -194,8 +194,9 @@ async fn handle_approval_callback(
         .await;
     }
 
-    // ADR-006 C1: Broadcast `approval_response` so the hook client blocked in
-    // `send_and_wait()` receives the decision instead of timing out.
+    // ADR-006 C1 / S-2: Send `approval_response` only to the specific socket
+    // client that originated the approval_request, preventing approval forgery
+    // where a different hook client could intercept another session's decision.
     let mut metadata = serde_json::Map::new();
     metadata.insert(
         "approvalId".to_string(),
@@ -208,13 +209,58 @@ async fn handle_approval_callback(
         content: action.to_string(),
         metadata: Some(metadata),
     };
-    broadcast_to_clients(&ctx.socket_clients, &response).await;
-    tracing::info!(
-        approval_id,
-        action,
-        session_id = %approval.session_id,
-        "Approval resolved and broadcast over socket"
-    );
+
+    // S-2: Look up the specific client that sent the approval_request.
+    let originating_client = ctx
+        .pending_approval_clients
+        .write()
+        .await
+        .remove(approval_id);
+
+    if let Some(client_id) = originating_client {
+        // Send only to the originating client
+        let json = match serde_json::to_string(&response) {
+            Ok(j) => j,
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to serialise approval_response");
+                return;
+            }
+        };
+        let line = format!("{json}\n");
+        let guard = ctx.socket_clients.lock().await;
+        if let Some(writer) = guard.get(&client_id) {
+            let mut w = writer.lock().await;
+            let _ = w.write_all(line.as_bytes()).await;
+            tracing::info!(
+                approval_id,
+                action,
+                session_id = %approval.session_id,
+                client_id,
+                "Approval resolved and sent to originating client"
+            );
+        } else {
+            // Client disconnected; fall back to broadcast so the hook can
+            // still receive the response if it reconnected under a new client_id.
+            drop(guard);
+            broadcast_to_clients(&ctx.socket_clients, &response).await;
+            tracing::info!(
+                approval_id,
+                action,
+                session_id = %approval.session_id,
+                "Approval resolved, originating client gone — broadcast as fallback"
+            );
+        }
+    } else {
+        // No client_id recorded (e.g. older message without metadata injection);
+        // fall back to broadcast for compatibility.
+        broadcast_to_clients(&ctx.socket_clients, &response).await;
+        tracing::info!(
+            approval_id,
+            action,
+            session_id = %approval.session_id,
+            "Approval resolved and broadcast over socket (no originating client recorded)"
+        );
+    }
 
     // C2.2: Edit the original approval message to append the decision and remove keyboard.
     // Use plain text (parse_mode = None) because approval text may contain tool names

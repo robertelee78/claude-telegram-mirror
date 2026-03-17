@@ -1,5 +1,6 @@
 use crate::error::{AppError, Result};
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::fs;
 use std::path::PathBuf;
 
@@ -65,7 +66,7 @@ pub fn write_mirror_status(config_dir: &std::path::Path, enabled: bool, pid: Opt
 }
 
 /// CTM configuration loaded from env vars > config file > defaults
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Config {
     pub bot_token: String,
     pub chat_id: i64,
@@ -89,6 +90,30 @@ pub struct Config {
     /// Whether forum (topics) mode is enabled (default: false)
     #[allow(dead_code)] // Library API
     pub forum_enabled: bool,
+}
+
+/// S-4: Manual Debug impl that redacts bot_token to prevent accidental log exposure.
+impl fmt::Debug for Config {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Config")
+            .field("bot_token", &"[REDACTED]")
+            .field("chat_id", &self.chat_id)
+            .field("enabled", &self.enabled)
+            .field("verbose", &self.verbose)
+            .field("approvals", &self.approvals)
+            .field("use_threads", &self.use_threads)
+            .field("chunk_size", &self.chunk_size)
+            .field("rate_limit", &self.rate_limit)
+            .field("session_timeout", &self.session_timeout)
+            .field("stale_session_timeout_hours", &self.stale_session_timeout_hours)
+            .field("auto_delete_topics", &self.auto_delete_topics)
+            .field("topic_delete_delay_minutes", &self.topic_delete_delay_minutes)
+            .field("socket_path", &self.socket_path)
+            .field("config_dir", &self.config_dir)
+            .field("config_path", &self.config_path)
+            .field("forum_enabled", &self.forum_enabled)
+            .finish()
+    }
 }
 
 /// Config file structure (supports both camelCase and snake_case)
