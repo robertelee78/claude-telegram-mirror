@@ -107,11 +107,26 @@ fn get_transcript_path(event: &HookEvent) -> Option<&str> {
     base.transcript_path.as_deref()
 }
 
-/// Build metadata object with tmux info and hostname
+/// Extract cwd (project directory) from any hook event
+fn get_cwd(event: &HookEvent) -> Option<&str> {
+    let base = match event {
+        HookEvent::Stop(e) => &e.base,
+        HookEvent::SubagentStop(e) => &e.base,
+        HookEvent::PreToolUse(e) => &e.base,
+        HookEvent::PostToolUse(e) => &e.base,
+        HookEvent::Notification(e) => &e.base,
+        HookEvent::UserPromptSubmit(e) => &e.base,
+        HookEvent::PreCompact(e) => &e.base,
+    };
+    base.cwd.as_deref()
+}
+
+/// Build metadata object with tmux info, hostname, and project dir
 fn build_metadata(
     tmux_info: &Option<injector::TmuxInfo>,
     hostname: &str,
     transcript_path: Option<&str>,
+    project_dir: Option<&str>,
 ) -> serde_json::Map<String, serde_json::Value> {
     let mut meta = serde_json::Map::new();
     if let Some(info) = tmux_info {
@@ -136,6 +151,12 @@ fn build_metadata(
         meta.insert(
             "transcript_path".into(),
             serde_json::Value::String(path.to_string()),
+        );
+    }
+    if let Some(dir) = project_dir {
+        meta.insert(
+            "projectDir".into(),
+            serde_json::Value::String(dir.to_string()),
         );
     }
     meta
@@ -169,7 +190,8 @@ async fn build_messages(
     cfg: &config::Config,
 ) -> Vec<BridgeMessage> {
     let transcript_path = get_transcript_path(event);
-    let meta = build_metadata(tmux_info, hostname, transcript_path);
+    let project_dir = get_cwd(event);
+    let meta = build_metadata(tmux_info, hostname, transcript_path, project_dir);
     let mut messages = Vec::new();
 
     match event {
@@ -303,7 +325,12 @@ async fn get_hook_output(
 
     let tmux_info = InputInjector::detect_tmux_session();
     let hostname = injector::get_hostname();
-    let meta = build_metadata(&tmux_info, &hostname, get_transcript_path(event));
+    let meta = build_metadata(
+        &tmux_info,
+        &hostname,
+        get_transcript_path(event),
+        get_cwd(event),
+    );
 
     let mut approval_meta = meta;
     approval_meta.insert(
