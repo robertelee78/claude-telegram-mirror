@@ -181,6 +181,11 @@ jobs:
           node-version: '20'
           registry-url: 'https://registry.npmjs.org'
 
+      - name: Upgrade npm for OIDC provenance support
+        run: |
+          npm install -g npm@latest
+          echo "npm version: $(npm --version)"
+
       - name: Publish platform packages to npm
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
