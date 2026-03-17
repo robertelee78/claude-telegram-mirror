@@ -598,7 +598,7 @@ fn check_pid_file(fix: bool) -> CheckResult {
 }
 
 fn check_database() -> CheckResult {
-    let db_path = config_dir().join("bridge.db");
+    let db_path = config_dir().join("sessions.db");
     if !db_path.exists() {
         return CheckResult::warn("Database", "Database file not found")
             .with_details("Will be created on first daemon start");
