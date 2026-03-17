@@ -290,7 +290,7 @@ ctm install-hooks --project
 - **Topic routing**: Each daemon only processes topics it created (multi-bot safe)
 - **Rate limiting**: Governor-based with exponential backoff retry queue
 - **Token scrubbing**: All log output filtered through regex to strip bot tokens
-- **Test suite**: 387 Rust tests (unit + 8 integration test files)
+- **Test suite**: 512 Rust tests (unit + 10 integration test files)
 
 ## Troubleshooting
 
@@ -380,7 +380,7 @@ rust-crates/ctm/src/
                     #   telegram_handlers.rs, callback_handlers.rs, cleanup.rs, files.rs)
   service/          # OS service management (mod.rs, systemd.rs, launchd.rs, env.rs)
 
-rust-crates/ctm/tests/   # 8 integration test files
+rust-crates/ctm/tests/   # 10 integration test files
 ```
 
 </details>

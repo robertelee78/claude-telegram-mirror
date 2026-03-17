@@ -2,7 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
-## [0.2.0] - 2026-03-17
+## [0.2.0] - 2026-03-17 (updated 2026-03-17)
+
+### Release Readiness (post-initial)
+
+**Security:**
+- **Bounded NDJSON line reading** -- replaced `AsyncBufReadExt::read_line` (which accumulates without limit before the newline is found) with a new `read_bounded_line` helper that stops accumulating once `MAX_LINE_BYTES` are consumed, then drains to the next newline to keep the stream frame-aligned. Prevents a newline-free payload from exhausting memory before the size check fires.
+
+**Type safety:**
+- **`SessionStatus` and `ApprovalStatus` enums propagated to all call sites** -- `end_session` and `resolve_approval` now accept typed enum values instead of raw `&str`, eliminating the runtime string-validation step. `row_to_session` and `row_to_approval` parse DB strings into enums at deserialization time with a safe fallback for unknown values.
+
+**Test coverage expanded to 512 tests:**
+- **`bot_tests.rs`** -- new integration test file covering Telegram bot client: message sending, forum topic management, rate limiting, and callback query handling
+- **`daemon_handlers.rs`** -- new integration test file covering socket and Telegram handler logic: session routing, approval flow, echo prevention, and cleanup sequences
+- `concurrency.rs`, `config_validation.rs`, and `session_lifecycle.rs` expanded with additional cases
 
 ### Polish (ADR-009)
 
@@ -58,7 +71,7 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
-- **Complete Rust rewrite** — 30 source files (14 top-level modules + 3 sub-module groups), 387 tests (unit + 8 integration test files), ~12,000 lines of Rust replacing the TypeScript implementation
+- **Complete Rust rewrite** — 30 source files (14 top-level modules + 3 sub-module groups), 512 tests (unit + 10 integration test files), ~12,000 lines of Rust replacing the TypeScript implementation
 - **Single static binary** — ~9 MB self-contained binary with sub-millisecond hook latency (<1 ms)
 - **Tool summarizer** — 30+ regex patterns condense verbose tool output into compact Telegram messages
 - **AskUserQuestion rendering** — inline keyboard buttons displayed in Telegram for interactive Claude prompts
@@ -72,7 +85,7 @@ All notable changes to this project will be documented in this file.
 - **`linux-arm64` platform support** — pre-built binary available for ARM64 Linux (e.g., Raspberry Pi, AWS Graviton)
 - **Interactive setup wizard** — `ctm setup` uses `dialoguer` to guide first-time configuration without manual config editing
 - **TypeScript detection in code blocks** — code blocks in Claude output are annotated with the detected language for syntax-highlighted display
-- **Integration test suite** (ADR-008) — 8 test files covering CLI smoke tests, concurrency, config validation, formatting, hook pipeline, session lifecycle, socket roundtrip, and summarizer
+- **Integration test suite** (ADR-008) — 10 test files covering CLI smoke tests, concurrency, config validation, formatting, hook pipeline, session lifecycle, socket roundtrip, summarizer, bot client, and daemon handlers
 - **Binary integrity verification** (ADR-008) — `checksums.json` in the release workflow for verifiable artifact hashes
 - **Structural decomposition** (ADR-008) — bot/, daemon/, and service/ modules split into focused sub-modules (e.g., `bot/client.rs`, `bot/queue.rs`, `daemon/event_loop.rs`, `daemon/cleanup.rs`, `service/systemd.rs`, `service/launchd.rs`, `service/env.rs`)
 
