@@ -728,41 +728,26 @@ pub(super) async fn handle_ask_user_question(ctx: &HandlerContext, msg: &BridgeM
     let short_session_id = &msg.session_id[..std::cmp::min(20, msg.session_id.len())];
     let pending_key = msg.session_id.clone();
 
+    // ADR-012: Insert PendingQuestion with new tentative-selection model.
+    // No TTL — questions persist until Submit All or session end.
     {
         let mut pq = ctx.pending_q.write().await;
-        let mut selected = HashMap::new();
-        for (i, q) in questions.iter().enumerate() {
-            if q.multi_select {
-                selected.insert(i, HashSet::new());
-            }
-        }
         pq.insert(
             pending_key.clone(),
             PendingQuestion {
                 session_id: msg.session_id.clone(),
                 questions: questions.clone(),
-                answered: vec![false; questions.len()],
-                selected_options: selected,
-                timestamp: std::time::Instant::now(),
-                message_ids: Vec::new(),
+                tentative: HashMap::new(),
+                finalized: vec![false; questions.len()],
+                question_message_ids: Vec::new(),
+                summary_message_id: None,
             },
         );
     }
 
-    // Schedule question expiry
-    let pq_ref = Arc::clone(&ctx.pending_q);
-    let pk = pending_key.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(tokio::time::Duration::from_secs(QUESTION_TTL_SECS)).await;
-        let mut pq = pq_ref.write().await;
-        if let Some(pending) = pq.get(&pk) {
-            if pending.timestamp.elapsed().as_secs() >= QUESTION_TTL_SECS {
-                pq.remove(&pk);
-            }
-        }
-    });
-
-    // Render each question as a separate message
+    // ADR-012: Render each question as a separate message, capturing message_ids
+    // so we can edit them in place when the user changes their selection.
+    let mut question_message_ids: Vec<i64> = Vec::new();
     for (q_idx, q) in questions.iter().enumerate() {
         let mut text = format!(
             "\u{2753} *{}*\n\n{}\n",
@@ -787,7 +772,7 @@ pub(super) async fn handle_ask_user_question(ctx: &HandlerContext, msg: &BridgeM
                 });
             }
             buttons.push(InlineButton {
-                text: "\u{2705} Submit".into(),
+                text: "\u{2705} Done".into(),
                 callback_data: format!("submit:{short_session_id}:{q_idx}"),
             });
         } else {
@@ -799,17 +784,33 @@ pub(super) async fn handle_ask_user_question(ctx: &HandlerContext, msg: &BridgeM
             }
         }
 
-        ctx.bot
-            .send_with_buttons(
-                &text,
-                buttons,
-                Some(&SendOptions {
-                    parse_mode: Some("Markdown".into()),
-                    ..Default::default()
-                }),
-                thread_id,
-            )
-            .await;
+        // ADR-012 Phase 10: Use send_with_buttons_returning to capture message_id.
+        match ctx
+            .bot
+            .send_with_buttons_returning(&text, buttons, Some("Markdown"), thread_id)
+            .await
+        {
+            Ok(mid) => question_message_ids.push(mid),
+            Err(e) => {
+                tracing::warn!(
+                    session_id = %msg.session_id,
+                    q_idx,
+                    error = %e,
+                    "Failed to send question message — retrying via queue"
+                );
+                // Fall back to fire-and-forget; use 0 as sentinel so indices
+                // stay aligned (edit will silently fail but won't crash).
+                question_message_ids.push(0);
+            }
+        }
+    }
+
+    // Store captured message_ids back into the pending question.
+    {
+        let mut pq = ctx.pending_q.write().await;
+        if let Some(pending) = pq.get_mut(&pending_key) {
+            pending.question_message_ids = question_message_ids;
+        }
     }
 }
 

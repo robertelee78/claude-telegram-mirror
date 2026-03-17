@@ -505,6 +505,147 @@ impl TelegramBot {
         Ok(())
     }
 
+    /// Edit a message's text while preserving or replacing its inline keyboard.
+    ///
+    /// ADR-012: Unlike `edit_message_text_no_markup`, this method keeps the
+    /// keyboard visible. Required for tentative-selection re-renders where the
+    /// user must be able to change their answer after tapping.
+    pub async fn edit_message_text_with_markup(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        text: &str,
+        parse_mode: Option<&str>,
+        buttons: &[Vec<InlineButton>],
+    ) -> Result<()> {
+        // Flatten the row-of-rows button layout into a single list for
+        // build_inline_keyboard, which handles the 2-per-row layout itself.
+        // For question messages we pass a flat list; for the summary we build
+        // the rows explicitly and then flatten so we preserve the intended layout.
+        // We therefore accept Vec<Vec<InlineButton>> and flatten here.
+        let flat: Vec<InlineButton> = buttons.iter().flatten().cloned().collect();
+        let keyboard = build_inline_keyboard(&flat);
+        let mut body = serde_json::json!({
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": text,
+            "reply_markup": keyboard,
+        });
+        if let Some(pm) = parse_mode {
+            body["parse_mode"] = serde_json::Value::String(pm.to_string());
+        }
+        let _: TgResponse<TgMessage> = self.api_call("editMessageText", &body).await?;
+        Ok(())
+    }
+
+    /// Edit a message's text with a pre-built reply_markup JSON object.
+    ///
+    /// ADR-012: Used for the summary message which has a custom row layout
+    /// that doesn't fit `build_inline_keyboard`'s 2-per-row heuristic.
+    pub async fn edit_message_text_with_raw_markup(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        text: &str,
+        parse_mode: Option<&str>,
+        reply_markup: serde_json::Value,
+    ) -> Result<()> {
+        let mut body = serde_json::json!({
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": text,
+            "reply_markup": reply_markup,
+        });
+        if let Some(pm) = parse_mode {
+            body["parse_mode"] = serde_json::Value::String(pm.to_string());
+        }
+        let _: TgResponse<TgMessage> = self.api_call("editMessageText", &body).await?;
+        Ok(())
+    }
+
+    /// Delete a message.
+    ///
+    /// ADR-012: Used to delete the summary confirmation message when the user
+    /// taps "Change QN" so they can re-select without an outdated summary visible.
+    pub async fn delete_message(&self, chat_id: i64, message_id: i64) -> Result<()> {
+        let _: TgResponse<bool> = self
+            .api_call(
+                "deleteMessage",
+                &serde_json::json!({
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                }),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Send a message with a pre-built reply_markup and return the message_id.
+    ///
+    /// ADR-012: Used by `send_or_update_summary` to send the summary message
+    /// via a custom keyboard layout that doesn't fit the 2-per-row heuristic.
+    /// Returns `None` on failure.
+    pub async fn send_message_with_raw_markup_returning(
+        &self,
+        text: &str,
+        parse_mode: Option<&str>,
+        reply_markup: serde_json::Value,
+        thread_id: Option<i64>,
+    ) -> Result<i64> {
+        let mut body = serde_json::json!({
+            "chat_id": self.chat_id,
+            "text": text,
+            "reply_markup": reply_markup,
+        });
+        if let Some(pm) = parse_mode {
+            body["parse_mode"] = serde_json::Value::String(pm.to_string());
+        }
+        if let Some(tid) = thread_id {
+            body["message_thread_id"] = serde_json::Value::Number(tid.into());
+        }
+        let resp: TgResponse<TgMessage> = self.api_call("sendMessage", &body).await?;
+        let msg = resp.result.ok_or_else(|| {
+            AppError::Telegram(
+                resp.description
+                    .unwrap_or_else(|| "sendMessage failed".into()),
+            )
+        })?;
+        Ok(msg.message_id)
+    }
+
+    /// Send a message with inline buttons and return the sent message_id.
+    ///
+    /// ADR-012: Used by `handle_ask_user_question` to capture the message_id
+    /// of each question message so selections can be edited in place.
+    pub async fn send_with_buttons_returning(
+        &self,
+        text: &str,
+        buttons: Vec<InlineButton>,
+        parse_mode: Option<&str>,
+        thread_id: Option<i64>,
+    ) -> Result<i64> {
+        let keyboard = build_inline_keyboard(&buttons);
+        let mut body = serde_json::json!({
+            "chat_id": self.chat_id,
+            "text": text,
+            "reply_markup": keyboard,
+        });
+        if let Some(pm) = parse_mode {
+            body["parse_mode"] = serde_json::Value::String(pm.to_string());
+        }
+        if let Some(tid) = thread_id {
+            body["message_thread_id"] = serde_json::Value::Number(tid.into());
+        }
+        let resp: TgResponse<TgMessage> = self.api_call("sendMessage", &body).await?;
+        let msg = resp.result.ok_or_else(|| {
+            AppError::Telegram(
+                resp.description
+                    .unwrap_or_else(|| "sendMessage failed".into()),
+            )
+        })?;
+        Ok(msg.message_id)
+    }
+
     /// Edit a message's text and remove keyboard (for "Selected" / "Submitted" feedback).
     pub async fn edit_message_text_no_markup(
         &self,

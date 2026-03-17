@@ -43,7 +43,6 @@ use tokio::sync::{Mutex, RwLock};
 const CLEANUP_INTERVAL_SECS: u64 = 5 * 60; // 5 minutes
 const ECHO_TTL_SECS: u64 = 10;
 const TOOL_CACHE_TTL_SECS: u64 = 5 * 60; // 5 minutes
-const QUESTION_TTL_SECS: u64 = 10 * 60; // 10 minutes
 const DOWNLOAD_MAX_AGE_SECS: u64 = 24 * 60 * 60; // 24 hours
 const TMUX_SESSION_TIMEOUT_HOURS: u32 = 24;
 const NO_TMUX_SESSION_TIMEOUT_HOURS: u32 = 1;
@@ -59,20 +58,38 @@ pub(super) struct CachedToolInput {
     timestamp: std::time::Instant,
 }
 
+/// Tentative answer for a single AskUserQuestion question.
+///
+/// ADR-012: Single-select taps and free-text entries are tentative until the
+/// user taps "Submit All". Only committed to tmux on final confirmation.
+#[derive(Clone, Debug)]
+pub(super) enum TentativeAnswer {
+    /// Single-select: the index of the chosen option.
+    Option(usize),
+    /// Multi-select: the set of chosen option indices.
+    MultiOption(HashSet<usize>),
+    /// Free-text typed by the user.
+    FreeText(String),
+}
+
 /// Pending AskUserQuestion state.
+///
+/// ADR-012: Replaced `answered`/`selected_options`/`timestamp` with the
+/// unified `tentative` map and `finalized` vec. Questions persist until
+/// the user taps "Submit All" or the session ends — no TTL.
 pub(super) struct PendingQuestion {
     session_id: String,
     questions: Vec<QuestionDef>,
-    answered: Vec<bool>,
-    selected_options: HashMap<usize, HashSet<usize>>,
-    timestamp: std::time::Instant,
-    /// M5.5: Track Telegram message IDs associated with this question so they
-    /// can be cleaned up (edited/deleted) when the question is answered or the
-    /// session ends. Currently populated but cleanup logic is a future
-    /// enhancement -- the field exists so callers can begin tracking IDs now.
-    // Intentional: field pre-positioned for future cleanup enhancement
-    #[allow(dead_code)] // Pre-positioned for future cleanup enhancement
-    message_ids: Vec<i64>,
+    /// Tentative selections keyed by question index. Absent = unanswered.
+    tentative: HashMap<usize, TentativeAnswer>,
+    /// Whether each question has been finalized (injected into tmux).
+    /// Only set during the Submit All flow.
+    finalized: Vec<bool>,
+    /// Telegram message_id for each question message, in question order.
+    /// Used to edit messages when selections change.
+    question_message_ids: Vec<i64>,
+    /// Telegram message_id of the summary confirmation message, if sent.
+    summary_message_id: Option<i64>,
 }
 
 #[derive(Clone)]
