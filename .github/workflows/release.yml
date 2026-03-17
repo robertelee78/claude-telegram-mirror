@@ -180,11 +180,27 @@ jobs:
           node-version: '20.x'
           registry-url: 'https://registry.npmjs.org'
 
+      - name: Debug npm auth
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          echo "=== .npmrc location ==="
+          echo "NPM_CONFIG_USERCONFIG=$NPM_CONFIG_USERCONFIG"
+          cat "$NPM_CONFIG_USERCONFIG" | sed 's/_authToken=.*/_authToken=<REDACTED>/'
+          echo ""
+          echo "=== Token length ==="
+          echo "${#NODE_AUTH_TOKEN}"
+          echo "=== Token prefix ==="
+          echo "${NODE_AUTH_TOKEN:0:4}"
+          echo "=== npm config list ==="
+          npm config list
+          echo "=== npm whoami ==="
+          npm whoami
+
       - name: Publish platform packages to npm
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          npm whoami
           # Publish platform packages first
           for pkg in ctm-linux-x64 ctm-linux-arm64 ctm-darwin-arm64 ctm-darwin-x64; do
             tgz=$(find artifacts/$pkg -name "*.tgz" | head -1)
