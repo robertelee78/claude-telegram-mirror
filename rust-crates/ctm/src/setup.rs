@@ -737,10 +737,8 @@ pub async fn run_setup() -> anyhow::Result<()> {
                         gray("Global hooks will work here - no action needed!")
                     );
                 } else {
-                    // Save current dir, change to project dir, install, restore
-                    let orig = std::env::current_dir()?;
-                    std::env::set_current_dir(&full_path)?;
-                    match crate::installer::install_hooks(true) {
+                    // L9: pass project path directly instead of using set_current_dir
+                    match crate::installer::install_hooks_for_project(&full_path) {
                         Ok(()) => {
                             println!(
                                 "{} Hooks installed to {project_path}/.claude/settings.json",
@@ -751,7 +749,6 @@ pub async fn run_setup() -> anyhow::Result<()> {
                             println!("{} {e}", yellow("WARN"));
                         }
                     }
-                    std::env::set_current_dir(orig)?;
                 }
 
                 if !Confirm::new()

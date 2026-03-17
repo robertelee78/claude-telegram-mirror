@@ -20,6 +20,8 @@ pub struct Config {
     pub topic_delete_delay_minutes: u32,
     pub socket_path: PathBuf,
     pub config_dir: PathBuf,
+    /// Resolved path to config.json (may not exist if config was provided via env vars only)
+    pub config_path: PathBuf,
 }
 
 /// Config file structure (supports both camelCase and snake_case)
@@ -109,7 +111,17 @@ pub fn load_config(require_auth: bool) -> Result<Config> {
     // Load config file (if exists)
     let file_config = if config_path.exists() {
         match fs::read_to_string(&config_path) {
-            Ok(content) => serde_json::from_str::<ConfigFile>(&content).unwrap_or_default(),
+            Ok(content) => match serde_json::from_str::<ConfigFile>(&content) {
+                Ok(cfg) => cfg,
+                Err(e) => {
+                    tracing::warn!(
+                        path = %config_path.display(),
+                        error = %e,
+                        "Failed to parse config file as JSON, using defaults"
+                    );
+                    ConfigFile::default()
+                }
+            },
             Err(e) => {
                 tracing::warn!(path = %config_path.display(), error = %e, "Failed to read config file, using defaults");
                 ConfigFile::default()
@@ -208,12 +220,12 @@ pub fn load_config(require_auth: bool) -> Result<Config> {
     if require_auth {
         if bot_token.is_empty() {
             return Err(AppError::Config(
-                "TELEGRAM_BOT_TOKEN is required. Set it as an environment variable or in config.json.".into(),
+                "TELEGRAM_BOT_TOKEN is required. Create a bot via @BotFather (https://t.me/botfather) and paste the token.".into(),
             ));
         }
         if chat_id == 0 {
             return Err(AppError::Config(
-                "TELEGRAM_CHAT_ID is required. Supergroup IDs start with -100.".into(),
+                "TELEGRAM_CHAT_ID is required. Get your chat ID from https://api.telegram.org/bot<YOUR_TOKEN>/getUpdates after sending a message in your group. Supergroup IDs start with -100.".into(),
             ));
         }
     }
@@ -233,6 +245,7 @@ pub fn load_config(require_auth: bool) -> Result<Config> {
         topic_delete_delay_minutes,
         socket_path,
         config_dir,
+        config_path,
     })
 }
 

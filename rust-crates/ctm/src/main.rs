@@ -77,6 +77,9 @@ enum Commands {
         /// Enable verbose logging
         #[arg(short, long)]
         verbose: bool,
+        /// Run in foreground (accepted for script compatibility; daemon always runs in foreground)
+        #[arg(long)]
+        foreground: bool,
     },
 
     /// Stop the bridge daemon
@@ -174,7 +177,10 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Commands::Hook => hook::process_hook().await,
 
-        Commands::Start { verbose } => cmd_start(verbose).await,
+        Commands::Start {
+            verbose,
+            foreground: _,
+        } => cmd_start(verbose).await,
         Commands::Stop { force } => cmd_stop(force).await,
         Commands::Restart { verbose } => cmd_restart(verbose).await,
         Commands::Status => cmd_status(),

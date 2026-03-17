@@ -293,7 +293,14 @@ fn check_hooks(fix: bool) -> CheckResult {
     {
         Some(settings) => {
             let hooks = settings.get("hooks");
-            let check_types = ["PreToolUse", "PostToolUse", "Notification"];
+            let check_types = [
+                "PreToolUse",
+                "PostToolUse",
+                "Notification",
+                "Stop",
+                "UserPromptSubmit",
+                "PreCompact",
+            ];
             let installed = check_types
                 .iter()
                 .filter(|&&ht| {

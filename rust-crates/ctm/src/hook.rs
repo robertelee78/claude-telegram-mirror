@@ -221,7 +221,7 @@ async fn build_messages(
                 .filter(|s| !s.is_empty())
                 .or(e.tool_error.as_deref())
                 .unwrap_or("No output");
-            if cfg.verbose || output.len() > 10 {
+            if cfg.verbose || (output.len() >= 10 && !output.trim().is_empty()) {
                 let truncated = if output.len() > 2000 {
                     format!("{}...", &output[..2000])
                 } else {
@@ -374,6 +374,11 @@ async fn get_hook_output(
     let prompt = format_tool_approval_prompt(&pre_tool.tool_name, &pre_tool.tool_input);
     let msg = make_message("approval_request", session_id, &prompt, approval_meta);
 
+    // L20: Probe the socket first so we can distinguish "daemon not running"
+    // (connection refused / no socket) from a real timeout (approval expired).
+    // If the socket file exists but connect fails immediately we treat it the
+    // same way — the daemon is not available so we return None and let Claude
+    // continue normally rather than blocking on a phantom approval request.
     match send_and_wait(&cfg.socket_path, &msg, Duration::from_secs(300)).await {
         Ok(response) => {
             let action = response.content.as_str();
@@ -398,10 +403,18 @@ async fn get_hook_output(
                 decision, reason
             ))
         }
+        Err(AppError::Socket(ref msg_str)) if msg_str.contains("Failed to connect") => {
+            // L20: Connection refused — daemon is not running.
+            // Return None so Claude continues normally without blocking.
+            tracing::debug!(
+                "Approval socket connect failed (daemon not running), letting Claude continue"
+            );
+            None
+        }
         Err(_) => {
-            // Timeout or connection error — fall back to CLI
+            // L20: Timeout — approval window expired, escalate to CLI.
             Some(
-                "{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"ask\",\"permissionDecisionReason\":\"Telegram approval timed out. Falling back to CLI approval.\"}}"
+                "{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"ask\",\"permissionDecisionReason\":\"Telegram approval timed out.\"}}"
                     .to_string(),
             )
         }

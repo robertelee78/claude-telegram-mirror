@@ -74,8 +74,37 @@ fn ctm_hook_command() -> String {
 // ---------------------------------------------------------------------------
 
 /// Check if a hook command string belongs to CTM.
+///
+/// Matches when "ctm hook" appears as a literal substring, when the binary component
+/// of the command is exactly `ctm` (optionally followed by a hash suffix used by
+/// Rust test binaries, e.g. `ctm-abc123 hook`), or when legacy patterns are present.
+///
+/// This avoids false positives from tools like `xctm-linter` where "ctm" is embedded
+/// inside a longer identifier word.
 fn is_ctm_command(cmd: &str) -> bool {
-    cmd.contains("ctm") || cmd.contains("telegram-hook") || cmd.contains("hooks/handler")
+    if cmd.contains("telegram-hook") || cmd.contains("hooks/handler") {
+        return true;
+    }
+    // Extract the binary name: the part of the first token (up to the first space)
+    // after the last '/'.
+    let first_token = cmd.split_whitespace().next().unwrap_or("");
+    let bin_name = first_token
+        .rsplit('/')
+        .next()
+        .unwrap_or(first_token);
+
+    // Accept if the binary name is exactly "ctm" or starts with "ctm-" (Rust test binary
+    // naming convention: "ctm-<hash>").
+    if bin_name == "ctm" || bin_name.starts_with("ctm-") {
+        return true;
+    }
+
+    // Also accept the literal "ctm hook" substring for any path variation.
+    if cmd.contains("ctm hook") {
+        return true;
+    }
+
+    false
 }
 
 /// Check if a hook item (in the new format) contains a CTM command.
@@ -155,6 +184,48 @@ pub struct HookChangeReport {
 // ---------------------------------------------------------------------------
 // Install
 // ---------------------------------------------------------------------------
+
+/// Install CTM hooks for a specific project directory.
+///
+/// `project_path` must be the root of a Claude project (i.e. it must contain a `.claude/`
+/// subdirectory). This avoids mutating global process state via `set_current_dir`.
+pub fn install_hooks_for_project(project_path: &Path) -> anyhow::Result<()> {
+    let project_dir = project_path.join(".claude");
+    if !project_dir.exists() {
+        anyhow::bail!(
+            "No .claude directory found in {}. Run from a Claude project directory.",
+            project_path.display()
+        );
+    }
+    let settings_path = project_dir.join("settings.json");
+    let changes = install_hooks_to_path(&settings_path, &project_dir)?;
+
+    println!("\nClaude Code Telegram Hook Installation (project)\n");
+    println!("Settings: {}\n", settings_path.display());
+
+    let mut any_changed = false;
+    for report in &changes {
+        let icon = match report.status {
+            HookChangeStatus::Added => "+",
+            HookChangeStatus::Updated => "~",
+            HookChangeStatus::Unchanged => " ",
+        };
+        println!("  [{icon}] {}: {}", report.hook_type, report.status);
+        if report.status != HookChangeStatus::Unchanged {
+            any_changed = true;
+        }
+    }
+    println!();
+
+    if any_changed {
+        println!("Hooks installed successfully.");
+    } else {
+        println!("All hooks already up to date.");
+    }
+    println!();
+
+    Ok(())
+}
 
 /// Install CTM hooks into the given settings file.
 ///
@@ -440,11 +511,20 @@ mod tests {
 
     #[test]
     fn test_is_ctm_command() {
+        // Positive cases
         assert!(is_ctm_command("/usr/local/bin/ctm hook"));
+        assert!(is_ctm_command("ctm hook"));
+        assert!(is_ctm_command("ctm"));
+        assert!(is_ctm_command("/path/to/ctm"));
         assert!(is_ctm_command("/path/to/telegram-hook.sh"));
         assert!(is_ctm_command("node dist/hooks/handler.js"));
+        // Negative cases
         assert!(!is_ctm_command("some-other-tool"));
         assert!(!is_ctm_command(""));
+        // M9: must not match tools where "ctm" is embedded inside another word
+        // (e.g. a hypothetical "xctm-linter" tool where ctm has a non-separator prefix)
+        assert!(!is_ctm_command("xctm-linter --check"));
+        assert!(!is_ctm_command("factm-check"));
     }
 
     #[test]
