@@ -219,6 +219,13 @@ jobs:
             sleep 5
           done
 
+          # After the loop, verify all packages are available
+          if [ "$ALL_AVAILABLE" != "true" ]; then
+            echo "ERROR: Platform packages not available on npm registry after 150s timeout"
+            echo "Cannot publish main package without platform dependencies"
+            exit 1
+          fi
+
           # Publish the main package
           npm publish --access public --provenance
 
