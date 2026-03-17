@@ -174,12 +174,15 @@ jobs:
         with:
           path: artifacts
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
       - name: Publish platform packages to npm
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          echo "//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}" > ~/.npmrc
-
           # Publish platform packages first
           for pkg in ctm-linux-x64 ctm-linux-arm64 ctm-darwin-arm64 ctm-darwin-x64; do
             tgz=$(find artifacts/$pkg -name "*.tgz" | head -1)

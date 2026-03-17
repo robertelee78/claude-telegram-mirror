@@ -11,6 +11,9 @@
   "os": ["darwin"],
   "cpu": ["x64"],
   "files": ["bin/"],
+  "scripts": {
+    "prepublishOnly": "test -f bin/ctm || (echo 'ERROR: bin/ctm not found — build the binary first' && exit 1)"
+  },
   "publishConfig": {
     "access": "public"
   }
