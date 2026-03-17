@@ -66,7 +66,7 @@ pub struct Session {
     pub tmux_socket: Option<String>,
     pub started_at: String,       // ISO 8601 TEXT
     pub last_activity: String,    // ISO 8601 TEXT
-    pub status: String,           // "active" | "ended" | "aborted"
+    pub status: SessionStatus,    // Active | Ended | Aborted (ADR-010 C-6: enum, not raw string)
     pub project_dir: Option<String>,
     pub metadata: Option<String>,
 }
@@ -77,12 +77,12 @@ pub struct PendingApproval {
     pub prompt: String,
     pub created_at: String,
     pub expires_at: String,
-    pub status: String,           // "pending" | "approved" | "rejected" | "expired"
+    pub status: ApprovalStatus,   // Pending | Approved | Rejected | Expired (ADR-010 C-6: enum, not raw string)
     pub message_id: Option<i64>,  // Telegram message ID
 }
 ```
 
-`SessionManager` wraps a `rusqlite::Connection`. There is no explicit `close()` — RAII drops the connection automatically when `SessionManager` is dropped (L6.9 INTENTIONAL).
+`SessionManager` wraps a `rusqlite::Connection`. There is no explicit `close()` — RAII drops the connection automatically when `SessionManager` is dropped (L6.9 INTENTIONAL). All write operations (`create_session`, `create_approval`, `end_session`, `resolve_approval`) validate session IDs via `is_valid_session_id()` at the persistence boundary before executing any SQL (ADR-010 C-5). `end_session` wraps its two SQL statements in a single `conn.transaction()` for atomicity (ADR-010 C-4).
 
 ---
 
@@ -427,7 +427,7 @@ When the user types in Telegram and the daemon injects text into the tmux pane, 
 
 ### Implementation (BUG-011)
 
-`recent_telegram_inputs` is an `Arc<RwLock<HashSet<String>>>` keyed by `"<session_id>\0<text>"` (null separator -- ADR-009 item 11 changed from `:` to `\0`, which cannot appear in session IDs or UTF-8 text, eliminating the theoretical key collision class). The TTL is 10 seconds (`ECHO_TTL_SECS = 10`).
+`recent_telegram_inputs` is an `Arc<RwLock<HashSet<String>>>` keyed by `"<session_id>\0<text>"` (null separator -- ADR-009 item 11 changed from `:` to `\0`, which cannot appear in session IDs or UTF-8 text, eliminating the theoretical key collision class; ADR-010 C-1 confirmed both `add_echo_key` and `handle_user_input` use the same `\0` separator, fixing a prior mismatch where the two sides used different separators). The TTL is 10 seconds (`ECHO_TTL_SECS = 10`).
 
 **When Telegram input is injected:**
 

@@ -33,6 +33,8 @@ This installs a native Rust binary (`ctm`) via platform-specific optional packag
 - **Doctor Auto-Fix**: `ctm doctor --fix` auto-remediates common issues
 - **Token Scrubbing**: Global regex-based scrubbing prevents bot tokens from leaking to logs
 - **Atomic PID Locking**: `flock(2)` prevents duplicate daemon instances
+- **Path Traversal Protection**: Transcript paths validated and canonicalized before file access
+- **Char-Boundary Safe**: Unicode-safe message chunking and string truncation throughout
 
 ## Quick Start
 

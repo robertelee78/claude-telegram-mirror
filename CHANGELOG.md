@@ -20,6 +20,35 @@ All notable changes to this project will be documented in this file.
 - **Echo prevention key uses null separator** — `\0` instead of `:` eliminates the theoretical collision class between session IDs and text
 - **Renamed `escape_markdown` to `escape_markdown_v1`** — clarifies this is Telegram Markdown v1 escaping (backticks only)
 
+### Deep Audit Fixes (ADR-010)
+
+**Security (Round 1 -- all resolved):**
+- **S-1: Path traversal on `transcript_path` fixed** -- hook-supplied paths are now validated (absolute, canonicalized, safe-prefix check, no null bytes) before `fs::File::open()`
+- **S-2: Approval response routing fixed** -- responses are routed to the specific socket client that submitted the request, not broadcast to all connected clients
+- **S-3: `db_op` panic replaced with `Err`** -- `spawn_blocking` task cancellation during shutdown now returns an error instead of crashing the daemon
+- **S-4: `Config` Debug redaction** -- custom `Debug` impl redacts `bot_token` to `"[REDACTED]"`, preventing token leakage through `{:?}` formatting
+
+**Correctness (Round 1 -- all resolved):**
+- **C-1: Echo key separator mismatch fixed** -- `add_echo_key` and `handle_user_input` now use the same `\0` separator (were using `\0` vs `:`)
+- **C-2: RAII processing guard** -- `ProcessingGuard` drop guard prevents permanent queue stalls if an async task panics or is cancelled
+- **C-3: TOPIC_CLOSED error return** -- failed reopen now returns `Err` immediately instead of falling through to unrelated retry logic
+- **C-4: Atomic `end_session`** -- session status update and approval expiry wrapped in a single SQLite transaction
+- **C-5: Session ID validation at persistence boundary** -- `is_valid_session_id()` called before all database writes
+- **C-6: Status enum validation** -- `SessionStatus` and `ApprovalStatus` enums replace raw strings, preventing typo-induced data corruption
+
+**Unicode / Formatting (Round 1 -- all resolved):**
+- **U-1: Char-boundary-safe message chunking** -- all length checks use `.chars().count()`, split points use `char_indices()`, header size reserved before splitting
+- **U-2: Char-safe truncation** -- topic name and filename truncation use `.chars().take(N)` instead of byte slicing
+
+**Packaging (Round 1 -- all resolved):**
+- **P-2: `prepublishOnly` guard** -- platform packages fail to publish if `bin/ctm` binary is missing
+- **P-3: `setup-node` for npm provenance** -- `actions/setup-node@v4` added to release workflow for OIDC token injection
+
+**Round 2 blockers identified (7 items):**
+- **R2-B3: Rate limit default changed from 1 to 20** -- previous default caused extreme message delays under normal load
+- **R2-B6: `flock()` advisory lock on PID file** -- prevents double-start race where two concurrent `ctm start` commands both create daemons
+- **R2-B7: CI failure exit when platform packages unavailable** -- registry propagation loop now exits non-zero instead of silently publishing a broken main package
+
 ### Breaking Changes
 
 - **TypeScript source removed** — the package now ships a pre-compiled native binary; there are no `.js` or `.ts` files to import
@@ -75,7 +104,7 @@ All notable changes to this project will be documented in this file.
 
 ### Internal
 
-- **9 Architecture Decision Records (ADRs)** documenting key design choices (binary distribution, rate limiting, PID locking, socket security, token scrubbing, session validation, migration gap audit, release readiness audit, broken windows elimination)
+- **10 Architecture Decision Records (ADRs)** documenting key design choices (binary distribution, rate limiting, PID locking, socket security, token scrubbing, session validation, migration gap audit, release readiness audit, broken windows elimination, deep release readiness evaluation)
 - **SECURITY.md** with a full threat model covering all attack surfaces
 - **CI pipeline updated to Rust-only** — `cargo check`, `clippy`, `fmt`, and `cargo test` replace the TypeScript build/lint/test steps
 - **Release workflow** — GitHub Actions builds binaries for 4 platforms (`linux-x64`, `linux-arm64`, `darwin-x64`, `darwin-arm64`) and publishes scoped npm packages alongside the root package
