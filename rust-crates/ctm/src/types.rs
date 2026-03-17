@@ -23,6 +23,10 @@ pub struct HookEventBase {
     pub cwd: Option<String>,
     #[serde(default)]
     pub permission_mode: Option<String>,
+    #[serde(default)]
+    pub hook_id: Option<String>,
+    #[serde(default)]
+    pub timestamp: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

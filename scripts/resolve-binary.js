@@ -27,6 +27,7 @@ function getPlatformPackageName() {
 
   const packageMap = {
     'linux-x64': '@agidreams/ctm-linux-x64',
+    'linux-arm64': '@agidreams/ctm-linux-arm64',
     'darwin-arm64': '@agidreams/ctm-darwin-arm64',
     'darwin-x64': '@agidreams/ctm-darwin-x64',
   };

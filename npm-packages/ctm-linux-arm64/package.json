@@ -1,0 +1,17 @@
+{
+  "name": "@agidreams/ctm-linux-arm64",
+  "version": "0.1.0",
+  "description": "Claude Telegram Mirror native binary for Linux ARM64",
+  "license": "MIT",
+  "author": "Robert E. Lee <robert@agidreams.us>",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/robertelee78/claude-telegram-mirror.git"
+  },
+  "os": ["linux"],
+  "cpu": ["arm64"],
+  "files": ["bin/"],
+  "publishConfig": {
+    "access": "public"
+  }
+}

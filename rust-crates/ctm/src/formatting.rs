@@ -478,6 +478,15 @@ pub fn chunk_message(text: &str, max_length: usize) -> Vec<String> {
     )
 }
 
+/// Strip ANSI codes from `content` and split into Telegram-sized chunks.
+///
+/// Combines `strip_ansi` and `chunk_message` in a single convenient call.
+/// Uses `DEFAULT_MAX_LENGTH` when `max_length` is `None`.
+pub fn format_and_chunk(content: &str, max_length: Option<usize>) -> Vec<String> {
+    let cleaned = strip_ansi(content);
+    chunk_message(&cleaned, max_length.unwrap_or(DEFAULT_MAX_LENGTH))
+}
+
 /// Find triple-backtick code block positions.
 struct CodeBlock {
     start: usize,
