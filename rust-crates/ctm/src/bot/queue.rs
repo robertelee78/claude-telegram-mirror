@@ -5,13 +5,11 @@ use super::*;
 /// RAII guard that resets `queue_processing` to `false` when dropped.
 /// This ensures the flag is cleared even if the processing loop panics or
 /// the future is cancelled.
-struct ProcessingGuard(Arc<Mutex<bool>>);
+struct ProcessingGuard(Arc<AtomicBool>);
 
 impl Drop for ProcessingGuard {
     fn drop(&mut self) {
-        if let Ok(mut g) = self.0.try_lock() {
-            *g = false;
-        }
+        self.0.store(false, Ordering::Release);
     }
 }
 
@@ -39,12 +37,14 @@ impl TelegramBot {
 
     /// Process the message queue with retry logic.
     async fn process_queue(&self) {
+        // Atomically set processing = true only if it was false.
+        // If it was already true, another task is processing — return immediately.
+        if self
+            .queue_processing
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
         {
-            let mut processing = self.queue_processing.lock().await;
-            if *processing {
-                return;
-            }
-            *processing = true;
+            return;
         }
         // Hold the guard for the entire duration of the loop so that
         // cancellation or a panic always resets the flag via Drop.
@@ -341,7 +341,6 @@ mod tests {
     async fn queue_processing_flag_starts_false() {
         let config = test_config();
         let bot = TelegramBot::new(&config).unwrap();
-        let processing = bot.queue_processing.lock().await;
-        assert!(!*processing);
+        assert!(!bot.queue_processing.load(Ordering::Acquire));
     }
 }

@@ -64,7 +64,7 @@ fn write_settings(path: &Path, settings: &Value) -> anyhow::Result<()> {
 fn ctm_hook_command() -> String {
     // Use the current binary's path for the hook command
     match std::env::current_exe() {
-        Ok(exe) => format!("{} hook", exe.display()),
+        Ok(exe) => format!("\"{}\" hook", exe.display()),
         Err(_) => "ctm hook".into(),
     }
 }
@@ -85,10 +85,12 @@ fn is_ctm_command(cmd: &str) -> bool {
     if cmd.contains("telegram-hook") || cmd.contains("hooks/handler") {
         return true;
     }
-    // Extract the binary name: the part of the first token (up to the first space)
-    // after the last '/'.
+    // Extract the binary name: strip optional surrounding quotes from the first
+    // token (handles both unquoted `/path/to/ctm hook` and quoted
+    // `"/path/to/ctm" hook`), then take the basename after the last '/'.
     let first_token = cmd.split_whitespace().next().unwrap_or("");
-    let bin_name = first_token.rsplit('/').next().unwrap_or(first_token);
+    let unquoted = first_token.trim_matches('"');
+    let bin_name = unquoted.rsplit('/').next().unwrap_or(unquoted);
 
     // Accept if the binary name is "ctm", starts with "ctm-" (Rust test binary naming),
     // or matches the full binary name "claude-telegram-mirror" / "claude_telegram_mirror".

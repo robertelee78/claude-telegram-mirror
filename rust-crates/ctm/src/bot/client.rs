@@ -15,7 +15,7 @@ pub struct TelegramBot {
         >,
     >,
     pub(super) queue: Arc<Mutex<VecDeque<QueuedMessage>>>,
-    pub(super) queue_processing: Arc<Mutex<bool>>,
+    pub(super) queue_processing: Arc<AtomicBool>,
     pub(super) chunk_size: usize,
     #[allow(dead_code)] // Library API
     pub(super) running: Arc<AtomicBool>,
@@ -40,7 +40,7 @@ impl TelegramBot {
             client,
             rate_limiter: Arc::new(limiter),
             queue: Arc::new(Mutex::new(VecDeque::new())),
-            queue_processing: Arc::new(Mutex::new(false)),
+            queue_processing: Arc::new(AtomicBool::new(false)),
             chunk_size: config.chunk_size,
             running: Arc::new(AtomicBool::new(false)),
         })

@@ -322,7 +322,7 @@ pub fn load_config(require_auth: bool) -> Result<Config> {
         .ok()
         .map(|v| parse_u32(&v, 1))
         .or(file_config.rate_limit)
-        .unwrap_or(1);
+        .unwrap_or(20);
 
     let session_timeout = std::env::var("TELEGRAM_SESSION_TIMEOUT")
         .ok()
@@ -479,7 +479,7 @@ mod tests {
         assert!(config.approvals);
         assert!(config.use_threads);
         assert_eq!(config.chunk_size, 4000);
-        assert_eq!(config.rate_limit, 1);
+        assert_eq!(config.rate_limit, 20);
         assert_eq!(config.session_timeout, 30);
         assert_eq!(config.stale_session_timeout_hours, 72);
         assert!(config.auto_delete_topics);
