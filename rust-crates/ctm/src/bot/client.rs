@@ -732,7 +732,8 @@ mod tests {
     fn scrub_token_removes_token_from_text() {
         let config = test_config();
         let bot = TelegramBot::new(&config).unwrap();
-        let error_msg = "POST https://api.telegram.org/bot123456:ABC-DEF_test-token/sendMessage failed";
+        let error_msg =
+            "POST https://api.telegram.org/bot123456:ABC-DEF_test-token/sendMessage failed";
         let scrubbed = bot.scrub_token(error_msg);
         assert!(!scrubbed.contains("123456:ABC-DEF_test-token"));
         assert!(scrubbed.contains("[REDACTED]"));

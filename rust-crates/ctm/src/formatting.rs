@@ -600,4 +600,3 @@ fn find_best_split_point(
     // Fallback: split at target.
     target
 }
-

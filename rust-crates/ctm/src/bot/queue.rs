@@ -218,7 +218,10 @@ mod tests {
 
         let mut q = bot.queue.lock().await;
         assert!(q.is_empty());
-        assert!(q.pop_front().is_none(), "pop_front on empty queue returns None, no panic");
+        assert!(
+            q.pop_front().is_none(),
+            "pop_front on empty queue returns None, no panic"
+        );
     }
 
     #[tokio::test]

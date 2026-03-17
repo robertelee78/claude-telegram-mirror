@@ -457,11 +457,9 @@ impl HandlerContext {
 
         if let Some(state) = lock {
             // Wait up to 5 seconds
-            let _ = tokio::time::timeout(
-                tokio::time::Duration::from_secs(5),
-                state.notify.notified(),
-            )
-            .await;
+            let _ =
+                tokio::time::timeout(tokio::time::Duration::from_secs(5), state.notify.notified())
+                    .await;
             // Check again after notification
             return self.get_thread_id(session_id).await;
         }
@@ -726,8 +724,7 @@ async fn ensure_session_exists(ctx: &HandlerContext, msg: &BridgeMessage) {
             let notify = Arc::clone(&state.notify);
             drop(locks);
             let _ =
-                tokio::time::timeout(tokio::time::Duration::from_secs(5), notify.notified())
-                    .await;
+                tokio::time::timeout(tokio::time::Duration::from_secs(5), notify.notified()).await;
             return;
         }
     }

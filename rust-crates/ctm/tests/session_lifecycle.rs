@@ -17,7 +17,15 @@ fn create_session_and_verify_exists() {
     let (mgr, _tmp) = make_mgr();
 
     let id = mgr
-        .create_session("integ-sess-1", 42, Some("myhost"), Some("/project"), None, None, None)
+        .create_session(
+            "integ-sess-1",
+            42,
+            Some("myhost"),
+            Some("/project"),
+            None,
+            None,
+            None,
+        )
         .unwrap();
     assert_eq!(id, "integ-sess-1");
 
@@ -124,7 +132,10 @@ fn pending_approval_lifecycle() {
 
     // Cannot resolve again
     let re_resolved = mgr.resolve_approval(&approval_id, "rejected").unwrap();
-    assert!(!re_resolved, "Already-resolved approval should not be re-resolved");
+    assert!(
+        !re_resolved,
+        "Already-resolved approval should not be re-resolved"
+    );
 }
 
 #[test]
@@ -218,7 +229,10 @@ fn create_session_with_all_fields() {
     assert_eq!(session.project_dir.as_deref(), Some("/workspace"));
     assert_eq!(session.thread_id, Some(42));
     assert_eq!(session.tmux_target.as_deref(), Some("s0:0.1"));
-    assert_eq!(session.tmux_socket.as_deref(), Some("/tmp/tmux-1234/default"));
+    assert_eq!(
+        session.tmux_socket.as_deref(),
+        Some("/tmp/tmux-1234/default")
+    );
 }
 
 // ---- tests merged from inline #[cfg(test)] module (Story 13.6) ----

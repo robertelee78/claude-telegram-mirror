@@ -161,10 +161,7 @@ fn bridge_message_type_field_serializes_correctly() {
 #[test]
 fn bridge_message_with_metadata() {
     let mut meta = serde_json::Map::new();
-    meta.insert(
-        "tool".into(),
-        serde_json::Value::String("Bash".into()),
-    );
+    meta.insert("tool".into(), serde_json::Value::String("Bash".into()));
     meta.insert(
         "hostname".into(),
         serde_json::Value::String("builder-01".into()),

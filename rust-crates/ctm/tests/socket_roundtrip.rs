@@ -3,8 +3,8 @@
 //! Exercises SocketServer + SocketClient through a real Unix domain socket
 //! in a temporary directory, verifying NDJSON framing and flock semantics.
 
-use ctm::socket::SocketServer;
 use ctm::socket::SocketClient;
+use ctm::socket::SocketServer;
 use ctm::types::{BridgeMessage, MessageType};
 use tempfile::tempdir;
 use tokio::time::Duration;
@@ -80,7 +80,10 @@ async fn socket_file_cleaned_on_server_drop() {
     {
         let mut server = SocketServer::new(&sock, &pid);
         server.listen().await.unwrap();
-        assert!(sock.exists(), "Socket file should exist while server is alive");
+        assert!(
+            sock.exists(),
+            "Socket file should exist while server is alive"
+        );
         // server dropped here
     }
 
@@ -137,5 +140,8 @@ async fn client_connect_to_missing_socket_fails() {
 
     let mut client = SocketClient::new();
     let result = client.connect(&sock).await;
-    assert!(result.is_err(), "Connecting to non-existent socket should fail");
+    assert!(
+        result.is_err(),
+        "Connecting to non-existent socket should fail"
+    );
 }

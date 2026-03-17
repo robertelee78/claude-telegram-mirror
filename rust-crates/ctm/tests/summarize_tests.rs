@@ -2,7 +2,7 @@
 //!
 //! Extracted from `src/summarize.rs` inline `#[cfg(test)]` module (Story 13.6).
 
-use ctm::formatting::{short_path, truncate};
+use ctm::formatting::short_path;
 use ctm::summarize::{find_meaningful_command, summarize_tool_action, summarize_tool_result};
 use serde_json::json;
 

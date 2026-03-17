@@ -27,7 +27,10 @@ fn load_config_returns_expected_default_types() {
     // These are always defaulted regardless of config file
     assert!(cfg.chunk_size > 0, "chunk_size should be positive");
     assert!(cfg.rate_limit > 0, "rate_limit should be positive");
-    assert!(cfg.session_timeout > 0, "session_timeout should be positive");
+    assert!(
+        cfg.session_timeout > 0,
+        "session_timeout should be positive"
+    );
     assert!(
         !cfg.socket_path.as_os_str().is_empty(),
         "socket_path should not be empty"

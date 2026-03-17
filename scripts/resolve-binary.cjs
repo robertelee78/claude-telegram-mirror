@@ -205,7 +205,7 @@ if (require.main === module) {
     const pkg = getPlatformPackageName();
     console.error(`No native binary found for this platform (${os.platform()}-${os.arch()}).`);
     console.error(`Expected package: ${pkg || 'unsupported platform'}`);
-    console.error('Falling back to TypeScript implementation.');
+    console.error('Build from source: cd rust-crates && cargo build --release');
     process.exit(1);
   }
 }

@@ -32,9 +32,9 @@ async fn concurrent_session_creation_no_deadlock() {
             let bar = Arc::clone(&barrier);
             handles.push(tokio::spawn(async move {
                 bar.wait().await; // synchronize start
-                // Each task gets its own manager (own Connection) on the same DB
-                let mgr = SessionManager::new(&path, 5)
-                    .expect("SessionManager::new should succeed");
+                                  // Each task gets its own manager (own Connection) on the same DB
+                let mgr =
+                    SessionManager::new(&path, 5).expect("SessionManager::new should succeed");
                 let session_id = format!("conc-sess-{}", i);
                 mgr.create_session(
                     &session_id,
@@ -63,7 +63,10 @@ async fn concurrent_session_creation_no_deadlock() {
     })
     .await;
 
-    assert!(result.is_ok(), "Concurrent session creation should not deadlock (5s timeout)");
+    assert!(
+        result.is_ok(),
+        "Concurrent session creation should not deadlock (5s timeout)"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -134,10 +137,7 @@ async fn concurrent_approval_resolution_first_wins() {
         }
     }
 
-    assert_eq!(
-        success_count, 1,
-        "Only the first resolution should succeed"
-    );
+    assert_eq!(success_count, 1, "Only the first resolution should succeed");
 
     let approval = mgr.get_approval(&approval_id).unwrap().unwrap();
     assert_eq!(approval.status, "approved");
@@ -185,7 +185,10 @@ async fn concurrent_approval_resolution_across_connections() {
     .await;
 
     let wins = result.expect("Should not deadlock");
-    assert_eq!(wins, 1, "Exactly one resolution should win across connections");
+    assert_eq!(
+        wins, 1,
+        "Exactly one resolution should win across connections"
+    );
 }
 
 // ========================================================== SocketServer
@@ -193,10 +196,12 @@ async fn concurrent_approval_resolution_across_connections() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn multiple_concurrent_clients_all_messages_received() {
     let tmp = tempdir().unwrap();
-    let sub = tmp.path().join("conc");
-    std::fs::create_dir_all(&sub).unwrap();
-    let sock = sub.join("bridge.sock");
-    let pid = sub.join("bridge.pid");
+    // Place socket directly in tempdir (not a subdirectory) to avoid
+    // permission issues from process-global umask(0o177) leaking across
+    // parallel socket tests.  SocketServer::listen() will set 0o700 on
+    // the parent directory itself, which is fine for a dedicated tempdir.
+    let sock = tmp.path().join("bridge.sock");
+    let pid = tmp.path().join("bridge.pid");
 
     let mut server = SocketServer::new(&sock, &pid);
     server.listen().await.unwrap();
@@ -263,10 +268,8 @@ async fn multiple_concurrent_clients_all_messages_received() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn client_disconnect_mid_session_server_continues() {
     let tmp = tempdir().unwrap();
-    let sub = tmp.path().join("disconnect");
-    std::fs::create_dir_all(&sub).unwrap();
-    let sock = sub.join("bridge.sock");
-    let pid = sub.join("bridge.pid");
+    let sock = tmp.path().join("bridge.sock");
+    let pid = tmp.path().join("bridge.pid");
 
     let mut server = SocketServer::new(&sock, &pid);
     server.listen().await.unwrap();
@@ -323,17 +326,18 @@ async fn client_disconnect_mid_session_server_continues() {
     })
     .await;
 
-    assert!(result.is_ok(), "Server should continue after client disconnect");
+    assert!(
+        result.is_ok(),
+        "Server should continue after client disconnect"
+    );
     server.close().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn server_broadcast_reaches_all_clients() {
     let tmp = tempdir().unwrap();
-    let sub = tmp.path().join("broadcast");
-    std::fs::create_dir_all(&sub).unwrap();
-    let sock = sub.join("bridge.sock");
-    let pid = sub.join("bridge.pid");
+    let sock = tmp.path().join("bridge.sock");
+    let pid = tmp.path().join("bridge.pid");
 
     let mut server = SocketServer::new(&sock, &pid);
     server.listen().await.unwrap();

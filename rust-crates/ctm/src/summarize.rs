@@ -466,4 +466,3 @@ fn regex_matches_error(line: &str) -> bool {
     }
     false
 }
-

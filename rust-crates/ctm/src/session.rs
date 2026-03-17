@@ -737,4 +737,3 @@ fn row_to_approval(row: &rusqlite::Row<'_>) -> rusqlite::Result<PendingApproval>
         message_id: row.get("message_id")?,
     })
 }
-
