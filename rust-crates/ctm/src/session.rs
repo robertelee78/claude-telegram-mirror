@@ -172,19 +172,29 @@ impl SessionManager {
 
     // -------------------------------------------------------------- sessions
 
-    /// Create (or reactivate) a session.
+    /// Create (or reactivate) a session with all fields in a single atomic INSERT.
+    ///
+    /// Accepts the full set of session fields so callers can set everything at
+    /// creation time without requiring subsequent `set_session_thread` /
+    /// `set_tmux_info` calls.  If the session already exists, its `last_activity`
+    /// is updated and the existing ID is returned unchanged.
+    ///
     /// Returns the session ID actually used.
+    #[allow(clippy::too_many_arguments)]
     pub fn create_session(
         &self,
         session_id: &str,
         chat_id: i64,
         hostname: Option<&str>,
         project_dir: Option<&str>,
+        thread_id: Option<i64>,
+        tmux_target: Option<&str>,
+        tmux_socket: Option<&str>,
     ) -> Result<String> {
         let now = now_iso();
 
-        // Check if session already exists
-        if let Some(_existing) = self.get_session(session_id)? {
+        // If the session already exists, touch its activity timestamp and return.
+        if self.get_session(session_id)?.is_some() {
             self.update_activity(session_id)?;
             return Ok(session_id.to_string());
         }
@@ -194,8 +204,17 @@ impl SessionManager {
                 "INSERT INTO sessions
                  (id, chat_id, thread_id, hostname, tmux_target, tmux_socket,
                   started_at, last_activity, status, project_dir)
-                 VALUES (?1, ?2, NULL, ?3, NULL, NULL, ?4, ?4, 'active', ?5)",
-                params![session_id, chat_id, hostname, now, project_dir],
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, 'active', ?8)",
+                params![
+                    session_id,
+                    chat_id,
+                    thread_id,
+                    hostname,
+                    tmux_target,
+                    tmux_socket,
+                    now,
+                    project_dir
+                ],
             )
             .map_err(|e| AppError::Database(e.to_string()))?;
 
@@ -666,7 +685,15 @@ mod tests {
     fn create_and_get_session() {
         let (mgr, _tmp) = make_mgr();
         let id = mgr
-            .create_session("sess-1", 42, Some("myhost"), Some("/project"))
+            .create_session(
+                "sess-1",
+                42,
+                Some("myhost"),
+                Some("/project"),
+                None,
+                None,
+                None,
+            )
             .unwrap();
         assert_eq!(id, "sess-1");
 
@@ -678,13 +705,41 @@ mod tests {
     }
 
     #[test]
+    fn create_session_all_fields_atomic() {
+        // M2.12: verify all fields are persisted in the single INSERT.
+        let (mgr, _tmp) = make_mgr();
+        mgr.create_session(
+            "full-sess",
+            100,
+            Some("builder"),
+            Some("/workspace"),
+            Some(42),
+            Some("s0:0.1"),
+            Some("/tmp/tmux-1234/default"),
+        )
+        .unwrap();
+
+        let sess = mgr.get_session("full-sess").unwrap().unwrap();
+        assert_eq!(sess.chat_id, 100);
+        assert_eq!(sess.hostname.as_deref(), Some("builder"));
+        assert_eq!(sess.project_dir.as_deref(), Some("/workspace"));
+        assert_eq!(sess.thread_id, Some(42));
+        assert_eq!(sess.tmux_target.as_deref(), Some("s0:0.1"));
+        assert_eq!(sess.tmux_socket.as_deref(), Some("/tmp/tmux-1234/default"));
+        assert_eq!(sess.status, "active");
+    }
+
+    #[test]
     fn duplicate_create_updates_activity() {
         let (mgr, _tmp) = make_mgr();
-        mgr.create_session("sess-dup", 1, None, None).unwrap();
+        mgr.create_session("sess-dup", 1, None, None, None, None, None)
+            .unwrap();
         let s1 = mgr.get_session("sess-dup").unwrap().unwrap();
 
         // small delay is not needed — create again returns same id
-        let id2 = mgr.create_session("sess-dup", 1, None, None).unwrap();
+        let id2 = mgr
+            .create_session("sess-dup", 1, None, None, None, None, None)
+            .unwrap();
         assert_eq!(id2, "sess-dup");
 
         let s2 = mgr.get_session("sess-dup").unwrap().unwrap();
@@ -694,7 +749,8 @@ mod tests {
     #[test]
     fn set_and_get_thread_id() {
         let (mgr, _tmp) = make_mgr();
-        mgr.create_session("sess-t", 1, None, None).unwrap();
+        mgr.create_session("sess-t", 1, None, None, None, None, None)
+            .unwrap();
         mgr.set_session_thread("sess-t", 999).unwrap();
 
         let sess = mgr.get_session_by_thread_id(999).unwrap().unwrap();
@@ -704,7 +760,8 @@ mod tests {
     #[test]
     fn clear_thread_id_works() {
         let (mgr, _tmp) = make_mgr();
-        mgr.create_session("sess-ct", 1, None, None).unwrap();
+        mgr.create_session("sess-ct", 1, None, None, None, None, None)
+            .unwrap();
         mgr.set_session_thread("sess-ct", 777).unwrap();
         mgr.clear_thread_id("sess-ct").unwrap();
 
@@ -714,7 +771,8 @@ mod tests {
     #[test]
     fn get_session_by_chat_id() {
         let (mgr, _tmp) = make_mgr();
-        mgr.create_session("sess-chat", 55, None, None).unwrap();
+        mgr.create_session("sess-chat", 55, None, None, None, None, None)
+            .unwrap();
 
         let sess = mgr.get_session_by_chat_id(55).unwrap().unwrap();
         assert_eq!(sess.id, "sess-chat");
@@ -725,8 +783,10 @@ mod tests {
     #[test]
     fn get_active_sessions() {
         let (mgr, _tmp) = make_mgr();
-        mgr.create_session("a1", 1, None, None).unwrap();
-        mgr.create_session("a2", 1, None, None).unwrap();
+        mgr.create_session("a1", 1, None, None, None, None, None)
+            .unwrap();
+        mgr.create_session("a2", 1, None, None, None, None, None)
+            .unwrap();
         mgr.end_session("a1", "ended").unwrap();
 
         let active = mgr.get_active_sessions().unwrap();
@@ -737,7 +797,8 @@ mod tests {
     #[test]
     fn end_session_expires_approvals() {
         let (mgr, _tmp) = make_mgr();
-        mgr.create_session("sess-end", 1, None, None).unwrap();
+        mgr.create_session("sess-end", 1, None, None, None, None, None)
+            .unwrap();
         let aid = mgr
             .create_approval("sess-end", "Allow write?", None)
             .unwrap();
@@ -751,7 +812,8 @@ mod tests {
     #[test]
     fn reactivate_session() {
         let (mgr, _tmp) = make_mgr();
-        mgr.create_session("sess-react", 1, None, None).unwrap();
+        mgr.create_session("sess-react", 1, None, None, None, None, None)
+            .unwrap();
         mgr.end_session("sess-react", "ended").unwrap();
 
         let s = mgr.get_session("sess-react").unwrap().unwrap();
@@ -765,7 +827,8 @@ mod tests {
     #[test]
     fn tmux_info_roundtrip() {
         let (mgr, _tmp) = make_mgr();
-        mgr.create_session("sess-tmux", 1, None, None).unwrap();
+        mgr.create_session("sess-tmux", 1, None, None, None, None, None)
+            .unwrap();
         mgr.set_tmux_info("sess-tmux", Some("s:0.0"), Some("/tmp/tmux-1000/default"))
             .unwrap();
 
@@ -777,8 +840,10 @@ mod tests {
     #[test]
     fn tmux_target_ownership() {
         let (mgr, _tmp) = make_mgr();
-        mgr.create_session("s1", 1, None, None).unwrap();
-        mgr.create_session("s2", 1, None, None).unwrap();
+        mgr.create_session("s1", 1, None, None, None, None, None)
+            .unwrap();
+        mgr.create_session("s2", 1, None, None, None, None, None)
+            .unwrap();
         mgr.set_tmux_info("s1", Some("target:0.0"), None).unwrap();
 
         assert!(mgr
@@ -794,7 +859,8 @@ mod tests {
     #[test]
     fn approval_lifecycle() {
         let (mgr, _tmp) = make_mgr();
-        mgr.create_session("sess-appr", 1, None, None).unwrap();
+        mgr.create_session("sess-appr", 1, None, None, None, None, None)
+            .unwrap();
 
         let aid = mgr
             .create_approval("sess-appr", "Allow Bash?", Some(123))
@@ -824,7 +890,8 @@ mod tests {
     #[test]
     fn stale_candidates_returns_old_sessions() {
         let (mgr, _tmp) = make_mgr();
-        mgr.create_session("old-1", 1, None, None).unwrap();
+        mgr.create_session("old-1", 1, None, None, None, None, None)
+            .unwrap();
 
         // Manually set last_activity to the past
         mgr.conn
@@ -844,7 +911,8 @@ mod tests {
     #[test]
     fn orphaned_thread_sessions() {
         let (mgr, _tmp) = make_mgr();
-        mgr.create_session("orph-1", 1, None, None).unwrap();
+        mgr.create_session("orph-1", 1, None, None, None, None, None)
+            .unwrap();
         mgr.set_session_thread("orph-1", 888).unwrap();
         mgr.end_session("orph-1", "ended").unwrap();
 
@@ -858,8 +926,10 @@ mod tests {
     #[test]
     fn get_stats_counts() {
         let (mgr, _tmp) = make_mgr();
-        mgr.create_session("st-1", 1, None, None).unwrap();
-        mgr.create_session("st-2", 1, None, None).unwrap();
+        mgr.create_session("st-1", 1, None, None, None, None, None)
+            .unwrap();
+        mgr.create_session("st-2", 1, None, None, None, None, None)
+            .unwrap();
         mgr.create_approval("st-1", "approve?", None).unwrap();
 
         let (active, pending) = mgr.get_stats().unwrap();
@@ -872,7 +942,8 @@ mod tests {
     #[test]
     fn cleanup_old_sessions_removes_ancient() {
         let (mgr, _tmp) = make_mgr();
-        mgr.create_session("ancient", 1, None, None).unwrap();
+        mgr.create_session("ancient", 1, None, None, None, None, None)
+            .unwrap();
         mgr.conn
             .execute(
                 "UPDATE sessions SET last_activity = '2020-01-01T00:00:00.000Z' WHERE id = 'ancient'",

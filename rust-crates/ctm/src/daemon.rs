@@ -646,14 +646,18 @@ async fn handle_session_start(ctx: &HandlerContext, msg: &BridgeMessage) {
         .and_then(|m| m.get("tmuxSocket"))
         .and_then(|v| v.as_str());
 
-    // Create session in DB
+    // Create session in DB — all fields in a single atomic INSERT (M2.12).
     {
         let sess = ctx.sessions.lock().await;
-        let _ = sess.create_session(&msg.session_id, ctx.config.chat_id, hostname, project_dir);
-
-        if let (Some(target), _) = (tmux_target, tmux_socket) {
-            let _ = sess.set_tmux_info(&msg.session_id, Some(target), tmux_socket);
-        }
+        let _ = sess.create_session(
+            &msg.session_id,
+            ctx.config.chat_id,
+            hostname,
+            project_dir,
+            None, // thread_id assigned later via set_session_thread
+            tmux_target,
+            tmux_socket,
+        );
     }
 
     // Cache tmux target

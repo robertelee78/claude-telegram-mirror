@@ -203,6 +203,11 @@ fn generate_systemd_service() -> String {
     let config_dir = home_dir().join(".config").join(SERVICE_NAME);
     let env_file = systemd_env_file_path();
 
+    // Note (M2.7): WorkingDirectory uses %h (the user's home directory), which is the
+    // appropriate working directory for a Rust binary installed to the system.  The
+    // TypeScript implementation used the package directory because it required
+    // node_modules relative resolution — that constraint does not apply here.
+    // %h ensures the daemon always starts in a predictable, writable directory.
     format!(
         r#"[Unit]
 Description=Claude Code Telegram Mirror Bridge

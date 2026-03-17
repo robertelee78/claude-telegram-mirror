@@ -376,17 +376,43 @@ pub fn short_path(path: &str) -> String {
 
 // -------------------------------------------------------- message chunking
 
-/// Chunk a message into pieces that fit Telegram's 4096-char limit.
+/// Options for `chunk_message_with_options`.
+pub struct ChunkOptions {
+    /// Maximum character length per chunk (default: 4000).
+    pub max_length: usize,
+    /// Whether to avoid splitting inside triple-backtick code blocks (default: true).
+    pub preserve_code_blocks: bool,
+    /// Whether to prepend "Part N/M" headers to multi-chunk output (default: true).
+    pub add_part_headers: bool,
+}
+
+impl Default for ChunkOptions {
+    fn default() -> Self {
+        Self {
+            max_length: 4000,
+            preserve_code_blocks: true,
+            add_part_headers: true,
+        }
+    }
+}
+
+/// Chunk a message using explicit `ChunkOptions`.
 ///
-/// - Code-block aware: never splits inside ` ``` ` blocks.
+/// - Code-block aware: never splits inside ` ``` ` blocks (when `preserve_code_blocks` is true).
 /// - Uses natural break points (double newline > single newline > period+space > space).
-/// - Adds "Part N/M" headers when multi-chunk.
-pub fn chunk_message(text: &str, max_length: usize) -> Vec<String> {
+/// - Adds "Part N/M" headers when multi-chunk (when `add_part_headers` is true).
+pub fn chunk_message_with_options(text: &str, opts: &ChunkOptions) -> Vec<String> {
+    let max_length = opts.max_length;
     if text.len() <= max_length {
         return vec![text.to_string()];
     }
 
-    let code_blocks = find_code_blocks(text);
+    let code_blocks = if opts.preserve_code_blocks {
+        find_code_blocks(text)
+    } else {
+        Vec::new()
+    };
+
     let mut chunks = Vec::new();
     let mut remaining = text;
     let mut offset = 0usize;
@@ -404,7 +430,7 @@ pub fn chunk_message(text: &str, max_length: usize) -> Vec<String> {
         chunks.push(chunk);
     }
 
-    if chunks.len() > 1 {
+    if opts.add_part_headers && chunks.len() > 1 {
         let total = chunks.len();
         chunks = chunks
             .into_iter()
@@ -414,6 +440,19 @@ pub fn chunk_message(text: &str, max_length: usize) -> Vec<String> {
     }
 
     chunks
+}
+
+/// Chunk a message into pieces that fit Telegram's 4096-char limit.
+///
+/// Convenience wrapper around `chunk_message_with_options` using default options.
+pub fn chunk_message(text: &str, max_length: usize) -> Vec<String> {
+    chunk_message_with_options(
+        text,
+        &ChunkOptions {
+            max_length,
+            ..ChunkOptions::default()
+        },
+    )
 }
 
 /// Find triple-backtick code block positions.
@@ -587,6 +626,34 @@ mod tests {
         assert!(chunks.len() >= 2);
         // All chunks have part headers
         assert!(chunks[0].contains("Part 1/"));
+    }
+
+    #[test]
+    fn chunk_options_no_headers() {
+        let text = "a ".repeat(3000); // 6000 chars
+        let opts = ChunkOptions {
+            max_length: 4000,
+            preserve_code_blocks: true,
+            add_part_headers: false,
+        };
+        let chunks = chunk_message_with_options(&text, &opts);
+        assert!(chunks.len() >= 2);
+        // No part headers when add_part_headers is false
+        assert!(!chunks[0].contains("Part "));
+    }
+
+    #[test]
+    fn chunk_options_default_matches_chunk_message() {
+        let text = "word ".repeat(1500); // 7500 chars
+        let chunks_a = chunk_message(&text, 4000);
+        let chunks_b = chunk_message_with_options(
+            &text,
+            &ChunkOptions {
+                max_length: 4000,
+                ..ChunkOptions::default()
+            },
+        );
+        assert_eq!(chunks_a.len(), chunks_b.len());
     }
 
     #[test]

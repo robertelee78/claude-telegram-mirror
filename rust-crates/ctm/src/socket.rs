@@ -80,12 +80,27 @@ impl SocketServer {
         // Step 1: Acquire flock on PID file (atomic, no TOCTOU).
         let lock = acquire_flock(&self.pid_path)?;
 
-        // Step 2: Remove stale socket if present.
+        // Step 2: Enforce 0o700 on the parent directory so that the socket file
+        // (0o600) is nested inside a directory that is only accessible by the
+        // owner.  This prevents other users from even discovering the socket path.
+        if let Some(parent) = self.socket_path.parent() {
+            use std::os::unix::fs::PermissionsExt;
+            if parent.exists() {
+                let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+            } else {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    AppError::Socket(format!("Cannot create socket directory: {e}"))
+                })?;
+                let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+            }
+        }
+
+        // Step 3: Remove stale socket if present.
         if self.socket_path.exists() {
             let _ = std::fs::remove_file(&self.socket_path);
         }
 
-        // Step 3: Bind with restricted umask so the socket file is 0o600.
+        // Step 4: Bind with restricted umask so the socket file is 0o600.
         let old_mask = nix::sys::stat::umask(Mode::from_bits_truncate(0o177));
         let listener = UnixListener::bind(&self.socket_path).map_err(|e| {
             nix::sys::stat::umask(old_mask);
