@@ -1,522 +1,591 @@
-# Session Mapping Architecture - claude-telegram-mirror
+# Session Mapping Architecture — Rust Implementation
 
 ## Overview
 
-The `claude-telegram-mirror` system creates a bidirectional bridge between Claude Code CLI sessions and Telegram topics using a sophisticated three-layer mapping architecture with SQLite persistence.
+The `claude-telegram-mirror` daemon creates a bidirectional bridge between Claude Code CLI sessions and Telegram forum topics. The Rust implementation (`rust-crates/ctm`) uses SQLite for persistence, an in-memory cache layer for hot-path lookups, and a Unix domain socket for hook-to-daemon communication.
 
-## Critical Mappings
+All session state lives in `~/.config/claude-telegram-mirror/sessions.db`. The database survives daemon restarts; in-memory caches are rebuilt lazily on the next access.
 
-### 1. Claude Session ID → Telegram Topic (thread_id)
+---
 
-**Primary Key**: Claude's native `session_id` (from hook events)
+## 1. Session Data Model
 
-#### How thread_id is Created and Stored
+### SQLite Schema
 
-**Creation Flow** (`daemon.ts:handleSessionStart`, lines 323-387):
-```typescript
-// Step 1: Extract Claude's native session_id from hook event
-const sessionId = msg.sessionId; // e.g., "session-abc123xyz"
+Initialised in `session.rs:SessionManager::init_schema`:
 
-// Step 2: Check if session already has a thread (daemon restart resilience)
-let threadId = this.sessions.getSessionThread(sessionId);
+```sql
+CREATE TABLE IF NOT EXISTS sessions (
+    id            TEXT PRIMARY KEY,   -- Claude's native session_id
+    chat_id       INTEGER NOT NULL,   -- Telegram group chat ID
+    thread_id     INTEGER,            -- Telegram forum topic ID (nullable)
+    hostname      TEXT,               -- Machine hostname
+    tmux_target   TEXT,               -- Session:window.pane (e.g. "1:0.0")
+    tmux_socket   TEXT,               -- Socket path (e.g. "/tmp/tmux-1000/default")
+    started_at    TEXT NOT NULL,      -- ISO 8601 UTC with milliseconds
+    last_activity TEXT NOT NULL,      -- ISO 8601 UTC with milliseconds
+    status        TEXT DEFAULT 'active',  -- active | ended | aborted
+    project_dir   TEXT,               -- cwd reported by hook
+    metadata      TEXT                -- reserved JSON blob
+);
 
-if (threadId) {
-  // Reuse existing thread - don't create duplicate topics
-  this.sessionThreads.set(sessionId, threadId);
-  logger.info('Reusing existing session thread');
-} else if (this.config.useThreads) {
-  // Step 3: Create new forum topic (only if none exists)
-  const topicName = this.formatTopicName(sessionId, hostname, projectDir);
-  threadId = await this.bot.createForumTopic(topicName, 0); // Blue color
+CREATE TABLE IF NOT EXISTS pending_approvals (
+    id          TEXT PRIMARY KEY,     -- "approval-<base36ts>-<rand8hex>"
+    session_id  TEXT NOT NULL,
+    prompt      TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    expires_at  TEXT NOT NULL,
+    status      TEXT DEFAULT 'pending',  -- pending | approved | rejected | expired
+    message_id  INTEGER,              -- Telegram message ID for the approval prompt
+    FOREIGN KEY (session_id) REFERENCES sessions(id)
+);
 
-  // Step 4: Persist to database AND memory cache
-  this.sessions.setSessionThread(sessionId, threadId);
-  this.sessionThreads.set(sessionId, threadId);
+CREATE INDEX IF NOT EXISTS idx_sessions_chat     ON sessions(chat_id);
+CREATE INDEX IF NOT EXISTS idx_sessions_status   ON sessions(status);
+CREATE INDEX IF NOT EXISTS idx_approvals_session ON pending_approvals(session_id);
+CREATE INDEX IF NOT EXISTS idx_approvals_status  ON pending_approvals(status);
+```
+
+**Date field design (L5.3 INTENTIONAL):** `started_at` and `last_activity` are stored as ISO 8601 `TEXT` (`to_rfc3339_opts` with millisecond precision) rather than epoch integers or `chrono::DateTime`. This matches the TypeScript predecessor, sorts lexicographically, and is human-readable in raw SQL. Converting to typed timestamps would add serde complexity without practical benefit.
+
+**Migration:** `migrate_add_tmux_columns` checks `PRAGMA table_info(sessions)` and issues `ALTER TABLE ... ADD COLUMN` for `tmux_target` / `tmux_socket` when upgrading from an older database that predates those columns.
+
+**File permissions:** The database file is created at `sessions.db` inside the config directory, then `chmod 0o600` is applied on Unix.
+
+### Rust Structs
+
+```rust
+// session.rs
+
+pub struct Session {
+    pub id: String,
+    pub chat_id: i64,
+    pub thread_id: Option<i64>,
+    pub hostname: Option<String>,
+    pub tmux_target: Option<String>,
+    pub tmux_socket: Option<String>,
+    pub started_at: String,       // ISO 8601 TEXT
+    pub last_activity: String,    // ISO 8601 TEXT
+    pub status: String,           // "active" | "ended" | "aborted"
+    pub project_dir: Option<String>,
+    pub metadata: Option<String>,
+}
+
+pub struct PendingApproval {
+    pub id: String,
+    pub session_id: String,
+    pub prompt: String,
+    pub created_at: String,
+    pub expires_at: String,
+    pub status: String,           // "pending" | "approved" | "rejected" | "expired"
+    pub message_id: Option<i64>,  // Telegram message ID
 }
 ```
 
-**Storage Layers**:
-- **SQLite** (`sessions.db`): Persistent storage across daemon restarts
-  ```sql
-  CREATE TABLE sessions (
-    id TEXT PRIMARY KEY,           -- Claude's session_id
-    thread_id INTEGER,             -- Telegram topic ID
-    ...
-  );
-  ```
+`SessionManager` wraps a `rusqlite::Connection`. There is no explicit `close()` — RAII drops the connection automatically when `SessionManager` is dropped (L6.9 INTENTIONAL).
 
-- **Memory Cache** (`daemon.ts`): Fast lookups during daemon runtime
-  ```typescript
-  private sessionThreads: Map<string, number> = new Map();
-  // Example: "session-abc123" → 42
-  ```
+---
 
-#### How Messages are Routed to Correct Topics
+## 2. Session Lifecycle
 
-**Outbound (CLI → Telegram)** - All handlers use `getSessionThreadId()`:
-```typescript
-// daemon.ts lines 459-472
-private getSessionThreadId(sessionId: string): number | undefined {
-  // Step 1: Check memory cache first (fast path)
-  let threadId = this.sessionThreads.get(sessionId);
-  if (threadId) return threadId;
+### State Diagram
 
-  // Step 2: Fallback to database (daemon restart recovery)
-  const dbThreadId = this.sessions.getSessionThread(sessionId);
-  if (dbThreadId) {
-    // Repopulate cache for future requests
-    this.sessionThreads.set(sessionId, dbThreadId);
-    return dbThreadId;
-  }
+```
+                   hook fires (any event)
+                         │
+                         ▼
+              ┌─────────────────────┐
+              │  ensure_session_    │  BUG-006/BUG-010:
+              │  exists() called    │  on-the-fly creation
+              └────────┬────────────┘
+                       │
+           ┌───────────▼───────────┐
+           │  session in DB?       │
+           └───────────┬───────────┘
+          No           │ Yes
+           │           │
+           │   ┌───────▼──────────┐
+           │   │  status=active?  │
+           │   └───────┬──────────┘
+           │          No│Yes
+           │           │  │
+           │    BUG-009 │  └──────────────────────────┐
+           │   reactivate│                             │
+           │   _session()│                             │
+           ▼           ▼                             ▼
+     ┌──────────┐  ┌──────────┐             ┌──────────────┐
+     │ Created  ├─►│  Active  │             │   Active     │
+     │ (INSERT) │  │          │             │   (existing) │
+     └──────────┘  └────┬─────┘             └──────────────┘
+                        │
+               hook Stop event
+               end_session()
+                        │
+               ┌────────▼────────┐
+               │     Ended       │──── cleanup timer ──►  topic deleted
+               └─────────────────┘                        thread_id cleared
 
-  return undefined; // No thread (message goes to General topic)
-}
+               abort_session() sets status = "aborted"
 ```
 
-**Inbound (Telegram → CLI)** - Multi-bot isolation (`daemon.ts:setupBotHandlers`, lines 238-319):
-```typescript
-this.bot.onMessage(async (text, chatId, threadId) => {
-  if (threadId) {
-    // CRITICAL: Only process topics we own (multi-bot architecture)
-    session = this.sessions.getSessionByThreadId(threadId);
-    if (!session) {
-      // This topic belongs to another daemon - IGNORE
-      logger.debug('Ignoring message for unknown topic (multi-bot)');
-      return;
+### On-the-Fly Creation (BUG-006/BUG-010)
+
+In the TypeScript implementation, `session_start` had to arrive before any other message type. The Rust daemon uses `ensure_session_exists` instead — every socket handler that needs a session calls it, and the session is created transparently if it does not yet exist:
+
+```rust
+// daemon/mod.rs
+
+async fn ensure_session_exists(ctx: &HandlerContext, msg: &BridgeMessage) {
+    let existing = ctx.db_op(|sess| sess.get_session(&sid).ok().flatten()).await;
+
+    if let Some(session) = existing {
+        // BUG-009: Reactivate ended session if hooks are still firing
+        if session.status != "active" {
+            ctx.db_op(|sess| sess.reactivate_session(&sid)).await;
+            cleanup::cancel_pending_topic_deletion(ctx, &msg.session_id).await;
+        }
+        return;
     }
-  } else {
-    // Message in General topic - use chatId fallback
-    session = this.sessions.getSessionByChatId(chatId);
-  }
-  // ... inject input to correct tmux session
-});
-```
 
-**Database Query** (`session.ts:getSessionByThreadId`, lines 232-240):
-```typescript
-getSessionByThreadId(threadId: number): Session | null {
-  const row = this.db.prepare(`
-    SELECT * FROM sessions
-    WHERE thread_id = ? AND status = 'active'
-    LIMIT 1
-  `).get(threadId);
-  return row ? this.rowToSession(row) : null;
+    // Session missing — create it now via handle_session_start
+    socket_handlers::handle_session_start(ctx, msg).await;
 }
 ```
+
+The hook process sends `session_start` on **every** invocation (ADR-006 M4.4). `create_session` is idempotent: if the ID already exists it updates `last_activity` and returns without inserting a duplicate row.
+
+### Reactivation (BUG-009)
+
+When hook events arrive for a session that was previously `ended` or `aborted` (e.g. the user restarted Claude Code without starting a new tmux pane), `reactivate_session` flips the status back to `active` and refreshes `last_activity`:
+
+```rust
+pub fn reactivate_session(&self, session_id: &str) -> Result<()> {
+    self.conn.execute(
+        "UPDATE sessions SET status = 'active', last_activity = ?1 WHERE id = ?2",
+        params![now_iso(), session_id],
+    )?;
+    Ok(())
+}
+```
+
+Any pending topic-deletion timer is cancelled at the same time (see Section 8).
 
 ---
 
-### 2. Claude Session ID → tmux Target + Socket
+## 3. Thread Mapping
 
-**Purpose**: Enable Telegram → CLI input injection (reverse communication)
+### How Sessions Map to Telegram Forum Topics
 
-#### What is Stored
+Each active session maps to one Telegram forum topic (thread). The mapping is stored in the `thread_id` column. The daemon also keeps an in-memory cache (`session_threads: Arc<RwLock<HashMap<String, i64>>>`) for sub-millisecond lookups.
 
-**Two Critical Fields**:
-- `tmux_target`: Session:Window.Pane identifier (e.g., `"1:0.0"`)
-  - Session `1`
-  - Window `0`
-  - Pane `0`
-- `tmux_socket`: Socket path for explicit targeting (e.g., `"/tmp/tmux-1000/default"`)
-  - Extracted from `$TMUX` environment variable
-  - Required to target the correct tmux server when multiple instances exist
+**Outbound routing (socket message → correct topic):**
 
-#### How it's Captured from $TMUX
+```rust
+// daemon/mod.rs HandlerContext::get_thread_id
 
-**Hook Script** (`telegram-hook.sh:get_tmux_info`, lines 112-137):
-```bash
-get_tmux_info() {
-  if [[ -z "$TMUX" ]]; then
-    echo "{}"
-    return
-  fi
-
-  # $TMUX format: /path/to/socket,pid,index
-  # Example: "/tmp/tmux-1000/default,12345,0"
-  local socket_path="${TMUX%%,*}"  # Extract everything before first comma
-
-  local session=$(tmux display-message -p "#S" 2>/dev/null)  # e.g., "1"
-  local pane=$(tmux display-message -p "#P" 2>/dev/null)     # e.g., "0"
-  local window=$(tmux display-message -p "#I" 2>/dev/null)   # e.g., "0"
-
-  if [[ -n "$session" && -n "$window" && -n "$pane" ]]; then
-    local target="${session}:${window}.${pane}"  # e.g., "1:0.0"
-    jq -cn \
-      --arg target "$target" \
-      --arg socket "$socket_path" \
-      '{tmuxTarget: $target, tmuxSocket: $socket}'
-  fi
-}
-```
-
-**Sent in session_start Hook** (`telegram-hook.sh`, lines 387-407):
-```bash
-if is_first_event; then
-  TMUX_INFO=$(get_tmux_info)
-  SESSION_START=$(jq -cn \
-    --arg sessionId "$SESSION_ID" \
-    --argjson tmux "$TMUX_INFO" \
-    '{sessionId: $sessionId, metadata: ({...} + $tmux)}')
-  send_to_bridge "$SESSION_START"
-fi
-```
-
-#### How it Survives Daemon Restarts
-
-**Persistence Strategy** - Three-layer architecture:
-
-**Layer 1: Database** (`session.ts:createSession`, lines 117-149):
-```typescript
-createSession(
-  chatId: number,
-  projectDir?: string,
-  threadId?: number,
-  hostname?: string,
-  sessionId?: string,
-  tmuxTarget?: string,  // Persist to disk
-  tmuxSocket?: string   // Persist to disk
-): string {
-  const id = sessionId || generateId('session');
-
-  this.db.prepare(`
-    INSERT INTO sessions (id, tmux_target, tmux_socket, ...)
-    VALUES (?, ?, ?, ...)
-  `).run(id, ..., tmuxTarget || null, tmuxSocket || null, ...);
-
-  return id;
-}
-```
-
-**Layer 2: Memory Cache** (`daemon.ts:handleSessionStart`, lines 342-345):
-```typescript
-// Cache in memory for fast lookups
-if (tmuxTarget) {
-  this.sessionTmuxTargets.set(sessionId, tmuxTarget);
-  logger.info('Session tmux info stored', { sessionId, tmuxTarget, tmuxSocket });
-}
-```
-
-**Layer 3: Lazy Restoration** (`daemon.ts:setupBotHandlers`, lines 264-282):
-```typescript
-// When message arrives, check cache first
-let tmuxTarget = this.sessionTmuxTargets.get(session.id);
-let tmuxSocket: string | undefined;
-
-if (!tmuxTarget) {
-  // Cache miss - restore from database (daemon restart scenario)
-  const tmuxInfo = this.sessions.getTmuxInfo(session.id);
-  tmuxTarget = tmuxInfo.target || undefined;
-  tmuxSocket = tmuxInfo.socket || undefined;
-
-  if (tmuxTarget) {
-    // Repopulate cache for future requests
-    this.sessionTmuxTargets.set(session.id, tmuxTarget);
-    logger.info('Restored tmux info from database', { sessionId, tmuxTarget });
-  }
-}
-```
-
-**Input Injection** (`daemon.ts`, lines 284-309):
-```typescript
-if (tmuxTarget) {
-  this.injector.setTmuxSession(tmuxTarget, tmuxSocket);
-}
-
-// Inject input into Claude Code via tmux send-keys
-const injected = await this.injector.inject(text);
-
-if (injected) {
-  logger.info('Injected input to CLI', { method: this.injector.getMethod() });
-} else {
-  await this.bot.sendMessage(
-    `⚠️ Could not send input to CLI. No tmux session found.`,
-    { parseMode: 'Markdown' },
-    threadId
-  );
-}
-```
-
----
-
-### 3. Multi-System Architecture
-
-**Design Philosophy**: Multiple independent daemons can coexist on different machines, each managing their own subset of Telegram topics.
-
-#### How Multiple Daemons Coexist
-
-**Key Insight**: Each daemon has its own SQLite database (`~/.config/claude-telegram-mirror/sessions.db`)
-
-**Database Isolation**:
-```
-Machine A: ~/.config/claude-telegram-mirror/sessions.db
-  ├─ session-abc123 → thread_id: 42
-  ├─ session-def456 → thread_id: 43
-
-Machine B: ~/.config/claude-telegram-mirror/sessions.db
-  ├─ session-xyz789 → thread_id: 44
-  ├─ session-uvw012 → thread_id: 45
-```
-
-**No Central Coordination Required**:
-- Each daemon creates and tracks its own topics
-- Telegram group supports unlimited topics (forum mode)
-- No collision risk because thread_ids are globally unique (assigned by Telegram)
-
-#### How Each Daemon Knows Which Topics Belong to It
-
-**Topic Ownership Check** (`daemon.ts:setupBotHandlers`, lines 240-252):
-```typescript
-this.bot.onMessage(async (text, chatId, threadId) => {
-  if (threadId) {
-    // Message is in a specific topic - check ownership
-    session = this.sessions.getSessionByThreadId(threadId);
-
-    if (!session) {
-      // This topic is NOT in our database - belongs to another daemon
-      // Silently ignore - another daemon will handle it
-      logger.debug('Ignoring message for unknown topic (multi-bot)', { threadId });
-      return;  // CRITICAL: Early exit prevents processing
+async fn get_thread_id(&self, session_id: &str) -> Option<i64> {
+    // 1. Memory cache (fast path)
+    if let Some(tid) = self.session_threads.read().await.get(session_id) {
+        return Some(*tid);
     }
-  }
-  // ... only processes messages for topics we created
-});
+    // 2. Database fallback (daemon restart recovery)
+    let session = self.db_op(|sess| sess.get_session(&sid).ok().flatten()).await;
+    if let Some(s) = session {
+        if let Some(tid) = s.thread_id {
+            self.session_threads.write().await.insert(session_id.to_string(), tid);
+            return Some(tid);
+        }
+    }
+    None
+}
 ```
 
-**Database-First Approach**:
-1. Telegram message arrives with `threadId: 42`
-2. Daemon A queries: `SELECT * FROM sessions WHERE thread_id = 42`
-   - **Found** → Daemon A handles it
-3. Daemon B queries: `SELECT * FROM sessions WHERE thread_id = 42`
-   - **Not found** → Daemon B ignores it
-4. Daemon C queries: `SELECT * FROM sessions WHERE thread_id = 42`
-   - **Not found** → Daemon C ignores it
+**Inbound routing (Telegram message → correct session):**
 
-**Result**: Each daemon only responds to topics it created, enabling true multi-tenant operation.
+```rust
+// daemon/telegram_handlers.rs
+
+let session = ctx
+    .db_op(move |sess| sess.get_session_by_thread_id(thread_id).ok().flatten())
+    .await;
+
+if session.is_none() {
+    return; // Thread belongs to another daemon instance — silent drop
+}
+```
+
+The database query is: `SELECT * FROM sessions WHERE thread_id = ?1 AND status = 'active' LIMIT 1`. If the thread_id is not in this daemon's database, the message is silently dropped, enabling multi-daemon isolation.
+
+### Topic Naming
+
+Topic names are formatted by `HandlerContext::format_topic_name`:
+
+```
+{hostname} • {project_basename} • {session_id_prefix8}
+```
+
+For example: `builder • my-project • abc12345`
+
+If hostname or project are absent, only the available parts are joined. The short ID is the first 8 characters of the session ID after stripping the `session-` prefix.
+
+### Custom Title via /rename
+
+When a `/rename` slash command is issued inside Claude Code's chat, a `custom-title` record is written to the JSONL transcript. The hook reads the last 8 KB of the transcript, finds the most recent `custom-title` entry, and sends a `session_rename` message to the daemon. The daemon calls `bot.edit_forum_topic` to update the Telegram topic name.
 
 ---
 
-## Complete Mapping Chain
+## 4. Stale Session Cleanup
 
-### Session Start (Claude Code → Telegram)
+### Cleanup Loop
 
-```
-1. User starts Claude Code in tmux
-   └─ $TMUX = "/tmp/tmux-1000/default,12345,0"
+The cleanup task runs every 5 minutes (`CLEANUP_INTERVAL_SECS = 300`) inside the event loop. It performs four operations in sequence:
 
-2. Hook fires: UserPromptSubmit
-   └─ telegram-hook.sh extracts:
-      ├─ session_id: "session-abc123xyz" (from Claude)
-      ├─ tmuxTarget: "1:0.0" (from tmux display-message)
-      └─ tmuxSocket: "/tmp/tmux-1000/default" (from $TMUX)
+1. **Expire old approvals** — marks `pending_approvals` rows past `expires_at` as `expired`.
+2. **Clean stale sessions** — differentiated timeouts (see below).
+3. **Clean orphaned threads** — removes `thread_id` from `ended` sessions that still hold one.
+4. **Clean old downloads** — deletes files in `~/.config/claude-telegram-mirror/downloads/` older than 24 hours.
 
-3. daemon.ts:handleSessionStart receives:
-   └─ Creates/updates session in SQLite:
-      ├─ id: "session-abc123xyz" (PRIMARY KEY)
-      ├─ tmux_target: "1:0.0"
-      ├─ tmux_socket: "/tmp/tmux-1000/default"
-      └─ thread_id: NULL (not yet created)
+### Differentiated Timeouts
 
-4. daemon.ts creates Telegram topic:
-   └─ bot.createForumTopic("hostname • project • abc123")
-      ├─ Returns: threadId = 42
-      └─ Updates SQLite: thread_id = 42
+Defined in `daemon/mod.rs`:
 
-5. Final SQLite state:
-   ┌─────────────────────┬───────────┬────────────┬──────────────────────────────┐
-   │ id                  │ thread_id │ tmux_target│ tmux_socket                  │
-   ├─────────────────────┼───────────┼────────────┼──────────────────────────────┤
-   │ session-abc123xyz   │ 42        │ 1:0.0      │ /tmp/tmux-1000/default       │
-   └─────────────────────┴───────────┴────────────┴──────────────────────────────┘
-
-6. Memory caches populated:
-   ├─ sessionThreads: {"session-abc123xyz" → 42}
-   └─ sessionTmuxTargets: {"session-abc123xyz" → "1:0.0"}
+```rust
+const TMUX_SESSION_TIMEOUT_HOURS: u32 = 24;
+const NO_TMUX_SESSION_TIMEOUT_HOURS: u32 = 1;
 ```
 
-### Message Flow (CLI → Telegram)
+`get_stale_session_candidates(NO_TMUX_SESSION_TIMEOUT_HOURS)` fetches all active sessions with `last_activity` older than 1 hour. For each candidate:
+
+| Session has `tmux_target`? | `last_activity` age | Pane still alive? | Action |
+|---|---|---|---|
+| No | > 1 hour | N/A | End session immediately |
+| Yes | < 24 hours | N/A | Skip (not yet stale) |
+| Yes | > 24 hours | Yes, same owner | Skip (still active) |
+| Yes | > 24 hours | No (dead pane) | End session |
+| Yes | > 24 hours | Pane reassigned | End session |
+
+Pane liveness is checked via `InputInjector::is_pane_alive` (calls `tmux list-panes -t <target>`). Reassignment is detected via `SessionManager::is_tmux_target_owned_by_other`.
+
+### Orphaned Thread Cleanup
+
+Sessions in `ended` status that still have a `thread_id` set are cleaned up by `cleanup_orphaned_threads`. For each, the daemon attempts `bot.delete_forum_topic(tid)`, then clears `thread_id` in the database via `clear_thread_id`. Rate-limiting: 200 ms sleep between deletions, max 50 per cleanup cycle.
+
+### Stale Session Teardown Sequence
+
+When a stale session is torn down by `handle_stale_session_cleanup`:
+
+1. Send "Session ended (terminal closed)" message to the session's topic.
+2. If `auto_delete_topics` is enabled: delete the forum topic; otherwise close it.
+3. Remove the session from in-memory caches (`session_threads`, `session_tmux`, `custom_titles`).
+4. Call `end_session(sid, "ended")`, which also expires all pending approvals for that session.
+
+---
+
+## 5. Approval Flow
+
+### Request Lifecycle
 
 ```
-1. Claude Code outputs text
-   └─ Hook fires: Stop
-
-2. telegram-hook.sh sends:
-   └─ {type: "agent_response", sessionId: "session-abc123xyz", content: "..."}
-
-3. daemon.ts:handleAgentResponse:
-   ├─ Calls getSessionThreadId("session-abc123xyz")
-   │  ├─ Checks sessionThreads cache → found: 42
-   │  └─ Returns 42
-   └─ bot.sendMessage(content, threadId: 42)
-
-4. Message appears in Telegram topic #42 ✓
+Claude Code (PreToolUse hook)
+    │
+    │ approval_request message over Unix socket
+    ▼
+Daemon: handle_approval_request()
+    │
+    │ create_approval() → INSERT pending_approvals row
+    │ message_id = Telegram message ID of the prompt
+    │
+    │ Send Telegram message with [Approve] [Reject] inline buttons
+    ▼
+User clicks button in Telegram
+    │
+    │ callback_query arrives: "approve:<approval_id>" or "reject:<approval_id>"
+    ▼
+Daemon: handle_callback_query() → resolve_approval(id, "approved"|"rejected")
+    │
+    │ UPDATE pending_approvals SET status = ?1 WHERE id = ?2 AND status = 'pending'
+    │ returns true if row was actually changed (prevents double-resolution)
+    │
+    │ Send approval_response message back over socket to blocked hook process
+    ▼
+Hook process: receives response, writes hookSpecificOutput to stdout
+    │
+    │ {"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow"}}
+    ▼
+Claude Code proceeds (or is denied)
 ```
 
-### Message Flow (Telegram → CLI)
+### Approval ID Generation
+
+```rust
+// session.rs generate_id("approval")
+// Format: "approval-<base36(timestamp_millis)>-<8hex>"
+// Example: "approval-lhv7f2k4-a3b4c5d6"
+```
+
+### IDOR Defence
+
+`resolve_approval` only updates rows where `status = 'pending'`. A callback with a valid `approval_id` but already-resolved status returns `changed == 0` (false), and the daemon discards the duplicate without side effects. The `session_id` foreign key constraint and the `message_id` field together allow the daemon to verify that the callback originates from the correct session's message.
+
+### Expiry
+
+`create_approval` sets `expires_at = now + approval_timeout_ms`. The cleanup loop calls `expire_old_approvals()` every 5 minutes. `end_session` also expires all pending approvals for the session atomically:
+
+```sql
+UPDATE pending_approvals
+SET status = 'expired'
+WHERE session_id = ?1 AND status = 'pending'
+```
+
+---
+
+## 6. tmux Target Management
+
+### Capture Path
+
+The hook process (`hook.rs`) calls `InputInjector::detect_tmux_session()` on every invocation:
+
+```rust
+// injector.rs
+pub fn detect_tmux_session() -> Option<TmuxInfo> {
+    let tmux_env = std::env::var("TMUX").ok()?;
+    // $TMUX format: "/path/to/socket,pid,index"
+    let socket_path = tmux_env.split(',').next().map(|s| s.to_string());
+
+    // tmux display-message -p "#S" / "#I" / "#P"
+    let target = format!("{}:{}.{}", session, window, pane);
+    Some(TmuxInfo { session, pane, target, socket: socket_path })
+}
+```
+
+This information is included in every bridge message's `metadata` as `tmuxTarget` and `tmuxSocket`.
+
+### Auto-Refresh (BUG-001)
+
+On every incoming socket message, `check_and_update_tmux_target` inspects the message metadata. If `tmuxTarget` differs from the cached value, the cache and the database are updated immediately:
+
+```rust
+// daemon/mod.rs
+
+async fn check_and_update_tmux_target(ctx: &HandlerContext, msg: &BridgeMessage) {
+    let new_target = meta.get("tmuxTarget").and_then(|v| v.as_str())?;
+    let current = ctx.session_tmux.read().await.get(&msg.session_id).cloned();
+    if current.as_deref() == Some(new_target) { return; }
+
+    // Update memory cache
+    ctx.session_tmux.write().await.insert(session_id, new_target.to_string());
+    // Persist to DB
+    ctx.db_op(|sess| sess.set_tmux_info(&sid, Some(target), socket)).await;
+}
+```
+
+This ensures the daemon always routes to the correct pane even if Claude Code migrated to a different window or pane.
+
+### Socket Path Validation
+
+When `InputInjector::set_target` is called, the socket path is validated:
+
+- Must be an absolute path (starts with `/`).
+- Must not contain `..` (directory traversal prevention).
+- Must be at most 256 characters.
+
+Invalid paths are rejected and logged; `tmux_socket` is set to `None`.
+
+### Target Validation Before Injection
+
+Before every `inject()` call, `validate_target()` runs `tmux list-panes -t <target>`. If the pane no longer exists, `inject` returns `Ok(false)` and the daemon sends the user an actionable error:
+
+> "Pane not found. Claude may have moved to a different pane. Send any command in Claude to refresh the connection."
+
+All tmux commands use `Command::arg()` — no shell interpolation is possible regardless of user-supplied session names or socket paths.
+
+---
+
+## 7. Echo Prevention
+
+### Problem
+
+When the user types in Telegram and the daemon injects text into the tmux pane, Claude Code's `UserPromptSubmit` hook fires and sends the same text back through the bridge as a `user_input` message. Without prevention, this creates a visible echo in Telegram.
+
+### Implementation (BUG-011)
+
+`recent_telegram_inputs` is an `Arc<RwLock<HashSet<String>>>` keyed by `"<session_id>:<text>"`. The TTL is 10 seconds (`ECHO_TTL_SECS = 10`).
+
+**When Telegram input is injected:**
+
+```rust
+// telegram_handlers.rs
+add_echo_key(ctx, &session.id, text.trim()).await;
+```
+
+`add_echo_key` inserts the key and spawns a task that removes it after 10 seconds:
+
+```rust
+async fn add_echo_key(ctx: &HandlerContext, session_id: &str, text: &str) {
+    let key = format!("{session_id}:{text}");
+    ctx.recent_inputs.write().await.insert(key.clone());
+    let inputs = Arc::clone(&ctx.recent_inputs);
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(ECHO_TTL_SECS)).await;
+        inputs.write().await.remove(&key);
+    });
+}
+```
+
+**When a `user_input` socket message arrives:**
+
+The `handle_user_input` handler checks whether the text is present in `recent_telegram_inputs` before forwarding to Telegram. If found, the message is silently dropped.
+
+---
+
+## 8. Topic Auto-Deletion
+
+### Configurable Delay (default 24 hours)
+
+When a session ends normally (Stop hook event), the daemon calls `schedule_topic_deletion` with a delay configured via `auto_delete_delay_ms` (default: 86 400 000 ms = 24 hours):
+
+```rust
+// daemon/cleanup.rs
+
+pub(super) async fn schedule_topic_deletion(
+    ctx: &HandlerContext,
+    session_id: &str,
+    thread_id: i64,
+    delay_ms: u64,
+) {
+    let handle = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        if bot.delete_forum_topic(thread_id).await.unwrap_or(false) {
+            session_threads.write().await.remove(&sid);
+            sess.blocking_lock().clear_thread_id(&sid);
+        } else {
+            bot.close_forum_topic(thread_id).await;
+        }
+    });
+    ctx.pending_del.write().await.insert(session_id.to_string(), handle);
+}
+```
+
+The `JoinHandle` is stored in `pending_del: Arc<RwLock<HashMap<String, JoinHandle<()>>>>`.
+
+### Cancellation on Session Resume (BUG-012)
+
+If new hook events arrive for a session that has a pending deletion scheduled, `cancel_pending_topic_deletion` aborts the timer before it fires:
+
+```rust
+pub(super) async fn cancel_pending_topic_deletion(ctx: &HandlerContext, session_id: &str) {
+    if let Some(handle) = ctx.pending_del.write().await.remove(session_id) {
+        handle.abort();
+        tracing::info!(session_id, "Cancelled pending topic deletion (session resumed)");
+    }
+}
+```
+
+This is called from both `handle_session_start` (BUG-012) and `ensure_session_exists` (BUG-009), covering all session-resume paths.
+
+If the delay expires before the session resumes, the topic is deleted and `thread_id` is cleared in the database. The next session-start or `ensure_session_exists` call detects `thread_id IS NULL` and creates a new forum topic, posting a "Session resumed — new topic created" message.
+
+---
+
+## 9. Complete Message Flow Reference
+
+### Hook Event → Telegram
 
 ```
-1. User types in Telegram topic #42
+Claude Code fires hook (any event type)
+  └── hook.rs: process_hook()
+        ├── InputInjector::detect_tmux_session()  -- reads $TMUX env var
+        ├── build_messages()                       -- always prepends session_start
+        └── send_messages() → Unix socket (NDJSON)
 
-2. daemon.ts:setupBotHandlers receives:
-   └─ onMessage(text, chatId, threadId: 42)
+Daemon receives message
+  └── event_loop.rs: handle_socket_message()
+        ├── check_and_update_tmux_target()         -- BUG-001 auto-refresh
+        ├── ensure_session_exists()                -- BUG-006/BUG-010/BUG-009
+        └── dispatch to socket handler
+              └── bot.send_message(content, thread_id)
+                    thread_id from: session_threads cache → DB fallback
+```
 
-3. Topic ownership check:
-   └─ getSessionByThreadId(42)
-      ├─ Query: SELECT * FROM sessions WHERE thread_id = 42
-      └─ Returns: {id: "session-abc123xyz", tmux_target: "1:0.0", ...}
+### Telegram Message → Claude Code
 
-4. Get tmux info (with restart resilience):
-   ├─ Check cache: sessionTmuxTargets.get("session-abc123xyz")
-   │  └─ Cache miss (daemon restarted)
-   ├─ Query database: getTmuxInfo("session-abc123xyz")
-   │  └─ Returns: {target: "1:0.0", socket: "/tmp/tmux-1000/default"}
-   └─ Repopulate cache for future requests
-
-5. Input injection:
-   └─ injector.setTmuxSession("1:0.0", "/tmp/tmux-1000/default")
-      └─ tmux -S /tmp/tmux-1000/default send-keys -t 1:0.0 "user text" Enter
-
-6. Text appears in Claude Code CLI ✓
+```
+User types in Telegram topic
+  └── telegram_handlers.rs: handle_telegram_text()
+        ├── session = get_session_by_thread_id(thread_id)   -- ownership check
+        │     None → silent drop (belongs to another daemon)
+        ├── get_tmux_target() → cache → DB fallback
+        ├── injector.set_target(target, socket)
+        ├── add_echo_key()                                   -- BUG-011
+        └── injector.inject(text)                           -- tmux send-keys -t -l
+              validate_target() before injection             -- BUG-001
 ```
 
 ### Daemon Restart Recovery
 
 ```
-1. Daemon stops (kill process)
-   └─ Memory caches cleared
-      ├─ sessionThreads: {}
-      └─ sessionTmuxTargets: {}
+Daemon stops → in-memory state lost:
+  session_threads: {}
+  session_tmux: {}
+  recent_telegram_inputs: {}
 
-2. Daemon starts again
-   └─ Database intact: sessions.db still has all mappings
+Daemon restarts → database intact
 
-3. Telegram message arrives (threadId: 42)
-   └─ getSessionThreadId(42):
-      ├─ Cache miss (empty)
-      ├─ Query database → {id: "session-abc123xyz", thread_id: 42, tmux_target: "1:0.0"}
-      └─ Repopulate cache
+Next socket message for session X:
+  get_thread_id("X") → cache miss → DB query → repopulate cache
+  get_tmux_target("X") → cache miss → get_tmux_info() → repopulate cache
 
-4. Full functionality restored ✓
-   └─ All mappings recovered from persistent SQLite storage
+Full functionality restored from SQLite.
 ```
 
 ---
 
-## Database Schema
+## 10. Multi-Daemon Isolation
 
-```sql
-CREATE TABLE sessions (
-  id TEXT PRIMARY KEY,              -- Claude's native session_id
-  chat_id INTEGER NOT NULL,         -- Telegram chat (group) ID
-  thread_id INTEGER,                -- Telegram topic ID (forum thread)
-  hostname TEXT,                    -- Machine hostname (for multi-system)
-  tmux_target TEXT,                 -- tmux session:window.pane (e.g., "1:0.0")
-  tmux_socket TEXT,                 -- tmux socket path (e.g., "/tmp/tmux-1000/default")
-  started_at TEXT NOT NULL,         -- Session start timestamp
-  last_activity TEXT NOT NULL,      -- Last message timestamp
-  status TEXT DEFAULT 'active',     -- active | ended | aborted
-  project_dir TEXT,                 -- Working directory
-  metadata TEXT                     -- JSON blob for extensions
-);
-
-CREATE INDEX idx_sessions_chat ON sessions(chat_id);
-CREATE INDEX idx_sessions_status ON sessions(status);
-```
-
-**Key Queries**:
-- `getSession(sessionId)`: `SELECT * FROM sessions WHERE id = ?`
-- `getSessionByThreadId(threadId)`: `SELECT * FROM sessions WHERE thread_id = ? AND status = 'active'`
-- `getSessionByChatId(chatId)`: `SELECT * FROM sessions WHERE chat_id = ? AND status = 'active' ORDER BY last_activity DESC LIMIT 1`
-- `getTmuxInfo(sessionId)`: `SELECT tmux_target, tmux_socket FROM sessions WHERE id = ?`
-
----
-
-## Persistence Strategy Summary
-
-| Component | Storage Type | Survives Restart? | Recovery Method |
-|-----------|--------------|-------------------|-----------------|
-| **Session ID** | SQLite (PRIMARY KEY) | ✅ Yes | N/A (always persisted) |
-| **Thread ID** | SQLite + Memory cache | ✅ Yes | `getSessionThread()` → cache repopulation |
-| **tmux Target** | SQLite + Memory cache | ✅ Yes | `getTmuxInfo()` → cache repopulation |
-| **tmux Socket** | SQLite + Session object | ✅ Yes | `getTmuxInfo()` → cache repopulation |
-| **Topic Ownership** | SQLite (presence check) | ✅ Yes | `getSessionByThreadId()` → NULL = not ours |
-
-**Recovery Pattern**:
-1. Check memory cache (fast path)
-2. On miss, query SQLite (restart recovery)
-3. Repopulate cache for subsequent requests
-4. Log restoration for debugging
-
----
-
-## Multi-Bot Isolation
-
-**Scenario**: 3 machines running bridge daemons, all connected to same Telegram group
+Each daemon instance has its own `sessions.db`. Thread IDs are assigned by Telegram and are globally unique within the group. Ownership is determined purely by a database lookup: if `thread_id` is not in this daemon's `sessions` table, the message is silently ignored.
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    Telegram Group (Forum Mode)              │
-│  ┌──────────┬──────────┬──────────┬──────────┬──────────┐  │
-│  │ Topic 42 │ Topic 43 │ Topic 44 │ Topic 45 │ Topic 46 │  │
-│  └──────────┴──────────┴──────────┴──────────┴──────────┘  │
-└─────────────────────────────────────────────────────────────┘
-       ▲            ▲            ▲            ▲
-       │            │            │            │
-   ┌───┴───┐    ┌───┴───┐    ┌───┴───┐    ┌───┴───┐
-   │Daemon │    │Daemon │    │Daemon │    │Daemon │
-   │   A   │    │   A   │    │   B   │    │   C   │
-   └───────┘    └───────┘    └───────┘    └───────┘
-   Machine A    Machine A    Machine B    Machine C
+Telegram group (forum mode)
+  ├── Topic 42   ← Machine A session
+  ├── Topic 43   ← Machine A session
+  ├── Topic 44   ← Machine B session
+  └── Topic 45   ← Machine C session
 
-   sessions.db  sessions.db  sessions.db  sessions.db
-   ├─ T42 ✓     ├─ T42 ✓     ├─ T44 ✓     ├─ T46 ✓
-   └─ T43 ✓     └─ T43 ✓     └─ T45 ✓     └─ (none)
+Message to Topic 44:
+  Daemon A: get_session_by_thread_id(44) → None → drop
+  Daemon B: get_session_by_thread_id(44) → Session → handle
+  Daemon C: get_session_by_thread_id(44) → None → drop
 ```
 
-**Message to Topic 44**:
-- Daemon A: `getSessionByThreadId(44)` → NULL → **IGNORE**
-- Daemon B: `getSessionByThreadId(44)` → session → **HANDLE** ✓
-- Daemon C: `getSessionByThreadId(44)` → NULL → **IGNORE**
+---
 
-**Result**: Only Daemon B processes the message. Perfect isolation.
+## 11. Key Files
+
+| File | Purpose |
+|------|---------|
+| `rust-crates/ctm/src/session.rs` | `SessionManager`, SQLite schema, all CRUD operations |
+| `rust-crates/ctm/src/daemon/mod.rs` | `Daemon`, `HandlerContext`, `ensure_session_exists`, BUG-001/009/010 fixes |
+| `rust-crates/ctm/src/daemon/cleanup.rs` | Stale cleanup, orphaned threads, `schedule_topic_deletion`, BUG-012 |
+| `rust-crates/ctm/src/daemon/socket_handlers.rs` | `handle_session_start`, approval request, agent response, tool events |
+| `rust-crates/ctm/src/daemon/telegram_handlers.rs` | Telegram → CLI routing, echo prevention, BUG-004/011 |
+| `rust-crates/ctm/src/daemon/callback_handlers.rs` | Approval resolution, inline button callbacks |
+| `rust-crates/ctm/src/daemon/event_loop.rs` | Main event loop, cleanup timer spawn |
+| `rust-crates/ctm/src/injector.rs` | `InputInjector`, tmux detection, socket path validation |
+| `rust-crates/ctm/src/hook.rs` | Hook entry point, `session_start` prepend, approval send-and-wait |
+| `rust-crates/ctm/src/types.rs` | `BridgeMessage`, `MessageType`, `HookEvent`, `is_valid_session_id` |
 
 ---
 
-## Key Files
+## 12. Bug Fix Index
 
-| File | Purpose | Lines of Interest |
-|------|---------|-------------------|
-| `src/bridge/session.ts` | SQLite schema & persistence | 52-84 (schema), 117-149 (createSession), 174-202 (tmux methods) |
-| `src/bridge/daemon.ts` | Message routing & coordination | 238-319 (bot handlers), 323-387 (handleSessionStart), 459-472 (getSessionThreadId) |
-| `scripts/telegram-hook.sh` | tmux info extraction | 112-137 (get_tmux_info), 387-407 (session_start event) |
-| `src/bridge/types.ts` | Type definitions | 26-38 (Session interface) |
-
----
-
-## Architecture Highlights
-
-✅ **Restart Resilient**: All critical state persisted to SQLite
-✅ **Multi-Bot Safe**: Database-first ownership checks prevent conflicts
-✅ **Two-Way Communication**: tmux socket enables Telegram → CLI input injection
-✅ **Claude-Native Sessions**: Uses Claude's own session_id as primary key
-✅ **Lazy Cache Repopulation**: Automatic recovery after daemon restart
-✅ **Topic Isolation**: Each daemon only handles topics it created
-
----
-
-## Troubleshooting
-
-**Problem**: Messages go to wrong topic
-→ **Check**: `sessionThreads` cache vs database `thread_id`
-→ **Fix**: Restart daemon to repopulate cache from database
-
-**Problem**: Input injection fails after restart
-→ **Check**: `getTmuxInfo()` returns null or stale data
-→ **Fix**: Verify tmux session still running, check socket permissions
-
-**Problem**: Multiple daemons respond to same message
-→ **Check**: `getSessionByThreadId()` ownership check
-→ **Fix**: Ensure each daemon has separate SQLite database
-
----
-
-**End of Analysis**
+| Bug | Root cause | Rust fix |
+|-----|------------|----------|
+| BUG-001 | Stale tmux target after pane change | `check_and_update_tmux_target` on every socket message; `validate_target()` before inject |
+| BUG-002 | Duplicate topic creation under concurrency | `topic_creation_locks: RwLock<HashMap<String, Arc<TopicCreationState>>>` with `Notify` |
+| BUG-003 | Sessions never cleaned up | Periodic cleanup in event loop: 5-minute interval, differentiated timeouts |
+| BUG-004 | Special keys (Escape, Ctrl-C) not sent correctly | Whitelist in `ALLOWED_TMUX_KEYS`; `send_key` uses `-S socket` flag |
+| BUG-006 | Messages dropped if `session_start` not first | `ensure_session_exists` called by every handler |
+| BUG-009 | Ended session ignores resumed hook events | `reactivate_session()` called by `ensure_session_exists` |
+| BUG-010 | Race: on-the-fly creation creates duplicate topics | `topic_creation_locks` guard; concurrent callers wait on `Notify` |
+| BUG-011 | Telegram input echoed back as `user_input` | `recent_telegram_inputs` HashSet with 10-second TTL |
+| BUG-012 | Topic deleted while session was mid-restart | `cancel_pending_topic_deletion` called on `session_start` and `ensure_session_exists` |
