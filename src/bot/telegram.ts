@@ -3,7 +3,7 @@
  * Core bot using grammY with rate limiting and message queue
  */
 
-import { Bot, Context, session, SessionFlavor, GrammyError, HttpError } from 'grammy';
+import { Bot, Context, session, SessionFlavor, GrammyError, HttpError, InputFile } from 'grammy';
 import { InlineKeyboard } from 'grammy';
 import { writeFileSync } from 'fs';
 import { loadConfig, TelegramMirrorConfig } from '../utils/config.js';
@@ -510,6 +510,28 @@ export class TelegramBot {
         await ctx.answerCallbackQuery();
       });
     }
+  }
+
+  /**
+   * Send a photo file to the configured chat
+   */
+  async sendPhoto(filePath: string, caption?: string, threadId?: number): Promise<void> {
+    const file = new InputFile(filePath);
+    await this.bot.api.sendPhoto(this.config.chatId, file, {
+      caption,
+      message_thread_id: threadId,
+    });
+  }
+
+  /**
+   * Send a document file to the configured chat
+   */
+  async sendDocument(filePath: string, caption?: string, threadId?: number): Promise<void> {
+    const file = new InputFile(filePath);
+    await this.bot.api.sendDocument(this.config.chatId, file, {
+      caption,
+      message_thread_id: threadId,
+    });
   }
 
   /**

@@ -365,6 +365,7 @@ async fn run_event_loop(
                                 pending_q: Arc::clone(&pending_q),
                                 topic_locks: Arc::clone(&topic_locks),
                                 bot_sessions: Arc::clone(&bot_sessions),
+                                mirroring_enabled: Arc::clone(&mirroring_enabled),
                                 config: config.clone(),
                                 socket_clients: Arc::clone(&socket_clients),
                             };
@@ -396,6 +397,7 @@ async fn run_event_loop(
                     pending_q: Arc::clone(&pending_q),
                     topic_locks: Arc::clone(&topic_locks),
                     bot_sessions: Arc::clone(&bot_sessions),
+                    mirroring_enabled: Arc::clone(&mirroring_enabled),
                     config: config.clone(),
                     socket_clients: Arc::clone(&socket_clients),
                 };
@@ -429,6 +431,8 @@ struct HandlerContext {
     topic_locks: Arc<RwLock<HashMap<String, Arc<TopicCreationState>>>>,
     /// Per-thread bot session state (keyed by thread_id).
     bot_sessions: Arc<RwLock<HashMap<i64, BotSessionState>>>,
+    /// Epic 1: Runtime mirroring toggle.
+    mirroring_enabled: Arc<std::sync::atomic::AtomicBool>,
     config: Config,
     /// Shared reference to the socket's connected-client map for outbound broadcasts.
     socket_clients: SocketClients,
@@ -547,6 +551,18 @@ async fn handle_socket_message(ctx: HandlerContext, msg: BridgeMessage) {
     // BUG-001: Auto-update tmux target
     check_and_update_tmux_target(&ctx, &msg).await;
 
+    // Epic 1: Toggle gating — skip outbound messages when mirroring is disabled.
+    // Safety-critical paths (approvals, commands) always proceed.
+    let msg_type_str = msg.msg_type.as_str();
+    let is_always_active = matches!(
+        msg_type_str,
+        "approval_request" | "approval_response" | "command"
+    );
+    if !is_always_active && !ctx.mirroring_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+        tracing::debug!(msg_type = %msg.msg_type, "Mirroring disabled, dropping message");
+        return;
+    }
+
     match msg.msg_type.as_str() {
         "session_start" => handle_session_start(&ctx, &msg).await,
         "session_end" => handle_session_end(&ctx, &msg).await,
@@ -586,6 +602,13 @@ async fn handle_socket_message(ctx: HandlerContext, msg: BridgeMessage) {
         }
         "session_rename" => {
             handle_session_rename(&ctx, &msg.session_id, &msg.content).await;
+        }
+        "command" => {
+            handle_command(&ctx, &msg).await;
+        }
+        "send_image" => {
+            ensure_session_exists(&ctx, &msg).await;
+            handle_send_image(&ctx, &msg).await;
         }
         _ => {
             tracing::debug!(msg_type = %msg.msg_type, "Unknown message type");
@@ -1138,6 +1161,38 @@ async fn handle_error(ctx: &HandlerContext, msg: &BridgeMessage) {
             thread_id,
         )
         .await;
+}
+
+/// Handler: command — handle system commands (toggle/enable/disable).
+async fn handle_command(ctx: &HandlerContext, msg: &BridgeMessage) {
+    let cmd = msg.content.trim().to_lowercase();
+    let new_state = match cmd.as_str() {
+        "toggle" => !ctx.mirroring_enabled.load(std::sync::atomic::Ordering::Relaxed),
+        "enable" | "on" => true,
+        "disable" | "off" => false,
+        _ => {
+            tracing::debug!(cmd = %cmd, "Unknown system command");
+            return;
+        }
+    };
+
+    ctx.mirroring_enabled
+        .store(new_state, std::sync::atomic::Ordering::Relaxed);
+    crate::config::write_mirror_status(&ctx.config.config_dir, new_state, Some(std::process::id()));
+
+    let status_text = if new_state {
+        "\u{1F7E2} *Telegram mirroring: ON*"
+    } else {
+        "\u{1F534} *Telegram mirroring: OFF*"
+    };
+
+    tracing::info!(enabled = new_state, "Mirroring toggled");
+
+    let opts = SendOptions {
+        parse_mode: Some("Markdown".into()),
+        ..Default::default()
+    };
+    ctx.bot.send_message(status_text, Some(&opts), None).await;
 }
 
 /// Handler 12: pre_compact
@@ -1989,6 +2044,13 @@ async fn handle_bot_command(ctx: &HandlerContext, msg: &TgMessage, text: &str) {
                 status_text.push_str("\nAttached to: none");
             }
             status_text.push_str(&format!("\nMuted: {}", if muted { "yes" } else { "no" }));
+            let mirror_on = ctx
+                .mirroring_enabled
+                .load(std::sync::atomic::Ordering::Relaxed);
+            status_text.push_str(&format!(
+                "\nMirroring: {}",
+                if mirror_on { "ON" } else { "OFF" }
+            ));
             ctx.bot
                 .send_message(&status_text, Some(&opts), msg.message_thread_id)
                 .await;
@@ -2310,6 +2372,31 @@ async fn handle_bot_command(ctx: &HandlerContext, msg: &TgMessage, text: &str) {
                         .await;
                 }
             }
+        }
+        "/toggle" => {
+            let new_state = if args == "on" {
+                true
+            } else if args == "off" {
+                false
+            } else {
+                !ctx.mirroring_enabled.load(std::sync::atomic::Ordering::Relaxed)
+            };
+            ctx.mirroring_enabled
+                .store(new_state, std::sync::atomic::Ordering::Relaxed);
+            crate::config::write_mirror_status(
+                &ctx.config.config_dir,
+                new_state,
+                Some(std::process::id()),
+            );
+            let status_text = if new_state {
+                "\u{1F7E2} *Telegram mirroring: ON*"
+            } else {
+                "\u{1F534} *Telegram mirroring: OFF*"
+            };
+            tracing::info!(enabled = new_state, "Mirroring toggled via Telegram");
+            ctx.bot
+                .send_message(status_text, Some(&opts), msg.message_thread_id)
+                .await;
         }
         _ => {
             // Unknown command — ignore silently
@@ -3147,6 +3234,98 @@ fn cleanup_old_downloads() {
     }
 }
 
+// ====================================================================== send_image
+
+/// Image file extensions that should be sent as photos (with inline preview).
+const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "gif", "webp", "bmp"];
+
+/// Maximum file size for Telegram uploads (50 MB).
+const MAX_UPLOAD_BYTES: u64 = 50 * 1024 * 1024;
+
+/// Validate a file path for send_image.
+fn validate_send_image_path(path: &str) -> std::result::Result<&std::path::Path, &'static str> {
+    let p = std::path::Path::new(path);
+    if !p.is_absolute() {
+        return Err("path must be absolute");
+    }
+    if path.contains("..") {
+        return Err("path must not contain '..'");
+    }
+    if !p.exists() {
+        return Err("file does not exist");
+    }
+    match p.metadata() {
+        Ok(meta) => {
+            if meta.len() > MAX_UPLOAD_BYTES {
+                return Err("file exceeds 50 MB limit");
+            }
+        }
+        Err(_) => return Err("cannot read file metadata"),
+    }
+    Ok(p)
+}
+
+/// Check if a file extension indicates an image (for sendPhoto vs sendDocument).
+fn is_image_extension(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| IMAGE_EXTENSIONS.contains(&e.to_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
+/// Handle send_image message: upload a local file to Telegram.
+async fn handle_send_image(ctx: &HandlerContext, msg: &BridgeMessage) {
+    let path = match validate_send_image_path(&msg.content) {
+        Ok(p) => p,
+        Err(reason) => {
+            tracing::warn!(
+                path = %msg.content,
+                reason,
+                "SendImage: invalid path"
+            );
+            return;
+        }
+    };
+
+    let thread_id = ctx.get_thread_id(&msg.session_id).await;
+    if thread_id.is_none() {
+        tracing::debug!(
+            session_id = %msg.session_id,
+            "SendImage: no forum topic for session"
+        );
+        return;
+    }
+
+    let caption = msg
+        .metadata
+        .as_ref()
+        .and_then(|m| m.get("caption"))
+        .and_then(|v| v.as_str());
+
+    let result = if is_image_extension(path) {
+        ctx.bot.send_photo(path, caption, thread_id).await
+    } else {
+        ctx.bot.send_document(path, caption, thread_id).await
+    };
+
+    match result {
+        Ok(()) => {
+            tracing::info!(
+                path = %msg.content,
+                session_id = %msg.session_id,
+                "Sent file to Telegram"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                path = %msg.content,
+                error = %e,
+                "Failed to send file to Telegram"
+            );
+        }
+    }
+}
+
 // ===================================================================== tests
 
 #[cfg(test)]
@@ -3269,5 +3448,35 @@ mod tests {
             assert_eq!(parsed.msg_type, "approval_response");
             assert_eq!(parsed.content, *action);
         }
+    }
+
+    #[test]
+    fn test_validate_send_image_path_relative() {
+        assert!(validate_send_image_path("relative/path.png").is_err());
+    }
+
+    #[test]
+    fn test_validate_send_image_path_traversal() {
+        assert!(validate_send_image_path("/tmp/../etc/passwd").is_err());
+    }
+
+    #[test]
+    fn test_validate_send_image_path_nonexistent() {
+        assert!(validate_send_image_path("/tmp/definitely_nonexistent_file_xyzzy.png").is_err());
+    }
+
+    #[test]
+    fn test_is_image_extension() {
+        use std::path::Path;
+        assert!(is_image_extension(Path::new("photo.jpg")));
+        assert!(is_image_extension(Path::new("photo.JPEG")));
+        assert!(is_image_extension(Path::new("photo.png")));
+        assert!(is_image_extension(Path::new("photo.gif")));
+        assert!(is_image_extension(Path::new("photo.webp")));
+        assert!(is_image_extension(Path::new("photo.bmp")));
+        assert!(!is_image_extension(Path::new("doc.pdf")));
+        assert!(!is_image_extension(Path::new("file.txt")));
+        assert!(!is_image_extension(Path::new("archive.zip")));
+        assert!(!is_image_extension(Path::new("noext")));
     }
 }

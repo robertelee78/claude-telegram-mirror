@@ -158,6 +158,7 @@ export function formatHelp(): string {
 /mute - Mute notifications
 /unmute - Resume notifications
 /abort - Abort current session
+/toggle - Toggle mirroring ON/OFF (or /toggle on|off)
 /help - Show this message
 
 *Inline Responses:*

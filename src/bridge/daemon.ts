@@ -9,7 +9,7 @@ import { registerCommands, registerApprovalHandlers, registerToolDetailsHandler,
 import { SocketServer } from './socket.js';
 import { SessionManager } from './session.js';
 import { InputInjector } from './injector.js';
-import { loadConfig, TelegramMirrorConfig } from '../utils/config.js';
+import { loadConfig, TelegramMirrorConfig, readMirrorStatus, writeMirrorStatus } from '../utils/config.js';
 import {
   formatAgentResponse,
   formatToolExecution,
@@ -51,6 +51,7 @@ export class BridgeDaemon extends EventEmitter {
   private sessions: SessionManager;
   private injector: InputInjector;
   private running = false;
+  private mirroringEnabled: boolean = true;
   private cleanupInterval: NodeJS.Timeout | null = null;
   private sessionThreads: Map<string, number> = new Map(); // sessionId -> threadId
   private sessionTmuxTargets: Map<string, string> = new Map(); // sessionId -> tmux target
@@ -90,6 +91,7 @@ export class BridgeDaemon extends EventEmitter {
     this.socket = new SocketServer(this.config.socketPath);
     this.sessions = new SessionManager();
     this.injector = new InputInjector();
+    this.mirroringEnabled = readMirrorStatus(getConfigDir());
   }
 
   /**
@@ -147,6 +149,15 @@ export class BridgeDaemon extends EventEmitter {
           timestamp: new Date().toISOString(),
           content: text
         }), true;
+      },
+      toggleMirroring: async (force?: boolean) => {
+        const newState = force !== undefined ? force : !this.mirroringEnabled;
+        this.mirroringEnabled = newState;
+        writeMirrorStatus(getConfigDir(), newState, process.pid);
+        return newState;
+      },
+      getMirroringEnabled: () => {
+        return this.mirroringEnabled;
       },
       injectSlashCommandToThread: async (threadId: number, command: string) => {
         // Look up session by threadId, then inject the slash command via tmux
@@ -273,6 +284,17 @@ export class BridgeDaemon extends EventEmitter {
       // Every message from hooks includes current tmux info, so we can detect moves
       this.checkAndUpdateTmuxTarget(msg);
 
+      // Always-process types: approval_request, approval_response, command
+      // All other outbound message types are gated by mirroringEnabled
+      const alwaysProcess = msg.type === 'approval_request' ||
+        msg.type === 'approval_response' ||
+        msg.type === 'command';
+
+      if (!this.mirroringEnabled && !alwaysProcess) {
+        logger.debug('Mirroring disabled, skipping message', { type: msg.type, sessionId: msg.sessionId });
+        return;
+      }
+
       switch (msg.type) {
         case 'session_start':
           await this.handleSessionStart(msg);
@@ -329,6 +351,14 @@ export class BridgeDaemon extends EventEmitter {
 
         case 'session_rename':
           await this.handleSessionRename(msg.sessionId, msg.content);
+          break;
+
+        case 'command':
+          this.handleCommand(msg);
+          break;
+
+        case 'send_image':
+          await this.handleSendImage(msg);
           break;
 
         default:
@@ -1953,6 +1983,81 @@ export class BridgeDaemon extends EventEmitter {
       if (pending.sessionId === sessionId) {
         this.pendingQuestions.delete(key);
       }
+    }
+  }
+
+  // ============ Toggle Command Handler (Epic 1) ============
+
+  private async handleCommand(msg: BridgeMessage): Promise<void> {
+    const cmd = msg.content.trim().toLowerCase();
+    let newState: boolean;
+    switch (cmd) {
+      case 'toggle':
+        newState = !this.mirroringEnabled;
+        break;
+      case 'enable':
+      case 'on':
+        newState = true;
+        break;
+      case 'disable':
+      case 'off':
+        newState = false;
+        break;
+      default:
+        return;
+    }
+    this.mirroringEnabled = newState;
+    writeMirrorStatus(getConfigDir(), newState, process.pid);
+    const statusText = newState
+      ? '\u{1F7E2} *Telegram mirroring: ON*'
+      : '\u{1F534} *Telegram mirroring: OFF*';
+    await this.bot.sendMessage(statusText, { parseMode: 'Markdown' });
+  }
+
+  // ============ Outbound File Transfer Handler (Epic 2) ============
+
+  private static readonly IMAGE_EXTENSIONS = new Set(['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp']);
+  private static readonly MAX_UPLOAD_BYTES = 50 * 1024 * 1024;
+
+  private async handleSendImage(msg: BridgeMessage): Promise<void> {
+    const filePath = msg.content;
+
+    // Validate path
+    if (!path.isAbsolute(filePath)) {
+      logger.warn('SendImage: path must be absolute', { path: filePath });
+      return;
+    }
+    if (filePath.includes('..')) {
+      logger.warn('SendImage: path must not contain ..', { path: filePath });
+      return;
+    }
+    if (!existsSync(filePath)) {
+      logger.warn('SendImage: file not found', { path: filePath });
+      return;
+    }
+    const stats = statSync(filePath);
+    if (stats.size > BridgeDaemon.MAX_UPLOAD_BYTES) {
+      logger.warn('SendImage: file exceeds 50MB', { path: filePath, size: stats.size });
+      return;
+    }
+
+    const threadId = this.getSessionThreadId(msg.sessionId);
+    if (!threadId) {
+      return;
+    }
+
+    const ext = path.extname(filePath).toLowerCase().replace('.', '');
+    const caption = msg.metadata?.caption as string | undefined;
+
+    try {
+      if (BridgeDaemon.IMAGE_EXTENSIONS.has(ext)) {
+        await this.bot.sendPhoto(filePath, caption, threadId);
+      } else {
+        await this.bot.sendDocument(filePath, caption, threadId);
+      }
+      logger.info('Sent file to Telegram', { path: filePath, sessionId: msg.sessionId });
+    } catch (err) {
+      logger.warn('Failed to send file to Telegram', { path: filePath, error: err });
     }
   }
 

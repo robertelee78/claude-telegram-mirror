@@ -11,7 +11,7 @@ import { dirname, join } from 'path';
 import { homedir } from 'os';
 import { BridgeDaemon } from './bridge/daemon.js';
 import { installHooks, uninstallHooks, printHookStatus } from './hooks/installer.js';
-import { loadConfig, validateConfig } from './utils/config.js';
+import { loadConfig, validateConfig, readMirrorStatus, writeMirrorStatus, getConfigDir } from './utils/config.js';
 import {
   installService,
   uninstallService,
@@ -353,6 +353,42 @@ program
       console.error('Doctor failed:', error);
       process.exit(1);
     }
+  });
+
+/**
+ * Toggle command - Toggle Telegram mirroring on/off
+ */
+program
+  .command('toggle')
+  .description('Toggle Telegram mirroring on/off')
+  .option('--on', 'Force mirroring ON')
+  .option('--off', 'Force mirroring OFF')
+  .action(async (opts) => {
+    const configDirPath = getConfigDir();
+    const current = readMirrorStatus(configDirPath);
+    const newState = opts.on ? true : opts.off ? false : !current;
+    writeMirrorStatus(configDirPath, newState);
+
+    // Notify daemon if running
+    const socketPath = join(homedir(), '.config', 'claude-telegram-mirror', 'bridge.sock');
+    if (existsSync(socketPath)) {
+      try {
+        const net = await import('net');
+        const client = net.createConnection(socketPath);
+        const msg = JSON.stringify({
+          type: 'command',
+          sessionId: '_system',
+          timestamp: new Date().toISOString(),
+          content: newState ? 'enable' : 'disable',
+        });
+        client.write(msg + '\n');
+        client.end();
+      } catch {
+        // Daemon not running, that's fine
+      }
+    }
+
+    console.log(`Telegram mirroring: ${newState ? 'ON' : 'OFF'}`);
   });
 
 // Helper: Config directory and paths

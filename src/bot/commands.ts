@@ -26,6 +26,8 @@ export interface BridgeCallbacks {
   abortSession(sessionId: string): Promise<boolean>;
   sendToSession(sessionId: string, text: string): Promise<boolean>;
   injectSlashCommandToThread?(threadId: number, command: string): Promise<boolean>;
+  toggleMirroring?(force?: boolean): Promise<boolean>;
+  getMirroringEnabled?(): boolean;
 }
 
 /**
@@ -59,10 +61,32 @@ export function registerCommands(
     const session = ctx.session;
     const hasSession = !!session?.attachedSessionId;
 
-    await ctx.reply(
-      formatStatus(hasSession, session?.attachedSessionId || undefined, session?.muted),
-      { parse_mode: 'Markdown' }
-    );
+    let statusMsg = formatStatus(hasSession, session?.attachedSessionId || undefined, session?.muted);
+    if (bridge?.getMirroringEnabled) {
+      const enabled = bridge.getMirroringEnabled();
+      statusMsg += `\nMirroring: ${enabled ? '\u{1F7E2} ON' : '\u{1F534} OFF'}`;
+    }
+
+    await ctx.reply(statusMsg, { parse_mode: 'Markdown' });
+  });
+
+  // /toggle - Toggle Telegram mirroring on/off
+  bot.command('toggle', async (ctx) => {
+    if (!bridge?.toggleMirroring) {
+      await ctx.reply('Bridge not connected. Cannot toggle mirroring.');
+      return;
+    }
+
+    const args = ctx.match?.trim().toLowerCase();
+    let force: boolean | undefined;
+    if (args === 'on') force = true;
+    else if (args === 'off') force = false;
+
+    const newState = await bridge.toggleMirroring(force);
+    const statusText = newState
+      ? '\u{1F7E2} *Telegram mirroring: ON*'
+      : '\u{1F534} *Telegram mirroring: OFF*';
+    await ctx.reply(statusText, { parse_mode: 'Markdown' });
   });
 
   // /sessions - List active sessions

@@ -144,6 +144,7 @@ pub fn format_help() -> String {
 /detach - Detach from current session
 /mute - Mute notifications
 /unmute - Resume notifications
+/toggle - Toggle Telegram mirroring on/off
 /abort - Abort current session
 /help - Show this message
 
@@ -709,6 +710,7 @@ mod tests {
         assert!(h.contains("/status"));
         assert!(h.contains("/help"));
         assert!(h.contains("/abort"));
+        assert!(h.contains("/toggle"));
     }
 
     #[test]

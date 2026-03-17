@@ -1,4 +1,6 @@
 // Public API modules — some exports used in tests and future phases.
+use tokio::io::AsyncWriteExt;
+
 #[allow(dead_code)]
 mod bot;
 #[allow(dead_code)]
@@ -138,6 +140,16 @@ enum Commands {
         #[command(subcommand)]
         action: ServiceAction,
     },
+
+    /// Toggle Telegram mirroring on/off
+    Toggle {
+        /// Force mirroring ON
+        #[arg(long)]
+        on: bool,
+        /// Force mirroring OFF
+        #[arg(long)]
+        off: bool,
+    },
 }
 
 #[derive(Subcommand, Clone)]
@@ -193,6 +205,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Setup => setup::run_setup().await,
         Commands::Doctor { fix } => doctor::run_doctor(fix).await,
         Commands::Service { action } => service::handle_service_command(&action),
+        Commands::Toggle { on, off } => cmd_toggle(on, off).await,
     }
 }
 
@@ -520,6 +533,45 @@ async fn cmd_config(test: bool) -> anyhow::Result<()> {
     println!("  export TELEGRAM_CHAT_ID=\"your-chat-id\"");
     println!();
 
+    Ok(())
+}
+
+/// Toggle mirroring state, optionally notifying a running daemon.
+async fn cmd_toggle(force_on: bool, force_off: bool) -> anyhow::Result<()> {
+    let cfg = config::load_config(false)?;
+    let current = config::read_mirror_status(&cfg.config_dir);
+    let new_state = if force_on {
+        true
+    } else if force_off {
+        false
+    } else {
+        !current
+    };
+    config::write_mirror_status(&cfg.config_dir, new_state, None);
+
+    // If bridge is running, send a toggle command through the socket
+    if cfg.socket_path.exists() {
+        let cmd_str = if new_state { "enable" } else { "disable" };
+        let msg = types::BridgeMessage {
+            msg_type: "command".to_string(),
+            session_id: "_system".to_string(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            content: cmd_str.to_string(),
+            metadata: None,
+        };
+        if let Ok(mut stream) = tokio::net::UnixStream::connect(&cfg.socket_path).await {
+            if let Ok(json) = serde_json::to_string(&msg) {
+                let _ = stream.write_all(format!("{}\n", json).as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        }
+    }
+
+    if new_state {
+        println!("Telegram mirroring: ON");
+    } else {
+        println!("Telegram mirroring: OFF");
+    }
     Ok(())
 }
 

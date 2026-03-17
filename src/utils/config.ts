@@ -3,10 +3,38 @@
  * Loads configuration from environment variables and optional config file
  */
 
-import { existsSync, readFileSync, mkdirSync, chmodSync } from 'fs';
+import { existsSync, readFileSync, mkdirSync, chmodSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
 import logger from './logger.js';
+
+interface MirrorStatus {
+  enabled: boolean;
+  pid?: number;
+  toggled_at: string;
+}
+
+export function readMirrorStatus(configDir: string): boolean {
+  const statusPath = join(configDir, 'status.json');
+  try {
+    const content = readFileSync(statusPath, 'utf-8');
+    const status: MirrorStatus = JSON.parse(content);
+    return status.enabled;
+  } catch {
+    return true; // default enabled
+  }
+}
+
+export function writeMirrorStatus(configDir: string, enabled: boolean, pid?: number): void {
+  const statusPath = join(configDir, 'status.json');
+  const status: MirrorStatus = {
+    enabled,
+    pid,
+    toggled_at: new Date().toISOString(),
+  };
+  const json = JSON.stringify(status, null, 2);
+  writeFileSync(statusPath, json, { mode: 0o600 });
+}
 
 export interface TelegramMirrorConfig {
   // Required

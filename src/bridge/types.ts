@@ -15,7 +15,8 @@ export type MessageType =
   | 'session_end'
   | 'turn_complete'   // Claude fires Stop after every turn, not session end
   | 'pre_compact'     // Fires just before context compaction (manual or auto)
-  | 'session_rename'; // Custom title detected in session JSONL (Epic 5)
+  | 'session_rename'  // Custom title detected in session JSONL (Epic 5)
+  | 'send_image';     // Outbound file transfer (Epic 2)
 
 export interface BridgeMessage {
   type: MessageType;
