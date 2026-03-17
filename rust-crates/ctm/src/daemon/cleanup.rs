@@ -95,6 +95,10 @@ async fn cleanup_stale_sessions(ctx: &HandlerContext) {
 }
 
 /// Handle cleanup of a stale session.
+///
+/// NOTE: Stale sessions are deleted immediately (no delay) because they represent
+/// abandoned sessions where the user is no longer monitoring. Using the normal
+/// topic_delete_delay_minutes delay would accumulate dead topics.
 async fn handle_stale_session_cleanup(
     ctx: &HandlerContext,
     session: &crate::session::Session,
@@ -124,6 +128,13 @@ async fn handle_stale_session_cleanup(
                 .await;
             } else {
                 let _ = ctx.bot.close_forum_topic(tid).await;
+                // Clear thread_id so orphaned cleanup doesn't retry endlessly
+                // on a closed-but-not-deleted topic.
+                let sid = session.id.clone();
+                ctx.db_op(move |sess| {
+                    let _ = sess.clear_thread_id(&sid);
+                })
+                .await;
             }
         } else {
             let _ = ctx.bot.close_forum_topic(tid).await;
@@ -161,7 +172,17 @@ async fn cleanup_orphaned_threads(ctx: &HandlerContext) {
     let mut cleaned = 0;
     for session in &orphans {
         if let Some(tid) = session.thread_id {
-            let _ = ctx.bot.delete_forum_topic(tid).await;
+            match ctx.bot.delete_forum_topic(tid).await {
+                Ok(true) => {
+                    tracing::debug!(thread_id = tid, session_id = %session.id, "Deleted orphaned topic")
+                }
+                Ok(false) => {
+                    tracing::warn!(thread_id = tid, session_id = %session.id, "Failed to delete orphaned topic (may already be deleted)")
+                }
+                Err(e) => {
+                    tracing::warn!(thread_id = tid, session_id = %session.id, error = %e, "Failed to delete orphaned topic")
+                }
+            }
             let sid = session.id.clone();
             ctx.db_op(move |sess| {
                 let _ = sess.clear_thread_id(&sid);
@@ -230,6 +251,14 @@ pub(super) async fn schedule_topic_deletion(
             tracing::warn!(session_id = %sid, thread_id, "Failed to delete topic, falling back to close");
             let _ = bot.close_forum_topic(thread_id).await;
             session_threads.write().await.remove(&sid);
+            // Clear thread_id so orphaned cleanup doesn't retry endlessly
+            // on a closed-but-not-deleted topic.
+            let session_id_clone = sid.clone();
+            let sess = sessions.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                sess.blocking_lock().clear_thread_id(&session_id_clone)
+            })
+            .await;
         }
     });
 
@@ -240,6 +269,13 @@ pub(super) async fn schedule_topic_deletion(
 }
 
 /// BUG-012: Cancel pending topic deletion when session resumes.
+///
+/// NOTE: There is a TOCTOU window here. If the deletion task has already passed
+/// the sleep and is executing the HTTP delete_forum_topic call, abort() will
+/// cancel the task but the HTTP request may already be inflight. In this case,
+/// the topic may be deleted even though cancellation was requested.
+/// This is handled by ensure_session_exists which checks for missing thread_id
+/// and creates a new topic if needed. See BUG-012 documentation.
 pub(super) async fn cancel_pending_topic_deletion(ctx: &HandlerContext, session_id: &str) {
     if let Some(handle) = ctx.pending_del.write().await.remove(session_id) {
         handle.abort();

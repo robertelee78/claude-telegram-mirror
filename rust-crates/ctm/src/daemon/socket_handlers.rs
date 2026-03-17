@@ -64,7 +64,13 @@ pub(super) async fn handle_session_start(ctx: &HandlerContext, msg: &BridgeMessa
         Some(tid)
     } else if ctx.config.use_threads {
         let topic_name = HandlerContext::format_topic_name(&msg.session_id, hostname, project_dir);
-        match ctx.bot.create_forum_topic(&topic_name, 0).await {
+        // Hash session_id to pick a color (6 valid Telegram topic colors)
+        let color_index = msg
+            .session_id
+            .bytes()
+            .fold(0u32, |acc, b| acc.wrapping_add(b as u32)) as usize
+            % 6;
+        match ctx.bot.create_forum_topic(&topic_name, color_index).await {
             Ok(Some(tid)) => {
                 let sid = msg.session_id.clone();
                 ctx.db_op(move |sess| {

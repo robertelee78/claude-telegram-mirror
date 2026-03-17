@@ -153,6 +153,15 @@ impl TelegramBot {
             }
         }
 
+        // TOPIC_ID_INVALID: topic has been deleted, don't retry
+        if code == 400 && desc.contains("TOPIC_ID_INVALID") {
+            tracing::warn!(
+                thread_id = ?item.thread_id,
+                "Topic no longer exists, dropping message"
+            );
+            return Err(AppError::Telegram("Topic deleted".into()));
+        }
+
         // Entity parse error: strip formatting, retry as plain text
         if code == 400 && desc.contains("can't parse entities") {
             tracing::warn!("Markdown parsing failed, retrying as plain text");

@@ -686,11 +686,39 @@ async fn ensure_session_exists(ctx: &HandlerContext, msg: &BridgeMessage) {
         // Check if topic was deleted -- need to create new one
         let thread_id = ctx.get_thread_id(&msg.session_id).await;
         if thread_id.is_none() && ctx.config.use_threads {
+            // BUG-002: Acquire topic creation lock to prevent duplicate topics
+            // from concurrent messages for the same session.
+            let lock = {
+                let mut locks = ctx.topic_locks.write().await;
+                if let Some(state) = locks.get(&msg.session_id) {
+                    // Another task is already creating the topic -- wait for it.
+                    let notify = Arc::clone(&state.notify);
+                    drop(locks);
+                    let _ = tokio::time::timeout(
+                        tokio::time::Duration::from_secs(5),
+                        notify.notified(),
+                    )
+                    .await;
+                    return;
+                }
+                let state = Arc::new(TopicCreationState {
+                    notify: Arc::new(tokio::sync::Notify::new()),
+                });
+                locks.insert(msg.session_id.clone(), state.clone());
+                state
+            };
+
             let hostname = session.hostname.as_deref();
             let project_dir = session.project_dir.as_deref();
             let topic_name =
                 HandlerContext::format_topic_name(&msg.session_id, hostname, project_dir);
-            if let Ok(Some(tid)) = ctx.bot.create_forum_topic(&topic_name, 0).await {
+            // Hash session_id to pick a color (6 valid Telegram topic colors)
+            let color_index =
+                msg.session_id
+                    .bytes()
+                    .fold(0u32, |acc, b| acc.wrapping_add(b as u32)) as usize
+                    % 6;
+            if let Ok(Some(tid)) = ctx.bot.create_forum_topic(&topic_name, color_index).await {
                 let sid = msg.session_id.clone();
                 ctx.db_op(move |sess| {
                     let _ = sess.set_session_thread(&sid, tid);
@@ -712,6 +740,10 @@ async fn ensure_session_exists(ctx: &HandlerContext, msg: &BridgeMessage) {
                     .await;
                 let _ = ctx.bot.unpin_all_topic_messages(tid).await;
             }
+
+            // Release topic creation lock
+            lock.notify.notify_waiters();
+            ctx.topic_locks.write().await.remove(&msg.session_id);
         }
         return;
     }
