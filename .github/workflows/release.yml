@@ -178,22 +178,14 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: '20.x'
           registry-url: 'https://registry.npmjs.org'
-
-      - name: Verify auth and publish config
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          echo "Node: $(node --version)"
-          echo "npm: $(npm --version)"
-          npm whoami
-          cat ~/.npmrc || true
 
       - name: Publish platform packages to npm
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
+          npm whoami
           # Publish platform packages first
           for pkg in ctm-linux-x64 ctm-linux-arm64 ctm-darwin-arm64 ctm-darwin-x64; do
             tgz=$(find artifacts/$pkg -name "*.tgz" | head -1)
