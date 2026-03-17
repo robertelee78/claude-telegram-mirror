@@ -13,6 +13,7 @@
 'use strict';
 
 const { execSync } = require('child_process');
+const { createHash } = require('crypto');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
@@ -66,11 +67,63 @@ function findInNodeModules(nodeModulesDir, packageName) {
 }
 
 /**
+ * Verify the integrity of a resolved binary against checksums.json.
+ *
+ * Looks for checksums.json in the same directory as the binary. If found,
+ * computes SHA-256 of the binary and compares against the expected hash.
+ *
+ * @param {string} binaryPath - Absolute path to the resolved binary.
+ * @returns {boolean} true if verification passed or was skipped (no checksums.json).
+ */
+function verifyBinaryIntegrity(binaryPath) {
+  const binDir = path.dirname(binaryPath);
+  const checksumsPath = path.join(binDir, 'checksums.json');
+
+  if (!fs.existsSync(checksumsPath)) {
+    console.warn('Warning: No checksums.json found — skipping integrity check');
+    return true;
+  }
+
+  let checksums;
+  try {
+    checksums = JSON.parse(fs.readFileSync(checksumsPath, 'utf8'));
+  } catch (err) {
+    console.error(`Error: Failed to parse checksums.json: ${err.message}`);
+    return false;
+  }
+
+  const entry = checksums.ctm;
+  if (!entry || !entry.sha256) {
+    console.error('Error: checksums.json missing "ctm.sha256" field');
+    return false;
+  }
+
+  const binaryData = fs.readFileSync(binaryPath);
+
+  // Verify file size if present
+  if (typeof entry.size === 'number' && binaryData.length !== entry.size) {
+    console.error(
+      `Binary integrity check failed: size mismatch (expected ${entry.size}, got ${binaryData.length})`
+    );
+    return false;
+  }
+
+  const actualHash = createHash('sha256').update(binaryData).digest('hex');
+  if (actualHash !== entry.sha256) {
+    console.error('Binary integrity check failed: SHA-256 mismatch');
+    console.error(`  expected: ${entry.sha256}`);
+    console.error(`  actual:   ${actualHash}`);
+    return false;
+  }
+
+  return true;
+}
+
+/**
  * Resolve the native CTM binary path using multiple search strategies.
  *
- * NOTE: No checksum/signature verification is performed on the resolved binary.
- * A future release should add integrity verification to prevent supply-chain attacks
- * via compromised node_modules. See ADR-006 L3.8.
+ * After resolution, verifies the binary's SHA-256 checksum against checksums.json
+ * if present. See ADR-006 L3.8.
  *
  * @returns {{ binary: string, packageDir: string } | null}
  */
@@ -144,6 +197,9 @@ function resolveBinary() {
 if (require.main === module) {
   const result = resolveBinary();
   if (result) {
+    if (!verifyBinaryIntegrity(result.binary)) {
+      process.exit(1);
+    }
     console.log(result.binary);
   } else {
     const pkg = getPlatformPackageName();
@@ -154,4 +210,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { resolveBinary, getPlatformPackageName };
+module.exports = { resolveBinary, getPlatformPackageName, verifyBinaryIntegrity };

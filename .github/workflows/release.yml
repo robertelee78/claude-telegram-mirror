@@ -26,6 +26,13 @@ jobs:
         run: |
           cp rust-crates/target/release/ctm npm-packages/ctm-linux-x64/bin/ctm
           chmod 755 npm-packages/ctm-linux-x64/bin/ctm
+          node -e "
+            const crypto = require('crypto');
+            const fs = require('fs');
+            const bin = fs.readFileSync('npm-packages/ctm-linux-x64/bin/ctm');
+            const checksums = { ctm: { sha256: crypto.createHash('sha256').update(bin).digest('hex'), size: bin.length } };
+            fs.writeFileSync('npm-packages/ctm-linux-x64/bin/checksums.json', JSON.stringify(checksums, null, 2) + '\n');
+          "
           cd npm-packages/ctm-linux-x64
           npm pack
           mv *.tgz ../../
@@ -56,6 +63,13 @@ jobs:
         run: |
           cp rust-crates/target/release/ctm npm-packages/ctm-darwin-arm64/bin/ctm
           chmod 755 npm-packages/ctm-darwin-arm64/bin/ctm
+          node -e "
+            const crypto = require('crypto');
+            const fs = require('fs');
+            const bin = fs.readFileSync('npm-packages/ctm-darwin-arm64/bin/ctm');
+            const checksums = { ctm: { sha256: crypto.createHash('sha256').update(bin).digest('hex'), size: bin.length } };
+            fs.writeFileSync('npm-packages/ctm-darwin-arm64/bin/checksums.json', JSON.stringify(checksums, null, 2) + '\n');
+          "
           cd npm-packages/ctm-darwin-arm64
           npm pack
           mv *.tgz ../../
@@ -86,6 +100,13 @@ jobs:
         run: |
           cp rust-crates/target/release/ctm npm-packages/ctm-darwin-x64/bin/ctm
           chmod 755 npm-packages/ctm-darwin-x64/bin/ctm
+          node -e "
+            const crypto = require('crypto');
+            const fs = require('fs');
+            const bin = fs.readFileSync('npm-packages/ctm-darwin-x64/bin/ctm');
+            const checksums = { ctm: { sha256: crypto.createHash('sha256').update(bin).digest('hex'), size: bin.length } };
+            fs.writeFileSync('npm-packages/ctm-darwin-x64/bin/checksums.json', JSON.stringify(checksums, null, 2) + '\n');
+          "
           cd npm-packages/ctm-darwin-x64
           npm pack
           mv *.tgz ../../
@@ -123,6 +144,13 @@ jobs:
         run: |
           cp rust-crates/target/aarch64-unknown-linux-gnu/release/ctm npm-packages/ctm-linux-arm64/bin/ctm
           chmod 755 npm-packages/ctm-linux-arm64/bin/ctm
+          node -e "
+            const crypto = require('crypto');
+            const fs = require('fs');
+            const bin = fs.readFileSync('npm-packages/ctm-linux-arm64/bin/ctm');
+            const checksums = { ctm: { sha256: crypto.createHash('sha256').update(bin).digest('hex'), size: bin.length } };
+            fs.writeFileSync('npm-packages/ctm-linux-arm64/bin/checksums.json', JSON.stringify(checksums, null, 2) + '\n');
+          "
           cd npm-packages/ctm-linux-arm64
           npm pack
           mv *.tgz ../../
@@ -138,6 +166,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      id-token: write
     steps:
       - uses: actions/checkout@v4
 
@@ -156,7 +185,7 @@ jobs:
             tgz=$(find artifacts/$pkg -name "*.tgz" | head -1)
             if [ -n "$tgz" ]; then
               echo "Publishing $pkg..."
-              npm publish "$tgz" --access public || true
+              npm publish "$tgz" --access public --provenance || true
             fi
           done
 
@@ -173,7 +202,7 @@ jobs:
           done
 
           # Publish the main package
-          npm publish --access public
+          npm publish --access public --provenance
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
