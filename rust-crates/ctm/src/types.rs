@@ -150,16 +150,9 @@ pub struct SocketClientInfo {
     pub session_id: Option<String>,
 }
 
-/// L3.1: Inline keyboard button definition (domain-level type).
-///
-/// Note: `bot::InlineButton` is the same shape but lives in the bot module.
-/// This type is provided for external consumers who want to construct buttons
-/// without depending on the bot module internals.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct InlineButton {
-    pub text: String,
-    pub callback_data: String,
-}
+// L4.5: InlineButton is defined solely in bot.rs and re-exported from lib.rs.
+// This eliminates the duplicate definition that previously lived here.
+// External consumers should use `ctm::bot::InlineButton`.
 
 /// L3.1: Result returned by hook processing.
 ///

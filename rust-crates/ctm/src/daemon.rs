@@ -206,6 +206,11 @@ impl Daemon {
 
     /// Start the daemon. Runs until shutdown signal.
     pub async fn start(&mut self) -> Result<()> {
+        // L4.1: Double-start guard — prevent re-entering start() if already running.
+        if self.running.load(std::sync::atomic::Ordering::Relaxed) {
+            tracing::warn!("Daemon already running, ignoring start()");
+            return Ok(());
+        }
         tracing::info!("Starting bridge daemon...");
 
         // Start socket server
@@ -1749,7 +1754,10 @@ async fn cleanup_pending_questions(ctx: &HandlerContext, session_id: &str) {
 
 /// Handle an incoming Telegram update (message or callback).
 async fn handle_telegram_update(ctx: HandlerContext, update: Update) {
-    // Security: Check chat_id on ALL updates
+    // Security: Check chat_id on ALL updates.
+    // INTENTIONAL (ADR-006 L4.6): Do not reply to unauthorized chats. Replying
+    // would confirm the bot's existence and function to an attacker. Silent drop
+    // is more secure than the TS behavior of replying "Unauthorized."
     if let Some(msg) = &update.message {
         if msg.chat.id != ctx.config.chat_id {
             tracing::warn!(chat_id = msg.chat.id, "Unauthorized message");
@@ -2555,14 +2563,15 @@ async fn handle_bot_command(ctx: &HandlerContext, msg: &TgMessage, text: &str) {
 // ====================================================================== callback query handler
 
 /// Handle callback queries (button presses).
+///
+/// H4.2: Each sub-handler answers the callback individually with appropriate
+/// text and show_alert, rather than answering early with None. This allows
+/// handlers to provide meaningful feedback (e.g. "Approved", "Details expired").
 async fn handle_callback_query(ctx: &HandlerContext, cb: &CallbackQuery) {
     let data = match &cb.data {
         Some(d) => d.as_str(),
         None => return,
     };
-
-    // Answer the callback to dismiss spinner
-    let _ = ctx.bot.answer_callback_query(&cb.id, None).await;
 
     // /abort confirmation callbacks
     if let Some(session_id) = data.strip_prefix("confirm_abort:") {
@@ -2594,6 +2603,15 @@ async fn handle_callback_query(ctx: &HandlerContext, cb: &CallbackQuery) {
 
 /// Handle /abort confirmation callback.
 async fn handle_confirm_abort_callback(ctx: &HandlerContext, session_id: &str, cb: &CallbackQuery) {
+    // Defense-in-depth: verify chat ownership (ADR-006 M4.5)
+    if cb.message.as_ref().map(|m| m.chat.id) != Some(ctx.config.chat_id) {
+        tracing::warn!("IDOR: callback from wrong chat in confirm_abort");
+        return;
+    }
+    let _ = ctx
+        .bot
+        .answer_callback_query(&cb.id, Some("Aborting..."), false)
+        .await;
     let thread_id = cb.message.as_ref().and_then(|m| m.message_thread_id);
     let message_id = cb.message.as_ref().map(|m| m.message_id);
 
@@ -2656,6 +2674,15 @@ async fn handle_confirm_abort_callback(ctx: &HandlerContext, session_id: &str, c
 
 /// Handle /abort cancellation callback.
 async fn handle_cancel_abort_callback(ctx: &HandlerContext, cb: &CallbackQuery) {
+    // Defense-in-depth: verify chat ownership (ADR-006 M4.5)
+    if cb.message.as_ref().map(|m| m.chat.id) != Some(ctx.config.chat_id) {
+        tracing::warn!("IDOR: callback from wrong chat in cancel_abort");
+        return;
+    }
+    let _ = ctx
+        .bot
+        .answer_callback_query(&cb.id, Some("Cancelled"), false)
+        .await;
     if let Some(msg) = &cb.message {
         let _ = ctx
             .bot
@@ -2696,6 +2723,20 @@ async fn handle_approval_callback(
     action: &str,
     cb: &CallbackQuery,
 ) {
+    // Defense-in-depth: verify chat ownership (ADR-006 M4.5)
+    if cb.message.as_ref().map(|m| m.chat.id) != Some(ctx.config.chat_id) {
+        tracing::warn!("IDOR: callback from wrong chat in approval");
+        return;
+    }
+    let action_label = match action {
+        "approve" => "Approved",
+        "reject" => "Rejected",
+        _ => "Aborted",
+    };
+    let _ = ctx
+        .bot
+        .answer_callback_query(&cb.id, Some(action_label), false)
+        .await;
     let approval = ctx
         .sessions
         .lock()
@@ -2782,6 +2823,11 @@ async fn handle_approval_callback(
 /// Handle tool details callback.
 /// M4: Send details as a reply to the original message.
 async fn handle_tool_details_callback(ctx: &HandlerContext, tool_use_id: &str, cb: &CallbackQuery) {
+    // Defense-in-depth: verify chat ownership (ADR-006 M4.5)
+    if cb.message.as_ref().map(|m| m.chat.id) != Some(ctx.config.chat_id) {
+        tracing::warn!("IDOR: callback from wrong chat in tool_details");
+        return;
+    }
     let cached = {
         let cache = ctx.tool_cache.read().await;
         cache
@@ -2791,6 +2837,7 @@ async fn handle_tool_details_callback(ctx: &HandlerContext, tool_use_id: &str, c
 
     match cached {
         Some((tool, input)) => {
+            let _ = ctx.bot.answer_callback_query(&cb.id, None, false).await;
             let details = format_tool_details(&tool, &input);
             let thread_id = cb.message.as_ref().and_then(|m| m.message_thread_id);
             let reply_to = cb.message.as_ref().map(|m| m.message_id);
@@ -2825,7 +2872,7 @@ async fn handle_tool_details_callback(ctx: &HandlerContext, tool_use_id: &str, c
         None => {
             let _ = ctx
                 .bot
-                .answer_callback_query(&cb.id, Some("Details expired (5 min cache)"))
+                .answer_callback_query(&cb.id, Some("Details expired (5 min cache)"), true)
                 .await;
         }
     }
@@ -2833,6 +2880,15 @@ async fn handle_tool_details_callback(ctx: &HandlerContext, tool_use_id: &str, c
 
 /// Handle single-select answer callback.
 async fn handle_answer_callback(ctx: &HandlerContext, data: &str, cb: &CallbackQuery) {
+    // Defense-in-depth: verify chat ownership (ADR-006 M4.5)
+    if cb.message.as_ref().map(|m| m.chat.id) != Some(ctx.config.chat_id) {
+        tracing::warn!("IDOR: callback from wrong chat in answer");
+        return;
+    }
+    let _ = ctx
+        .bot
+        .answer_callback_query(&cb.id, Some("Selected"), false)
+        .await;
     // Format: answer:{sessionId}:{questionIndex}:{optionIndex}
     let parts: Vec<&str> = data.splitn(4, ':').collect();
     if parts.len() != 4 {
@@ -2912,6 +2968,12 @@ async fn handle_answer_callback(ctx: &HandlerContext, data: &str, cb: &CallbackQ
 
 /// Handle multi-select toggle callback.
 async fn handle_toggle_callback(ctx: &HandlerContext, data: &str, cb: &CallbackQuery) {
+    // Defense-in-depth: verify chat ownership (ADR-006 M4.5)
+    if cb.message.as_ref().map(|m| m.chat.id) != Some(ctx.config.chat_id) {
+        tracing::warn!("IDOR: callback from wrong chat in toggle");
+        return;
+    }
+    let _ = ctx.bot.answer_callback_query(&cb.id, None, false).await;
     let parts: Vec<&str> = data.splitn(4, ':').collect();
     if parts.len() != 4 {
         return;
@@ -2978,6 +3040,15 @@ async fn handle_toggle_callback(ctx: &HandlerContext, data: &str, cb: &CallbackQ
 
 /// Handle multi-select submit callback.
 async fn handle_submit_callback(ctx: &HandlerContext, data: &str, cb: &CallbackQuery) {
+    // Defense-in-depth: verify chat ownership (ADR-006 M4.5)
+    if cb.message.as_ref().map(|m| m.chat.id) != Some(ctx.config.chat_id) {
+        tracing::warn!("IDOR: callback from wrong chat in submit");
+        return;
+    }
+    let _ = ctx
+        .bot
+        .answer_callback_query(&cb.id, Some("Submitted"), false)
+        .await;
     let parts: Vec<&str> = data.splitn(3, ':').collect();
     if parts.len() != 3 {
         return;

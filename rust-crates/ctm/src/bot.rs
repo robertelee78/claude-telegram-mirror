@@ -26,7 +26,9 @@ static BOT_TOKEN_REGEX: LazyLock<Regex> =
 
 // ---------------------------------------------------------------- types
 
-#[derive(Debug, Clone, Serialize)]
+/// L4.5: Single canonical definition of InlineButton. Previously duplicated
+/// in types.rs — now lives only here and is re-exported via lib.rs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InlineButton {
     pub text: String,
     pub callback_data: String,
@@ -900,12 +902,19 @@ impl TelegramBot {
     }
 
     /// Answer a callback query (dismiss the loading spinner).
+    ///
+    /// H4.1: `show_alert` controls whether the response is shown as a toast
+    /// notification (`false`) or a modal alert dialog (`true`).
     pub async fn answer_callback_query(
         &self,
         callback_query_id: &str,
         text: Option<&str>,
+        show_alert: bool,
     ) -> Result<()> {
-        let mut body = serde_json::json!({"callback_query_id": callback_query_id});
+        let mut body = serde_json::json!({
+            "callback_query_id": callback_query_id,
+            "show_alert": show_alert,
+        });
         if let Some(t) = text {
             body["text"] = serde_json::Value::String(t.to_string());
         }

@@ -207,6 +207,11 @@ async fn build_messages(
     // The daemon's ensure_session_exists / create_session handles dedup — if
     // the session already exists this is a no-op update.  This guarantees the
     // daemon knows about the session even on the very first hook invocation.
+    //
+    // NOTE (ADR-006 M4.4): session_start is sent on every hook invocation.
+    // This is intentional. The daemon's create_session is idempotent (INSERT OR
+    // REPLACE), so duplicates are harmless. This simplifies the hook (no state
+    // tracking) at the cost of minor socket overhead.
     messages.push(make_message(
         "session_start",
         session_id,
@@ -241,12 +246,10 @@ async fn build_messages(
                 .filter(|s| !s.is_empty())
                 .or(e.tool_error.as_deref())
                 .unwrap_or("No output");
+            // M4.2: Send full output — let the daemon's formatting/chunking layer
+            // handle display truncation. Truncating here at 2000 chars lost
+            // important tool output (stack traces, large diffs, etc.).
             if cfg.verbose || (output.len() >= 10 && !output.trim().is_empty()) {
-                let truncated = if output.len() > 2000 {
-                    format!("{}...", &output[..2000])
-                } else {
-                    output.to_string()
-                };
                 let mut tool_meta = meta.clone();
                 tool_meta.insert(
                     "tool".into(),
@@ -258,12 +261,7 @@ async fn build_messages(
                 if let Some(err) = &e.tool_error {
                     tool_meta.insert("error".into(), serde_json::Value::String(err.clone()));
                 }
-                messages.push(make_message(
-                    "tool_result",
-                    session_id,
-                    &truncated,
-                    tool_meta,
-                ));
+                messages.push(make_message("tool_result", session_id, output, tool_meta));
             }
         }
         HookEvent::Notification(e) => {

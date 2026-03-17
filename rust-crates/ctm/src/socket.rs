@@ -309,6 +309,11 @@ fn acquire_flock(pid_path: &Path) -> Result<Flock<OwnedFd>> {
 // ====================================================================== client
 
 /// Unix domain socket client for sending messages to the server.
+///
+/// NOTE (ADR-006 L4.3): Auto-reconnect is not implemented. The TS version had
+/// a reconnectTimer for automatic reconnection, but the Rust hook process is
+/// short-lived (exits after processing one event), so reconnection is
+/// unnecessary. Long-lived consumers should implement retry logic externally.
 pub struct SocketClient {
     stream: Option<UnixStream>,
 }
@@ -325,10 +330,21 @@ impl SocketClient {
     }
 
     /// Connect to the server at the given socket path.
+    ///
+    /// M4.3: Error messages distinguish between common failure modes so callers
+    /// can provide actionable feedback (e.g. "start the bridge daemon" vs retry).
     pub async fn connect(&mut self, socket_path: &Path) -> Result<()> {
-        let stream = UnixStream::connect(socket_path)
-            .await
-            .map_err(|e| AppError::Socket(format!("Failed to connect: {e}")))?;
+        let stream = UnixStream::connect(socket_path).await.map_err(|e| {
+            let msg = match e.kind() {
+                std::io::ErrorKind::NotFound => "Bridge not running (socket not found)".to_string(),
+                std::io::ErrorKind::ConnectionRefused => "Bridge refused connection".to_string(),
+                std::io::ErrorKind::PermissionDenied => {
+                    "Permission denied on bridge socket".to_string()
+                }
+                _ => format!("Failed to connect: {e}"),
+            };
+            AppError::Socket(msg)
+        })?;
         self.stream = Some(stream);
         Ok(())
     }

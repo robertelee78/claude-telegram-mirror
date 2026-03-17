@@ -233,22 +233,6 @@ async fn cmd_start(verbose: bool) -> anyhow::Result<()> {
 
     let mut daemon = daemon::Daemon::new(cfg)?;
 
-    // Handle shutdown signals
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    let shutdown_tx = std::sync::Arc::new(std::sync::Mutex::new(Some(shutdown_tx)));
-
-    {
-        let tx = std::sync::Arc::clone(&shutdown_tx);
-        ctrlc::set_handler(move || {
-            if let Ok(mut guard) = tx.lock() {
-                if let Some(sender) = guard.take() {
-                    let _ = sender.send(());
-                }
-            }
-        })
-        .ok();
-    }
-
     daemon.start().await?;
 
     println!("Bridge daemon running");
@@ -256,8 +240,23 @@ async fn cmd_start(verbose: bool) -> anyhow::Result<()> {
     println!("Reply in Telegram to send input to CLI\n");
     println!("Press Ctrl+C to stop\n");
 
-    // Wait for shutdown signal
-    let _ = shutdown_rx.await;
+    // C4.1: Handle both SIGINT (Ctrl-C) and SIGTERM for clean async shutdown.
+    // The ctrlc crate only handles SIGINT and runs in a sync context, which
+    // prevents async cleanup (Telegram notification, client disconnect). Using
+    // tokio::signal ensures both signals trigger the same graceful shutdown path
+    // including the async Daemon::stop() method.
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut sigint = signal(SignalKind::interrupt()).expect("register SIGINT");
+    let mut sigterm = signal(SignalKind::terminate()).expect("register SIGTERM");
+
+    tokio::select! {
+        _ = sigint.recv() => {
+            tracing::info!("Received SIGINT, shutting down...");
+        }
+        _ = sigterm.recv() => {
+            tracing::info!("Received SIGTERM, shutting down...");
+        }
+    }
 
     println!("\nShutting down...");
     daemon.stop().await;

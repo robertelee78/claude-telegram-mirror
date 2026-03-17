@@ -310,37 +310,49 @@ fn json_str<'a>(v: &'a serde_json::Value, key: &str) -> &'a str {
 pub fn detect_language(content: &str) -> &'static str {
     let trimmed = content.trim();
     type LangCheck = (&'static str, fn(&str) -> bool);
+    // L4.7: TypeScript is checked before JavaScript because TS-specific
+    // patterns (type annotations, interface/type keywords) should match first.
+    // JavaScript detection now also handles minified `import{` without space.
     let patterns: &[LangCheck] = &[
-        ("javascript", |t| {
-            t.starts_with("#!/usr/bin/env node")
-                || t.starts_with("import ") && (t.contains(" from '") || t.contains(" from \""))
-                || t.starts_with("const ") && t.contains(" = require(")
+        ("typescript", |t: &str| {
+            t.contains(": string")
+                || t.contains(": number")
+                || t.contains(": boolean")
+                || t.starts_with("interface ")
+                || t.starts_with("type ")
+                || t.contains("as const")
         }),
-        ("python", |t| {
+        ("javascript", |t: &str| {
+            t.starts_with("#!/usr/bin/env node")
+                || ((t.starts_with("import ") || t.starts_with("import{"))
+                    && (t.contains("from '") || t.contains("from \"")))
+                || (t.starts_with("const ") && t.contains(" = require("))
+        }),
+        ("python", |t: &str| {
             t.starts_with("#!/usr/bin/env python")
                 || t.starts_with("import ")
-                || t.starts_with("from ") && t.contains(" import ")
+                || (t.starts_with("from ") && t.contains(" import "))
                 || t.starts_with("def ")
         }),
-        ("go", |t| {
+        ("go", |t: &str| {
             t.starts_with("package ") || t.starts_with("import \"") || t.starts_with("func ")
         }),
-        ("rust", |t| {
+        ("rust", |t: &str| {
             t.starts_with("use ")
                 || t.starts_with("fn ")
                 || t.starts_with("let mut ")
                 || t.starts_with("impl ")
         }),
-        ("cpp", |t| {
+        ("cpp", |t: &str| {
             t.starts_with("#include ") || t.starts_with("int main(") || t.starts_with("void ")
         }),
-        ("bash", |t| {
+        ("bash", |t: &str| {
             t.starts_with("$ ") || t.starts_with("#!") || (t.starts_with('#') && t.contains("bash"))
         }),
-        ("json", |t| {
+        ("json", |t: &str| {
             (t.starts_with('{') && t.ends_with('}')) || (t.starts_with('[') && t.ends_with(']'))
         }),
-        ("xml", |t| {
+        ("xml", |t: &str| {
             t.starts_with("<?xml") || t.starts_with("<!DOCTYPE") || t.starts_with("<html")
         }),
     ];
@@ -718,6 +730,25 @@ mod tests {
     #[test]
     fn detect_language_python() {
         assert_eq!(detect_language("def foo():"), "python");
+    }
+
+    #[test]
+    fn detect_language_typescript() {
+        assert_eq!(detect_language("interface User {"), "typescript");
+        assert_eq!(detect_language("type Result = string"), "typescript");
+        assert_eq!(detect_language("const x: string = 'hello'"), "typescript");
+        assert_eq!(detect_language("const y: number = 42"), "typescript");
+        assert_eq!(detect_language("const z = [1, 2] as const"), "typescript");
+    }
+
+    #[test]
+    fn detect_language_javascript_minified_import() {
+        // L4.7: import{foo} from 'bar' (minified, no space after import)
+        assert_eq!(detect_language("import{foo} from 'bar'"), "javascript");
+        assert_eq!(
+            detect_language("import{a, b} from \"module\""),
+            "javascript"
+        );
     }
 
     #[test]
