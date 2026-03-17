@@ -1,6 +1,17 @@
 //! Main event loop multiplexing socket messages, Telegram updates, and cleanup timer.
 
 use super::*;
+use tokio::sync::Semaphore;
+
+/// Returns a pseudo-random fraction in [0.0, 1.0) derived from the current
+/// system clock nanoseconds. Used for jitter without a `rand` dependency.
+fn simple_jitter_fraction() -> f64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos();
+    (nanos % 1000) as f64 / 1000.0
+}
 
 /// FR43: Main event loop multiplexing socket messages, Telegram updates, and cleanup timer.
 ///
@@ -15,6 +26,13 @@ pub(super) async fn run_event_loop(
     cleanup_interval.tick().await; // skip first immediate tick
 
     let mut update_offset: i64 = 0;
+
+    // Fix #4: Track consecutive poll failures for exponential backoff.
+    let mut consecutive_poll_failures: u32 = 0;
+
+    // Fix #6: Semaphore bounding concurrent handler tasks to 50.
+    // Cleanup tasks are exempt — they must always run regardless of load.
+    let handler_semaphore = Arc::new(Semaphore::new(50));
 
     // Pre-construct a single HandlerContext; .clone() is cheap (Arc refcount bumps).
     let base_ctx = HandlerContext {
@@ -44,7 +62,9 @@ pub(super) async fn run_event_loop(
                 match msg_result {
                     Ok(msg) => {
                         let ctx = base_ctx.clone();
+                        let sem = handler_semaphore.clone();
                         tokio::spawn(async move {
+                            let _permit = sem.acquire().await.expect("semaphore closed");
                             handle_socket_message(ctx, msg).await;
                         });
                     }
@@ -62,24 +82,41 @@ pub(super) async fn run_event_loop(
             updates = base_ctx.bot.get_updates(update_offset) => {
                 match updates {
                     Ok(updates) => {
+                        // Fix #4: Reset failure counter on successful poll.
+                        consecutive_poll_failures = 0;
                         for update in updates {
                             if update.update_id >= update_offset {
                                 update_offset = update.update_id + 1;
                             }
                             let ctx = base_ctx.clone();
+                            let sem = handler_semaphore.clone();
                             tokio::spawn(async move {
+                                let _permit = sem.acquire().await.expect("semaphore closed");
                                 telegram_handlers::handle_telegram_update(ctx, update).await;
                             });
                         }
                     }
                     Err(e) => {
-                        tracing::error!(error = %e, "Failed to get Telegram updates");
-                        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                        // Fix #4: Exponential backoff with jitter on poll failures.
+                        // Schedule: 10s, 20s, 40s, 80s (cap), with ~20% jitter.
+                        consecutive_poll_failures += 1;
+                        let base_delay = 5u64
+                            .saturating_mul(1u64 << consecutive_poll_failures.min(4));
+                        let base_delay = base_delay.min(80);
+                        let jitter = (base_delay as f64 * 0.2 * simple_jitter_fraction()) as u64;
+                        let next_retry_secs = base_delay + jitter;
+                        tracing::error!(
+                            error = %e,
+                            consecutive_failures = consecutive_poll_failures,
+                            next_retry_secs = next_retry_secs,
+                            "Failed to get Telegram updates"
+                        );
+                        tokio::time::sleep(tokio::time::Duration::from_secs(next_retry_secs)).await;
                     }
                 }
             }
 
-            // Cleanup timer
+            // Cleanup timer — exempt from semaphore so it always runs.
             _ = cleanup_interval.tick() => {
                 let ctx = base_ctx.clone();
                 tokio::spawn(async move {
