@@ -25,6 +25,22 @@ pub struct SendOptions {
     pub reply_to_message_id: Option<i64>,
 }
 
+/// Message priority tier for the three-tier priority queue.
+///
+/// Critical messages are drained first; Low messages are drained last and
+/// dropped first when their sub-queue overflows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[allow(dead_code)] // Critical and Low are used in tests and future callers
+pub(super) enum MessagePriority {
+    /// User-blocking or safety-critical (approvals, session start/end, errors).
+    /// Drained first. Should never hit the cap in normal operation.
+    Critical = 0,
+    /// User-visible output (agent responses, tool results). Drained second.
+    Normal = 1,
+    /// Informational only (tool previews, turn-complete). Drained last, dropped first.
+    Low = 2,
+}
+
 /// A queued message waiting to be sent.
 #[derive(Debug, Clone)]
 pub(super) struct QueuedMessage {
@@ -39,6 +55,26 @@ pub(super) struct QueuedMessage {
     /// Epoch millis when this item was first enqueued (for staleness tracking).
     #[allow(dead_code)] // Tracked for future staleness-based queue eviction
     pub(super) created_at: u64,
+    /// Priority tier for queue ordering. Defaults to Normal.
+    pub(super) priority: MessagePriority,
+}
+
+/// Telegram API response parameters — present in certain error responses.
+///
+/// Included in 429 (rate-limited) responses since Bot API 8.0.
+#[derive(Debug, Deserialize, Default)]
+pub(super) struct ResponseParameters {
+    /// Seconds to wait before retrying. Present on 429 responses.
+    #[serde(default)]
+    pub(super) retry_after: Option<u64>,
+    /// Millisecond-precision adaptive retry (Bot API 8.0+, November 2025).
+    /// More granular than `retry_after`. Use this when available.
+    #[serde(default)]
+    pub(super) adaptive_retry: Option<u64>,
+    /// Chat migration target. Present when a group was upgraded to a supergroup.
+    #[serde(default)]
+    #[allow(dead_code)] // Present in Telegram API responses for future use
+    pub(super) migrate_to_chat_id: Option<i64>,
 }
 
 /// Telegram API response wrapper.
@@ -48,6 +84,9 @@ pub(super) struct TgResponse<T> {
     pub(super) result: Option<T>,
     pub(super) description: Option<String>,
     pub(super) error_code: Option<i32>,
+    /// Present in error responses when the API has additional retry metadata.
+    #[serde(default)]
+    pub(super) parameters: Option<ResponseParameters>,
 }
 
 /// Forum topic creation result.

@@ -34,7 +34,9 @@ use std::sync::{Arc, LazyLock};
 use tokio::sync::Mutex;
 
 // Re-export internal types for sub-modules
-use types::{ForumTopicResult, QueuedMessage, TgFile, TgResponse, TOPIC_COLORS};
+use types::{ForumTopicResult, MessagePriority, QueuedMessage, TgFile, TgResponse, TOPIC_COLORS};
+// Make PriorityMessageQueue visible to client.rs (via `use super::*`)
+use queue::PriorityMessageQueue;
 
 static BOT_TOKEN_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"bot\d+:[A-Za-z0-9_-]+/").unwrap());
