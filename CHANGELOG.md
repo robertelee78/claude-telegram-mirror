@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.1] - 2026-03-17
+
+### Changed
+- Version bump from 0.2.0 due to partial npm publish (linux-x64 0.2.0 already on registry)
+
 ## [0.2.0] - 2026-03-17 (updated 2026-03-17)
 
 ### Release Readiness (post-initial)

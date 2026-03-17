@@ -43,10 +43,10 @@ fn version_exits_zero_and_contains_version() {
     );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    // The version string from Cargo.toml is "0.2.0"
+    // The version string from Cargo.toml is "0.2.1"
     assert!(
-        stdout.contains("0.2.0"),
-        "stdout should contain version '0.2.0', got: {}",
+        stdout.contains("0.2.1"),
+        "stdout should contain version '0.2.1', got: {}",
         stdout
     );
 }
