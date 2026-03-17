@@ -441,10 +441,17 @@ async fn handle_answer_callback(ctx: &HandlerContext, data: &str, cb: &CallbackQ
         }
     }
 
-    // Clean up if all answered
+    // Clean up if all answered, and auto-submit the review screen
     if pending.answered.iter().all(|a| *a) {
+        let all_session_id = pending.session_id.clone();
         drop(pq);
         ctx.pending_q.write().await.remove(&full_key);
+
+        // After all individual answers are injected, Claude Code shows a
+        // "Review your answers" confirmation with "1. Submit answers".
+        // Auto-inject "1" after a short delay so the user doesn't have to
+        // switch back to the console just to confirm.
+        auto_submit_answers(ctx, &all_session_id).await;
     }
 }
 
@@ -623,7 +630,44 @@ async fn handle_submit_callback(ctx: &HandlerContext, data: &str, cb: &CallbackQ
     }
 
     if pending.answered.iter().all(|a| *a) {
+        let all_session_id = pending.session_id.clone();
         drop(pq);
         ctx.pending_q.write().await.remove(&full_key);
+
+        // Auto-submit the review screen (same as handle_answer_callback).
+        auto_submit_answers(ctx, &all_session_id).await;
+    }
+}
+
+/// After all AskUserQuestion answers are collected, Claude Code shows a
+/// "Review your answers" confirmation screen with numbered options:
+///   > 1. Submit answers
+///     2. Cancel
+///
+/// This helper waits briefly for Claude Code to render the review screen,
+/// then injects "1" to auto-select "Submit answers" so the user doesn't
+/// have to switch back to the console.
+pub(super) async fn auto_submit_answers(ctx: &HandlerContext, session_id: &str) {
+    // Brief delay for Claude Code to transition from the last question
+    // to the review screen. Without this, the "1" arrives before the
+    // review prompt is displayed and gets swallowed.
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+    let tmux_target = ctx.session_tmux.read().await.get(session_id).cloned();
+    if let Some(target) = tmux_target {
+        let sid = session_id.to_string();
+        let socket = ctx
+            .db_op(move |sess| {
+                sess.get_session(&sid)
+                    .ok()
+                    .flatten()
+                    .and_then(|s| s.tmux_socket)
+            })
+            .await;
+
+        let mut inj = ctx.injector.lock().await;
+        inj.set_target(&target, socket.as_deref());
+        let _ = inj.inject("1");
+        tracing::info!(session_id, "Auto-submitted AskUserQuestion review screen");
     }
 }

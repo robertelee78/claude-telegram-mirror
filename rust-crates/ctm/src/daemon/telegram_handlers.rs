@@ -915,9 +915,14 @@ pub(super) async fn handle_free_text_answer(
     }
 
     if pending.answered.iter().all(|a| *a) {
+        let all_session_id = pending.session_id.clone();
         let key = pending_key.clone();
         drop(pq);
         ctx.pending_q.write().await.remove(&key);
+
+        // Auto-submit the review screen so the user doesn't have to
+        // switch back to the console.
+        callback_handlers::auto_submit_answers(ctx, &all_session_id).await;
     }
 
     true
