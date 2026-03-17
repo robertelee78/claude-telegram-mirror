@@ -595,9 +595,13 @@ pub async fn run_setup() -> anyhow::Result<()> {
     separator();
     println!();
 
+    let existing_use_threads = config::load_config(false)
+        .map(|c| c.use_threads)
+        .unwrap_or(true);
+
     let use_threads = Confirm::new()
         .with_prompt("Enable forum threads (each session gets its own topic)?")
-        .default(true)
+        .default(existing_use_threads)
         .interact()?;
 
     let install_hooks_choice = Confirm::new()
