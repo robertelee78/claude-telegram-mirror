@@ -250,7 +250,7 @@ Runtime toggling of mirroring is implemented via `Arc<AtomicBool>`. The toggle c
 
 ## 8. Test Suite
 
-The project has 387 tests across unit and integration test suites, with 0 failures and 0 clippy warnings.
+The project has 512 tests across unit and integration test suites, with 0 failures and 0 clippy warnings.
 
 ### Unit tests
 
@@ -258,13 +258,15 @@ Unit tests are co-located in each source module (30 source files across `src/`).
 
 ### Integration tests
 
-Eight integration test files live in `rust-crates/ctm/tests/`:
+Ten integration test files live in `rust-crates/ctm/tests/`:
 
 | File | Coverage |
 |------|----------|
+| `bot_tests.rs` | Telegram bot client: message sending, forum topic management, rate limiting, callback handling |
 | `cli_smoke.rs` | Binary invocation, subcommand parsing, `--help` and `--version` output |
 | `concurrency.rs` | Multi-threaded socket access, concurrent session operations |
 | `config_validation.rs` | Environment variable parsing, config file loading, three-tier priority |
+| `daemon_handlers.rs` | Socket and Telegram handler logic: session routing, approval flow, echo prevention, cleanup |
 | `formatting_tests.rs` | ANSI stripping, MarkdownV2 escaping, message chunking, path truncation |
 | `hook_pipeline.rs` | Hook event parsing, message building, approval workflow plumbing |
 | `session_lifecycle.rs` | Session create/end/reactivate, stale cleanup, approval expiry |
@@ -275,7 +277,7 @@ Eight integration test files live in `rust-crates/ctm/tests/`:
 
 ```bash
 cd rust-crates
-cargo test          # All 387 tests
+cargo test          # All 512 tests
 cargo test -- -q    # Quiet output
 cargo clippy        # Lint (0 warnings required)
 ```
