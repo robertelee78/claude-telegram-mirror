@@ -1,6 +1,6 @@
 {
   "name": "@agidreams/ctm-linux-x64",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "description": "Claude Telegram Mirror native binary for Linux x86_64",
   "license": "MIT",
   "author": "Robert E. Lee <robert@agidreams.us>",
