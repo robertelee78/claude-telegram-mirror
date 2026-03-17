@@ -2,7 +2,7 @@
 
 ## Status
 
-**Revision 2 — In Progress** (2026-03-16)
+**Revision 2 — Resolved** (2026-03-16)
 
 > **Revision 1** (2026-03-16): Original 37 gaps identified and resolved across 8 epics.
 > C2 and C3 verified as false positives (TS hooks also don't send
