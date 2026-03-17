@@ -168,7 +168,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-      id-token: write
     steps:
       - uses: actions/checkout@v4
 
@@ -191,7 +190,7 @@ jobs:
             tgz=$(find artifacts/$pkg -name "*.tgz" | head -1)
             if [ -n "$tgz" ]; then
               echo "Publishing $pkg..."
-              if ! npm publish "$tgz" --access public --provenance 2>&1 | tee /tmp/npm-publish-$pkg.log; then
+              if ! npm publish "$tgz" --access public 2>&1 | tee /tmp/npm-publish-$pkg.log; then
                 if grep -q 'EPUBLISHCONFLICT\|You cannot publish over the previously published versions' /tmp/npm-publish-$pkg.log; then
                   echo "  $pkg already published at this version — skipping"
                 else
@@ -230,7 +229,7 @@ jobs:
           fi
 
           # Publish the main package
-          npm publish --access public --provenance
+          npm publish --access public
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
