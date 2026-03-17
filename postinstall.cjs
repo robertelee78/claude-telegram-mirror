@@ -41,7 +41,7 @@ console.log('   ctm service install Install as system service');
 console.log('');
 
 console.log('Documentation:');
-console.log('   https://github.com/robertelee78/claude-mobile');
+console.log('   https://github.com/robertelee78/claude-telegram-mirror');
 console.log('');
 
 // Detect native Rust binary

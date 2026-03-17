@@ -19,6 +19,7 @@ use std::path::Path;
 #[derive(Debug, Clone)]
 pub struct Session {
     pub id: String,
+    #[allow(dead_code)] // Deserialized from DB; Library API
     pub chat_id: i64,
     pub thread_id: Option<i64>,
     pub hostname: Option<String>,
@@ -28,18 +29,25 @@ pub struct Session {
     pub last_activity: String,
     pub status: String,
     pub project_dir: Option<String>,
+    #[allow(dead_code)] // Deserialized from DB; Library API
     pub metadata: Option<String>,
 }
 
 /// A pending tool-approval request.
 #[derive(Debug, Clone)]
 pub struct PendingApproval {
+    #[allow(dead_code)] // Deserialized from DB; Library API
     pub id: String,
     pub session_id: String,
+    #[allow(dead_code)] // Deserialized from DB; Library API
     pub prompt: String,
+    #[allow(dead_code)] // Deserialized from DB; Library API
     pub created_at: String,
+    #[allow(dead_code)] // Deserialized from DB; Library API
     pub expires_at: String,
+    #[allow(dead_code)] // Deserialized from DB; Library API
     pub status: String,
+    #[allow(dead_code)] // Deserialized from DB; Library API
     pub message_id: Option<i64>,
 }
 
@@ -248,6 +256,7 @@ impl SessionManager {
     /// L6.11: Retrieve the thread_id for a session directly, without loading
     /// the full `Session` struct.  Returns `None` if the session does not exist
     /// or has no thread_id set.
+    #[allow(dead_code)] // Library API
     pub fn get_session_thread(&self, session_id: &str) -> Result<Option<i64>> {
         let mut stmt = self
             .conn
@@ -314,6 +323,7 @@ impl SessionManager {
         }
     }
 
+    #[allow(dead_code)] // Library API
     pub fn get_session_by_chat_id(&self, chat_id: i64) -> Result<Option<Session>> {
         let mut stmt = self
             .conn
@@ -469,8 +479,9 @@ impl SessionManager {
         let id = generate_id("approval");
         let now = chrono::Utc::now();
         let created = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-        let expires = (now + chrono::Duration::milliseconds(self.approval_timeout_ms))
-            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let expires = (now
+            + chrono::TimeDelta::try_milliseconds(self.approval_timeout_ms).unwrap())
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
 
         self.conn
             .execute(
@@ -501,6 +512,7 @@ impl SessionManager {
         }
     }
 
+    #[allow(dead_code)] // Library API
     pub fn get_pending_approvals(&self, session_id: &str) -> Result<Vec<PendingApproval>> {
         let mut stmt = self
             .conn
@@ -554,7 +566,8 @@ impl SessionManager {
     // -------------------------------------------------------------- cleanup
 
     pub fn get_stale_session_candidates(&self, timeout_hours: u32) -> Result<Vec<Session>> {
-        let cutoff = chrono::Utc::now() - chrono::Duration::hours(i64::from(timeout_hours));
+        let cutoff =
+            chrono::Utc::now() - chrono::TimeDelta::try_hours(i64::from(timeout_hours)).unwrap();
         let cutoff_iso = cutoff.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
 
         let mut stmt = self
@@ -621,8 +634,10 @@ impl SessionManager {
         Ok(rows.next().is_some())
     }
 
+    #[allow(dead_code)] // Library API
     pub fn cleanup_old_sessions(&self, max_age_days: u32) -> Result<usize> {
-        let cutoff = chrono::Utc::now() - chrono::Duration::days(i64::from(max_age_days));
+        let cutoff =
+            chrono::Utc::now() - chrono::TimeDelta::try_days(i64::from(max_age_days)).unwrap();
         let cutoff_iso = cutoff.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
 
         // Delete old approvals first (foreign key)

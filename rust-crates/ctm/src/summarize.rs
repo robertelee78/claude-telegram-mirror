@@ -5,16 +5,9 @@
 use std::collections::HashSet;
 use std::sync::LazyLock;
 
-// ------------------------------------------------------------------ helpers
+use crate::formatting::{short_path, truncate};
 
-/// Last 2 path components with `.../` prefix.
-pub fn short_path(file_path: &str) -> String {
-    let parts: Vec<&str> = file_path.split('/').filter(|s| !s.is_empty()).collect();
-    if parts.len() <= 2 {
-        return file_path.to_string();
-    }
-    format!(".../{}", parts[parts.len() - 2..].join("/"))
-}
+// ------------------------------------------------------------------ helpers
 
 /// Extract hostname from a URL, falling back to first 40 chars.
 fn short_url(url: &str) -> String {
@@ -28,13 +21,6 @@ fn short_url(url: &str) -> String {
         }
     }
     truncate(url, 40)
-}
-
-fn truncate(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
-        return s.to_string();
-    }
-    format!("{}...", &s[..max_len])
 }
 
 // -------------------------------------------------------- trivial / wrapper
@@ -1078,7 +1064,7 @@ mod tests {
     fn grep_truncates_long_pattern() {
         let long_pattern = "a".repeat(50);
         let result = summarize_tool_action("Grep", &json!({"pattern": long_pattern}));
-        assert_eq!(result, format!("Searching for '{}...'", &"a".repeat(30)));
+        assert_eq!(result, format!("Searching for '{}...'", &"a".repeat(27)));
     }
 
     #[test]
@@ -1106,7 +1092,7 @@ mod tests {
     fn websearch_truncates_long_query() {
         let long_query = "a".repeat(60);
         let result = summarize_tool_action("WebSearch", &json!({"query": long_query}));
-        assert_eq!(result, format!("Searching: {}...", &"a".repeat(40)));
+        assert_eq!(result, format!("Searching: {}...", &"a".repeat(37)));
     }
 
     #[test]

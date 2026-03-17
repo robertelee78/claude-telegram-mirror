@@ -21,7 +21,7 @@ const HOOK_TYPES: &[&str] = &[
 ];
 
 fn home_dir() -> PathBuf {
-    dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"))
+    crate::config::home_dir()
 }
 
 fn global_claude_dir() -> PathBuf {
@@ -178,12 +178,13 @@ impl std::fmt::Display for HookChangeStatus {
     }
 }
 
-#[allow(dead_code)]
+// Intentional: public API for library consumers
 pub struct HookChangeReport {
     pub hook_type: String,
     pub status: HookChangeStatus,
     /// Human-readable description of what changed (e.g. "added ctm hook",
     /// "updated from old path", "no changes").
+    #[allow(dead_code)] // Library API
     pub details: String,
 }
 
@@ -452,13 +453,15 @@ pub fn uninstall_hooks() -> anyhow::Result<()> {
 // ---------------------------------------------------------------------------
 
 /// Programmatic hook status report.
-#[allow(dead_code)]
+// Intentional: public API for library consumers
 pub struct HookStatus {
     /// Whether all expected hook types are installed.
+    #[allow(dead_code)] // Library API
     pub installed: bool,
     /// List of hook types that have a CTM hook installed.
     pub hook_types: Vec<String>,
     /// Any errors encountered while checking.
+    #[allow(dead_code)] // Library API
     pub errors: Vec<String>,
 }
 

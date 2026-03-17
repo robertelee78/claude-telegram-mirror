@@ -51,5 +51,8 @@ CLAUDE.md
 # npm
 npm-debug.log*
 
+# Compiled output (legacy TS build)
+dist/
+
 # Rust build artifacts
 rust-crates/target/

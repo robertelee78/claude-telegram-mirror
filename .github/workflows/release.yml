@@ -96,8 +96,45 @@ jobs:
           name: ctm-darwin-x64
           path: '*.tgz'
 
+  build-linux-arm64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust-crates
+
+      - name: Install cross-linker
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Build release binary
+        working-directory: rust-crates
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: |
+          cargo build --release --target aarch64-unknown-linux-gnu --bin ctm
+          aarch64-linux-gnu-strip target/aarch64-unknown-linux-gnu/release/ctm
+          ls -lh target/aarch64-unknown-linux-gnu/release/ctm
+
+      - name: Package binary
+        run: |
+          cp rust-crates/target/aarch64-unknown-linux-gnu/release/ctm npm-packages/ctm-linux-arm64/bin/ctm
+          chmod 755 npm-packages/ctm-linux-arm64/bin/ctm
+          cd npm-packages/ctm-linux-arm64
+          npm pack
+          mv *.tgz ../../
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ctm-linux-arm64
+          path: '*.tgz'
+
   publish:
-    needs: [build-linux-x64, build-darwin-arm64, build-darwin-x64]
+    needs: [build-linux-x64, build-linux-arm64, build-darwin-arm64, build-darwin-x64]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -115,7 +152,7 @@ jobs:
           echo "//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}" > ~/.npmrc
 
           # Publish platform packages first
-          for pkg in ctm-linux-x64 ctm-darwin-arm64 ctm-darwin-x64; do
+          for pkg in ctm-linux-x64 ctm-linux-arm64 ctm-darwin-arm64 ctm-darwin-x64; do
             tgz=$(find artifacts/$pkg -name "*.tgz" | head -1)
             if [ -n "$tgz" ]; then
               echo "Publishing $pkg..."
@@ -124,9 +161,10 @@ jobs:
           done
 
           # Wait for npm registry propagation
-          echo "Waiting for npm registry propagation..."
+          VERSION=$(node -p "require('./package.json').version")
+          echo "Waiting for npm registry propagation (v${VERSION})..."
           for i in $(seq 1 30); do
-            if npm view @agidreams/ctm-linux-x64@0.1.0 version 2>/dev/null; then
+            if npm view @agidreams/ctm-linux-x64@${VERSION} version 2>/dev/null; then
               echo "Package available on registry"
               break
             fi

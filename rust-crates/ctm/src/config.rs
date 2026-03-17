@@ -59,19 +59,23 @@ pub struct Config {
     pub chat_id: i64,
     pub enabled: bool,
     pub verbose: bool,
+    #[allow(dead_code)] // Library API
     pub approvals: bool,
     pub use_threads: bool,
     pub chunk_size: usize,
     pub rate_limit: u32,
     pub session_timeout: u32,
+    #[allow(dead_code)] // Library API
     pub stale_session_timeout_hours: u32,
     pub auto_delete_topics: bool,
     pub topic_delete_delay_minutes: u32,
     pub socket_path: PathBuf,
     pub config_dir: PathBuf,
     /// Resolved path to config.json (may not exist if config was provided via env vars only)
+    #[allow(dead_code)] // Library API
     pub config_path: PathBuf,
     /// Whether forum (topics) mode is enabled (default: false)
+    #[allow(dead_code)] // Library API
     pub forum_enabled: bool,
 }
 
@@ -119,6 +123,7 @@ struct ConfigFile {
 /// `TELEGRAM_MIRROR` is `"true"` or `"1"`, `TELEGRAM_BOT_TOKEN` is non-empty,
 /// and `TELEGRAM_CHAT_ID` is non-empty. This avoids loading config files for
 /// callers that just need a quick guard.
+#[allow(dead_code)] // Library API
 pub fn is_mirror_enabled() -> bool {
     std::env::var("TELEGRAM_MIRROR")
         .ok()
@@ -134,12 +139,14 @@ pub fn is_mirror_enabled() -> bool {
             .is_some()
 }
 
+/// Get the user's home directory, falling back to /tmp if unavailable.
+pub fn home_dir() -> PathBuf {
+    dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"))
+}
+
 /// Get the config directory path
 pub fn get_config_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join(".config")
-        .join("claude-telegram-mirror")
+    home_dir().join(".config").join("claude-telegram-mirror")
 }
 
 /// Ensure config directory exists with secure permissions (0o700)

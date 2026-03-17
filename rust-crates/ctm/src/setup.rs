@@ -9,30 +9,8 @@ use std::path::PathBuf;
 
 use dialoguer::{Confirm, Input, Select};
 
+use crate::colors::{bold, cyan, gray, green, red, yellow};
 use crate::config;
-
-// ---------------------------------------------------------------------------
-// Colors
-// ---------------------------------------------------------------------------
-
-fn cyan(s: &str) -> String {
-    format!("\x1b[36m{s}\x1b[0m")
-}
-fn green(s: &str) -> String {
-    format!("\x1b[32m{s}\x1b[0m")
-}
-fn yellow(s: &str) -> String {
-    format!("\x1b[33m{s}\x1b[0m")
-}
-fn red(s: &str) -> String {
-    format!("\x1b[31m{s}\x1b[0m")
-}
-fn gray(s: &str) -> String {
-    format!("\x1b[90m{s}\x1b[0m")
-}
-fn bold(s: &str) -> String {
-    format!("\x1b[1m{s}\x1b[0m")
-}
 
 fn separator() {
     println!("{}", gray(&"-".repeat(60)));
@@ -62,7 +40,7 @@ pub fn print_box(text: &str) {
 // ---------------------------------------------------------------------------
 
 fn home_dir() -> PathBuf {
-    dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"))
+    config::home_dir()
 }
 
 fn config_dir() -> PathBuf {

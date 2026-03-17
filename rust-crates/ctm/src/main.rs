@@ -1,29 +1,21 @@
 // Public API modules — some exports used in tests and future phases.
 use tokio::io::AsyncWriteExt;
 
-#[allow(dead_code)]
 mod bot;
-#[allow(dead_code)]
+mod colors;
 mod config;
 mod daemon;
 mod doctor;
-#[allow(dead_code)]
 mod error;
-#[allow(dead_code)]
 mod formatting;
 mod hook;
-#[allow(dead_code)]
 mod injector;
 mod installer;
 mod service;
-#[allow(dead_code)]
 mod session;
 mod setup;
-#[allow(dead_code)]
 mod socket;
-#[allow(dead_code)]
 mod summarize;
-#[allow(dead_code)]
 mod types;
 
 use clap::{Parser, Subcommand};
@@ -597,7 +589,7 @@ async fn cmd_toggle(force_on: bool, force_off: bool) -> anyhow::Result<()> {
     if cfg.socket_path.exists() {
         let cmd_str = if new_state { "enable" } else { "disable" };
         let msg = types::BridgeMessage {
-            msg_type: "command".to_string(),
+            msg_type: types::MessageType::Command,
             session_id: "_system".to_string(),
             timestamp: chrono::Utc::now().to_rfc3339(),
             content: cmd_str.to_string(),

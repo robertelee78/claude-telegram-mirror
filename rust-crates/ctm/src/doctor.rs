@@ -7,30 +7,8 @@ use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::PathBuf;
 use std::process::Command;
 
+use crate::colors::{bold, cyan, gray, green, red, yellow};
 use crate::config;
-
-// ---------------------------------------------------------------------------
-// Colors
-// ---------------------------------------------------------------------------
-
-fn green(s: &str) -> String {
-    format!("\x1b[32m{s}\x1b[0m")
-}
-fn yellow(s: &str) -> String {
-    format!("\x1b[33m{s}\x1b[0m")
-}
-fn red(s: &str) -> String {
-    format!("\x1b[31m{s}\x1b[0m")
-}
-fn cyan(s: &str) -> String {
-    format!("\x1b[36m{s}\x1b[0m")
-}
-fn gray(s: &str) -> String {
-    format!("\x1b[90m{s}\x1b[0m")
-}
-fn bold(s: &str) -> String {
-    format!("\x1b[1m{s}\x1b[0m")
-}
 
 // ---------------------------------------------------------------------------
 // Check result
@@ -140,7 +118,7 @@ fn print_result(result: &CheckResult) {
 // ---------------------------------------------------------------------------
 
 fn home_dir() -> PathBuf {
-    dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"))
+    config::home_dir()
 }
 
 fn config_dir() -> PathBuf {

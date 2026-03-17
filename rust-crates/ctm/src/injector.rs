@@ -224,6 +224,7 @@ impl InputInjector {
     }
 
     /// Check if tmux is available
+    #[allow(dead_code)] // Library API
     pub fn is_tmux_available() -> bool {
         Command::new("tmux")
             .arg("-V")
@@ -348,6 +349,7 @@ impl InputInjector {
 /// L3.4: Get the injection method name.
 impl InputInjector {
     /// Returns the injection method: "tmux" if a target is configured, "none" otherwise.
+    #[allow(dead_code)] // Library API
     pub fn get_method(&self) -> &str {
         if self.tmux_target.is_some() {
             "tmux"
@@ -357,11 +359,13 @@ impl InputInjector {
     }
 
     /// Returns the configured tmux session target, if any.
+    #[allow(dead_code)] // Library API
     pub fn get_tmux_session(&self) -> Option<&str> {
         self.tmux_target.as_deref()
     }
 
     /// Returns the configured tmux socket path, if any.
+    #[allow(dead_code)] // Library API
     pub fn get_tmux_socket(&self) -> Option<&str> {
         self.tmux_socket.as_deref()
     }
@@ -370,6 +374,7 @@ impl InputInjector {
 /// L3.5: Factory function that creates a fully-configured InputInjector.
 ///
 /// Detects the current tmux session automatically if tmux is available.
+#[allow(dead_code)] // Library API
 pub fn create_injector() -> InputInjector {
     let mut inj = InputInjector::new();
     if InputInjector::is_tmux_available() {
@@ -385,6 +390,7 @@ pub fn create_injector() -> InputInjector {
 /// DEPRECATED: With `Command::arg()` and `-l` flag, no escaping is needed.
 /// This function is retained for API compatibility with external callers.
 #[deprecated(note = "Not needed with Command::arg() + -l flag")]
+#[allow(dead_code)] // Library API (deprecated)
 pub fn escape_tmux_text(text: &str) -> String {
     text.replace('\\', "\\\\").replace('"', "\\\"")
 }
@@ -407,6 +413,7 @@ pub fn get_hostname() -> String {
 #[derive(Debug, Clone)]
 pub struct TmuxInfo {
     pub session: String,
+    #[allow(dead_code)] // Library API
     pub pane: String,
     pub target: String,
     pub socket: Option<String>,

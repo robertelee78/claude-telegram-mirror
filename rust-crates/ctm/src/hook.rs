@@ -1,7 +1,7 @@
 use crate::config;
 use crate::error::{AppError, Result};
 use crate::injector::{self, InputInjector};
-use crate::types::{self, BridgeMessage, HookEvent, MAX_LINE_BYTES, SAFE_COMMANDS};
+use crate::types::{self, BridgeMessage, HookEvent, MessageType, MAX_LINE_BYTES, SAFE_COMMANDS};
 use std::io::Read;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -173,13 +173,13 @@ fn now_iso() -> String {
 }
 
 fn make_message(
-    msg_type: &str,
+    msg_type: MessageType,
     session_id: &str,
     content: &str,
     metadata: serde_json::Map<String, serde_json::Value>,
 ) -> BridgeMessage {
     BridgeMessage {
-        msg_type: msg_type.to_string(),
+        msg_type,
         session_id: session_id.to_string(),
         timestamp: now_iso(),
         content: content.to_string(),
@@ -219,7 +219,7 @@ async fn build_messages(
     // REPLACE), so duplicates are harmless. This simplifies the hook (no state
     // tracking) at the cost of minor socket overhead.
     messages.push(make_message(
-        "session_start",
+        MessageType::SessionStart,
         session_id,
         "Claude Code session started",
         meta.clone(),
@@ -238,7 +238,7 @@ async fn build_messages(
                 tool_meta.insert("toolUseId".into(), serde_json::Value::String(id.clone()));
             }
             messages.push(make_message(
-                "tool_start",
+                MessageType::ToolStart,
                 session_id,
                 &e.tool_name,
                 tool_meta,
@@ -267,7 +267,12 @@ async fn build_messages(
                 if let Some(err) = &e.tool_error {
                     tool_meta.insert("error".into(), serde_json::Value::String(err.clone()));
                 }
-                messages.push(make_message("tool_result", session_id, output, tool_meta));
+                messages.push(make_message(
+                    MessageType::ToolResult,
+                    session_id,
+                    output,
+                    tool_meta,
+                ));
             }
         }
         HookEvent::Notification(e) => {
@@ -276,9 +281,9 @@ async fn build_messages(
                 return messages;
             }
             let msg_type = if e.level.as_deref() == Some("error") {
-                "error"
+                MessageType::Error
             } else {
-                "agent_response"
+                MessageType::AgentResponse
             };
             messages.push(make_message(msg_type, session_id, &e.message, meta));
         }
@@ -286,7 +291,7 @@ async fn build_messages(
             let mut prompt_meta = meta.clone();
             prompt_meta.insert("source".into(), serde_json::Value::String("cli".into()));
             messages.push(make_message(
-                "user_input",
+                MessageType::UserInput,
                 session_id,
                 &e.prompt,
                 prompt_meta,
@@ -308,7 +313,7 @@ async fn build_messages(
 
             if let Some(text) = summary_text {
                 messages.push(make_message(
-                    "agent_response",
+                    MessageType::AgentResponse,
                     session_id,
                     &text,
                     meta.clone(),
@@ -318,7 +323,7 @@ async fn build_messages(
                 if let Some(text) = extract_transcript_text(path, session_id, &cfg.config_dir) {
                     if !text.is_empty() {
                         messages.push(make_message(
-                            "agent_response",
+                            MessageType::AgentResponse,
                             session_id,
                             &text,
                             meta.clone(),
@@ -331,7 +336,7 @@ async fn build_messages(
             if let Some(path) = transcript_path {
                 if let Some(title) = check_custom_title(path) {
                     messages.push(make_message(
-                        "session_rename",
+                        MessageType::SessionRename,
                         session_id,
                         &title,
                         meta.clone(),
@@ -340,17 +345,22 @@ async fn build_messages(
             }
 
             // Send turn_complete
-            messages.push(make_message("turn_complete", session_id, "", meta.clone()));
+            messages.push(make_message(
+                MessageType::TurnComplete,
+                session_id,
+                "",
+                meta.clone(),
+            ));
 
             // H2.1: Send session_end after turn_complete for wire protocol consumers.
             // External socket consumers expect a session_end message on Stop events.
-            messages.push(make_message("session_end", session_id, "", meta));
+            messages.push(make_message(MessageType::SessionEnd, session_id, "", meta));
         }
         HookEvent::SubagentStop(_) => {
             // Recognized but no message sent
         }
         HookEvent::PreCompact(_) => {
-            messages.push(make_message("pre_compact", session_id, "", meta));
+            messages.push(make_message(MessageType::PreCompact, session_id, "", meta));
         }
     }
 
@@ -405,7 +415,12 @@ async fn get_hook_output(
     }
 
     let prompt = format_tool_approval_prompt(&pre_tool.tool_name, &pre_tool.tool_input);
-    let msg = make_message("approval_request", session_id, &prompt, approval_meta);
+    let msg = make_message(
+        MessageType::ApprovalRequest,
+        session_id,
+        &prompt,
+        approval_meta,
+    );
 
     // L20: Probe the socket first so we can distinguish "daemon not running"
     // (connection refused / no socket) from a real timeout (approval expired).
@@ -710,7 +725,7 @@ async fn send_and_wait(
             }
 
             if let Ok(msg) = serde_json::from_str::<BridgeMessage>(line.trim()) {
-                if msg.session_id == *session_id && msg.msg_type == "approval_response" {
+                if msg.session_id == *session_id && msg.msg_type == MessageType::ApprovalResponse {
                     return Ok(msg);
                 }
             }

@@ -5,6 +5,7 @@
 //! module, e.g. `use ctm::session::SessionManager`.
 
 pub mod bot;
+pub mod colors;
 pub mod config;
 pub mod daemon;
 pub mod doctor;

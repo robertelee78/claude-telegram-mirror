@@ -339,34 +339,37 @@ For developers who want to work on the source code:
 ```bash
 # 1. Clone and build
 git clone https://github.com/robertelee78/claude-telegram-mirror.git
-cd claude-telegram-mirror && npm install && npm run build
+cd claude-telegram-mirror/rust-crates && cargo build --release
+# Binary at: rust-crates/target/release/ctm
 
-# 2. Create a Telegram bot via @BotFather, get the token
+# 2. Run tests
+cargo test
 
-# 3. Create a supergroup with Topics enabled, add your bot as admin
+# 3. Create a Telegram bot via @BotFather, get the token
 
-# 4. Get your chat ID
+# 4. Create a supergroup with Topics enabled, add your bot as admin
+
+# 5. Get your chat ID
 ./scripts/get-chat-id.sh YOUR_BOT_TOKEN
 
-# 5. Configure environment
+# 6. Configure environment
 cat > ~/.telegram-env << 'EOF'
 export TELEGRAM_BOT_TOKEN="your-token-here"
 export TELEGRAM_CHAT_ID="-100your-chat-id"
 export TELEGRAM_MIRROR=true
 EOF
 
-# 6. Install hooks
-node dist/cli.js install-hooks                    # Global install
+# 7. Install hooks
+ctm install-hooks                                 # Global install
 # OR for projects with custom .claude/settings.json:
-cd /path/to/project && node dist/cli.js install-hooks --project
+cd /path/to/project && ctm install-hooks --project
 
-# 7. Start daemon (choose one)
-node dist/cli.js start                            # Foreground (for testing)
-node dist/cli.js service install && \
-node dist/cli.js service start                    # As system service (recommended)
+# 8. Start daemon (choose one)
+ctm start                                         # Foreground (for testing)
+ctm service install && ctm service start           # As system service (recommended)
 ```
 
-**Note:** When using npm install, use `ctm` instead of `node dist/cli.js`.
+**Note:** When installed via `npm install -g`, the `ctm` command is available globally.
 
 </details>
 

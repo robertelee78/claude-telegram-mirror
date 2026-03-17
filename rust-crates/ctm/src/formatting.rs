@@ -7,6 +7,7 @@ use std::sync::LazyLock;
 
 /// Default maximum message length for Telegram (characters).
 /// Telegram's hard limit is 4096 but we use 4000 to leave room for part headers.
+#[allow(dead_code)] // Library API
 pub const DEFAULT_MAX_LENGTH: usize = 4000;
 
 // ------------------------------------------------------------------- ANSI
@@ -21,6 +22,7 @@ pub fn strip_ansi(text: &str) -> String {
 // ------------------------------------------------------------- MarkdownV2
 
 /// Characters that must be escaped outside code blocks.
+#[allow(dead_code)] // Used by escape_markdown_v2 (Library API)
 const MD_SPECIAL: &[char] = &[
     '_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!', '\\',
 ];
@@ -28,6 +30,7 @@ const MD_SPECIAL: &[char] = &[
 /// Escape MarkdownV2 special characters **outside** code blocks.
 ///
 /// Code blocks (triple-backtick and single-backtick) are left untouched.
+#[allow(dead_code)] // Library API
 pub fn escape_markdown_v2(text: &str) -> String {
     // Split on code blocks: ```...``` or `...`
     // Regex captures code spans so they appear at odd indices.
@@ -52,6 +55,7 @@ pub fn escape_markdown_v2(text: &str) -> String {
     result
 }
 
+#[allow(dead_code)] // Used by escape_markdown_v2
 fn escape_plain(text: &str, out: &mut String) {
     for ch in text.chars() {
         if MD_SPECIAL.contains(&ch) {
@@ -126,6 +130,7 @@ pub fn format_session_end(session_id: &str, duration_ms: Option<u64>) -> String 
     msg
 }
 
+#[allow(dead_code)] // Library API
 pub fn format_status(is_active: bool, session_id: Option<&str>, muted: Option<bool>) -> String {
     if !is_active {
         return "\u{1F4CA} *Status*\n\nNo active session attached.".to_string();
@@ -307,6 +312,7 @@ fn json_str<'a>(v: &'a serde_json::Value, key: &str) -> &'a str {
 // --------------------------------------------------- language detection
 
 /// Heuristic code-language detection.
+#[allow(dead_code)] // Library API
 pub fn detect_language(content: &str) -> &'static str {
     let trimmed = content.trim();
     type LangCheck = (&'static str, fn(&str) -> bool);
@@ -365,6 +371,7 @@ pub fn detect_language(content: &str) -> &'static str {
     ""
 }
 
+#[allow(dead_code)] // Library API
 pub fn wrap_in_code_block(content: &str, language: Option<&str>) -> String {
     let lang = language.unwrap_or_else(|| detect_language(content));
     format!("```{lang}\n{content}\n```")
@@ -383,6 +390,7 @@ pub fn truncate(text: &str, max_len: usize) -> String {
 }
 
 /// Estimate the number of chunks needed to fit `text` within `max_length`.
+#[allow(dead_code)] // Library API
 pub fn estimate_chunks(text: &str, max_length: usize) -> usize {
     if text.len() <= max_length {
         1
@@ -392,6 +400,7 @@ pub fn estimate_chunks(text: &str, max_length: usize) -> usize {
 }
 
 /// Returns `true` if `text` exceeds `max_length` and will need chunking.
+#[allow(dead_code)] // Library API
 pub fn needs_chunking(text: &str, max_length: usize) -> bool {
     text.len() > max_length
 }
@@ -494,6 +503,7 @@ pub fn chunk_message(text: &str, max_length: usize) -> Vec<String> {
 ///
 /// Combines `strip_ansi` and `chunk_message` in a single convenient call.
 /// Uses `DEFAULT_MAX_LENGTH` when `max_length` is `None`.
+#[allow(dead_code)] // Library API
 pub fn format_and_chunk(content: &str, max_length: Option<usize>) -> Vec<String> {
     let cleaned = strip_ansi(content);
     chunk_message(&cleaned, max_length.unwrap_or(DEFAULT_MAX_LENGTH))

@@ -26,6 +26,7 @@ pub struct HookEventBase {
     #[serde(default)]
     pub hook_id: Option<String>,
     #[serde(default)]
+    #[allow(dead_code)] // Deserialized from JSON
     pub timestamp: Option<String>,
 }
 
@@ -34,6 +35,7 @@ pub struct StopEvent {
     #[serde(flatten)]
     pub base: HookEventBase,
     #[serde(default)]
+    #[allow(dead_code)] // Deserialized from JSON
     pub stop_hook_active: bool,
     #[serde(default)]
     pub transcript_summary: Option<String>,
@@ -50,10 +52,12 @@ pub struct SubagentStopEvent {
     /// intentional relaxation for robustness — missing values deserialize as `None`
     /// instead of causing a parse failure.
     #[serde(default)]
+    #[allow(dead_code)] // Deserialized from JSON
     pub subagent_id: Option<String>,
     /// L6.2: Optional result text from the subagent, mirroring the TS type's
     /// `result?: string` field.
     #[serde(default)]
+    #[allow(dead_code)] // Deserialized from JSON
     pub result: Option<String>,
 }
 
@@ -114,7 +118,7 @@ pub struct PreCompactEvent {
 }
 
 /// Message types sent to the bridge daemon via Unix socket (NDJSON)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageType {
     AgentResponse,
@@ -131,6 +135,31 @@ pub enum MessageType {
     PreCompact,
     SessionRename,
     SendImage,
+    /// Forward-compatible catch-all for unknown message types.
+    #[serde(other)]
+    Unknown,
+}
+
+impl std::fmt::Display for MessageType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AgentResponse => write!(f, "agent_response"),
+            Self::ToolStart => write!(f, "tool_start"),
+            Self::ToolResult => write!(f, "tool_result"),
+            Self::ApprovalRequest => write!(f, "approval_request"),
+            Self::UserInput => write!(f, "user_input"),
+            Self::ApprovalResponse => write!(f, "approval_response"),
+            Self::Command => write!(f, "command"),
+            Self::Error => write!(f, "error"),
+            Self::SessionStart => write!(f, "session_start"),
+            Self::SessionEnd => write!(f, "session_end"),
+            Self::TurnComplete => write!(f, "turn_complete"),
+            Self::PreCompact => write!(f, "pre_compact"),
+            Self::SessionRename => write!(f, "session_rename"),
+            Self::SendImage => write!(f, "send_image"),
+            Self::Unknown => write!(f, "unknown"),
+        }
+    }
 }
 
 /// Bridge message sent over the Unix domain socket
@@ -138,7 +167,7 @@ pub enum MessageType {
 #[serde(rename_all = "camelCase")]
 pub struct BridgeMessage {
     #[serde(rename = "type")]
-    pub msg_type: String,
+    pub msg_type: MessageType,
     pub session_id: String,
     pub timestamp: String,
     #[serde(default)]
@@ -149,6 +178,7 @@ pub struct BridgeMessage {
 
 /// Information about a connected socket client (mirrors TS `SocketClientInfo`).
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // Library API
 pub struct SocketClientInfo {
     /// Unique client identifier (assigned on connect).
     pub id: String,
@@ -166,6 +196,7 @@ pub struct SocketClientInfo {
 ///
 /// Represents the decision made by a hook (e.g. PreToolUse approval).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)] // Library API
 pub struct HookResult {
     /// The permission decision: "allow", "deny", or "ask".
     ///
@@ -256,5 +287,40 @@ mod tests {
         assert!(!is_valid_slash_command("/cmd|pipe"));
         assert!(!is_valid_slash_command("/cmd>file"));
         assert!(!is_valid_slash_command("/cmd&&other"));
+    }
+
+    #[test]
+    fn test_message_type_serde_roundtrip() {
+        // Known variants round-trip correctly
+        let mt = MessageType::AgentResponse;
+        let json = serde_json::to_value(&mt).unwrap();
+        assert_eq!(json, serde_json::Value::String("agent_response".into()));
+        let parsed: MessageType = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed, MessageType::AgentResponse);
+    }
+
+    #[test]
+    fn test_message_type_unknown_variant() {
+        // Unknown string deserializes to Unknown (forward compat)
+        let parsed: MessageType =
+            serde_json::from_value(serde_json::Value::String("future_type".into())).unwrap();
+        assert_eq!(parsed, MessageType::Unknown);
+    }
+
+    #[test]
+    fn test_bridge_message_type_field_rename() {
+        // BridgeMessage.msg_type serializes as "type" in JSON
+        let msg = BridgeMessage {
+            msg_type: MessageType::Command,
+            session_id: "s1".into(),
+            timestamp: "2024-01-01T00:00:00Z".into(),
+            content: "test".into(),
+            metadata: None,
+        };
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json.get("type").and_then(|v| v.as_str()), Some("command"),);
+        // Round-trip
+        let parsed: BridgeMessage = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.msg_type, MessageType::Command);
     }
 }

@@ -1,4 +1,3 @@
-#[allow(dead_code)]
 /// Application error types for CTM.
 ///
 /// Every error variant has a clear source and context.
@@ -18,9 +17,11 @@ pub enum AppError {
     Socket(String),
 
     #[error("Injection error: {0}")]
+    #[allow(dead_code)] // Library API
     Injection(String),
 
     #[error("Hook error: {0}")]
+    #[allow(dead_code)] // Library API
     Hook(String),
 
     #[error("Database error: {0}")]

@@ -33,11 +33,13 @@ const MAX_CONNECTIONS: usize = 64;
 const MAX_LINE_BYTES: usize = 1_048_576;
 
 /// Default socket path: `~/.config/claude-telegram-mirror/bridge.sock`.
+#[allow(dead_code)] // Library API
 pub fn default_socket_path() -> std::path::PathBuf {
     config::get_config_dir().join("bridge.sock")
 }
 
 /// Directory containing the socket file.
+#[allow(dead_code)] // Library API
 pub fn socket_dir() -> std::path::PathBuf {
     config::get_config_dir()
 }
@@ -47,6 +49,7 @@ pub fn socket_dir() -> std::path::PathBuf {
 /// Uses `kill(pid, 0)` which checks for process existence without sending a
 /// signal.  Returns `false` if the process does not exist.  Returns `true` if
 /// the process exists (even if we lack permission to signal it -- EPERM).
+#[allow(dead_code)] // Library API
 pub fn is_pid_running(pid: u32) -> bool {
     use nix::sys::signal::kill;
     use nix::unistd::Pid;
@@ -66,6 +69,7 @@ pub fn is_pid_running(pid: u32) -> bool {
 /// - `"none"` if the file does not exist.
 /// - `"active"` if a connection to the socket succeeds (daemon is running).
 /// - `"stale"` if the file exists but the connection is refused (orphaned socket).
+#[allow(dead_code)] // Library API
 pub fn check_socket_status(socket_path: &std::path::Path) -> &'static str {
     if !socket_path.exists() {
         return "none";
@@ -108,6 +112,7 @@ impl SocketServer {
     }
 
     /// Number of currently connected clients.
+    #[allow(dead_code)] // Library API
     pub async fn client_count(&self) -> usize {
         self.clients.lock().await.len()
     }
@@ -212,6 +217,7 @@ impl SocketServer {
     }
 
     /// Send an NDJSON message to a specific client.
+    #[allow(dead_code)] // Library API
     pub async fn send(&self, client_id: &str, message: &BridgeMessage) -> Result<bool> {
         let clients = self.clients.lock().await;
         if let Some(writer) = clients.get(client_id) {
@@ -225,6 +231,7 @@ impl SocketServer {
     }
 
     /// Broadcast to all connected clients.
+    #[allow(dead_code)] // Library API
     pub async fn broadcast(&self, message: &BridgeMessage) -> Result<()> {
         let json = serde_json::to_string(message)?;
         let line = format!("{json}\n");
@@ -315,8 +322,6 @@ async fn handle_client(
 /// If the file is already locked, another daemon owns it.
 fn acquire_flock(pid_path: &Path) -> Result<Flock<OwnedFd>> {
     use std::fs::OpenOptions;
-    use std::os::fd::FromRawFd;
-    use std::os::fd::IntoRawFd;
 
     let file = OpenOptions::new()
         .create(true)
@@ -325,10 +330,8 @@ fn acquire_flock(pid_path: &Path) -> Result<Flock<OwnedFd>> {
         .open(pid_path)
         .map_err(|e| AppError::Lock(format!("Cannot open PID file: {e}")))?;
 
-    // Convert File -> OwnedFd
-    let raw_fd = file.into_raw_fd();
-    // SAFETY: we just obtained this fd from a valid File.
-    let owned_fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+    // Convert File -> OwnedFd via the safe From impl (File implements Into<OwnedFd>)
+    let owned_fd: OwnedFd = file.into();
 
     Flock::lock(owned_fd, nix::fcntl::FlockArg::LockExclusiveNonblock).map_err(|(_fd, errno)| {
         AppError::Lock(format!("Another daemon instance holds the lock: {errno}"))
@@ -343,6 +346,7 @@ fn acquire_flock(pid_path: &Path) -> Result<Flock<OwnedFd>> {
 /// a reconnectTimer for automatic reconnection, but the Rust hook process is
 /// short-lived (exits after processing one event), so reconnection is
 /// unnecessary. Long-lived consumers should implement retry logic externally.
+#[allow(dead_code)] // Library API
 pub struct SocketClient {
     stream: Option<UnixStream>,
 }
@@ -353,6 +357,7 @@ impl Default for SocketClient {
     }
 }
 
+#[allow(dead_code)] // Library API
 impl SocketClient {
     pub fn new() -> Self {
         Self { stream: None }
@@ -493,7 +498,7 @@ mod tests {
         let mut client = SocketClient::new();
         client.connect(&sock).await.unwrap();
         let msg = BridgeMessage {
-            msg_type: "test".to_string(),
+            msg_type: crate::types::MessageType::Unknown,
             session_id: "s1".to_string(),
             timestamp: "2024-01-01T00:00:00.000Z".to_string(),
             content: "hello".to_string(),
