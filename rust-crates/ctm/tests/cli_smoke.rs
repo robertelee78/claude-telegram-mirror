@@ -43,10 +43,13 @@ fn version_exits_zero_and_contains_version() {
     );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    // The version string from Cargo.toml is "0.2.1"
+    // Verify output contains a semver version (e.g. "0.2.4"), not a specific value.
+    let has_version = stdout
+        .split_whitespace()
+        .any(|w| w.split('.').count() == 3 && w.chars().all(|c| c.is_ascii_digit() || c == '.'));
     assert!(
-        stdout.contains("0.2.1"),
-        "stdout should contain version '0.2.1', got: {}",
+        has_version,
+        "stdout should contain a semver version, got: {}",
         stdout
     );
 }

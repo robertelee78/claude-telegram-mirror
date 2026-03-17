@@ -642,7 +642,7 @@ async fn handle_submit_callback(ctx: &HandlerContext, data: &str, cb: &CallbackQ
 /// After all AskUserQuestion answers are collected, Claude Code shows a
 /// "Review your answers" confirmation screen with numbered options:
 ///   > 1. Submit answers
-///     2. Cancel
+///   > 2. Cancel
 ///
 /// This helper waits briefly for Claude Code to render the review screen,
 /// then injects "1" to auto-select "Submit answers" so the user doesn't
