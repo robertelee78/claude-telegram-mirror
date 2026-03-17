@@ -574,6 +574,106 @@ impl TelegramBot {
         Ok(())
     }
 
+    /// Edit a message's inline keyboard (reply markup).
+    pub async fn edit_message_reply_markup(
+        &self,
+        message_id: i64,
+        buttons: &[InlineButton],
+    ) -> Result<()> {
+        let keyboard = build_inline_keyboard(buttons);
+        let _: TgResponse<TgMessage> = self
+            .api_call(
+                "editMessageReplyMarkup",
+                &serde_json::json!({
+                    "chat_id": self.chat_id,
+                    "message_id": message_id,
+                    "reply_markup": keyboard,
+                }),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Edit a message's text and remove keyboard (for "Selected" / "Submitted" feedback).
+    pub async fn edit_message_text_no_markup(
+        &self,
+        message_id: i64,
+        text: &str,
+        thread_id: Option<i64>,
+    ) -> Result<()> {
+        let mut body = serde_json::json!({
+            "chat_id": self.chat_id,
+            "message_id": message_id,
+            "text": text,
+        });
+        if let Some(tid) = thread_id {
+            body["message_thread_id"] = serde_json::Value::Number(tid.into());
+        }
+        let _: TgResponse<TgMessage> = self.api_call("editMessageText", &body).await?;
+        Ok(())
+    }
+
+    /// Send a message and return the sent message (for ping latency measurement).
+    pub async fn send_message_returning(
+        &self,
+        text: &str,
+        options: Option<&SendOptions>,
+        thread_id: Option<i64>,
+    ) -> Result<TgMessage> {
+        let parse_mode = options
+            .and_then(|o| o.parse_mode.clone())
+            .or_else(|| Some("Markdown".into()));
+
+        let mut body = serde_json::json!({
+            "chat_id": self.chat_id,
+            "text": text,
+        });
+        if let Some(pm) = parse_mode {
+            body["parse_mode"] = serde_json::Value::String(pm);
+        }
+        if let Some(tid) = thread_id {
+            body["message_thread_id"] = serde_json::Value::Number(tid.into());
+        }
+
+        let resp: TgResponse<TgMessage> = self.api_call("sendMessage", &body).await?;
+        resp.result.ok_or_else(|| {
+            AppError::Telegram(
+                resp.description
+                    .unwrap_or_else(|| "sendMessage failed".into()),
+            )
+        })
+    }
+
+    /// Send a message as a reply to another message.
+    pub async fn send_message_reply_to(
+        &self,
+        text: &str,
+        reply_to_message_id: i64,
+        options: Option<&SendOptions>,
+        thread_id: Option<i64>,
+    ) -> Result<()> {
+        let parse_mode = options
+            .and_then(|o| o.parse_mode.clone())
+            .or_else(|| Some("Markdown".into()));
+
+        let mut body = serde_json::json!({
+            "chat_id": self.chat_id,
+            "text": text,
+            "reply_parameters": {
+                "message_id": reply_to_message_id,
+            },
+        });
+        if let Some(pm) = parse_mode {
+            body["parse_mode"] = serde_json::Value::String(pm);
+        }
+        if let Some(tid) = thread_id {
+            body["message_thread_id"] = serde_json::Value::Number(tid.into());
+        }
+
+        let _: TgResponse<TgMessage> = self.api_call("sendMessage", &body).await?;
+        Ok(())
+    }
+
     // -------------------------------------------------------- file download
 
     /// Download a file from Telegram to a local path.
@@ -670,17 +770,26 @@ impl TelegramBot {
 // ---------------------------------------------------------------- helpers
 
 /// Build an inline keyboard JSON structure from our button list.
+/// Layout: two buttons per row, matching TypeScript's `if (idx + 1) % 2 === 0 keyboard.row()`.
 fn build_inline_keyboard(buttons: &[InlineButton]) -> serde_json::Value {
-    // Layout: one button per row for mobile readability
-    let rows: Vec<serde_json::Value> = buttons
-        .iter()
-        .map(|btn| {
-            serde_json::json!([{
-                "text": btn.text,
-                "callback_data": btn.callback_data,
-            }])
-        })
-        .collect();
+    let mut rows: Vec<serde_json::Value> = Vec::new();
+    let mut current_row: Vec<serde_json::Value> = Vec::new();
+
+    for (idx, btn) in buttons.iter().enumerate() {
+        current_row.push(serde_json::json!({
+            "text": btn.text,
+            "callback_data": btn.callback_data,
+        }));
+        // Start a new row after every 2nd button
+        if (idx + 1) % 2 == 0 {
+            rows.push(serde_json::Value::Array(current_row));
+            current_row = Vec::new();
+        }
+    }
+    // Flush any remaining button(s) in the last row
+    if !current_row.is_empty() {
+        rows.push(serde_json::Value::Array(current_row));
+    }
 
     serde_json::json!({"inline_keyboard": rows})
 }
@@ -755,7 +864,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_inline_keyboard() {
+    fn test_build_inline_keyboard_two_per_row() {
         let buttons = vec![
             InlineButton {
                 text: "Approve".into(),
@@ -768,7 +877,33 @@ mod tests {
         ];
         let kb = build_inline_keyboard(&buttons);
         let rows = kb["inline_keyboard"].as_array().unwrap();
+        // Two buttons should be in a single row
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_build_inline_keyboard_three_buttons() {
+        let buttons = vec![
+            InlineButton {
+                text: "A".into(),
+                callback_data: "a".into(),
+            },
+            InlineButton {
+                text: "B".into(),
+                callback_data: "b".into(),
+            },
+            InlineButton {
+                text: "C".into(),
+                callback_data: "c".into(),
+            },
+        ];
+        let kb = build_inline_keyboard(&buttons);
+        let rows = kb["inline_keyboard"].as_array().unwrap();
+        // First row has 2 buttons, second row has 1
         assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].as_array().unwrap().len(), 2);
+        assert_eq!(rows[1].as_array().unwrap().len(), 1);
     }
 
     #[test]

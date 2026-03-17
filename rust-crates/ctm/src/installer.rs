@@ -112,6 +112,20 @@ fn create_hook_entry(command: &str) -> Value {
     })
 }
 
+/// Create a hook entry with a custom timeout (for PreToolUse approval workflow).
+fn create_hook_entry_with_timeout(command: &str, timeout: u32) -> Value {
+    serde_json::json!({
+        "matcher": "",
+        "hooks": [
+            {
+                "type": "command",
+                "command": command,
+                "timeout": timeout
+            }
+        ]
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Change reporting
 // ---------------------------------------------------------------------------
@@ -208,7 +222,12 @@ fn install_hooks_to_path(
     }
 
     for &hook_type in HOOK_TYPES {
-        let expected = create_hook_entry(&command);
+        // PreToolUse needs timeout: 310 for approval workflow (5 min + 10s buffer)
+        let expected = if hook_type == "PreToolUse" {
+            create_hook_entry_with_timeout(&command, 310)
+        } else {
+            create_hook_entry(&command)
+        };
         let existing = settings["hooks"].get(hook_type);
 
         let status = determine_change_status(existing, &expected);

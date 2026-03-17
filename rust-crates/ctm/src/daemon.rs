@@ -165,6 +165,29 @@ impl Daemon {
             }
         }
 
+        // H9: Auto-detect tmux session at startup
+        {
+            let mut inj = self.injector.lock().await;
+            if let Some(info) = InputInjector::detect_tmux_session() {
+                inj.set_target(&info.target, info.socket.as_deref());
+                tracing::info!(
+                    target = %info.target,
+                    session = %info.session,
+                    "Input injector auto-detected tmux session at startup"
+                );
+            } else if let Some(session) = InputInjector::find_claude_code_session() {
+                inj.set_target(&session, None);
+                tracing::info!(
+                    target = %session,
+                    "Input injector found Claude Code tmux session at startup"
+                );
+            } else {
+                tracing::info!(
+                    "No tmux session detected at startup — will use per-session targets"
+                );
+            }
+        }
+
         // Send startup notification
         self.bot
             .send_message(
@@ -1267,9 +1290,8 @@ fn check_for_session_rename(
         if let Ok(record) = serde_json::from_str::<serde_json::Value>(line) {
             if record.get("type").and_then(|t| t.as_str()) == Some("custom-title") {
                 if let Some(title) = record.get("customTitle").and_then(|t| t.as_str()) {
-                    // Note: We can't easily do async check here, so we skip dedup
-                    // The daemon will handle dedup at the caller level
-                    let _ = session_id; // used in TS for dedup
+                    // Dedup is handled by handle_session_rename (H8)
+                    let _ = session_id;
                     let _ = custom_titles;
                     return Some(title.to_string());
                 }
@@ -1280,7 +1302,26 @@ fn check_for_session_rename(
 }
 
 /// Handle session rename: update Telegram forum topic name.
+/// H8: Skip editForumTopic when title is unchanged (dedup).
 async fn handle_session_rename(ctx: &HandlerContext, session_id: &str, custom_title: &str) {
+    // H8: Dedup — skip if title is the same as last known
+    {
+        let titles = ctx.custom_titles.read().await;
+        if titles.get(session_id).map(|s| s.as_str()) == Some(custom_title) {
+            tracing::debug!(
+                session_id,
+                custom_title,
+                "Skipping rename (title unchanged)"
+            );
+            return;
+        }
+    }
+    // Update the cached title
+    ctx.custom_titles
+        .write()
+        .await
+        .insert(session_id.to_string(), custom_title.to_string());
+
     let thread_id = match ctx.get_thread_id(session_id).await {
         Some(tid) => tid,
         None => return,
@@ -1923,6 +1964,19 @@ async fn handle_bot_command(ctx: &HandlerContext, msg: &TgMessage, text: &str) {
                 let mut text = "\u{1F4CB} *Active Sessions:*\n\n".to_string();
                 for (idx, s) in sessions.iter().enumerate() {
                     text.push_str(&format!("{}. `{}`\n", idx + 1, s.id));
+                    // M6: Show session age
+                    if let Ok(started) = chrono::DateTime::parse_from_rfc3339(&s.started_at) {
+                        let age_mins = (chrono::Utc::now() - started.to_utc()).num_minutes().max(0);
+                        if age_mins >= 60 {
+                            text.push_str(&format!(
+                                "   Started: {}h {}m ago\n",
+                                age_mins / 60,
+                                age_mins % 60
+                            ));
+                        } else {
+                            text.push_str(&format!("   Started: {}m ago\n", age_mins));
+                        }
+                    }
                     if let Some(pd) = &s.project_dir {
                         text.push_str(&format!("   Project: `{pd}`\n"));
                     }
@@ -1934,14 +1988,28 @@ async fn handle_bot_command(ctx: &HandlerContext, msg: &TgMessage, text: &str) {
             }
         }
         "/ping" => {
+            // M5: Measure actual round-trip by sending then editing
             let start = std::time::Instant::now();
-            ctx.bot
-                .send_message(
-                    &format!("\u{1F3D3} Pong! _{}ms_", start.elapsed().as_millis()),
-                    Some(&opts),
-                    msg.message_thread_id,
-                )
-                .await;
+            match ctx
+                .bot
+                .send_message_returning("\u{1F3D3} Pong!", Some(&opts), msg.message_thread_id)
+                .await
+            {
+                Ok(sent) => {
+                    let latency = start.elapsed().as_millis();
+                    let _ = ctx
+                        .bot
+                        .edit_message(
+                            sent.message_id,
+                            &format!("\u{1F3D3} Pong! _{}ms_", latency),
+                            msg.message_thread_id,
+                        )
+                        .await;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Ping send failed");
+                }
+            }
         }
         "/rename" => {
             let thread_id = match msg.message_thread_id {
@@ -2235,11 +2303,11 @@ async fn handle_callback_query(ctx: &HandlerContext, cb: &CallbackQuery) {
     }
     // AskUserQuestion callbacks
     else if data.starts_with("answer:") {
-        handle_answer_callback(ctx, data).await;
+        handle_answer_callback(ctx, data, cb).await;
     } else if data.starts_with("toggle:") {
         handle_toggle_callback(ctx, data, cb).await;
     } else if data.starts_with("submit:") {
-        handle_submit_callback(ctx, data).await;
+        handle_submit_callback(ctx, data, cb).await;
     }
 }
 
@@ -2391,6 +2459,7 @@ async fn handle_approval_callback(
 }
 
 /// Handle tool details callback.
+/// M4: Send details as a reply to the original message.
 async fn handle_tool_details_callback(ctx: &HandlerContext, tool_use_id: &str, cb: &CallbackQuery) {
     let cached = {
         let cache = ctx.tool_cache.read().await;
@@ -2403,17 +2472,34 @@ async fn handle_tool_details_callback(ctx: &HandlerContext, tool_use_id: &str, c
         Some((tool, input)) => {
             let details = format_tool_details(&tool, &input);
             let thread_id = cb.message.as_ref().and_then(|m| m.message_thread_id);
+            let reply_to = cb.message.as_ref().map(|m| m.message_id);
 
-            ctx.bot
-                .send_message(
-                    &details,
-                    Some(&SendOptions {
-                        parse_mode: Some("Markdown".into()),
-                        ..Default::default()
-                    }),
-                    thread_id,
-                )
-                .await;
+            // M4: Reply to the original message instead of standalone
+            if let Some(reply_to_id) = reply_to {
+                let _ = ctx
+                    .bot
+                    .send_message_reply_to(
+                        &details,
+                        reply_to_id,
+                        Some(&SendOptions {
+                            parse_mode: Some("Markdown".into()),
+                            ..Default::default()
+                        }),
+                        thread_id,
+                    )
+                    .await;
+            } else {
+                ctx.bot
+                    .send_message(
+                        &details,
+                        Some(&SendOptions {
+                            parse_mode: Some("Markdown".into()),
+                            ..Default::default()
+                        }),
+                        thread_id,
+                    )
+                    .await;
+            }
         }
         None => {
             let _ = ctx
@@ -2425,7 +2511,7 @@ async fn handle_tool_details_callback(ctx: &HandlerContext, tool_use_id: &str, c
 }
 
 /// Handle single-select answer callback.
-async fn handle_answer_callback(ctx: &HandlerContext, data: &str) {
+async fn handle_answer_callback(ctx: &HandlerContext, data: &str, cb: &CallbackQuery) {
     // Format: answer:{sessionId}:{questionIndex}:{optionIndex}
     let parts: Vec<&str> = data.splitn(4, ':').collect();
     if parts.len() != 4 {
@@ -2476,6 +2562,25 @@ async fn handle_answer_callback(ctx: &HandlerContext, data: &str) {
         let _ = inj.inject(&answer_text);
     }
 
+    // M1: Edit message to show "Selected" and remove keyboard
+    if let Some(msg) = &cb.message {
+        let original_text = msg.text.as_deref().unwrap_or("");
+        let updated = format!("{original_text}\n\n\u{2705} Selected");
+        let thread_id = msg.message_thread_id;
+        if ctx
+            .bot
+            .edit_message_text_no_markup(msg.message_id, &updated, thread_id)
+            .await
+            .is_err()
+        {
+            // Fallback: simpler edit
+            let _ = ctx
+                .bot
+                .edit_message_text_no_markup(msg.message_id, "\u{2705} Answer sent", thread_id)
+                .await;
+        }
+    }
+
     // Clean up if all answered
     if pending.answered.iter().all(|a| *a) {
         let key = session_key.to_string();
@@ -2485,7 +2590,7 @@ async fn handle_answer_callback(ctx: &HandlerContext, data: &str) {
 }
 
 /// Handle multi-select toggle callback.
-async fn handle_toggle_callback(ctx: &HandlerContext, data: &str, _cb: &CallbackQuery) {
+async fn handle_toggle_callback(ctx: &HandlerContext, data: &str, cb: &CallbackQuery) {
     let parts: Vec<&str> = data.splitn(4, ':').collect();
     if parts.len() != 4 {
         return;
@@ -2517,10 +2622,41 @@ async fn handle_toggle_callback(ctx: &HandlerContext, data: &str, _cb: &Callback
     } else {
         selected.insert(o_idx);
     }
+
+    // M2: Re-render keyboard with checkmarks
+    if let Some(question) = pending.questions.get(q_idx) {
+        let mut buttons: Vec<InlineButton> = question
+            .options
+            .iter()
+            .enumerate()
+            .map(|(idx, opt)| {
+                let label = if selected.contains(&idx) {
+                    format!("\u{2713} {}", opt.label)
+                } else {
+                    opt.label.clone()
+                };
+                InlineButton {
+                    text: label,
+                    callback_data: format!("toggle:{session_key}:{q_idx}:{idx}"),
+                }
+            })
+            .collect();
+        buttons.push(InlineButton {
+            text: "\u{2705} Submit".into(),
+            callback_data: format!("submit:{session_key}:{q_idx}"),
+        });
+
+        if let Some(msg) = &cb.message {
+            let _ = ctx
+                .bot
+                .edit_message_reply_markup(msg.message_id, &buttons)
+                .await;
+        }
+    }
 }
 
 /// Handle multi-select submit callback.
-async fn handle_submit_callback(ctx: &HandlerContext, data: &str) {
+async fn handle_submit_callback(ctx: &HandlerContext, data: &str, cb: &CallbackQuery) {
     let parts: Vec<&str> = data.splitn(3, ':').collect();
     if parts.len() != 3 {
         return;
@@ -2580,6 +2716,24 @@ async fn handle_submit_callback(ctx: &HandlerContext, data: &str) {
         let mut inj = ctx.injector.lock().await;
         inj.set_target(&target, socket.as_deref());
         let _ = inj.inject(&answer_text);
+    }
+
+    // M3: Edit message to show "Submitted" and remove keyboard
+    if let Some(msg) = &cb.message {
+        let original_text = msg.text.as_deref().unwrap_or("");
+        let updated = format!("{original_text}\n\n\u{2705} Submitted");
+        let thread_id = msg.message_thread_id;
+        if ctx
+            .bot
+            .edit_message_text_no_markup(msg.message_id, &updated, thread_id)
+            .await
+            .is_err()
+        {
+            let _ = ctx
+                .bot
+                .edit_message_text_no_markup(msg.message_id, "\u{2705} Submitted", thread_id)
+                .await;
+        }
     }
 
     if pending.answered.iter().all(|a| *a) {
