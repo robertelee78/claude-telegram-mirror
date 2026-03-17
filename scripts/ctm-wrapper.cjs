@@ -4,14 +4,29 @@
 const { spawn } = require('child_process');
 const path = require('path');
 
+const fs = require('fs');
+
 // Try native Rust binary first
 let binary = null;
 try {
-  const { resolveBinary } = require('./resolve-binary.js');
+  const { resolveBinary } = require('./resolve-binary.cjs');
   const result = resolveBinary();
   if (result) binary = result.binary;
 } catch {
-  // resolve-binary not available or failed — fall through to TS
+  // resolve-binary not available or failed — fall through
+}
+
+// Local development fallback: check for a local Rust build
+if (!binary) {
+  const localBuild = path.resolve(__dirname, '..', 'rust-crates', 'target', 'release', 'ctm');
+  if (fs.existsSync(localBuild)) {
+    try {
+      fs.accessSync(localBuild, fs.constants.X_OK);
+      binary = localBuild;
+    } catch {
+      // Not executable
+    }
+  }
 }
 
 let child;

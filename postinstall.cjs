@@ -64,7 +64,7 @@ console.log('');
 
 // Detect native Rust binary (default entry point)
 try {
-  const { resolveBinary, getPlatformPackageName } = require('./scripts/resolve-binary.js');
+  const { resolveBinary, getPlatformPackageName } = require('./scripts/resolve-binary.cjs');
   const result = resolveBinary();
   if (result) {
     console.log(chalk.green('✓ Using native binary (fast mode):'));
@@ -80,7 +80,7 @@ try {
     console.log('');
   }
 } catch (e) {
-  // resolve-binary.js not available or errored — skip silently
+  // resolve-binary.cjs not available or errored — skip silently
 }
 
 // Check for existing config
