@@ -554,7 +554,26 @@ async fn handle_socket_message(ctx: HandlerContext, msg: BridgeMessage) {
     }
 
     match msg.msg_type {
-        MessageType::SessionStart => socket_handlers::handle_session_start(&ctx, &msg).await,
+        MessageType::SessionStart => {
+            // Dedup: skip full handler if session already exists and is active.
+            // Activity and tmux target are already updated above (lines 528-539),
+            // so an early return here is safe — we only need the full handler
+            // (topic creation, Telegram "Session started" message) on the first
+            // occurrence for this session.
+            let sid = msg.session_id.clone();
+            let is_active = ctx
+                .db_op(move |sess| {
+                    sess.get_session(&sid)
+                        .ok()
+                        .flatten()
+                        .map(|s| s.status == crate::types::SessionStatus::Active)
+                        .unwrap_or(false)
+                })
+                .await;
+            if !is_active {
+                socket_handlers::handle_session_start(&ctx, &msg).await;
+            }
+        }
         MessageType::SessionEnd => socket_handlers::handle_session_end(&ctx, &msg).await,
         MessageType::AgentResponse => {
             ensure_session_exists(&ctx, &msg).await;
