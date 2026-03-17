@@ -2,6 +2,11 @@
 
 use super::*;
 
+// ADR-011 Fix #7: Cache size limits.
+// Eviction kicks in during the cleanup cycle when these thresholds are exceeded.
+const MAX_SESSION_CACHE: usize = 200;
+const MAX_TOOL_CACHE: usize = 500;
+
 /// BUG-003: Periodic cleanup of stale sessions, orphaned threads, expired caches, old downloads.
 pub(super) async fn run_cleanup(ctx: HandlerContext) {
     // Expire old approvals
@@ -16,14 +21,105 @@ pub(super) async fn run_cleanup(ctx: HandlerContext) {
     // Clean orphaned threads
     cleanup_orphaned_threads(&ctx).await;
 
-    // Clean expired tool input cache
+    // Clean expired tool input cache (TTL-based)
     {
         let mut cache = ctx.tool_cache.write().await;
         cache.retain(|_, v| v.timestamp.elapsed().as_secs() < TOOL_CACHE_TTL_SECS);
     }
 
+    // ADR-011 Fix #7: Enforce cache size limits.
+    enforce_cache_size_limits(&ctx).await;
+
     // Clean old downloads
     cleanup_old_downloads();
+}
+
+/// ADR-011 Fix #7: Evict excess entries from the session-keyed caches.
+///
+/// Acquires locks in the documented order (session_threads -> session_tmux ->
+/// custom_titles) to avoid deadlocks. Only evicts when a cache exceeds its
+/// size limit; entries whose session is no longer active are removed first so
+/// that live sessions are always preserved.
+async fn enforce_cache_size_limits(ctx: &HandlerContext) {
+    // Fetch active session IDs from the database once (avoids repeated DB calls).
+    let active_ids: std::collections::HashSet<String> = ctx
+        .db_op(|sess| {
+            sess.get_active_sessions()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|s| s.id)
+                .collect()
+        })
+        .await;
+
+    // Lock order 2: session_threads
+    {
+        let mut threads = ctx.session_threads.write().await;
+        if threads.len() > MAX_SESSION_CACHE {
+            let before = threads.len();
+            threads.retain(|k, _| active_ids.contains(k));
+            let evicted = before - threads.len();
+            if evicted > 0 {
+                tracing::info!(
+                    evicted,
+                    remaining = threads.len(),
+                    "Cache eviction: session_threads exceeded limit"
+                );
+            }
+        }
+    }
+
+    // Lock order 3: session_tmux
+    {
+        let mut tmux = ctx.session_tmux.write().await;
+        if tmux.len() > MAX_SESSION_CACHE {
+            let before = tmux.len();
+            tmux.retain(|k, _| active_ids.contains(k));
+            let evicted = before - tmux.len();
+            if evicted > 0 {
+                tracing::info!(
+                    evicted,
+                    remaining = tmux.len(),
+                    "Cache eviction: session_tmux exceeded limit"
+                );
+            }
+        }
+    }
+
+    // Lock order 4: custom_titles
+    {
+        let mut titles = ctx.custom_titles.write().await;
+        if titles.len() > MAX_SESSION_CACHE {
+            let before = titles.len();
+            titles.retain(|k, _| active_ids.contains(k));
+            let evicted = before - titles.len();
+            if evicted > 0 {
+                tracing::info!(
+                    evicted,
+                    remaining = titles.len(),
+                    "Cache eviction: custom_titles exceeded limit"
+                );
+            }
+        }
+    }
+
+    // Lock order 4 (tool_cache follows custom_titles in field declaration order)
+    {
+        let mut cache = ctx.tool_cache.write().await;
+        if cache.len() > MAX_TOOL_CACHE {
+            let before = cache.len();
+            // Evict entries older than 60 seconds when the cache is over the limit.
+            cache.retain(|_, v| v.timestamp.elapsed().as_secs() < 60);
+            let evicted = before - cache.len();
+            if evicted > 0 {
+                tracing::info!(
+                    evicted,
+                    remaining = cache.len(),
+                    "Cache eviction: tool_cache exceeded limit"
+                );
+            }
+        }
+    }
 }
 
 /// BUG-003: Stale session cleanup with differentiated timeouts.

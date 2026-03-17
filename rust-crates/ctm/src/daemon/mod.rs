@@ -520,7 +520,9 @@ async fn handle_socket_message(ctx: HandlerContext, msg: BridgeMessage) {
         return;
     }
 
-    tracing::debug!(msg_type = %msg.msg_type, session_id = %msg.session_id, "Received socket message");
+    // ADR-011 Fix #9: Determine message priority for future bot-level send routing.
+    let priority = message_priority(&msg.msg_type);
+    tracing::debug!(msg_type = %msg.msg_type, session_id = %msg.session_id, priority, "Received socket message");
 
     // Update session activity
     {
@@ -899,6 +901,32 @@ fn is_kill_command(text: &str) -> bool {
         text.trim().to_lowercase().as_str(),
         "kill" | "/kill" | "exit" | "/exit" | "quit" | "/quit" | "ctrl+c" | "ctrl-c" | "^c"
     )
+}
+
+/// ADR-011 Fix #9: Map a message type to its delivery priority tier.
+///
+/// Returns a static string label that identifies the priority band:
+///   "critical" — must arrive promptly; user approval or session lifecycle events.
+///   "normal"   — ordinary conversational traffic.
+///   "low"      — high-volume diagnostic noise that can be deprioritised.
+///
+/// This function is intentionally separate from the actual priority plumbing so
+/// that the mapping logic can be reviewed independently. The bot/client.rs module
+/// will consume these labels once it exposes a priority-aware send interface.
+fn message_priority(msg_type: &MessageType) -> &'static str {
+    match msg_type {
+        MessageType::ApprovalRequest
+        | MessageType::SessionStart
+        | MessageType::SessionEnd
+        | MessageType::Error => "critical",
+
+        MessageType::ToolStart | MessageType::PreCompact | MessageType::TurnComplete | MessageType::SendImage => {
+            "low"
+        }
+
+        // AgentResponse, UserInput, ToolResult, SessionRename, and everything else.
+        _ => "normal",
+    }
 }
 
 /// Add an echo prevention key with TTL.
