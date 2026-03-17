@@ -2,6 +2,66 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.0] - 2026-03-17
+
+### Breaking Changes
+
+- **TypeScript source removed** — the package now ships a pre-compiled native binary; there are no `.js` or `.ts` files to import
+- **Node.js no longer required at runtime** — Node.js is used only during `npm install` to download the binary for the target platform; the daemon and hook binary run standalone
+- **`telegram-hook` bin entry removed** — replaced by the unified `ctm hook` subcommand
+- **Public library API removed** — `import { ... } from 'claude-telegram-mirror'` is no longer supported; the package is now a CLI/binary distribution only
+
+### Added
+
+- **Complete Rust rewrite** — 17 modules, 211 tests, ~12,000 lines of Rust replacing the TypeScript implementation
+- **Single static binary** — ~9 MB self-contained binary with sub-millisecond hook latency (<1 ms)
+- **Tool summarizer** — 30+ regex patterns condense verbose tool output into compact Telegram messages
+- **AskUserQuestion rendering** — inline keyboard buttons displayed in Telegram for interactive Claude prompts
+- **Photo and document download** — files sent to a Telegram topic are downloaded and injected into the Claude session
+- **Session rename via `/rename`** — renames both the Telegram forum topic and the active tmux window to keep labels in sync with Claude Code
+- **`doctor --fix` auto-remediation** — detects and automatically corrects common configuration problems
+- **Governor token-bucket rate limiter** — per-chat rate limiting with configurable burst and refill, including retry/backoff for Telegram API calls
+- **`flock(2)` atomic PID locking** — eliminates the TOCTOU race present in the previous read-then-write PID-file scheme
+- **Global regex-based token scrubbing** — bot tokens and other secrets are redacted from all log output before writing
+- **SIGTERM signal handler** — daemon performs a clean shutdown (flushes queues, closes sockets) when it receives SIGTERM
+- **`linux-arm64` platform support** — pre-built binary available for ARM64 Linux (e.g., Raspberry Pi, AWS Graviton)
+- **Interactive setup wizard** — `ctm setup` uses `dialoguer` to guide first-time configuration without manual config editing
+- **TypeScript detection in code blocks** — code blocks in Claude output are annotated with the detected language for syntax-highlighted display
+
+### Security
+
+- **Shell injection eliminated** — all subprocess calls use `Command::arg` (no shell interpolation); `execSync` with user-controlled strings is gone
+- **Bot token scrubbing** — token is redacted from logs and error messages at the point of emission
+- **Session ID validation** — session identifiers are validated against `[a-zA-Z0-9._-]`, maximum 128 characters, before use in any file path or socket name
+- **Socket path traversal prevention** — computed socket paths are checked to confirm they remain within the expected runtime directory
+- **Config directory permissions enforced** — config directory is created with mode `0o700`; existing directories with wrong permissions are rejected
+- **File permissions enforced** — config and PID files are created with mode `0o600`
+- **NDJSON line size limits** — incoming NDJSON lines are capped at 1 MB to prevent memory exhaustion
+- **Connection concurrency limits** — the Unix socket listener rejects connections beyond a limit of 64 concurrent clients
+- **IDOR check on approval callbacks** — callback query payloads are validated to ensure the requesting Telegram user matches the session owner before approving a tool call
+- **`umask(0o177)` on socket bind** — socket file is created with mode `0o600`, preventing other local users from connecting
+
+### Fixed
+
+- **BUG-001: tmux target auto-refresh** — stale tmux pane targets are detected and refreshed automatically
+- **BUG-002: Topic creation race prevention** — concurrent session-start events cannot create duplicate forum topics
+- **BUG-003: Stale session cleanup with differentiated timeouts** — sessions without tmux info use a shorter inactivity timeout than sessions with a known-dead pane
+- **BUG-004: Escape vs Ctrl-C distinction** — `/stop` sends Escape (pause Claude); `/kill` sends Ctrl-C (exit Claude)
+- **BUG-005: Ignore General topic** — messages posted to the forum's General topic are silently dropped
+- **BUG-006: Stateless hooks** — hooks contain no local state; the daemon is the single source of truth
+- **BUG-009: Session reactivation** — sessions previously marked `ended` are reactivated when a new hook event arrives
+- **BUG-010: On-the-fly session creation** — the daemon creates a forum topic on the first hook event for an unknown session without requiring a prior `session_start` signal
+- **BUG-011: Echo prevention** — text injected from Telegram into tmux is not echoed back as a new Telegram message
+- **BUG-012: Topic deletion cancellation** — deleting a forum topic from Telegram does not terminate the underlying Claude session
+
+### Internal
+
+- **6 Architecture Decision Records (ADRs)** documenting key design choices (binary distribution, rate limiting, PID locking, socket security, token scrubbing, session validation)
+- **SECURITY.md** with a full threat model covering all attack surfaces
+- **CI pipeline updated to Rust-only** — `cargo check`, `clippy`, `fmt`, and `cargo test` replace the TypeScript build/lint/test steps
+- **Release workflow** — GitHub Actions builds binaries for 4 platforms (`linux-x64`, `linux-arm64`, `darwin-x64`, `darwin-arm64`) and publishes scoped npm packages alongside the root package
+- **Binary distribution via scoped npm packages** — platform-specific packages (e.g., `@claude-telegram-mirror/linux-x64`) are installed as optional dependencies; the root package selects the correct one at install time
+
 ## [0.1.20] - 2025-12-09
 
 ### Fixed
