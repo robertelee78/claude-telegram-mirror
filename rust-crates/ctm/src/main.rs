@@ -174,11 +174,24 @@ async fn main() -> anyhow::Result<()> {
     // L3.9: Enable ANSI colors in tracing output.
     // tracing-subscriber enables ANSI by default on TTYs, but we force it on
     // here because ScrubWriter wraps stderr and hides the TTY detection.
+    //
+    // M5.2: Use a custom timer that produces `YYYY-MM-DD HH:mm:ss` timestamps
+    // for consistency with the TypeScript implementation's log format.
+    //
+    // M5.3 (INTENTIONAL): Runtime log level changes are not supported.
+    // tracing-subscriber's `EnvFilter` is statically initialized, which is the
+    // standard Rust pattern. Changing log levels at runtime would require a
+    // `reload::Layer`, adding complexity for minimal operational benefit.
+    // Restart the daemon with a different RUST_LOG / LOG_LEVEL to change levels.
     tracing_subscriber::fmt()
         .with_env_filter(env_filter)
         .with_target(false)
         .with_ansi(true)
         .with_writer(ScrubWriter)
+        .with_timer(tracing_subscriber::fmt::time::OffsetTime::new(
+            time::UtcOffset::UTC,
+            time::macros::format_description!("[year]-[month]-[day] [hour]:[minute]:[second]"),
+        ))
         .compact()
         .init();
 
@@ -378,8 +391,22 @@ async fn cmd_restart(verbose: bool) -> anyhow::Result<()> {
 }
 
 /// Show daemon status.
+///
+/// L5.1: This command intentionally catches config load errors and falls back
+/// to partial output rather than exiting non-zero. A status command should
+/// always succeed — showing whatever information is available even when the
+/// configuration is incomplete or invalid.
 fn cmd_status() -> anyhow::Result<()> {
-    let cfg = config::load_config(false)?;
+    let cfg = match config::load_config(false) {
+        Ok(c) => c,
+        Err(e) => {
+            println!("\nClaude Telegram Mirror Status\n");
+            println!("Configuration:");
+            println!("  Error loading config: {e}");
+            println!("  Fix with: ctm setup\n");
+            return Ok(());
+        }
+    };
     let config_dir = config::get_config_dir();
     let pid_file = config_dir.join("bridge.pid");
     let socket_file = &cfg.socket_path;

@@ -240,18 +240,29 @@ impl Drop for SocketServer {
 }
 
 /// Read NDJSON lines from a client and broadcast each parsed message.
+///
+/// L5.5: Emits `tracing::info` events on connect and disconnect so operators
+/// can observe client lifecycle in logs. Full event emission (e.g. broadcasting
+/// a `client_connected` / `client_disconnected` BridgeMessage to other clients)
+/// is not implemented — the socket server is an internal transport layer, not a
+/// pub/sub bus. Tracing-level observability is sufficient for debugging.
 async fn handle_client(
     reader: tokio::net::unix::OwnedReadHalf,
     client_id: &str,
     tx: broadcast::Sender<BridgeMessage>,
 ) {
+    tracing::info!(client_id, "Socket client connected");
     let mut buf_reader = BufReader::new(reader);
     let mut line = String::new();
 
     loop {
         line.clear();
         match buf_reader.read_line(&mut line).await {
-            Ok(0) => break, // EOF
+            Ok(0) => {
+                // L5.5: Log disconnect on EOF
+                tracing::info!(client_id, "Socket client disconnected");
+                break;
+            }
             Ok(_) => {
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
@@ -275,7 +286,7 @@ async fn handle_client(
                 }
             }
             Err(e) => {
-                tracing::debug!(client_id, error = %e, "Read error");
+                tracing::info!(client_id, error = %e, "Socket client disconnected (read error)");
                 break;
             }
         }

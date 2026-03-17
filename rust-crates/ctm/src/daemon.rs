@@ -57,6 +57,12 @@ struct PendingQuestion {
     answered: Vec<bool>,
     selected_options: HashMap<usize, HashSet<usize>>,
     timestamp: std::time::Instant,
+    /// M5.5: Track Telegram message IDs associated with this question so they
+    /// can be cleaned up (edited/deleted) when the question is answered or the
+    /// session ends. Currently populated but cleanup logic is a future
+    /// enhancement — the field exists so callers can begin tracking IDs now.
+    #[allow(dead_code)]
+    message_ids: Vec<i64>,
 }
 
 #[derive(Clone)]
@@ -1664,6 +1670,7 @@ async fn handle_ask_user_question(ctx: &HandlerContext, msg: &BridgeMessage) {
                 answered: vec![false; questions.len()],
                 selected_options: selected,
                 timestamp: std::time::Instant::now(),
+                message_ids: Vec::new(),
             },
         );
     }

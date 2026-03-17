@@ -8,6 +8,14 @@ use rusqlite::{params, Connection};
 use std::path::Path;
 
 /// An active or ended Claude Code session.
+///
+/// L5.3 (INTENTIONAL): Date fields (`started_at`, `last_activity`) are `String`
+/// rather than `chrono::DateTime` or epoch integers. This is a deliberate design
+/// choice: SQLite stores them as ISO 8601 TEXT (`to_rfc3339_opts`), which is
+/// human-readable in raw SQL queries, sorts lexicographically, and avoids
+/// timezone-conversion bugs. The TypeScript implementation used the same TEXT
+/// representation. Converting to typed timestamps would add serde complexity
+/// with no practical benefit.
 #[derive(Debug, Clone)]
 pub struct Session {
     pub id: String,

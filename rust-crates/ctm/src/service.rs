@@ -458,6 +458,9 @@ fn install_systemd_service() -> ServiceResult {
     println!("  Created env file: {}", env_file.display());
 
     // Reload systemd
+    // M5.4: Uses `.status()` which inherits stdout/stderr so the user sees
+    // systemctl output. The uninstall path intentionally suppresses output
+    // with Stdio::null() because it runs during cleanup where noise is unhelpful.
     let _ = Command::new("systemctl")
         .args(["--user", "daemon-reload"])
         .status();

@@ -392,6 +392,11 @@ async fn get_hook_output(
         serde_json::Value::String(pre_tool.tool_name.clone()),
     );
     approval_meta.insert("input".into(), pre_tool.tool_input.clone());
+    // M5.1: Include hookId in approval_request metadata so the daemon can
+    // correlate the approval response back to the originating hook instance.
+    if let Some(hook_id) = &pre_tool.base.hook_id {
+        approval_meta.insert("hookId".into(), serde_json::Value::String(hook_id.clone()));
+    }
 
     let prompt = format_tool_approval_prompt(&pre_tool.tool_name, &pre_tool.tool_input);
     let msg = make_message("approval_request", session_id, &prompt, approval_meta);
@@ -444,6 +449,13 @@ async fn get_hook_output(
 }
 
 /// H5: Format a rich approval prompt matching TypeScript's formatToolDescription()
+///
+/// L5.4 (INTENTIONAL): String previews are truncated at display-friendly limits.
+/// Bash commands use 200 chars, edit old/new strings use 200 chars, Write content
+/// uses 500 chars, and generic JSON input uses 500 chars. These limits apply only
+/// to the Telegram display prompt. The full, untruncated tool input is always
+/// available in the `approval_request` message's `metadata.input` field, so no
+/// data is lost for programmatic consumers.
 fn format_tool_approval_prompt(tool_name: &str, tool_input: &serde_json::Value) -> String {
     let mut desc = format!("\u{1F527} **Tool:** `{tool_name}`\n\n");
     match tool_name {
