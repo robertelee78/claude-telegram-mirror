@@ -939,9 +939,10 @@ fn message_priority(msg_type: &MessageType) -> &'static str {
         | MessageType::SessionEnd
         | MessageType::Error => "critical",
 
-        MessageType::ToolStart | MessageType::PreCompact | MessageType::TurnComplete | MessageType::SendImage => {
-            "low"
-        }
+        MessageType::ToolStart
+        | MessageType::PreCompact
+        | MessageType::TurnComplete
+        | MessageType::SendImage => "low",
 
         // AgentResponse, UserInput, ToolResult, SessionRename, and everything else.
         _ => "normal",

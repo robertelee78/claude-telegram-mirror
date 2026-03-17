@@ -120,9 +120,7 @@ impl TelegramBot {
             .connect_timeout(std::time::Duration::from_secs(5))
             .tcp_keepalive(std::time::Duration::from_secs(30))
             .build()
-            .map_err(|e| {
-                AppError::Telegram(format!("Failed to build poll reqwest Client: {e}"))
-            })?;
+            .map_err(|e| AppError::Telegram(format!("Failed to build poll reqwest Client: {e}")))?;
 
         let max_rate = f64::from(rate);
 
