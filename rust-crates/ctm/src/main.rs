@@ -237,6 +237,23 @@ async fn cmd_start(verbose: bool) -> anyhow::Result<()> {
 
 /// Stop the bridge daemon.
 async fn cmd_stop(force: bool) -> anyhow::Result<()> {
+    // Check if running as OS service first — delegate if installed and running.
+    if service::is_service_installed() {
+        let status = service::get_service_status();
+        if status.running {
+            println!("Stopping via system service...");
+            let result = service::stop_service();
+            if result.success {
+                println!("{}", result.message);
+            } else {
+                eprintln!("{}", result.message);
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
+    }
+
+    // Fall back to PID file / SIGTERM for direct daemon mode.
     let config_dir = config::get_config_dir();
     let pid_file = config_dir.join("bridge.pid");
 
@@ -292,6 +309,23 @@ async fn cmd_stop(force: bool) -> anyhow::Result<()> {
 
 /// Restart the bridge daemon.
 async fn cmd_restart(verbose: bool) -> anyhow::Result<()> {
+    // Check if running as OS service first — delegate if installed (running or enabled).
+    if service::is_service_installed() {
+        let status = service::get_service_status();
+        if status.running || status.enabled {
+            println!("Restarting via system service...");
+            let result = service::restart_service();
+            if result.success {
+                println!("{}", result.message);
+            } else {
+                eprintln!("{}", result.message);
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
+    }
+
+    // Fall back to stopping existing direct-mode daemon then starting fresh.
     let config_dir = config::get_config_dir();
     let pid_file = config_dir.join("bridge.pid");
 
@@ -323,13 +357,35 @@ fn cmd_status() -> anyhow::Result<()> {
 
     println!("\nClaude Telegram Mirror Status\n");
 
-    // Check daemon running state
+    // Check daemon running state — service layer takes priority.
     println!("Daemon:");
-    if pid_file.exists() {
+    let mut daemon_running = false;
+
+    if service::is_service_installed() {
+        let svc_status = service::get_service_status();
+        if svc_status.running {
+            println!("  Status: Running (via system service)");
+            daemon_running = true;
+        } else if pid_file.exists() {
+            if let Ok(pid_str) = fs::read_to_string(&pid_file) {
+                if let Ok(pid) = pid_str.trim().parse::<i32>() {
+                    if is_process_running(pid) {
+                        println!("  Status: Running (PID {pid})");
+                        daemon_running = true;
+                    } else {
+                        println!("  Status: Not running (stale PID file)");
+                    }
+                }
+            }
+        } else {
+            println!("  Status: Not running");
+        }
+    } else if pid_file.exists() {
         if let Ok(pid_str) = fs::read_to_string(&pid_file) {
             if let Ok(pid) = pid_str.trim().parse::<i32>() {
                 if is_process_running(pid) {
                     println!("  Status: Running (PID {pid})");
+                    daemon_running = true;
                 } else {
                     println!("  Status: Not running (stale PID file)");
                 }
@@ -341,6 +397,8 @@ fn cmd_status() -> anyhow::Result<()> {
 
     if socket_file.exists() {
         println!("  Socket: {}", socket_file.display());
+    } else if daemon_running {
+        println!("  Socket: Missing (expected: {})", socket_file.display());
     } else {
         println!("  Socket: Not created");
     }
@@ -367,6 +425,9 @@ fn cmd_status() -> anyhow::Result<()> {
     println!("  Enabled: {}", cfg.enabled);
     println!("  Verbose: {}", cfg.verbose);
     println!();
+
+    // Hook status
+    let _ = installer::print_hook_status();
 
     Ok(())
 }

@@ -33,7 +33,7 @@ fn launchd_dir() -> PathBuf {
 }
 
 fn launchd_plist() -> PathBuf {
-    launchd_dir().join(format!("com.agidreams.{SERVICE_NAME}.plist"))
+    launchd_dir().join(format!("com.claude.{SERVICE_NAME}.plist"))
 }
 
 fn env_file_path() -> PathBuf {
@@ -212,6 +212,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+WorkingDirectory=%h
 ExecStart={binary} start
 EnvironmentFile={env_file}
 
@@ -287,10 +288,11 @@ fn generate_launchd_plist() -> String {
         "        <key>PATH</key>\n        <string>{}</string>",
         escape_xml(&get_macos_path())
     ));
+    env_lines.push("        <key>NODE_ENV</key>\n        <string>production</string>".to_string());
 
     // User-defined env vars from ~/.telegram-env
     for (key, value) in &env_vars {
-        if key == "HOME" || key == "PATH" {
+        if key == "HOME" || key == "PATH" || key == "NODE_ENV" {
             continue;
         }
         env_lines.push(format!(
@@ -306,13 +308,16 @@ fn generate_launchd_plist() -> String {
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.agidreams.{service_name}</string>
+    <string>com.claude.{service_name}</string>
 
     <key>ProgramArguments</key>
     <array>
         <string>{binary}</string>
         <string>start</string>
     </array>
+
+    <key>WorkingDirectory</key>
+    <string>{home_dir}</string>
 
     <key>EnvironmentVariables</key>
     <dict>
@@ -343,6 +348,7 @@ fn generate_launchd_plist() -> String {
 "#,
         service_name = SERVICE_NAME,
         binary = escape_xml(&binary.display().to_string()),
+        home_dir = escape_xml(&home.display().to_string()),
         env_block = env_lines.join("\n"),
         log_file = escape_xml(&log_file.display().to_string()),
         err_file = escape_xml(&err_file.display().to_string()),
@@ -356,6 +362,17 @@ fn generate_launchd_plist() -> String {
 pub struct ServiceResult {
     pub success: bool,
     pub message: String,
+}
+
+/// Check if the service is installed (service file / plist exists).
+pub fn is_service_installed() -> bool {
+    if has_systemd() {
+        systemd_service_file().exists()
+    } else if is_macos() {
+        launchd_plist().exists()
+    } else {
+        false
+    }
 }
 
 pub fn install_service() -> ServiceResult {
@@ -469,7 +486,7 @@ fn install_launchd_service() -> ServiceResult {
     ServiceResult {
         success: true,
         message: format!(
-            "Service installed: {plist}\n\nCommands:\n  Load & Start:  launchctl load {plist}\n  Start:         launchctl start com.agidreams.{SERVICE_NAME}\n  Stop:          launchctl stop com.agidreams.{SERVICE_NAME}\n  Unload:        launchctl unload {plist}\n  Logs:          tail -f ~/.config/{SERVICE_NAME}/daemon.log",
+            "Service installed: {plist}\n\nCommands:\n  Load & Start:  launchctl load {plist}\n  Start:         launchctl start com.claude.{SERVICE_NAME}\n  Stop:          launchctl stop com.claude.{SERVICE_NAME}\n  Unload:        launchctl unload {plist}\n  Logs:          tail -f ~/.config/{SERVICE_NAME}/daemon.log",
             plist = plist_path.display(),
         ),
     }
@@ -563,7 +580,7 @@ pub fn start_service() -> ServiceResult {
             .status();
 
         match Command::new("launchctl")
-            .args(["start", &format!("com.agidreams.{SERVICE_NAME}")])
+            .args(["start", &format!("com.claude.{SERVICE_NAME}")])
             .status()
         {
             Ok(s) if s.success() => ServiceResult {
@@ -600,7 +617,7 @@ pub fn stop_service() -> ServiceResult {
         }
     } else if is_macos() {
         match Command::new("launchctl")
-            .args(["stop", &format!("com.agidreams.{SERVICE_NAME}")])
+            .args(["stop", &format!("com.claude.{SERVICE_NAME}")])
             .status()
         {
             Ok(s) if s.success() => ServiceResult {
@@ -710,7 +727,7 @@ fn get_launchd_status() -> ServiceStatus {
         .output()
         .map(|o| {
             let out = String::from_utf8_lossy(&o.stdout);
-            out.contains(&format!("com.agidreams.{SERVICE_NAME}"))
+            out.contains(&format!("com.claude.{SERVICE_NAME}"))
         })
         .unwrap_or(false);
 
