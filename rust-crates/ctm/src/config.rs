@@ -140,6 +140,16 @@ pub fn is_mirror_enabled() -> bool {
 }
 
 /// Get the user's home directory, falling back to /tmp if unavailable.
+///
+/// # Examples
+///
+/// ```
+/// use ctm::config::home_dir;
+///
+/// let dir = home_dir();
+/// // The returned path is always absolute.
+/// assert!(dir.is_absolute());
+/// ```
 pub fn home_dir() -> PathBuf {
     dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"))
 }

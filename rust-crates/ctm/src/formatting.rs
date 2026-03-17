@@ -380,6 +380,22 @@ pub fn wrap_in_code_block(content: &str, language: Option<&str>) -> String {
 // ------------------------------------------------------------- truncate
 
 /// UTF-8 safe truncation with ellipsis.
+///
+/// If `text` has more than `max_len` characters, it is truncated and an
+/// ellipsis (`...`) is appended. The returned string is at most `max_len`
+/// characters long.
+///
+/// # Examples
+///
+/// ```
+/// use ctm::formatting::truncate;
+///
+/// // Short strings are returned unchanged.
+/// assert_eq!(truncate("hello", 10), "hello");
+///
+/// // Long strings are truncated with an ellipsis.
+/// assert_eq!(truncate("hello world", 8), "hello...");
+/// ```
 pub fn truncate(text: &str, max_len: usize) -> String {
     let char_count = text.chars().count();
     if char_count <= max_len {
@@ -410,6 +426,18 @@ pub fn needs_chunking(text: &str, max_length: usize) -> bool {
 /// Empty path components (e.g. from `//foo/bar`) are filtered out, which is an
 /// intentional improvement over the TypeScript version that did not handle
 /// consecutive separators gracefully.
+///
+/// # Examples
+///
+/// ```
+/// use ctm::formatting::short_path;
+///
+/// // Long paths are shortened to the last two components.
+/// assert_eq!(short_path("/opt/project/src/utils/config.ts"), ".../utils/config.ts");
+///
+/// // Paths with two or fewer components are returned as-is.
+/// assert_eq!(short_path("/src/file.ts"), "/src/file.ts");
+/// ```
 pub fn short_path(path: &str) -> String {
     let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     if parts.len() <= 2 {

@@ -227,7 +227,25 @@ pub const MAX_SESSION_ID_LEN: usize = 128;
 /// Maximum stdin/NDJSON line size (1 MiB)
 pub const MAX_LINE_BYTES: usize = 1_048_576;
 
-/// Session ID validation pattern
+/// Session ID validation pattern.
+///
+/// A valid session ID is non-empty, at most [`MAX_SESSION_ID_LEN`] characters,
+/// and contains only ASCII alphanumerics, hyphens, underscores, or dots.
+///
+/// # Examples
+///
+/// ```
+/// use ctm::types::is_valid_session_id;
+///
+/// assert!(is_valid_session_id("session-42"));
+/// assert!(is_valid_session_id("abc_def.123"));
+///
+/// // Empty or overly long IDs are rejected.
+/// assert!(!is_valid_session_id(""));
+///
+/// // Special characters are not allowed.
+/// assert!(!is_valid_session_id("bad;id"));
+/// ```
 pub fn is_valid_session_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= MAX_SESSION_ID_LEN
@@ -236,7 +254,24 @@ pub fn is_valid_session_id(id: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
 }
 
-/// Slash command character whitelist validation
+/// Slash command character whitelist validation.
+///
+/// Only ASCII alphanumerics, underscores, hyphens, spaces, and forward
+/// slashes are permitted. This prevents shell injection via crafted
+/// command strings.
+///
+/// # Examples
+///
+/// ```
+/// use ctm::types::is_valid_slash_command;
+///
+/// assert!(is_valid_slash_command("/clear"));
+/// assert!(is_valid_slash_command("/rename My Feature"));
+///
+/// // Shell metacharacters are rejected.
+/// assert!(!is_valid_slash_command("/cmd;rm -rf /"));
+/// assert!(!is_valid_slash_command(""));
+/// ```
 pub fn is_valid_slash_command(command: &str) -> bool {
     !command.is_empty()
         && command

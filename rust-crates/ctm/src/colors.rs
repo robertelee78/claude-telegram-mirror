@@ -2,6 +2,18 @@
 //!
 //! Centralized from duplicates in doctor.rs and setup.rs.
 
+/// Wrap `s` in ANSI green (code 32).
+///
+/// # Examples
+///
+/// ```
+/// use ctm::colors::green;
+///
+/// let colored = green("ok");
+/// assert!(colored.contains("ok"));
+/// assert!(colored.starts_with("\x1b[32m"));
+/// assert!(colored.ends_with("\x1b[0m"));
+/// ```
 pub fn green(s: &str) -> String {
     format!("\x1b[32m{s}\x1b[0m")
 }
