@@ -2,32 +2,19 @@
   "name": "claude-telegram-mirror",
   "version": "0.2.0",
   "description": "Bidirectional Telegram integration for Claude Code CLI - monitor and control your Claude Code sessions from Telegram",
-  "type": "module",
-  "main": "dist/index.js",
   "bin": {
     "claude-telegram-mirror": "./scripts/ctm-wrapper.cjs",
     "ctm": "./scripts/ctm-wrapper.cjs"
   },
   "scripts": {
-    "build": "tsc",
-    "dev": "tsc --watch",
-    "start": "ctm start",
-    "daemon": "ctm start --foreground",
-    "status": "ctm status",
-    "install-hooks": "ctm install-hooks",
-    "uninstall-hooks": "ctm uninstall-hooks",
-    "test": "vitest",
-    "test:coverage": "vitest --coverage",
-    "lint": "eslint src/",
-    "typecheck": "tsc --noEmit",
     "postinstall": "node postinstall.cjs",
-    "prepublishOnly": "npm run build && vitest --run"
+    "test": "cd rust-crates && cargo test"
   },
   "files": [
-    "dist/",
     "scripts/",
     "postinstall.cjs",
-    "README.md"
+    "README.md",
+    "SECURITY.md"
   ],
   "keywords": [
     "claude",
@@ -58,22 +45,6 @@
   },
   "publishConfig": {
     "access": "public"
-  },
-  "dependencies": {
-    "grammy": "^1.21.0",
-    "better-sqlite3": "^11.0.0",
-    "commander": "^12.0.0",
-    "winston": "^3.11.0",
-    "chalk": "^4.1.2"
-  },
-  "devDependencies": {
-    "@types/better-sqlite3": "^7.6.8",
-    "@types/node": "^20.10.0",
-    "typescript": "^5.3.0",
-    "vitest": "^1.0.0",
-    "eslint": "^8.55.0",
-    "@typescript-eslint/eslint-plugin": "^6.0.0",
-    "@typescript-eslint/parser": "^6.0.0"
   },
   "optionalDependencies": {
     "@agidreams/ctm-linux-x64": "0.2.0",

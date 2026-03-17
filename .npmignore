@@ -1,17 +1,17 @@
-# Source files (use dist/)
-src/
-tests/
-*.ts
-tsconfig.json
-vitest.config.ts
+# Rust source (users get prebuilt binaries via optional deps)
+rust-crates/
 
 # Development files
 .git/
 .github/
 .gitignore
 .claude-flow/
+.claude/
 .swarm/
-node_modules/
+_bmad/
+_bmad-output/
+CLAUDE.md
+.mcp.json
 
 # IDE/editor files
 .vscode/
@@ -24,8 +24,8 @@ node_modules/
 *.tgz
 coverage/
 
-# Documentation (README is included)
+# Documentation (README is included via files)
 docs/
 
-# Systemd template (generated at install time)
-systemd/
+# npm packages source (distributed separately)
+npm-packages/

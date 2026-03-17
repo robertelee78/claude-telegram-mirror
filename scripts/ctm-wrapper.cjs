@@ -3,7 +3,6 @@
 
 const { spawn } = require('child_process');
 const path = require('path');
-
 const fs = require('fs');
 
 // Try native Rust binary first
@@ -29,22 +28,25 @@ if (!binary) {
   }
 }
 
-let child;
-
-if (binary) {
-  // Spawn Rust binary with all CLI args forwarded
-  child = spawn(binary, process.argv.slice(2), {
-    stdio: 'inherit',
-    env: process.env,
-  });
-} else {
-  // Fall back to TypeScript CLI via node
-  const tsCli = path.resolve(__dirname, '..', 'dist', 'cli.js');
-  child = spawn(process.execPath, [tsCli, ...process.argv.slice(2)], {
-    stdio: 'inherit',
-    env: process.env,
-  });
+if (!binary) {
+  console.error('Error: No native ctm binary found for this platform.');
+  console.error(`Platform: ${process.platform}-${process.arch}`);
+  console.error('');
+  console.error('Supported platforms:');
+  console.error('  - Linux x64');
+  console.error('  - Linux arm64');
+  console.error('  - macOS ARM64 (Apple Silicon)');
+  console.error('  - macOS x64 (Intel)');
+  console.error('');
+  console.error('To build from source: cd rust-crates && cargo build --release');
+  process.exit(1);
 }
+
+// Spawn Rust binary with all CLI args forwarded
+const child = spawn(binary, process.argv.slice(2), {
+  stdio: 'inherit',
+  env: process.env,
+});
 
 // Forward signals to child process
 ['SIGINT', 'SIGTERM', 'SIGHUP'].forEach(function (sig) {

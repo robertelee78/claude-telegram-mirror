@@ -1,9 +1,6 @@
 # Dependencies
 node_modules/
 
-# Build output
-dist/
-
 # Environment and secrets
 .env
 .env.local
@@ -53,4 +50,6 @@ CLAUDE.md
 
 # npm
 npm-debug.log*
+
+# Rust build artifacts
 rust-crates/target/
