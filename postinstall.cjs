@@ -62,17 +62,21 @@ console.log(chalk.yellow('📚 Documentation:'));
 console.log('   ' + chalk.blue('https://github.com/robertelee78/claude-mobile'));
 console.log('');
 
-// H2.5: Detect native Rust binary
+// Detect native Rust binary (default entry point)
 try {
-  const { resolveBinary } = require('./scripts/resolve-binary.js');
+  const { resolveBinary, getPlatformPackageName } = require('./scripts/resolve-binary.js');
   const result = resolveBinary();
   if (result) {
-    console.log(chalk.green('✓ Native binary found:'));
+    console.log(chalk.green('✓ Using native binary (fast mode):'));
     console.log('   ' + chalk.gray(result.binary));
     console.log('');
   } else {
-    console.log(chalk.yellow('⚠ No native binary found for this platform.'));
-    console.log('   ' + chalk.gray('Using TypeScript implementation as fallback.'));
+    const pkg = getPlatformPackageName();
+    console.log(chalk.yellow('⚠ Native binary not available for this platform.'));
+    console.log('   ' + chalk.gray('Using TypeScript fallback.'));
+    if (pkg) {
+      console.log('   ' + chalk.gray('Install the native binary: npm install ' + pkg));
+    }
     console.log('');
   }
 } catch (e) {
