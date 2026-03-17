@@ -36,6 +36,10 @@ pub struct InlineButton {
 pub struct SendOptions {
     pub parse_mode: Option<String>,
     pub disable_notification: Option<bool>,
+    /// When set, the sent message will be a reply to this message ID.
+    /// This allows callers to use `SendOptions` instead of the separate
+    /// `send_message_reply_to` method for reply threading.
+    pub reply_to_message_id: Option<i64>,
 }
 
 /// A queued message waiting to be sent.
@@ -47,6 +51,7 @@ struct QueuedMessage {
     buttons: Option<Vec<InlineButton>>,
     parse_mode: Option<String>,
     disable_notification: Option<bool>,
+    reply_to_message_id: Option<i64>,
     retries: u32,
 }
 
@@ -253,6 +258,10 @@ impl TelegramBot {
     // ---------------------------------------------------------- sending
 
     /// Send a message (queued with rate limiting + chunking).
+    ///
+    /// If `options.reply_to_message_id` is set, the first chunk will be sent as a
+    /// reply to that message.  Subsequent chunks (if the message is split) are sent
+    /// without the reply parameter to avoid cluttering the thread.
     pub async fn send_message(
         &self,
         text: &str,
@@ -264,8 +273,11 @@ impl TelegramBot {
             .and_then(|o| o.parse_mode.clone())
             .or_else(|| Some("Markdown".into()));
         let disable_notification = options.and_then(|o| o.disable_notification);
+        let reply_to_message_id = options.and_then(|o| o.reply_to_message_id);
 
-        for chunk in chunks {
+        for (idx, chunk) in chunks.into_iter().enumerate() {
+            // Only apply reply_to on the first chunk; subsequent parts read naturally.
+            let reply_id = if idx == 0 { reply_to_message_id } else { None };
             self.enqueue(QueuedMessage {
                 chat_id: self.chat_id,
                 text: chunk,
@@ -273,6 +285,7 @@ impl TelegramBot {
                 buttons: None,
                 parse_mode: parse_mode.clone(),
                 disable_notification,
+                reply_to_message_id: reply_id,
                 retries: 0,
             })
             .await;
@@ -291,6 +304,7 @@ impl TelegramBot {
             .and_then(|o| o.parse_mode.clone())
             .or_else(|| Some("Markdown".into()));
         let disable_notification = options.and_then(|o| o.disable_notification);
+        let reply_to_message_id = options.and_then(|o| o.reply_to_message_id);
 
         self.enqueue(QueuedMessage {
             chat_id: self.chat_id,
@@ -299,6 +313,7 @@ impl TelegramBot {
             buttons: Some(buttons),
             parse_mode,
             disable_notification,
+            reply_to_message_id,
             retries: 0,
         })
         .await;
@@ -371,6 +386,9 @@ impl TelegramBot {
         }
         if let Some(tid) = item.thread_id {
             body["message_thread_id"] = serde_json::Value::Number(tid.into());
+        }
+        if let Some(reply_id) = item.reply_to_message_id {
+            body["reply_parameters"] = serde_json::json!({ "message_id": reply_id });
         }
         if let Some(buttons) = &item.buttons {
             let keyboard = build_inline_keyboard(buttons);
