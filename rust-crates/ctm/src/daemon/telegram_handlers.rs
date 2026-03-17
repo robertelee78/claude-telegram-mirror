@@ -203,6 +203,52 @@ async fn handle_telegram_text(ctx: &HandlerContext, msg: &TgMessage, text: &str)
     }
 }
 
+/// Look up a session by thread_id, reactivating ended sessions if needed.
+///
+/// This is the Telegram-side equivalent of `ensure_session_exists` for socket
+/// messages. Without this, messages sent to topics whose sessions were cleaned
+/// up by the stale session detector are silently dropped.
+async fn recover_session_by_thread(
+    ctx: &HandlerContext,
+    thread_id: i64,
+) -> Option<crate::session::Session> {
+    // Fast path: active session
+    let session = ctx
+        .db_op(move |sess| sess.get_session_by_thread_id(thread_id).ok().flatten())
+        .await;
+    if session.is_some() {
+        return session;
+    }
+
+    // Slow path: check ended sessions and reactivate
+    let ended = ctx
+        .db_op(move |sess| {
+            sess.get_session_by_thread_id_any_status(thread_id)
+                .ok()
+                .flatten()
+        })
+        .await;
+
+    match ended {
+        Some(s) if s.status != crate::types::SessionStatus::Active => {
+            tracing::info!(
+                session_id = %s.id,
+                thread_id,
+                prev_status = %s.status,
+                "Reactivating ended session from Telegram message"
+            );
+            let sid = s.id.clone();
+            ctx.db_op(move |sess| {
+                let _ = sess.reactivate_session(&sid);
+            })
+            .await;
+            Some(s)
+        }
+        Some(s) => Some(s),
+        None => None,
+    }
+}
+
 /// Handle photo message from Telegram.
 async fn handle_telegram_photo(ctx: &HandlerContext, msg: &TgMessage) {
     let thread_id = match msg.message_thread_id {
@@ -210,10 +256,7 @@ async fn handle_telegram_photo(ctx: &HandlerContext, msg: &TgMessage) {
         None => return, // BUG-005
     };
 
-    let session = match ctx
-        .db_op(move |sess| sess.get_session_by_thread_id(thread_id).ok().flatten())
-        .await
-    {
+    let session = match recover_session_by_thread(ctx, thread_id).await {
         Some(s) => s,
         None => return,
     };
@@ -272,10 +315,7 @@ async fn handle_telegram_document(ctx: &HandlerContext, msg: &TgMessage) {
         None => return, // BUG-005
     };
 
-    let session = match ctx
-        .db_op(move |sess| sess.get_session_by_thread_id(thread_id).ok().flatten())
-        .await
-    {
+    let session = match recover_session_by_thread(ctx, thread_id).await {
         Some(s) => s,
         None => return,
     };

@@ -331,6 +331,33 @@ impl SessionManager {
         }
     }
 
+    /// Look up a session by thread_id regardless of status.
+    ///
+    /// Used by Telegram message handlers to recover ended sessions: if the user
+    /// sends a message to a topic whose session was cleaned up, we can find the
+    /// ended session and reactivate it instead of silently dropping the message.
+    pub fn get_session_by_thread_id_any_status(&self, thread_id: i64) -> Result<Option<Session>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT * FROM sessions
+                 WHERE thread_id = ?1
+                 ORDER BY last_activity DESC
+                 LIMIT 1",
+            )
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        let mut rows = stmt
+            .query_map(params![thread_id], row_to_session)
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        match rows.next() {
+            Some(Ok(s)) => Ok(Some(s)),
+            Some(Err(e)) => Err(AppError::Database(e.to_string())),
+            None => Ok(None),
+        }
+    }
+
     #[allow(dead_code)] // Library API
     pub fn get_session_by_chat_id(&self, chat_id: i64) -> Result<Option<Session>> {
         let mut stmt = self

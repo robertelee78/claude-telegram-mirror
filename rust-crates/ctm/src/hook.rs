@@ -97,6 +97,7 @@ fn get_session_id(event: &HookEvent) -> String {
         HookEvent::Notification(e) => e.base.session_id.clone(),
         HookEvent::UserPromptSubmit(e) => e.base.session_id.clone(),
         HookEvent::PreCompact(e) => e.base.session_id.clone(),
+        HookEvent::SessionEnd(e) => e.base.session_id.clone(),
     }
 }
 
@@ -110,6 +111,7 @@ fn get_transcript_path(event: &HookEvent) -> Option<&str> {
         HookEvent::Notification(e) => &e.base,
         HookEvent::UserPromptSubmit(e) => &e.base,
         HookEvent::PreCompact(e) => &e.base,
+        HookEvent::SessionEnd(e) => &e.base,
     };
     base.transcript_path.as_deref()
 }
@@ -124,6 +126,7 @@ fn get_cwd(event: &HookEvent) -> Option<&str> {
         HookEvent::Notification(e) => &e.base,
         HookEvent::UserPromptSubmit(e) => &e.base,
         HookEvent::PreCompact(e) => &e.base,
+        HookEvent::SessionEnd(e) => &e.base,
     };
     base.cwd.as_deref()
 }
@@ -357,20 +360,33 @@ async fn build_messages(
             // fires after every assistant turn, not just on process exit. Sending
             // session_end would mark the session as ended and trigger topic deletion
             // after every turn, causing a cycle of session death and recreation.
-            // Real session cleanup is handled by the daemon's stale session detector
-            // which checks tmux pane liveness (cleanup.rs).
-
-            // Clean up transcript state file (tracks last processed JSONL line).
-            let state_file = cfg.config_dir.join(format!(".last_line_{}", session_id));
-            if state_file.exists() {
-                let _ = std::fs::remove_file(&state_file);
-            }
+            // Real session cleanup is handled by the SessionEnd hook event,
+            // which fires exactly once when the session actually terminates.
+            // Stale session detection in cleanup.rs serves as a fallback.
         }
         HookEvent::SubagentStop(_) => {
             // Recognized but no message sent
         }
         HookEvent::PreCompact(_) => {
             messages.push(make_message(MessageType::PreCompact, session_id, "", meta));
+        }
+        HookEvent::SessionEnd(e) => {
+            // SessionEnd fires exactly once when the session actually terminates
+            // (process exit, /clear, logout, etc.) — unlike Stop which fires
+            // after every turn. This is the correct place to send session_end.
+            let reason = e.reason.as_deref().unwrap_or("unknown");
+            messages.push(make_message(
+                MessageType::SessionEnd,
+                session_id,
+                reason,
+                meta.clone(),
+            ));
+
+            // Clean up transcript state file
+            let state_file = cfg.config_dir.join(format!(".last_line_{}", session_id));
+            if state_file.exists() {
+                let _ = std::fs::remove_file(&state_file);
+            }
         }
     }
 

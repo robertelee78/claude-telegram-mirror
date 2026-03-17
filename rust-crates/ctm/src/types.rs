@@ -11,6 +11,7 @@ pub enum HookEvent {
     Notification(NotificationEvent),
     UserPromptSubmit(UserPromptSubmitEvent),
     PreCompact(PreCompactEvent),
+    SessionEnd(SessionEndEvent),
 }
 
 /// Base fields present on all hook events
@@ -115,6 +116,19 @@ pub struct UserPromptSubmitEvent {
 pub struct PreCompactEvent {
     #[serde(flatten)]
     pub base: HookEventBase,
+}
+
+/// Fires when the Claude Code session actually terminates (process exit,
+/// /clear, logout, etc.). Unlike `Stop` which fires after every turn,
+/// `SessionEnd` fires exactly once at the end of the session's lifetime.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionEndEvent {
+    #[serde(flatten)]
+    pub base: HookEventBase,
+    /// Why the session ended: "clear", "logout", "prompt_input_exit",
+    /// "bypass_permissions_disabled", or "other".
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 /// Message types sent to the bridge daemon via Unix socket (NDJSON)
