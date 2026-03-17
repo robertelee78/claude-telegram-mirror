@@ -320,7 +320,7 @@ pub fn load_config(require_auth: bool) -> Result<Config> {
 
     let rate_limit = std::env::var("TELEGRAM_RATE_LIMIT")
         .ok()
-        .map(|v| parse_u32(&v, 1))
+        .map(|v| parse_u32(&v, 20))
         .or(file_config.rate_limit)
         .unwrap_or(20);
 

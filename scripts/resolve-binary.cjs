@@ -133,18 +133,7 @@ function resolveBinary() {
     return null;
   }
 
-  // Strategy 1: npm global root
-  try {
-    const npmRoot = execSync('npm root -g', { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
-    const binary = findInNodeModules(npmRoot, packageName);
-    if (binary) {
-      return { binary, packageDir: path.join(npmRoot, packageName) };
-    }
-  } catch {
-    // npm not available or not installed globally
-  }
-
-  // Strategy 2: Walk upward from this file to find node_modules
+  // Strategy 1: Walk upward from this file to find node_modules (fast, no subprocess)
   let dir = __dirname;
   for (let i = 0; i < 10; i++) {
     const nodeModules = path.join(dir, 'node_modules');
@@ -157,6 +146,17 @@ function resolveBinary() {
     const parent = path.dirname(dir);
     if (parent === dir) break;
     dir = parent;
+  }
+
+  // Strategy 2: npm global root (slower — spawns `npm` subprocess)
+  try {
+    const npmRoot = execSync('npm root -g', { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
+    const binary = findInNodeModules(npmRoot, packageName);
+    if (binary) {
+      return { binary, packageDir: path.join(npmRoot, packageName) };
+    }
+  } catch {
+    // npm not available or not installed globally
   }
 
   // Strategy 3: Check NVM_DIR global installs

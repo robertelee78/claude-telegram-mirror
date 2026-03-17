@@ -762,7 +762,7 @@ pub async fn run_doctor(fix: bool) -> anyhow::Result<()> {
         .count();
     let fixed_count = checks.iter().filter(|c| c.fixed).count();
     let issues_found = warnings + failed;
-    let require_manual = issues_found - fixed_count;
+    let require_manual = issues_found.saturating_sub(fixed_count);
 
     println!("{}", gray(&"-".repeat(60)));
     println!("{}", bold("Summary"));

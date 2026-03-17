@@ -143,13 +143,17 @@ async fn handle_stale_session_cleanup(
 
     let sid = session.id.clone();
     ctx.db_op(move |sess| {
-        let _ = sess.end_session(&sid, "ended");
+        let _ = sess.end_session(&sid, crate::types::SessionStatus::Ended);
     })
     .await;
 }
 
 /// Clean up orphaned threads (ended sessions still with thread_ids).
 async fn cleanup_orphaned_threads(ctx: &HandlerContext) {
+    if !ctx.config.auto_delete_topics {
+        return;
+    }
+
     let orphans = ctx
         .db_op(|sess| sess.get_orphaned_thread_sessions().unwrap_or_default())
         .await;

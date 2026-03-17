@@ -58,7 +58,7 @@ async fn handle_confirm_abort_callback(ctx: &HandlerContext, session_id: &str, c
     // Mark session as aborted in DB
     let aborted = {
         let sid = session_id.to_string();
-        ctx.db_op(move |sess| sess.end_session(&sid, "aborted").is_ok())
+        ctx.db_op(move |sess| sess.end_session(&sid, crate::types::SessionStatus::Aborted).is_ok())
             .await
     };
 
@@ -180,13 +180,13 @@ async fn handle_approval_callback(
         let act = action.to_string();
         ctx.db_op(move |sess| {
             if act == "abort" {
-                let _ = sess.end_session(&asid, "aborted");
-                let _ = sess.resolve_approval(&aid, "rejected");
+                let _ = sess.end_session(&asid, crate::types::SessionStatus::Aborted);
+                let _ = sess.resolve_approval(&aid, crate::types::ApprovalStatus::Rejected);
             } else {
                 let status = if act == "approve" {
-                    "approved"
+                    crate::types::ApprovalStatus::Approved
                 } else {
-                    "rejected"
+                    crate::types::ApprovalStatus::Rejected
                 };
                 let _ = sess.resolve_approval(&aid, status);
             }

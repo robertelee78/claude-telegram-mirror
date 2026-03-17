@@ -308,6 +308,28 @@ async fn cmd_stop(force: bool) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Verify the daemon actually holds the flock before signalling.
+    // This prevents killing an unrelated process that reused the PID.
+    {
+        use std::os::fd::OwnedFd;
+        if let Ok(file) = std::fs::OpenOptions::new().read(true).open(&pid_file) {
+            let fd: OwnedFd = file.into();
+            match nix::fcntl::Flock::lock(fd, nix::fcntl::FlockArg::LockExclusiveNonblock) {
+                Ok(_lock) => {
+                    // We acquired the lock — daemon is NOT running (stale PID, reused by OS)
+                    println!(
+                        "Daemon is not running (stale PID file, lock not held), cleaning up..."
+                    );
+                    cleanup_stale_files(&config_dir);
+                    return Ok(());
+                }
+                Err(_) => {
+                    // Lock held by daemon — safe to signal
+                }
+            }
+        }
+    }
+
     println!("Stopping daemon (PID {pid})...");
 
     // Send SIGTERM
@@ -614,6 +636,9 @@ async fn cmd_toggle(force_on: bool, force_off: bool) -> anyhow::Result<()> {
 // ====================================================================== helpers
 
 fn is_process_running(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
     nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
 }
 

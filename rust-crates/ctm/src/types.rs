@@ -176,6 +176,101 @@ pub struct BridgeMessage {
     pub metadata: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
+impl BridgeMessage {
+    /// Return a typed accessor for the metadata map.
+    pub fn meta(&self) -> MessageMetadata<'_> {
+        MessageMetadata(self.metadata.as_ref())
+    }
+}
+
+/// Typed accessor for `BridgeMessage` metadata fields.
+///
+/// Wraps `Option<&serde_json::Map<String, serde_json::Value>>` and provides
+/// named methods for every known metadata key, eliminating repetitive
+/// `.metadata.as_ref().and_then(|m| m.get("key")).and_then(|v| v.as_str())`
+/// chains throughout the daemon code.
+///
+/// Wire format and serialization are unchanged -- this is a read-only view.
+pub struct MessageMetadata<'a>(Option<&'a serde_json::Map<String, serde_json::Value>>);
+
+impl<'a> MessageMetadata<'a> {
+    /// Helper: get a string value by key.
+    fn str_field(&self, key: &str) -> Option<&'a str> {
+        self.0?.get(key)?.as_str()
+    }
+
+    /// Helper: get a `serde_json::Value` reference by key.
+    fn value_field(&self, key: &str) -> Option<&'a serde_json::Value> {
+        self.0?.get(key)
+    }
+
+    /// Tool name (`"tool"`).
+    pub fn tool(&self) -> Option<&'a str> {
+        self.str_field("tool")
+    }
+
+    /// Tool input object (`"input"`).
+    pub fn input(&self) -> Option<&'a serde_json::Value> {
+        self.value_field("input")
+    }
+
+    /// Tool use identifier (`"toolUseId"`).
+    pub fn tool_use_id(&self) -> Option<&'a str> {
+        self.str_field("toolUseId")
+    }
+
+    /// Socket client identifier (`"_client_id"`).
+    pub fn client_id(&self) -> Option<&'a str> {
+        self.str_field("_client_id")
+    }
+
+    /// Hostname of the machine running the session (`"hostname"`).
+    pub fn hostname(&self) -> Option<&'a str> {
+        self.str_field("hostname")
+    }
+
+    /// Tmux target pane (`"tmuxTarget"`).
+    pub fn tmux_target(&self) -> Option<&'a str> {
+        self.str_field("tmuxTarget")
+    }
+
+    /// Tmux socket path (`"tmuxSocket"`).
+    pub fn tmux_socket(&self) -> Option<&'a str> {
+        self.str_field("tmuxSocket")
+    }
+
+    /// Message source (`"source"`, e.g. `"telegram"` or `"cli"`).
+    pub fn source(&self) -> Option<&'a str> {
+        self.str_field("source")
+    }
+
+    /// Project directory (`"projectDir"`).
+    pub fn project_dir(&self) -> Option<&'a str> {
+        self.str_field("projectDir")
+    }
+
+    /// Transcript file path (`"transcript_path"`).
+    pub fn transcript_path(&self) -> Option<&'a str> {
+        self.str_field("transcript_path")
+    }
+
+    /// Compact trigger (`"trigger"`, e.g. `"auto"` or `"manual"`).
+    pub fn trigger(&self) -> Option<&'a str> {
+        self.str_field("trigger")
+    }
+
+    /// Image/document caption (`"caption"`).
+    pub fn caption(&self) -> Option<&'a str> {
+        self.str_field("caption")
+    }
+
+    /// Approval identifier (`"approvalId"`).
+    #[allow(dead_code)] // Public API — used in tests and available for callers
+    pub fn approval_id(&self) -> Option<&'a str> {
+        self.str_field("approvalId")
+    }
+}
+
 /// Information about a connected socket client (mirrors TS `SocketClientInfo`).
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // Library API
@@ -225,20 +320,122 @@ pub const ALLOWED_TMUX_KEYS: &[&str] = &[
 pub const MAX_SESSION_ID_LEN: usize = 128;
 
 /// Valid status values for sessions.
+///
+/// Kept for backward compatibility with external callers. Prefer
+/// [`SessionStatus`] for compile-time safety.
+#[allow(dead_code)] // Backward-compat public API
 pub const VALID_SESSION_STATUSES: &[&str] = &["active", "ended", "aborted"];
 
 /// Valid status values for approvals.
+///
+/// Kept for backward compatibility with external callers. Prefer
+/// [`ApprovalStatus`] for compile-time safety.
+#[allow(dead_code)] // Backward-compat public API
 pub const VALID_APPROVAL_STATUSES: &[&str] =
     &["pending", "approved", "denied", "rejected", "expired"];
 
 /// Returns true if `s` is a recognized session status.
+///
+/// Kept for backward compatibility. Prefer `SessionStatus::try_from(s)`.
+#[allow(dead_code)] // Backward-compat public API
 pub fn is_valid_session_status(s: &str) -> bool {
     VALID_SESSION_STATUSES.contains(&s)
 }
 
 /// Returns true if `s` is a recognized approval status.
+///
+/// Kept for backward compatibility. Prefer `ApprovalStatus::try_from(s)`.
+#[allow(dead_code)] // Backward-compat public API
 pub fn is_valid_approval_status(s: &str) -> bool {
     VALID_APPROVAL_STATUSES.contains(&s)
+}
+
+/// Typed session status for compile-time safety.
+///
+/// The SQLite layer still stores these as TEXT strings; use `.as_str()` when
+/// writing to the database and `TryFrom<&str>` when reading back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionStatus {
+    Active,
+    Ended,
+    Aborted,
+}
+
+impl SessionStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Ended => "ended",
+            Self::Aborted => "aborted",
+        }
+    }
+}
+
+impl std::fmt::Display for SessionStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+impl TryFrom<&str> for SessionStatus {
+    type Error = String;
+
+    fn try_from(s: &str) -> std::result::Result<Self, Self::Error> {
+        match s {
+            "active" => Ok(Self::Active),
+            "ended" => Ok(Self::Ended),
+            "aborted" => Ok(Self::Aborted),
+            other => Err(format!("invalid session status: {other}")),
+        }
+    }
+}
+
+/// Typed approval status for compile-time safety.
+///
+/// The SQLite layer still stores these as TEXT strings; use `.as_str()` when
+/// writing to the database and `TryFrom<&str>` when reading back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalStatus {
+    Pending,
+    Approved,
+    Denied,
+    Rejected,
+    Expired,
+}
+
+impl ApprovalStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Approved => "approved",
+            Self::Denied => "denied",
+            Self::Rejected => "rejected",
+            Self::Expired => "expired",
+        }
+    }
+}
+
+impl std::fmt::Display for ApprovalStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+impl TryFrom<&str> for ApprovalStatus {
+    type Error = String;
+
+    fn try_from(s: &str) -> std::result::Result<Self, Self::Error> {
+        match s {
+            "pending" => Ok(Self::Pending),
+            "approved" => Ok(Self::Approved),
+            "denied" => Ok(Self::Denied),
+            "rejected" => Ok(Self::Rejected),
+            "expired" => Ok(Self::Expired),
+            other => Err(format!("invalid approval status: {other}")),
+        }
+    }
 }
 
 /// Maximum stdin/NDJSON line size (1 MiB)
@@ -374,5 +571,88 @@ mod tests {
         // Round-trip
         let parsed: BridgeMessage = serde_json::from_value(json).unwrap();
         assert_eq!(parsed.msg_type, MessageType::Command);
+    }
+
+    #[test]
+    fn test_session_status_as_str() {
+        assert_eq!(SessionStatus::Active.as_str(), "active");
+        assert_eq!(SessionStatus::Ended.as_str(), "ended");
+        assert_eq!(SessionStatus::Aborted.as_str(), "aborted");
+    }
+
+    #[test]
+    fn test_session_status_display() {
+        assert_eq!(format!("{}", SessionStatus::Active), "active");
+        assert_eq!(format!("{}", SessionStatus::Ended), "ended");
+        assert_eq!(format!("{}", SessionStatus::Aborted), "aborted");
+    }
+
+    #[test]
+    fn test_session_status_try_from() {
+        assert_eq!(SessionStatus::try_from("active"), Ok(SessionStatus::Active));
+        assert_eq!(SessionStatus::try_from("ended"), Ok(SessionStatus::Ended));
+        assert_eq!(
+            SessionStatus::try_from("aborted"),
+            Ok(SessionStatus::Aborted)
+        );
+        assert!(SessionStatus::try_from("unknown").is_err());
+    }
+
+    #[test]
+    fn test_session_status_serde_roundtrip() {
+        let status = SessionStatus::Active;
+        let json = serde_json::to_value(status).unwrap();
+        assert_eq!(json, serde_json::Value::String("active".into()));
+        let parsed: SessionStatus = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed, SessionStatus::Active);
+    }
+
+    #[test]
+    fn test_approval_status_as_str() {
+        assert_eq!(ApprovalStatus::Pending.as_str(), "pending");
+        assert_eq!(ApprovalStatus::Approved.as_str(), "approved");
+        assert_eq!(ApprovalStatus::Denied.as_str(), "denied");
+        assert_eq!(ApprovalStatus::Rejected.as_str(), "rejected");
+        assert_eq!(ApprovalStatus::Expired.as_str(), "expired");
+    }
+
+    #[test]
+    fn test_approval_status_display() {
+        assert_eq!(format!("{}", ApprovalStatus::Pending), "pending");
+        assert_eq!(format!("{}", ApprovalStatus::Approved), "approved");
+    }
+
+    #[test]
+    fn test_approval_status_try_from() {
+        assert_eq!(
+            ApprovalStatus::try_from("pending"),
+            Ok(ApprovalStatus::Pending)
+        );
+        assert_eq!(
+            ApprovalStatus::try_from("approved"),
+            Ok(ApprovalStatus::Approved)
+        );
+        assert_eq!(
+            ApprovalStatus::try_from("denied"),
+            Ok(ApprovalStatus::Denied)
+        );
+        assert_eq!(
+            ApprovalStatus::try_from("rejected"),
+            Ok(ApprovalStatus::Rejected)
+        );
+        assert_eq!(
+            ApprovalStatus::try_from("expired"),
+            Ok(ApprovalStatus::Expired)
+        );
+        assert!(ApprovalStatus::try_from("unknown").is_err());
+    }
+
+    #[test]
+    fn test_approval_status_serde_roundtrip() {
+        let status = ApprovalStatus::Approved;
+        let json = serde_json::to_value(status).unwrap();
+        assert_eq!(json, serde_json::Value::String("approved".into()));
+        let parsed: ApprovalStatus = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed, ApprovalStatus::Approved);
     }
 }

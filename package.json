@@ -11,7 +11,9 @@
     "test": "cd rust-crates && cargo test"
   },
   "files": [
-    "scripts/",
+    "scripts/ctm-wrapper.cjs",
+    "scripts/resolve-binary.cjs",
+    "scripts/get-chat-id.sh",
     "postinstall.cjs",
     "README.md",
     "SECURITY.md"

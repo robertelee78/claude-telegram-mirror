@@ -6,7 +6,7 @@
 
 use ctm::session::SessionManager;
 use ctm::socket::{SocketClient, SocketServer};
-use ctm::types::{BridgeMessage, MessageType};
+use ctm::types::{ApprovalStatus, BridgeMessage, MessageType, SessionStatus};
 use std::sync::Arc;
 use tempfile::tempdir;
 use tokio::sync::Barrier;
@@ -85,7 +85,7 @@ async fn concurrent_read_write_consistent_state() {
                 mgr.create_session(&id, 1, None, None, None, None, None)
                     .unwrap();
                 if i % 3 == 0 {
-                    mgr.end_session(&id, "ended").unwrap();
+                    mgr.end_session(&id, SessionStatus::Ended).unwrap();
                 }
             }
         });
@@ -130,7 +130,7 @@ async fn concurrent_approval_resolution_first_wins() {
     let mut success_count = 0;
     for _ in 0..10 {
         let resolved = mgr
-            .resolve_approval(&approval_id, "approved")
+            .resolve_approval(&approval_id, ApprovalStatus::Approved)
             .expect("resolve_approval should not error");
         if resolved {
             success_count += 1;
@@ -140,7 +140,7 @@ async fn concurrent_approval_resolution_first_wins() {
     assert_eq!(success_count, 1, "Only the first resolution should succeed");
 
     let approval = mgr.get_approval(&approval_id).unwrap().unwrap();
-    assert_eq!(approval.status, "approved");
+    assert_eq!(approval.status, ApprovalStatus::Approved);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -169,7 +169,7 @@ async fn concurrent_approval_resolution_across_connections() {
             handles.push(tokio::spawn(async move {
                 bar.wait().await;
                 let mgr = SessionManager::new(&path, 5).unwrap();
-                mgr.resolve_approval(&aid, "approved")
+                mgr.resolve_approval(&aid, ApprovalStatus::Approved)
                     .expect("resolve should not error")
             }));
         }

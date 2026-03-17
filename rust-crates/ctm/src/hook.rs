@@ -4,7 +4,7 @@ use crate::formatting;
 use crate::injector::{self, InputInjector};
 use crate::types::{self, BridgeMessage, HookEvent, MessageType, MAX_LINE_BYTES, SAFE_COMMANDS};
 use std::io::Read;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::time::{timeout, Duration};
 
@@ -749,20 +749,19 @@ async fn send_and_wait(
         let mut line = String::new();
         loop {
             line.clear();
-            let bytes = buf_reader
-                .read_line(&mut line)
-                .await
-                .map_err(|e| AppError::Socket(format!("Failed to read: {}", e)))?;
+            let bytes =
+                crate::socket::read_bounded_line(&mut buf_reader, &mut line, MAX_LINE_BYTES)
+                    .await
+                    .map_err(|e| AppError::Socket(format!("Failed to read: {}", e)))?;
 
             if bytes == 0 {
                 return Err(AppError::Socket("Connection closed".into()));
             }
 
             // FR31: Bound client read to MAX_LINE_BYTES
-            if line.len() > MAX_LINE_BYTES {
+            if bytes > MAX_LINE_BYTES {
                 return Err(AppError::Socket(format!(
-                    "Response line too large ({} bytes, max {MAX_LINE_BYTES})",
-                    line.len()
+                    "Response line too large ({bytes} bytes, max {MAX_LINE_BYTES})",
                 )));
             }
 

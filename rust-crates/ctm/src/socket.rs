@@ -269,6 +269,45 @@ impl Drop for SocketServer {
     }
 }
 
+/// Read a single line from an async buffered reader, bounding memory to `max_bytes`.
+///
+/// Unlike `AsyncBufReadExt::read_line`, this stops accumulating into `buf` once
+/// `max_bytes` have been consumed, preventing a single newline-free payload from
+/// exhausting memory. The function always drains to the next newline (or EOF) to
+/// keep the stream frame-aligned for subsequent reads.
+///
+/// Returns `Ok(0)` on EOF, `Ok(n)` on success where `n` is the total bytes consumed.
+/// If `n > max_bytes`, the line was oversized and `buf` should be discarded.
+pub(crate) async fn read_bounded_line<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    buf: &mut String,
+    max_bytes: usize,
+) -> std::io::Result<usize> {
+    buf.clear();
+    let mut total = 0usize;
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(total);
+        }
+        if let Some(pos) = available.iter().position(|&b| b == b'\n') {
+            let to_consume = pos + 1;
+            if total + to_consume <= max_bytes {
+                buf.push_str(&String::from_utf8_lossy(&available[..to_consume]));
+            }
+            reader.consume(to_consume);
+            total += to_consume;
+            return Ok(total);
+        }
+        let len = available.len();
+        if total + len <= max_bytes {
+            buf.push_str(&String::from_utf8_lossy(available));
+        }
+        reader.consume(len);
+        total += len;
+    }
+}
+
 /// Read NDJSON lines from a client and broadcast each parsed message.
 ///
 /// L5.5: Emits `tracing::info` events on connect and disconnect so operators
@@ -287,23 +326,19 @@ async fn handle_client(
 
     loop {
         line.clear();
-        match buf_reader.read_line(&mut line).await {
+        match read_bounded_line(&mut buf_reader, &mut line, MAX_LINE_BYTES).await {
             Ok(0) => {
                 // L5.5: Log disconnect on EOF
                 tracing::info!(client_id, "Socket client disconnected");
                 break;
             }
-            Ok(_) => {
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
+            Ok(n) => {
+                if n > MAX_LINE_BYTES {
+                    tracing::warn!(client_id, len = n, "Oversized NDJSON line dropped");
                     continue;
                 }
-                if trimmed.len() > MAX_LINE_BYTES {
-                    tracing::warn!(
-                        client_id,
-                        len = trimmed.len(),
-                        "Oversized NDJSON line dropped"
-                    );
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
                     continue;
                 }
                 match serde_json::from_str::<BridgeMessage>(trimmed) {
@@ -434,8 +469,7 @@ impl SocketClient {
             let mut line = String::new();
             loop {
                 line.clear();
-                let bytes = buf_reader
-                    .read_line(&mut line)
+                let bytes = read_bounded_line(&mut buf_reader, &mut line, MAX_LINE_BYTES)
                     .await
                     .map_err(|e| AppError::Socket(format!("Read failed: {e}")))?;
 
@@ -444,10 +478,9 @@ impl SocketClient {
                 }
 
                 // FR31: Bound client read to MAX_LINE_BYTES
-                if line.len() > MAX_LINE_BYTES {
+                if bytes > MAX_LINE_BYTES {
                     return Err(AppError::Socket(format!(
-                        "Response line too large ({} bytes, max {MAX_LINE_BYTES})",
-                        line.len()
+                        "Response line too large ({bytes} bytes, max {MAX_LINE_BYTES})",
                     )));
                 }
 

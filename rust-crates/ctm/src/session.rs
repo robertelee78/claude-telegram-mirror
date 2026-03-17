@@ -4,6 +4,7 @@
 
 use crate::config::ensure_config_dir;
 use crate::error::{AppError, Result};
+use crate::types::{ApprovalStatus, SessionStatus};
 use rusqlite::{params, Connection};
 use std::path::Path;
 
@@ -27,7 +28,7 @@ pub struct Session {
     pub tmux_socket: Option<String>,
     pub started_at: String,
     pub last_activity: String,
-    pub status: String,
+    pub status: SessionStatus,
     pub project_dir: Option<String>,
     #[allow(dead_code)] // Deserialized from DB; Library API
     pub metadata: Option<String>,
@@ -46,7 +47,7 @@ pub struct PendingApproval {
     #[allow(dead_code)] // Deserialized from DB; Library API
     pub expires_at: String,
     #[allow(dead_code)] // Deserialized from DB; Library API
-    pub status: String,
+    pub status: ApprovalStatus,
     #[allow(dead_code)] // Deserialized from DB; Library API
     pub message_id: Option<i64>,
 }
@@ -388,14 +389,7 @@ impl SessionManager {
     /// Both SQL statements execute inside a single transaction so that a crash
     /// between them cannot leave the session marked ended while its approvals
     /// remain pending (C-4 atomicity fix).
-    pub fn end_session(&self, session_id: &str, status: &str) -> Result<()> {
-        if !crate::types::is_valid_session_status(status) {
-            return Err(AppError::Config(format!(
-                "invalid session status: {}",
-                status
-            )));
-        }
-
+    pub fn end_session(&self, session_id: &str, status: SessionStatus) -> Result<()> {
         let now = now_iso();
         self.conn
             .execute_batch("BEGIN")
@@ -405,7 +399,7 @@ impl SessionManager {
             self.conn
                 .execute(
                     "UPDATE sessions SET status = ?1, last_activity = ?2 WHERE id = ?3",
-                    params![status, now, session_id],
+                    params![status.as_str(), now, session_id],
                 )
                 .map_err(|e| AppError::Database(e.to_string()))?;
 
@@ -580,21 +574,14 @@ impl SessionManager {
     }
 
     /// Resolve an approval; returns true if a row was actually updated.
-    pub fn resolve_approval(&self, approval_id: &str, status: &str) -> Result<bool> {
-        if !crate::types::is_valid_approval_status(status) {
-            return Err(AppError::Config(format!(
-                "invalid approval status: {}",
-                status
-            )));
-        }
-
+    pub fn resolve_approval(&self, approval_id: &str, status: ApprovalStatus) -> Result<bool> {
         let changed = self
             .conn
             .execute(
                 "UPDATE pending_approvals
                  SET status = ?1
                  WHERE id = ?2 AND status = 'pending'",
-                params![status, approval_id],
+                params![status.as_str(), approval_id],
             )
             .map_err(|e| AppError::Database(e.to_string()))?;
 
@@ -762,6 +749,9 @@ impl SessionManager {
 // ------------------------------------------------------------------ helpers
 
 fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
+    let status_str: String = row.get("status")?;
+    let status = SessionStatus::try_from(status_str.as_str())
+        .unwrap_or(SessionStatus::Active); // Fallback for unknown DB values
     Ok(Session {
         id: row.get("id")?,
         chat_id: row.get("chat_id")?,
@@ -771,20 +761,23 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
         tmux_socket: row.get("tmux_socket")?,
         started_at: row.get("started_at")?,
         last_activity: row.get("last_activity")?,
-        status: row.get("status")?,
+        status,
         project_dir: row.get("project_dir")?,
         metadata: row.get("metadata")?,
     })
 }
 
 fn row_to_approval(row: &rusqlite::Row<'_>) -> rusqlite::Result<PendingApproval> {
+    let status_str: String = row.get("status")?;
+    let status = ApprovalStatus::try_from(status_str.as_str())
+        .unwrap_or(ApprovalStatus::Pending); // Fallback for unknown DB values
     Ok(PendingApproval {
         id: row.get("id")?,
         session_id: row.get("session_id")?,
         prompt: row.get("prompt")?,
         created_at: row.get("created_at")?,
         expires_at: row.get("expires_at")?,
-        status: row.get("status")?,
+        status,
         message_id: row.get("message_id")?,
     })
 }

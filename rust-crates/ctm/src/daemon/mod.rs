@@ -604,11 +604,9 @@ async fn handle_socket_message(ctx: HandlerContext, msg: BridgeMessage) {
     }
 
     // After processing, check transcript for custom-title rename (Epic 5)
-    if let Some(meta) = &msg.metadata {
-        if let Some(tp) = meta.get("transcript_path").and_then(|v| v.as_str()) {
-            if let Some(title) = socket_handlers::check_for_session_rename(tp) {
-                socket_handlers::handle_session_rename(&ctx, &msg.session_id, &title).await;
-            }
+    if let Some(tp) = msg.meta().transcript_path() {
+        if let Some(title) = socket_handlers::check_for_session_rename(tp) {
+            socket_handlers::handle_session_rename(&ctx, &msg.session_id, &title).await;
         }
     }
 }
@@ -617,16 +615,13 @@ async fn handle_socket_message(ctx: HandlerContext, msg: BridgeMessage) {
 
 /// BUG-001: Auto-update tmux target on every message.
 async fn check_and_update_tmux_target(ctx: &HandlerContext, msg: &BridgeMessage) {
-    let meta = match &msg.metadata {
-        Some(m) => m,
-        None => return,
-    };
+    let meta = msg.meta();
 
-    let new_target = match meta.get("tmuxTarget").and_then(|v| v.as_str()) {
+    let new_target = match meta.tmux_target() {
         Some(t) => t,
         None => return,
     };
-    let new_socket = meta.get("tmuxSocket").and_then(|v| v.as_str());
+    let new_socket = meta.tmux_socket();
 
     let current = ctx.session_tmux.read().await.get(&msg.session_id).cloned();
     if current.as_deref() == Some(new_target) {
@@ -674,7 +669,7 @@ async fn ensure_session_exists(ctx: &HandlerContext, msg: &BridgeMessage) {
 
     if let Some(session) = existing {
         // BUG-009: Reactivate ended session if hook events are still arriving
-        if session.status != "active" {
+        if session.status != crate::types::SessionStatus::Active {
             tracing::info!(
                 session_id = %msg.session_id,
                 prev_status = %session.status,

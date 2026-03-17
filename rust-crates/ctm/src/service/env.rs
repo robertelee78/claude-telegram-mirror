@@ -83,8 +83,15 @@ pub(super) fn create_systemd_env_file() -> anyhow::Result<PathBuf> {
 
     let mut lines = vec!["# Auto-generated from ~/.telegram-env for systemd".to_string()];
     for (key, value) in &env_vars {
-        if value.contains(' ') || value.contains('$') || value.contains('`') {
-            lines.push(format!("{key}=\"{value}\""));
+        if value.contains(' ')
+            || value.contains('$')
+            || value.contains('`')
+            || value.contains('"')
+            || value.contains('\\')
+        {
+            // Escape backslashes first, then double quotes
+            let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+            lines.push(format!("{key}=\"{escaped}\""));
         } else {
             lines.push(format!("{key}={value}"));
         }

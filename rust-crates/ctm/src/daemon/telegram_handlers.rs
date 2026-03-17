@@ -729,7 +729,7 @@ async fn handle_bot_command(ctx: &HandlerContext, msg: &TgMessage, text: &str) {
                     // Mark session as aborted in DB
                     let aborted = {
                         let sid = session_id.clone();
-                        ctx.db_op(move |sess| sess.end_session(&sid, "aborted").is_ok())
+                        ctx.db_op(move |sess| sess.end_session(&sid, crate::types::SessionStatus::Aborted).is_ok())
                             .await
                     };
 

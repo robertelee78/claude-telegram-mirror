@@ -37,18 +37,18 @@ fn load_config_returns_expected_default_types() {
     );
 }
 
+/// NOTE: Tests that mutate env vars are combined into a single test function to
+/// avoid data races — `std::env::set_var` is process-global and unsound when
+/// called from multiple threads (which `cargo test` runs by default).
 #[test]
-fn load_config_require_auth_with_env_vars_succeeds() {
-    // Set both required env vars, should succeed regardless of config file
-    std::env::set_var("TELEGRAM_BOT_TOKEN", "test-token-for-validation");
-    std::env::set_var("TELEGRAM_CHAT_ID", "123456");
+fn load_config_env_var_tests() {
+    // Sub-test 1: load_config(true) succeeds with both required env vars set
+    unsafe {
+        std::env::set_var("TELEGRAM_BOT_TOKEN", "test-token-for-validation");
+        std::env::set_var("TELEGRAM_CHAT_ID", "123456");
+    }
 
     let result = config::load_config(true);
-
-    // Cleanup
-    std::env::remove_var("TELEGRAM_BOT_TOKEN");
-    std::env::remove_var("TELEGRAM_CHAT_ID");
-
     assert!(
         result.is_ok(),
         "load_config(true) should succeed with both env vars set"
@@ -56,25 +56,16 @@ fn load_config_require_auth_with_env_vars_succeeds() {
     let cfg = result.unwrap();
     assert_eq!(cfg.bot_token, "test-token-for-validation");
     assert_eq!(cfg.chat_id, 123456);
-}
 
-#[test]
-fn validate_config_reports_empty_credentials() {
-    // Construct a Config-like scenario via validate_config with known empty fields.
-    // We create a config with empty bot_token and zero chat_id via env overrides.
-    std::env::set_var("TELEGRAM_BOT_TOKEN", "");
-    std::env::set_var("TELEGRAM_CHAT_ID", "0");
-    std::env::set_var("TELEGRAM_MIRROR", "false");
+    // Sub-test 2: validate_config reports empty credentials
+    unsafe {
+        std::env::set_var("TELEGRAM_BOT_TOKEN", "");
+        std::env::set_var("TELEGRAM_CHAT_ID", "0");
+        std::env::set_var("TELEGRAM_MIRROR", "false");
+    }
 
-    let cfg = config::load_config(false).unwrap();
-
-    // Cleanup
-    std::env::remove_var("TELEGRAM_BOT_TOKEN");
-    std::env::remove_var("TELEGRAM_CHAT_ID");
-    std::env::remove_var("TELEGRAM_MIRROR");
-
-    // Env vars take priority over config file, so these should always hold
-    let (errors, warnings) = config::validate_config(&cfg);
+    let cfg2 = config::load_config(false).unwrap();
+    let (errors, warnings) = config::validate_config(&cfg2);
     assert!(
         errors.iter().any(|e| e.contains("BOT_TOKEN")),
         "Should report missing bot token in errors: {:?}",
@@ -90,6 +81,13 @@ fn validate_config_reports_empty_credentials() {
         "Should warn about mirror not enabled: {:?}",
         warnings
     );
+
+    // Cleanup
+    unsafe {
+        std::env::remove_var("TELEGRAM_BOT_TOKEN");
+        std::env::remove_var("TELEGRAM_CHAT_ID");
+        std::env::remove_var("TELEGRAM_MIRROR");
+    }
 }
 
 #[test]

@@ -4,6 +4,7 @@
 //! database in a temporary directory.
 
 use ctm::session::SessionManager;
+use ctm::types::{ApprovalStatus, SessionStatus};
 use tempfile::tempdir;
 
 fn make_mgr() -> (SessionManager, tempfile::TempDir) {
@@ -37,7 +38,7 @@ fn create_session_and_verify_exists() {
     assert_eq!(session.chat_id, 42);
     assert_eq!(session.hostname.as_deref(), Some("myhost"));
     assert_eq!(session.project_dir.as_deref(), Some("/project"));
-    assert_eq!(session.status, "active");
+    assert_eq!(session.status, SessionStatus::Active);
 }
 
 #[test]
@@ -62,10 +63,10 @@ fn end_session_marks_ended() {
 
     mgr.create_session("sess-end", 1, None, None, None, None, None)
         .unwrap();
-    mgr.end_session("sess-end", "ended").unwrap();
+    mgr.end_session("sess-end", SessionStatus::Ended).unwrap();
 
     let session = mgr.get_session("sess-end").unwrap().unwrap();
-    assert_eq!(session.status, "ended");
+    assert_eq!(session.status, SessionStatus::Ended);
 
     // Session should not appear in active list
     let active = mgr.get_active_sessions().unwrap();
@@ -90,7 +91,7 @@ fn multiple_sessions_coexist() {
     assert_eq!(active.len(), 3, "All three sessions should be active");
 
     // End one and verify the others remain
-    mgr.end_session("coexist-2", "ended").unwrap();
+    mgr.end_session("coexist-2", SessionStatus::Ended).unwrap();
     let active = mgr.get_active_sessions().unwrap();
     assert_eq!(active.len(), 2, "Two sessions should remain active");
 
@@ -119,19 +120,19 @@ fn pending_approval_lifecycle() {
 
     // Verify it exists and is pending
     let approval = mgr.get_approval(&approval_id).unwrap().unwrap();
-    assert_eq!(approval.status, "pending");
+    assert_eq!(approval.status, ApprovalStatus::Pending);
     assert_eq!(approval.session_id, "sess-appr");
 
     // Resolve it
-    let resolved = mgr.resolve_approval(&approval_id, "approved").unwrap();
+    let resolved = mgr.resolve_approval(&approval_id, ApprovalStatus::Approved).unwrap();
     assert!(resolved, "resolve_approval should return true");
 
     // Verify resolved status
     let approval = mgr.get_approval(&approval_id).unwrap().unwrap();
-    assert_eq!(approval.status, "approved");
+    assert_eq!(approval.status, ApprovalStatus::Approved);
 
     // Cannot resolve again
-    let re_resolved = mgr.resolve_approval(&approval_id, "rejected").unwrap();
+    let re_resolved = mgr.resolve_approval(&approval_id, ApprovalStatus::Rejected).unwrap();
     assert!(
         !re_resolved,
         "Already-resolved approval should not be re-resolved"
@@ -149,11 +150,11 @@ fn end_session_expires_pending_approvals() {
         .unwrap();
 
     // End session should expire pending approvals
-    mgr.end_session("sess-exp", "ended").unwrap();
+    mgr.end_session("sess-exp", SessionStatus::Ended).unwrap();
 
     let approval = mgr.get_approval(&aid).unwrap().unwrap();
     assert_eq!(
-        approval.status, "expired",
+        approval.status, ApprovalStatus::Expired,
         "Pending approval should be expired when session ends"
     );
 }
@@ -164,15 +165,15 @@ fn reactivate_ended_session() {
 
     mgr.create_session("sess-react", 1, None, None, None, None, None)
         .unwrap();
-    mgr.end_session("sess-react", "ended").unwrap();
+    mgr.end_session("sess-react", SessionStatus::Ended).unwrap();
 
     let session = mgr.get_session("sess-react").unwrap().unwrap();
-    assert_eq!(session.status, "ended");
+    assert_eq!(session.status, SessionStatus::Ended);
 
     mgr.reactivate_session("sess-react").unwrap();
 
     let session = mgr.get_session("sess-react").unwrap().unwrap();
-    assert_eq!(session.status, "active");
+    assert_eq!(session.status, SessionStatus::Active);
 }
 
 #[test]
@@ -331,7 +332,7 @@ fn orphaned_thread_sessions() {
     mgr.create_session("orph-1", 1, None, None, None, None, None)
         .unwrap();
     mgr.set_session_thread("orph-1", 888).unwrap();
-    mgr.end_session("orph-1", "ended").unwrap();
+    mgr.end_session("orph-1", SessionStatus::Ended).unwrap();
 
     let orphans = mgr.get_orphaned_thread_sessions().unwrap();
     assert_eq!(orphans.len(), 1);

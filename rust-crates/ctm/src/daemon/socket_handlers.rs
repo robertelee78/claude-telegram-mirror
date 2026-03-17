@@ -4,19 +4,11 @@ use super::*;
 
 /// Handler 1: session_start
 pub(super) async fn handle_session_start(ctx: &HandlerContext, msg: &BridgeMessage) {
-    let meta = msg.metadata.as_ref();
-    let hostname = meta
-        .and_then(|m| m.get("hostname"))
-        .and_then(|v| v.as_str());
-    let project_dir = meta
-        .and_then(|m| m.get("projectDir"))
-        .and_then(|v| v.as_str());
-    let tmux_target = meta
-        .and_then(|m| m.get("tmuxTarget"))
-        .and_then(|v| v.as_str());
-    let tmux_socket = meta
-        .and_then(|m| m.get("tmuxSocket"))
-        .and_then(|v| v.as_str());
+    let meta = msg.meta();
+    let hostname = meta.hostname();
+    let project_dir = meta.project_dir();
+    let tmux_target = meta.tmux_target();
+    let tmux_socket = meta.tmux_socket();
 
     // Create session in DB -- all fields in a single atomic INSERT (M2.12).
     {
@@ -201,7 +193,7 @@ pub(super) async fn handle_session_end(ctx: &HandlerContext, msg: &BridgeMessage
 
         let sid = msg.session_id.clone();
         ctx.db_op(move |sess| {
-            let _ = sess.end_session(&sid, "ended");
+            let _ = sess.end_session(&sid, crate::types::SessionStatus::Ended);
         })
         .await;
     }
@@ -238,11 +230,8 @@ pub(super) async fn handle_agent_response(ctx: &HandlerContext, msg: &BridgeMess
 
 /// Handler 4: tool_start
 pub(super) async fn handle_tool_start(ctx: &HandlerContext, msg: &BridgeMessage) {
-    let meta = msg.metadata.as_ref();
-    let tool_name = meta
-        .and_then(|m| m.get("tool"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("Unknown");
+    let meta = msg.meta();
+    let tool_name = meta.tool().unwrap_or("Unknown");
 
     // Intercept AskUserQuestion tool
     if tool_name == "AskUserQuestion" {
@@ -256,7 +245,7 @@ pub(super) async fn handle_tool_start(ctx: &HandlerContext, msg: &BridgeMessage)
     }
 
     let tool_input = meta
-        .and_then(|m| m.get("input"))
+        .input()
         .cloned()
         .unwrap_or(serde_json::Value::Null);
 
@@ -270,8 +259,7 @@ pub(super) async fn handle_tool_start(ctx: &HandlerContext, msg: &BridgeMessage)
 
     // Use hook-provided toolUseId if present, otherwise generate one
     let tool_use_id = meta
-        .and_then(|m| m.get("toolUseId"))
-        .and_then(|v| v.as_str())
+        .tool_use_id()
         .map(|s| s.to_string())
         .unwrap_or_else(|| {
             format!(
@@ -343,15 +331,12 @@ pub(super) async fn handle_tool_result(ctx: &HandlerContext, msg: &BridgeMessage
         return;
     }
 
-    let meta = msg.metadata.as_ref();
-    let tool_name = meta
-        .and_then(|m| m.get("tool"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("Unknown");
+    let meta = msg.meta();
+    let tool_name = meta.tool().unwrap_or("Unknown");
     // H10: tool_input is stored as a JSON Value (object), not a plain string.
     // .as_str() always returns None for objects — use to_string() / as_str() on the
     // owned serialization instead.
-    let tool_input_owned: Option<String> = meta.and_then(|m| m.get("input")).map(|v| {
+    let tool_input_owned: Option<String> = meta.input().map(|v| {
         v.as_str()
             .map(|s| s.to_string())
             .unwrap_or_else(|| serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string()))
@@ -390,12 +375,7 @@ pub(super) async fn handle_tool_result(ctx: &HandlerContext, msg: &BridgeMessage
 
 /// Handler 6: user_input — BUG-011 echo prevention.
 pub(super) async fn handle_user_input(ctx: &HandlerContext, msg: &BridgeMessage) {
-    let source = msg
-        .metadata
-        .as_ref()
-        .and_then(|m| m.get("source"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("cli");
+    let source = msg.meta().source().unwrap_or("cli");
 
     // Skip messages explicitly from Telegram
     if source == "telegram" {
@@ -444,12 +424,7 @@ pub(super) async fn handle_approval_request(ctx: &HandlerContext, msg: &BridgeMe
 
     // S-2: Record which socket client sent this approval_request so the
     // response can be routed back to that specific client only.
-    if let Some(client_id) = msg
-        .metadata
-        .as_ref()
-        .and_then(|m| m.get("_client_id"))
-        .and_then(|v| v.as_str())
-    {
+    if let Some(client_id) = msg.meta().client_id() {
         ctx.pending_approval_clients
             .write()
             .await
@@ -531,12 +506,7 @@ pub(super) async fn handle_command(ctx: &HandlerContext, msg: &BridgeMessage) {
 
 /// Handler 12: pre_compact
 pub(super) async fn handle_pre_compact(ctx: &HandlerContext, msg: &BridgeMessage) {
-    let trigger = msg
-        .metadata
-        .as_ref()
-        .and_then(|m| m.get("trigger"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("auto");
+    let trigger = msg.meta().trigger().unwrap_or("auto");
 
     let thread_id = ctx.wait_for_topic(&msg.session_id).await;
     if thread_id.is_none() && ctx.config.use_threads {
@@ -687,7 +657,7 @@ pub(super) async fn handle_ask_user_question(ctx: &HandlerContext, msg: &BridgeM
         return;
     }
 
-    let tool_input = match msg.metadata.as_ref().and_then(|m| m.get("input")) {
+    let tool_input = match msg.meta().input() {
         Some(v) => v,
         None => return,
     };
@@ -865,11 +835,7 @@ pub(super) async fn handle_send_image(ctx: &HandlerContext, msg: &BridgeMessage)
         return;
     }
 
-    let caption = msg
-        .metadata
-        .as_ref()
-        .and_then(|m| m.get("caption"))
-        .and_then(|v| v.as_str());
+    let caption = msg.meta().caption();
 
     let result = if files::is_image_extension(path) {
         ctx.bot.send_photo(path, caption, thread_id).await
