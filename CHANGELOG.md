@@ -17,6 +17,8 @@ All notable changes to this project will be documented in this file.
 - **Transcript state file cleanup** — `.last_line_*` files cleaned up on session end instead of accumulating indefinitely
 - **Removed duplicate code** — consolidated `truncate_path` → `short_path`, removed duplicate test coverage
 - **Retry backoff overflow-safe** — `saturating_mul` prevents integer overflow at high retry counts
+- **Echo prevention key uses null separator** — `\0` instead of `:` eliminates the theoretical collision class between session IDs and text
+- **Renamed `escape_markdown` to `escape_markdown_v1`** — clarifies this is Telegram Markdown v1 escaping (backticks only)
 
 ### Breaking Changes
 
@@ -27,7 +29,7 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
-- **Complete Rust rewrite** — 17 modules, 211 tests, ~12,000 lines of Rust replacing the TypeScript implementation
+- **Complete Rust rewrite** — 30 source files (14 top-level modules + 3 sub-module groups), 387 tests (unit + 8 integration test files), ~12,000 lines of Rust replacing the TypeScript implementation
 - **Single static binary** — ~9 MB self-contained binary with sub-millisecond hook latency (<1 ms)
 - **Tool summarizer** — 30+ regex patterns condense verbose tool output into compact Telegram messages
 - **AskUserQuestion rendering** — inline keyboard buttons displayed in Telegram for interactive Claude prompts
@@ -41,6 +43,9 @@ All notable changes to this project will be documented in this file.
 - **`linux-arm64` platform support** — pre-built binary available for ARM64 Linux (e.g., Raspberry Pi, AWS Graviton)
 - **Interactive setup wizard** — `ctm setup` uses `dialoguer` to guide first-time configuration without manual config editing
 - **TypeScript detection in code blocks** — code blocks in Claude output are annotated with the detected language for syntax-highlighted display
+- **Integration test suite** (ADR-008) — 8 test files covering CLI smoke tests, concurrency, config validation, formatting, hook pipeline, session lifecycle, socket roundtrip, and summarizer
+- **Binary integrity verification** (ADR-008) — `checksums.json` in the release workflow for verifiable artifact hashes
+- **Structural decomposition** (ADR-008) — bot/, daemon/, and service/ modules split into focused sub-modules (e.g., `bot/client.rs`, `bot/queue.rs`, `daemon/event_loop.rs`, `daemon/cleanup.rs`, `service/systemd.rs`, `service/launchd.rs`, `service/env.rs`)
 
 ### Security
 
@@ -53,7 +58,7 @@ All notable changes to this project will be documented in this file.
 - **NDJSON line size limits** — incoming NDJSON lines are capped at 1 MB to prevent memory exhaustion
 - **Connection concurrency limits** — the Unix socket listener rejects connections beyond a limit of 64 concurrent clients
 - **IDOR check on approval callbacks** — callback query payloads are validated to ensure the requesting Telegram user matches the session owner before approving a tool call
-- **`umask(0o177)` on socket bind** — socket file is created with mode `0o600`, preventing other local users from connecting
+- **`chmod(0o600)` after socket bind** — socket file permissions set via post-bind `chmod` (ADR-009: replaced process-global `umask` which caused race conditions in multi-threaded contexts)
 
 ### Fixed
 
@@ -70,7 +75,7 @@ All notable changes to this project will be documented in this file.
 
 ### Internal
 
-- **6 Architecture Decision Records (ADRs)** documenting key design choices (binary distribution, rate limiting, PID locking, socket security, token scrubbing, session validation)
+- **9 Architecture Decision Records (ADRs)** documenting key design choices (binary distribution, rate limiting, PID locking, socket security, token scrubbing, session validation, migration gap audit, release readiness audit, broken windows elimination)
 - **SECURITY.md** with a full threat model covering all attack surfaces
 - **CI pipeline updated to Rust-only** — `cargo check`, `clippy`, `fmt`, and `cargo test` replace the TypeScript build/lint/test steps
 - **Release workflow** — GitHub Actions builds binaries for 4 platforms (`linux-x64`, `linux-arm64`, `darwin-x64`, `darwin-arm64`) and publishes scoped npm packages alongside the root package

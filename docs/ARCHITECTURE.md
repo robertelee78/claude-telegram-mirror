@@ -51,7 +51,7 @@ flowchart LR
 
 ## 2. Module Structure
 
-The crate lives at `rust-crates/ctm/` and compiles to both a binary (`main.rs`) and a library (`lib.rs`). There are 17 top-level modules plus sub-modules within `bot/`, `daemon/`, and `service/`.
+The crate lives at `rust-crates/ctm/` and compiles to both a binary (`main.rs`) and a library (`lib.rs`). There are 30 source files across 14 top-level modules and three sub-module groups (`bot/`, `daemon/`, `service/`).
 
 ### Top-level modules
 
@@ -71,11 +71,11 @@ The crate lives at `rust-crates/ctm/` and compiles to both a binary (`main.rs`) 
 
 **session.rs** -- SQLite-backed session and approval manager. Uses `rusqlite` with file permissions set to `0o600`. Schema has two tables: `sessions` (with columns for id, chat_id, thread_id, hostname, tmux_target, tmux_socket, started_at, last_activity, status, project_dir, metadata) and `pending_approvals` (with expiry tracking). Supports session creation, reactivation, thread ID management, tmux info storage, stale candidate queries, orphaned thread detection, and approval lifecycle (create, resolve, expire). Uses ISO 8601 TEXT timestamps for human-readable SQLite queries. Includes automatic schema migration for tmux columns.
 
-**socket.rs** -- Unix domain socket server and client with NDJSON framing. The server uses `flock(2)` on the PID file for atomic single-instance enforcement (no TOCTOU race). Sets `umask(0o177)` before `bind()` so the socket file gets `0o600` permissions, and ensures the parent directory is `0o700`. Supports up to 64 concurrent connections. Each client is handled in a spawned tokio task that reads NDJSON lines and broadcasts them via `tokio::sync::broadcast`. The client side provides `connect`, `send`, `send_and_wait` (with timeout and session ID correlation), and `disconnect`.
+**socket.rs** -- Unix domain socket server and client with NDJSON framing. The server uses `flock(2)` on the PID file for atomic single-instance enforcement (no TOCTOU race). After `bind()`, applies `chmod(0o600)` to the socket file (ADR-009: replaced the previous `umask(0o177)` approach which was process-global and caused race conditions in multi-threaded contexts). Ensures the parent directory is `0o700`. Supports up to 64 concurrent connections. Each client is handled in a spawned tokio task that reads NDJSON lines and broadcasts them via `tokio::sync::broadcast`. The client side provides `connect`, `send`, `send_and_wait` (with timeout and session ID correlation), and `disconnect`.
 
-**bot/ (module)** -- Telegram Bot API client. Split into three sub-modules: `client.rs` (the `TelegramBot` struct with HTTP API methods for sending messages, managing forum topics, editing messages, downloading/uploading files, long polling, and callback query handling), `queue.rs` (message queue with rate limiting via `governor`, retry with exponential backoff, TOPIC_CLOSED recovery, and entity parse error fallback to plain text), and `types.rs` (Telegram API response types including `Update`, `TgMessage`, `CallbackQuery`, `InlineButton`, etc.). Bot token scrubbing uses a compiled regex `bot\d+:[A-Za-z0-9_-]+/` applied globally to all error messages.
+**bot/ (module)** -- Telegram Bot API client. Split into three sub-modules: `client.rs` (the `TelegramBot` struct with HTTP API methods for sending messages, managing forum topics, editing messages, downloading/uploading files, long polling, and callback query handling), `queue.rs` (message queue with rate limiting via `governor` clamped to `[1, 30]` msgs/sec (ADR-009), bounded to `MAX_QUEUE_SIZE = 500` messages with oldest-eviction, retry with overflow-safe exponential backoff using `saturating_mul`, TOPIC_CLOSED recovery, and entity parse error fallback to plain text), and `types.rs` (Telegram API response types including `Update`, `TgMessage`, `CallbackQuery`, `InlineButton`, etc.). Bot token scrubbing uses a compiled regex `bot\d+:[A-Za-z0-9_-]+/` applied globally to all error messages.
 
-**daemon/ (module)** -- The bridge daemon, the central orchestrator. Split into six sub-modules: `mod.rs` (the `Daemon` struct with `start()`/`stop()`, shared state in `Arc<RwLock<...>>` and `Arc<Mutex<...>>`, the `HandlerContext` passed to all handlers, and documented lock ordering to prevent deadlocks), `event_loop.rs` (the main `tokio::select!` loop multiplexing socket messages, Telegram long-polling updates, and a 5-minute cleanup timer), `socket_handlers.rs` (handlers for each `MessageType`: session start/end, agent response, tool start/result, approval request, user input, error, pre-compact, session rename, commands, and image sending), `telegram_handlers.rs` (handlers for Telegram messages and inline commands like /status, /help, /mute, /attach, /abort, /toggle, /ping, /sessions), `callback_handlers.rs` (handlers for inline keyboard callbacks: approval responses, tool detail expansion, and AskUserQuestion multi-select), `cleanup.rs` (stale session detection with differentiated timeouts, topic deletion with configurable delay, download directory cleanup), and `files.rs` (file download handling for photos and documents sent from Telegram).
+**daemon/ (module)** -- The bridge daemon, the central orchestrator. Split into six sub-modules: `mod.rs` (the `Daemon` struct with `start()`/`stop()`, shared state in `Arc<RwLock<...>>` and `Arc<Mutex<...>>`, the `HandlerContext` passed to all handlers, documented lock ordering to prevent deadlocks, `ensure_session_exists` with atomic topic creation locks, and echo prevention via null-separated keys (ADR-009)), `event_loop.rs` (the main `tokio::select!` loop multiplexing socket messages, Telegram long-polling updates, and a 5-minute cleanup timer), `socket_handlers.rs` (handlers for each `MessageType`: session start/end, agent response, tool start/result, approval request, user input, error, pre-compact, session rename, commands, and image sending), `telegram_handlers.rs` (handlers for Telegram messages and inline commands like /status, /help, /mute, /attach, /abort, /toggle, /ping, /sessions), `callback_handlers.rs` (handlers for inline keyboard callbacks: approval responses, tool detail expansion, and AskUserQuestion multi-select), `cleanup.rs` (stale session detection with differentiated timeouts, topic deletion with configurable delay, download directory cleanup, and state file cleanup for `.last_line_*` files (ADR-009)), and `files.rs` (file download handling for photos and documents sent from Telegram).
 
 **formatting.rs** -- Message formatting and chunking for Telegram display. ANSI escape stripping, MarkdownV2 escaping (code-block aware), message chunking that respects code block boundaries and uses natural break points (paragraph, line, sentence, word), tool-specific detail formatting for 10+ tool types, heuristic language detection for code blocks, and path truncation. The chunker adds "Part N/M" headers to multi-part messages.
 
@@ -188,7 +188,7 @@ For full details, see `docs/SECURITY.md`. Key security properties of the Rust im
 
 **flock(2) for single-instance enforcement.** The socket server acquires an exclusive `flock` on the PID file before binding. This is atomic and avoids the TOCTOU race inherent in checking a PID file's contents. If another daemon holds the lock, startup fails immediately with a clear error.
 
-**umask for socket permissions.** Before calling `bind()`, the server sets `umask(0o177)` so the socket file is created with `0o600` (owner read/write only). The parent directory is set to `0o700`. This prevents other users on the system from connecting to the socket.
+**Post-bind chmod for socket permissions.** After calling `bind()`, the server applies `chmod(0o600)` to the socket file (owner read/write only). The parent directory is set to `0o700`. This prevents other users on the system from connecting to the socket. (ADR-009: replaced the previous `umask(0o177)` approach, which was per-process and caused race conditions in multi-threaded contexts.)
 
 **Bot token scrubbing.** A global `ScrubWriter` wraps stderr and applies a regex (`bot\d+:[A-Za-z0-9_-]+/`) to all log output before it reaches the terminal or log files. This catches tokens from any source, not just the configured token. The `TelegramBot` struct also scrubs tokens from API error messages.
 
@@ -196,7 +196,7 @@ For full details, see `docs/SECURITY.md`. Key security properties of the Rust im
 
 **Slash command validation.** Commands forwarded from Telegram to the CLI are validated against a character whitelist (ASCII alphanumerics, underscores, hyphens, spaces, and forward slashes). Shell metacharacters (`;`, `|`, `&`, `$`, backticks, etc.) are rejected.
 
-**tmux socket path validation.** Paths must be absolute, must not contain `..`, and must not exceed 256 characters.
+**tmux socket path validation.** Paths must be absolute, must not contain `..`, and must not exceed 256 characters. (Note: the Unix socket path used by the bridge itself is validated against the AF_UNIX `sun_path` limit of 104 bytes (ADR-009), which is more restrictive than the tmux path limit.)
 
 **Secure file permissions.** The config directory is `0o700`. The SQLite database, config.json, and status.json are `0o600`. Downloaded files are written with `0o600`.
 
@@ -234,7 +234,7 @@ The daemon's shared state uses a combination of `Arc<RwLock<T>>` for read-heavy 
 
 ### Rate limiting
 
-The `TelegramBot` uses `governor::RateLimiter` for per-second rate limiting of Telegram API calls. The rate is configurable via `TELEGRAM_RATE_LIMIT` (default: 1 request/second). The message queue provides retry with exponential backoff (3 retries at 1s/2s/4s intervals) and automatic recovery from TOPIC_CLOSED errors (reopen + retry) and entity parse errors (strip formatting, retry as plain text).
+The `TelegramBot` uses `governor::RateLimiter` for per-second rate limiting of Telegram API calls. The rate is configurable via `TELEGRAM_RATE_LIMIT` and clamped to `[1, 30]` msgs/sec (ADR-009: Telegram enforces ~30 msgs/sec per bot; unbounded values would trigger 429 errors). The message queue is bounded to `MAX_QUEUE_SIZE = 500` with oldest-message eviction (ADR-009: previously unbounded, risking OOM under sustained send failures). Retry uses overflow-safe exponential backoff with `saturating_mul` (3 retries at 1s/2s/4s intervals) and automatic recovery from TOPIC_CLOSED errors (reopen + retry) and entity parse errors (strip formatting, retry as plain text).
 
 ### Signal handling
 
@@ -243,3 +243,44 @@ The binary registers handlers for both SIGINT (Ctrl-C) and SIGTERM using `tokio:
 ### Mirroring toggle
 
 Runtime toggling of mirroring is implemented via `Arc<AtomicBool>`. The toggle command writes to `status.json` and optionally sends a command through the socket to notify the running daemon. Safety-critical paths (approval requests/responses, commands) always bypass the toggle check.
+
+## 8. Test Suite
+
+The project has 387 tests across unit and integration test suites, with 0 failures and 0 clippy warnings.
+
+### Unit tests
+
+Unit tests are co-located in each source module (30 source files across `src/`). They cover configuration parsing, session management, formatting, summarization, socket communication, error handling, and security validation.
+
+### Integration tests
+
+Eight integration test files live in `rust-crates/ctm/tests/`:
+
+| File | Coverage |
+|------|----------|
+| `cli_smoke.rs` | Binary invocation, subcommand parsing, `--help` and `--version` output |
+| `concurrency.rs` | Multi-threaded socket access, concurrent session operations |
+| `config_validation.rs` | Environment variable parsing, config file loading, three-tier priority |
+| `formatting_tests.rs` | ANSI stripping, MarkdownV2 escaping, message chunking, path truncation |
+| `hook_pipeline.rs` | Hook event parsing, message building, approval workflow plumbing |
+| `session_lifecycle.rs` | Session create/end/reactivate, stale cleanup, approval expiry |
+| `socket_roundtrip.rs` | Full NDJSON roundtrip through socket server, connection limits, PID locking |
+| `summarize_tests.rs` | Tool summarizer coverage for all 30+ command patterns |
+
+### Running tests
+
+```bash
+cd rust-crates
+cargo test          # All 387 tests
+cargo test -- -q    # Quiet output
+cargo clippy        # Lint (0 warnings required)
+```
+
+## 9. Architecture Decision Records
+
+| ADR | Title | Key changes |
+|-----|-------|-------------|
+| ADR-008 | v0.2.0 Release Readiness Audit | Structural decomposition (17 -> 30 source files), integration test suite (8 files), binary integrity verification, npm distribution pipeline |
+| ADR-009 | Release Polish -- Broken Windows | 19 fixes: umask race elimination, socket path limit (104 bytes), topic creation atomic write lock, rate limiter bounds `[1, 30]`, queue bound (500), overflow-safe backoff, char-count consistency, state file cleanup, duplicate code removal |
+
+Full ADR documents are in `docs/adr/`.

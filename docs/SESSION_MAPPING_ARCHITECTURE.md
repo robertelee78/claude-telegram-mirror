@@ -147,6 +147,22 @@ async fn ensure_session_exists(ctx: &HandlerContext, msg: &BridgeMessage) {
         return;
     }
 
+    // BUG-002/BUG-010 + ADR-009: Atomically check-and-insert the topic creation
+    // lock under a single write guard. This prevents two concurrent callers from
+    // both seeing "no lock" and racing to create duplicate forum topics.
+    {
+        let mut locks = ctx.topic_locks.write().await;
+        if let Some(state) = locks.get(&msg.session_id) {
+            let notify = Arc::clone(&state.notify);
+            drop(locks);
+            let _ = tokio::time::timeout(Duration::from_secs(5), notify.notified()).await;
+            return;
+        }
+        if ctx.config.use_threads {
+            locks.insert(msg.session_id.clone(), Arc::new(TopicCreationState { ... }));
+        }
+    }
+
     // Session missing — create it now via handle_session_start
     socket_handlers::handle_session_start(ctx, msg).await;
 }
@@ -387,7 +403,9 @@ When `InputInjector::set_target` is called, the socket path is validated:
 
 - Must be an absolute path (starts with `/`).
 - Must not contain `..` (directory traversal prevention).
-- Must be at most 256 characters.
+- Must be at most 256 characters (tmux socket paths).
+
+The bridge socket path itself is validated against the AF_UNIX `sun_path` limit of 104 bytes (ADR-009: tightened from 256 to match the actual kernel limit on Linux -- 108 minus overhead).
 
 Invalid paths are rejected and logged; `tmux_socket` is set to `None`.
 
@@ -409,7 +427,7 @@ When the user types in Telegram and the daemon injects text into the tmux pane, 
 
 ### Implementation (BUG-011)
 
-`recent_telegram_inputs` is an `Arc<RwLock<HashSet<String>>>` keyed by `"<session_id>:<text>"`. The TTL is 10 seconds (`ECHO_TTL_SECS = 10`).
+`recent_telegram_inputs` is an `Arc<RwLock<HashSet<String>>>` keyed by `"<session_id>\0<text>"` (null separator -- ADR-009 item 11 changed from `:` to `\0`, which cannot appear in session IDs or UTF-8 text, eliminating the theoretical key collision class). The TTL is 10 seconds (`ECHO_TTL_SECS = 10`).
 
 **When Telegram input is injected:**
 
@@ -422,7 +440,9 @@ add_echo_key(ctx, &session.id, text.trim()).await;
 
 ```rust
 async fn add_echo_key(ctx: &HandlerContext, session_id: &str, text: &str) {
-    let key = format!("{session_id}:{text}");
+    // Use \0 as separator — cannot appear in session IDs (alphanumeric + . _ -)
+    // or in UTF-8 text, preventing key collisions.
+    let key = format!("{session_id}\0{text}");
     ctx.recent_inputs.write().await.insert(key.clone());
     let inputs = Arc::clone(&ctx.recent_inputs);
     tokio::spawn(async move {
@@ -581,7 +601,7 @@ Message to Topic 44:
 | Bug | Root cause | Rust fix |
 |-----|------------|----------|
 | BUG-001 | Stale tmux target after pane change | `check_and_update_tmux_target` on every socket message; `validate_target()` before inject |
-| BUG-002 | Duplicate topic creation under concurrency | `topic_creation_locks: RwLock<HashMap<String, Arc<TopicCreationState>>>` with `Notify` |
+| BUG-002 | Duplicate topic creation under concurrency | `topic_creation_locks: RwLock<HashMap<String, Arc<TopicCreationState>>>` with `Notify`; ADR-009 changed to atomic write lock for check-and-insert (single `write()` guard prevents two callers from both seeing "no lock") |
 | BUG-003 | Sessions never cleaned up | Periodic cleanup in event loop: 5-minute interval, differentiated timeouts |
 | BUG-004 | Special keys (Escape, Ctrl-C) not sent correctly | Whitelist in `ALLOWED_TMUX_KEYS`; `send_key` uses `-S socket` flag |
 | BUG-006 | Messages dropped if `session_start` not first | `ensure_session_exists` called by every handler |

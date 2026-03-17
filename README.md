@@ -288,7 +288,7 @@ ctm install-hooks --project
 - **Topic routing**: Each daemon only processes topics it created (multi-bot safe)
 - **Rate limiting**: Governor-based with exponential backoff retry queue
 - **Token scrubbing**: All log output filtered through regex to strip bot tokens
-- **Test suite**: 250+ Rust tests (unit + integration)
+- **Test suite**: 387 Rust tests (unit + 8 integration test files)
 
 ## Troubleshooting
 
@@ -354,25 +354,31 @@ cargo test
 ./target/release/ctm start
 ```
 
-### Project Structure
+### Project Structure (30 source files)
 
 ```
 rust-crates/ctm/src/
   main.rs           # CLI entry point (clap)
   lib.rs            # Library re-exports
   hook.rs           # Hook event processing
-  daemon/           # Bridge daemon (event loop, socket, Telegram handlers)
-  bot/              # Telegram API client, message queue, rate limiting
+  config.rs         # Configuration loading (env > file > defaults)
+  error.rs          # Centralized error types (thiserror)
+  types.rs          # Shared types, validation, security constants
   session.rs        # SQLite session management
+  socket.rs         # Unix socket server/client (flock, NDJSON)
+  injector.rs       # tmux input injection
+  formatting.rs     # Message formatting, chunking, ANSI stripping
   summarize.rs      # Tool action summarizer (30+ patterns)
+  colors.rs         # ANSI color helpers for terminal output
   doctor.rs         # Diagnostic checks with --fix
   installer.rs      # Hook installer
   setup.rs          # Interactive setup wizard
-  config.rs         # Configuration loading
-  service/          # systemd/launchd service management
-  formatting.rs     # Message formatting
-  injector.rs       # tmux input injection
-  socket.rs         # Unix socket server
+  bot/              # Telegram API client (client.rs, queue.rs, types.rs)
+  daemon/           # Bridge daemon (mod.rs, event_loop.rs, socket_handlers.rs,
+                    #   telegram_handlers.rs, callback_handlers.rs, cleanup.rs, files.rs)
+  service/          # OS service management (mod.rs, systemd.rs, launchd.rs, env.rs)
+
+rust-crates/ctm/tests/   # 8 integration test files
 ```
 
 </details>
