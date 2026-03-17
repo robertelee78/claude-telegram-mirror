@@ -67,6 +67,11 @@ function findInNodeModules(nodeModulesDir, packageName) {
 
 /**
  * Resolve the native CTM binary path using multiple search strategies.
+ *
+ * NOTE: No checksum/signature verification is performed on the resolved binary.
+ * A future release should add integrity verification to prevent supply-chain attacks
+ * via compromised node_modules. See ADR-006 L3.8.
+ *
  * @returns {{ binary: string, packageDir: string } | null}
  */
 function resolveBinary() {

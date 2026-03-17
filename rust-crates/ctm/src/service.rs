@@ -10,6 +10,23 @@ use std::process::Command;
 
 use crate::config;
 
+/// Service management actions (moved here from main.rs so the lib crate can resolve it).
+#[derive(clap::Subcommand, Clone)]
+pub enum ServiceAction {
+    /// Install as a system service
+    Install,
+    /// Uninstall the system service
+    Uninstall,
+    /// Start the service
+    Start,
+    /// Stop the service
+    Stop,
+    /// Restart the service
+    Restart,
+    /// Show service status
+    Status,
+}
+
 const SERVICE_NAME: &str = "claude-telegram-mirror";
 
 // ---------------------------------------------------------------------------
@@ -750,36 +767,36 @@ fn get_launchd_status() -> ServiceStatus {
 }
 
 /// Handle the `ctm service <action>` CLI command.
-pub fn handle_service_command(action: &super::ServiceAction) -> anyhow::Result<()> {
+pub fn handle_service_command(action: &ServiceAction) -> anyhow::Result<()> {
     let result = match action {
-        super::ServiceAction::Install => {
+        ServiceAction::Install => {
             println!("Installing service...\n");
             let r = install_service();
             println!("{}", r.message);
             r
         }
-        super::ServiceAction::Uninstall => {
+        ServiceAction::Uninstall => {
             println!("Uninstalling service...\n");
             let r = uninstall_service();
             println!("{}", r.message);
             r
         }
-        super::ServiceAction::Start => {
+        ServiceAction::Start => {
             let r = start_service();
             println!("{}", r.message);
             r
         }
-        super::ServiceAction::Stop => {
+        ServiceAction::Stop => {
             let r = stop_service();
             println!("{}", r.message);
             r
         }
-        super::ServiceAction::Restart => {
+        ServiceAction::Restart => {
             let r = restart_service();
             println!("{}", r.message);
             r
         }
-        super::ServiceAction::Status => {
+        ServiceAction::Status => {
             let s = get_service_status();
             println!("\nService Status\n");
             println!("  Running: {}", if s.running { "Yes" } else { "No" });

@@ -37,6 +37,9 @@ pub struct InlineButton {
 pub struct SendOptions {
     pub parse_mode: Option<String>,
     pub disable_notification: Option<bool>,
+    /// L3.1: When set, the message is sent to this forum thread.
+    /// This provides an alternative to passing `thread_id` as a separate parameter.
+    pub thread_id: Option<i64>,
     /// When set, the sent message will be a reply to this message ID.
     /// This allows callers to use `SendOptions` instead of the separate
     /// `send_message_reply_to` method for reply threading.
@@ -45,6 +48,7 @@ pub struct SendOptions {
 
 /// A queued message waiting to be sent.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct QueuedMessage {
     chat_id: i64,
     text: String,

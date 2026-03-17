@@ -313,6 +313,12 @@ pub struct SocketClient {
     stream: Option<UnixStream>,
 }
 
+impl Default for SocketClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SocketClient {
     pub fn new() -> Self {
         Self { stream: None }

@@ -116,6 +116,20 @@ pub struct Daemon {
 
     // Epic 1: Runtime mirroring toggle
     mirroring_enabled: Arc<std::sync::atomic::AtomicBool>,
+
+    // L3.2: Track running state
+    running: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// L3.2: Programmatic daemon status.
+#[allow(dead_code)]
+pub struct DaemonStatus {
+    /// Whether the daemon event loop is running.
+    pub running: bool,
+    /// Number of connected socket clients.
+    pub clients: usize,
+    /// Number of active sessions in the database.
+    pub sessions: usize,
 }
 
 impl Daemon {
@@ -143,7 +157,51 @@ impl Daemon {
             topic_creation_locks: Arc::new(RwLock::new(HashMap::new())),
             bot_sessions: Arc::new(RwLock::new(HashMap::new())),
             mirroring_enabled,
+            running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
+    }
+
+    /// L3.2: Check if the daemon is currently running.
+    #[allow(dead_code)]
+    pub fn is_running(&self) -> bool {
+        self.running.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// L3.2: Get programmatic daemon status.
+    #[allow(dead_code)]
+    pub async fn get_status(&self) -> DaemonStatus {
+        let clients = match &self.socket {
+            Some(s) => s.clients_ref().lock().await.len(),
+            None => 0,
+        };
+        let sessions = self
+            .sessions
+            .lock()
+            .await
+            .get_active_sessions()
+            .map(|s| s.len())
+            .unwrap_or(0);
+        DaemonStatus {
+            running: self.is_running(),
+            clients,
+            sessions,
+        }
+    }
+
+    /// L3.3: Send a user_input message to socket clients for a given session.
+    #[allow(dead_code)]
+    pub async fn send_to_session(&self, session_id: &str, text: &str) {
+        let msg = BridgeMessage {
+            msg_type: "user_input".to_string(),
+            session_id: session_id.to_string(),
+            timestamp: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            content: text.to_string(),
+            metadata: None,
+        };
+        if let Some(socket) = &self.socket {
+            let clients = socket.clients_ref();
+            broadcast_to_clients(&clients, &msg).await;
+        }
     }
 
     /// Start the daemon. Runs until shutdown signal.
@@ -247,6 +305,8 @@ impl Daemon {
             .await;
         });
 
+        self.running
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         tracing::info!("Bridge daemon started");
         Ok(())
     }
@@ -272,6 +332,8 @@ impl Daemon {
             socket.close().await;
         }
 
+        self.running
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         tracing::info!("Bridge daemon stopped");
     }
 }
@@ -1919,6 +1981,8 @@ async fn handle_telegram_photo(ctx: &HandlerContext, msg: &TgMessage) {
                 injection_text.push_str(&format!(" Caption: {caption}"));
             }
             inject_to_session(ctx, &session, &injection_text, thread_id, "Photo").await;
+            // M3.1: Update lastActivity for photo messages to prevent stale cleanup
+            let _ = ctx.sessions.lock().await.update_activity(&session.id);
         }
         _ => {
             ctx.bot
@@ -1984,6 +2048,8 @@ async fn handle_telegram_document(ctx: &HandlerContext, msg: &TgMessage) {
                 injection_text.push_str(&format!(" Caption: {caption}"));
             }
             inject_to_session(ctx, &session, &injection_text, thread_id, "Document").await;
+            // M3.1: Update lastActivity for document messages to prevent stale cleanup
+            let _ = ctx.sessions.lock().await.update_activity(&session.id);
         }
         _ => {
             ctx.bot

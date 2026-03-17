@@ -336,7 +336,11 @@ async fn build_messages(
             }
 
             // Send turn_complete
-            messages.push(make_message("turn_complete", session_id, "", meta));
+            messages.push(make_message("turn_complete", session_id, "", meta.clone()));
+
+            // H2.1: Send session_end after turn_complete for wire protocol consumers.
+            // External socket consumers expect a session_end message on Stop events.
+            messages.push(make_message("session_end", session_id, "", meta));
         }
         HookEvent::SubagentStop(_) => {
             // Recognized but no message sent

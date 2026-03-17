@@ -62,6 +62,23 @@ console.log(chalk.yellow('📚 Documentation:'));
 console.log('   ' + chalk.blue('https://github.com/robertelee78/claude-mobile'));
 console.log('');
 
+// H2.5: Detect native Rust binary
+try {
+  const { resolveBinary } = require('./scripts/resolve-binary.js');
+  const result = resolveBinary();
+  if (result) {
+    console.log(chalk.green('✓ Native binary found:'));
+    console.log('   ' + chalk.gray(result.binary));
+    console.log('');
+  } else {
+    console.log(chalk.yellow('⚠ No native binary found for this platform.'));
+    console.log('   ' + chalk.gray('Using TypeScript implementation as fallback.'));
+    console.log('');
+  }
+} catch (e) {
+  // resolve-binary.js not available or errored — skip silently
+}
+
 // Check for existing config
 const configDir = path.join(os.homedir(), '.config', 'claude-telegram-mirror');
 const configFile = path.join(configDir, 'config.json');

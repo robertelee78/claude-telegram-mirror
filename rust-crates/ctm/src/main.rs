@@ -152,21 +152,8 @@ enum Commands {
     },
 }
 
-#[derive(Subcommand, Clone)]
-pub enum ServiceAction {
-    /// Install as a system service
-    Install,
-    /// Uninstall the system service
-    Uninstall,
-    /// Start the service
-    Start,
-    /// Stop the service
-    Stop,
-    /// Restart the service
-    Restart,
-    /// Show service status
-    Status,
-}
+// ServiceAction is defined in service.rs for lib crate compatibility.
+use service::ServiceAction;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -184,9 +171,13 @@ async fn main() -> anyhow::Result<()> {
         })
         .unwrap_or_else(|_: Box<dyn std::error::Error>| EnvFilter::new("info"));
 
+    // L3.9: Enable ANSI colors in tracing output.
+    // tracing-subscriber enables ANSI by default on TTYs, but we force it on
+    // here because ScrubWriter wraps stderr and hides the TTY detection.
     tracing_subscriber::fmt()
         .with_env_filter(env_filter)
         .with_target(false)
+        .with_ansi(true)
         .with_writer(ScrubWriter)
         .compact()
         .init();

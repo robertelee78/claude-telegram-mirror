@@ -12,6 +12,12 @@ pub struct InputInjector {
     tmux_socket: Option<String>,
 }
 
+impl Default for InputInjector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl InputInjector {
     pub fn new() -> Self {
         Self {
@@ -337,6 +343,50 @@ impl InputInjector {
 
         None
     }
+}
+
+/// L3.4: Get the injection method name.
+impl InputInjector {
+    /// Returns the injection method: "tmux" if a target is configured, "none" otherwise.
+    pub fn get_method(&self) -> &str {
+        if self.tmux_target.is_some() {
+            "tmux"
+        } else {
+            "none"
+        }
+    }
+
+    /// Returns the configured tmux session target, if any.
+    pub fn get_tmux_session(&self) -> Option<&str> {
+        self.tmux_target.as_deref()
+    }
+
+    /// Returns the configured tmux socket path, if any.
+    pub fn get_tmux_socket(&self) -> Option<&str> {
+        self.tmux_socket.as_deref()
+    }
+}
+
+/// L3.5: Factory function that creates a fully-configured InputInjector.
+///
+/// Detects the current tmux session automatically if tmux is available.
+pub fn create_injector() -> InputInjector {
+    let mut inj = InputInjector::new();
+    if InputInjector::is_tmux_available() {
+        if let Some(info) = InputInjector::detect_tmux_session() {
+            inj.set_target(&info.target, info.socket.as_deref());
+        }
+    }
+    inj
+}
+
+/// L3.6: Escape text for tmux send-keys.
+///
+/// DEPRECATED: With `Command::arg()` and `-l` flag, no escaping is needed.
+/// This function is retained for API compatibility with external callers.
+#[deprecated(note = "Not needed with Command::arg() + -l flag")]
+pub fn escape_tmux_text(text: &str) -> String {
+    text.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 /// Get hostname safely

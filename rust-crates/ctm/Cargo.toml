@@ -6,6 +6,10 @@ description = "Claude Telegram Mirror — Bidirectional Claude Code <-> Telegram
 license = "MIT"
 authors = ["Robert E. Lee <robert@agidreams.us>"]
 
+[lib]
+name = "ctm"
+path = "src/lib.rs"
+
 [[bin]]
 name = "ctm"
 path = "src/main.rs"

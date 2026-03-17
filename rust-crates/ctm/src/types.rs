@@ -45,6 +45,10 @@ pub struct StopEvent {
 pub struct SubagentStopEvent {
     #[serde(flatten)]
     pub base: HookEventBase,
+    /// L3.10: The TypeScript type declares `subagent_id: string` (required), but
+    /// the JSON payload may omit it in practice.  We keep `Option<String>` as an
+    /// intentional relaxation for robustness — missing values deserialize as `None`
+    /// instead of causing a parse failure.
     #[serde(default)]
     pub subagent_id: Option<String>,
 }
@@ -144,6 +148,30 @@ pub struct SocketClientInfo {
     pub connected_at: u64,
     /// Session ID the client is associated with, if known.
     pub session_id: Option<String>,
+}
+
+/// L3.1: Inline keyboard button definition (domain-level type).
+///
+/// Note: `bot::InlineButton` is the same shape but lives in the bot module.
+/// This type is provided for external consumers who want to construct buttons
+/// without depending on the bot module internals.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InlineButton {
+    pub text: String,
+    pub callback_data: String,
+}
+
+/// L3.1: Result returned by hook processing.
+///
+/// Represents the decision made by a hook (e.g. PreToolUse approval).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HookResult {
+    /// The permission decision: "allow", "deny", or "ask".
+    pub decision: Option<String>,
+    /// Human-readable reason for the decision.
+    pub reason: Option<String>,
+    /// Modified input (for hooks that transform tool input before execution).
+    pub modified_input: Option<serde_json::Value>,
 }
 
 /// Whitelist of safe Bash commands that auto-approve without Telegram confirmation
