@@ -124,7 +124,9 @@ fn pending_approval_lifecycle() {
     assert_eq!(approval.session_id, "sess-appr");
 
     // Resolve it
-    let resolved = mgr.resolve_approval(&approval_id, ApprovalStatus::Approved).unwrap();
+    let resolved = mgr
+        .resolve_approval(&approval_id, ApprovalStatus::Approved)
+        .unwrap();
     assert!(resolved, "resolve_approval should return true");
 
     // Verify resolved status
@@ -132,7 +134,9 @@ fn pending_approval_lifecycle() {
     assert_eq!(approval.status, ApprovalStatus::Approved);
 
     // Cannot resolve again
-    let re_resolved = mgr.resolve_approval(&approval_id, ApprovalStatus::Rejected).unwrap();
+    let re_resolved = mgr
+        .resolve_approval(&approval_id, ApprovalStatus::Rejected)
+        .unwrap();
     assert!(
         !re_resolved,
         "Already-resolved approval should not be re-resolved"
@@ -154,7 +158,8 @@ fn end_session_expires_pending_approvals() {
 
     let approval = mgr.get_approval(&aid).unwrap().unwrap();
     assert_eq!(
-        approval.status, ApprovalStatus::Expired,
+        approval.status,
+        ApprovalStatus::Expired,
         "Pending approval should be expired when session ends"
     );
 }

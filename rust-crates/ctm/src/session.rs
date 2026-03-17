@@ -750,8 +750,7 @@ impl SessionManager {
 
 fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
     let status_str: String = row.get("status")?;
-    let status = SessionStatus::try_from(status_str.as_str())
-        .unwrap_or(SessionStatus::Active); // Fallback for unknown DB values
+    let status = SessionStatus::try_from(status_str.as_str()).unwrap_or(SessionStatus::Active); // Fallback for unknown DB values
     Ok(Session {
         id: row.get("id")?,
         chat_id: row.get("chat_id")?,
@@ -769,8 +768,7 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
 
 fn row_to_approval(row: &rusqlite::Row<'_>) -> rusqlite::Result<PendingApproval> {
     let status_str: String = row.get("status")?;
-    let status = ApprovalStatus::try_from(status_str.as_str())
-        .unwrap_or(ApprovalStatus::Pending); // Fallback for unknown DB values
+    let status = ApprovalStatus::try_from(status_str.as_str()).unwrap_or(ApprovalStatus::Pending); // Fallback for unknown DB values
     Ok(PendingApproval {
         id: row.get("id")?,
         session_id: row.get("session_id")?,

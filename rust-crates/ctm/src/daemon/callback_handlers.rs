@@ -58,8 +58,11 @@ async fn handle_confirm_abort_callback(ctx: &HandlerContext, session_id: &str, c
     // Mark session as aborted in DB
     let aborted = {
         let sid = session_id.to_string();
-        ctx.db_op(move |sess| sess.end_session(&sid, crate::types::SessionStatus::Aborted).is_ok())
-            .await
+        ctx.db_op(move |sess| {
+            sess.end_session(&sid, crate::types::SessionStatus::Aborted)
+                .is_ok()
+        })
+        .await
     };
 
     if aborted {

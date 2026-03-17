@@ -68,8 +68,16 @@ fn session_lifecycle_full_sequence() {
     let sid = "session-lifecycle-full";
 
     // Step 1: session_start -- handler calls create_session
-    mgr.create_session(sid, 42, Some("devbox"), Some("/opt/myapp"), None, None, None)
-        .unwrap();
+    mgr.create_session(
+        sid,
+        42,
+        Some("devbox"),
+        Some("/opt/myapp"),
+        None,
+        None,
+        None,
+    )
+    .unwrap();
     let s = mgr.get_session(sid).unwrap().unwrap();
     assert_eq!(s.status, SessionStatus::Active);
     assert_eq!(s.hostname.as_deref(), Some("devbox"));
@@ -298,10 +306,7 @@ fn message_metadata_accessor_coverage() {
     meta.insert("tmuxSocket".into(), serde_json::json!("/tmp/tmux.sock"));
     meta.insert("source".into(), serde_json::json!("telegram"));
     meta.insert("projectDir".into(), serde_json::json!("/opt/proj"));
-    meta.insert(
-        "transcript_path".into(),
-        serde_json::json!("/tmp/t.jsonl"),
-    );
+    meta.insert("transcript_path".into(), serde_json::json!("/tmp/t.jsonl"));
     meta.insert("trigger".into(), serde_json::json!("manual"));
     meta.insert("caption".into(), serde_json::json!("A photo"));
     meta.insert("approvalId".into(), serde_json::json!("approval-789"));
@@ -418,12 +423,8 @@ fn session_end_expires_all_pending_approvals() {
     mgr.create_session(sid, 1, None, None, None, None, None)
         .unwrap();
 
-    let a1 = mgr
-        .create_approval(sid, "Approve action 1?", None)
-        .unwrap();
-    let a2 = mgr
-        .create_approval(sid, "Approve action 2?", None)
-        .unwrap();
+    let a1 = mgr.create_approval(sid, "Approve action 1?", None).unwrap();
+    let a2 = mgr.create_approval(sid, "Approve action 2?", None).unwrap();
 
     // Verify both are pending
     let (_, pending) = mgr.get_stats().unwrap();
@@ -490,7 +491,10 @@ fn stale_session_candidates_by_age() {
 
     let stale = mgr.get_stale_session_candidates(1).unwrap();
     let stale_ids: Vec<&str> = stale.iter().map(|s| s.id.as_str()).collect();
-    assert!(stale_ids.contains(&"stale-1"), "Old session should be stale");
+    assert!(
+        stale_ids.contains(&"stale-1"),
+        "Old session should be stale"
+    );
     assert!(
         !stale_ids.contains(&"fresh-1"),
         "Fresh session should NOT be stale"
@@ -573,8 +577,7 @@ fn clear_thread_removes_orphan() {
     mgr.create_session("clear-orph", 1, None, None, None, None, None)
         .unwrap();
     mgr.set_session_thread("clear-orph", 222).unwrap();
-    mgr.end_session("clear-orph", SessionStatus::Ended)
-        .unwrap();
+    mgr.end_session("clear-orph", SessionStatus::Ended).unwrap();
 
     assert_eq!(mgr.get_orphaned_thread_sessions().unwrap().len(), 1);
 
@@ -816,10 +819,7 @@ fn config_validation_missing_credentials() {
         errors.len() >= 2,
         "Should have at least 2 errors (token + chat_id)"
     );
-    assert!(
-        !warnings.is_empty(),
-        "Should warn about disabled mirroring"
-    );
+    assert!(!warnings.is_empty(), "Should warn about disabled mirroring");
 }
 
 /// validate_config warns about extreme chunk_size.
@@ -1003,10 +1003,16 @@ fn detect_language_coverage() {
     // detect_language uses starts_with patterns
     assert_eq!(ctm::formatting::detect_language("fn main() { }"), "rust");
     assert_eq!(ctm::formatting::detect_language("use std::io;"), "rust");
-    assert_eq!(ctm::formatting::detect_language("def hello():\n    pass"), "python");
+    assert_eq!(
+        ctm::formatting::detect_language("def hello():\n    pass"),
+        "python"
+    );
     assert_eq!(ctm::formatting::detect_language("import os"), "python");
     assert_eq!(ctm::formatting::detect_language("package main"), "go");
-    assert_eq!(ctm::formatting::detect_language("#include <stdio.h>"), "cpp");
+    assert_eq!(
+        ctm::formatting::detect_language("#include <stdio.h>"),
+        "cpp"
+    );
     // Unknown content returns empty string
     assert_eq!(ctm::formatting::detect_language("just plain text"), "");
 }
@@ -1089,8 +1095,7 @@ fn pending_approvals_per_session() {
     );
 
     // Resolve one
-    mgr.resolve_approval(&a1, ApprovalStatus::Approved)
-        .unwrap();
+    mgr.resolve_approval(&a1, ApprovalStatus::Approved).unwrap();
 
     let pending = mgr.get_pending_approvals("pa-sess").unwrap();
     assert_eq!(

@@ -244,10 +244,7 @@ pub(super) async fn handle_tool_start(ctx: &HandlerContext, msg: &BridgeMessage)
         return;
     }
 
-    let tool_input = meta
-        .input()
-        .cloned()
-        .unwrap_or(serde_json::Value::Null);
+    let tool_input = meta.input().cloned().unwrap_or(serde_json::Value::Null);
 
     let thread_id = ctx.wait_for_topic(&msg.session_id).await;
     if thread_id.is_none() && ctx.config.use_threads {

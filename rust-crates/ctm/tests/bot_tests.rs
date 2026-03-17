@@ -2,9 +2,7 @@
 //!
 //! All tests use only the `ctm::` public API and require no network access.
 
-use ctm::bot::{
-    create_approval_keyboard, scrub_bot_token, InlineButton, SendOptions, TelegramBot,
-};
+use ctm::bot::{create_approval_keyboard, scrub_bot_token, InlineButton, SendOptions, TelegramBot};
 use ctm::config::Config;
 use std::path::PathBuf;
 
