@@ -353,9 +353,12 @@ async fn build_messages(
                 meta.clone(),
             ));
 
-            // H2.1: Send session_end after turn_complete for wire protocol consumers.
-            // External socket consumers expect a session_end message on Stop events.
-            messages.push(make_message(MessageType::SessionEnd, session_id, "", meta));
+            // NOTE: We intentionally do NOT send session_end here. The Stop hook
+            // fires after every assistant turn, not just on process exit. Sending
+            // session_end would mark the session as ended and trigger topic deletion
+            // after every turn, causing a cycle of session death and recreation.
+            // Real session cleanup is handled by the daemon's stale session detector
+            // which checks tmux pane liveness (cleanup.rs).
 
             // Clean up transcript state file (tracks last processed JSONL line).
             let state_file = cfg.config_dir.join(format!(".last_line_{}", session_id));
