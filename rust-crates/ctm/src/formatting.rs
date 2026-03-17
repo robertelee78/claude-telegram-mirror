@@ -397,28 +397,39 @@ pub fn wrap_in_code_block(content: &str, language: Option<&str>) -> String {
 /// assert_eq!(truncate("hello world", 8), "hello...");
 /// ```
 pub fn truncate(text: &str, max_len: usize) -> String {
+    if max_len < 4 {
+        // Below minimum useful length — return what fits without ellipsis.
+        return text.chars().take(max_len).collect();
+    }
     let char_count = text.chars().count();
     if char_count <= max_len {
         return text.to_string();
     }
-    let truncated: String = text.chars().take(max_len.saturating_sub(3)).collect();
+    let truncated: String = text.chars().take(max_len - 3).collect();
     format!("{truncated}...")
 }
 
 /// Estimate the number of chunks needed to fit `text` within `max_length`.
+///
+/// Uses character count (not byte length) for consistency with `truncate()`
+/// and Telegram's character-based message limits.
 #[allow(dead_code)] // Library API
 pub fn estimate_chunks(text: &str, max_length: usize) -> usize {
-    if text.len() <= max_length {
+    let char_count = text.chars().count();
+    if char_count <= max_length {
         1
     } else {
-        text.len().div_ceil(max_length)
+        char_count.div_ceil(max_length)
     }
 }
 
-/// Returns `true` if `text` exceeds `max_length` and will need chunking.
+/// Returns `true` if `text` exceeds `max_length` characters and will need chunking.
+///
+/// Uses character count (not byte length) for consistency with `truncate()`
+/// and Telegram's character-based message limits.
 #[allow(dead_code)] // Library API
 pub fn needs_chunking(text: &str, max_length: usize) -> bool {
-    text.len() > max_length
+    text.chars().count() > max_length
 }
 
 /// Last 2 path components with `.../` prefix.

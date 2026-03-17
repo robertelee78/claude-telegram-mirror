@@ -6,12 +6,14 @@
 use ctm::socket::SocketClient;
 use ctm::socket::SocketServer;
 use ctm::types::{BridgeMessage, MessageType};
+use std::os::unix::fs::PermissionsExt;
 use tempfile::tempdir;
 use tokio::time::Duration;
 
 #[tokio::test]
 async fn server_client_message_roundtrip() {
     let tmp = tempdir().unwrap();
+    let _ = std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700));
     let sock = tmp.path().join("bridge.sock");
     let pid = tmp.path().join("bridge.pid");
 
@@ -53,6 +55,9 @@ async fn server_client_message_roundtrip() {
 #[tokio::test]
 async fn flock_prevents_second_server() {
     let tmp = tempdir().unwrap();
+    // Ensure tempdir is accessible despite process-global umask(0o177)
+    // leaking from parallel SocketServer::listen() calls.
+    let _ = std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700));
     let sock = tmp.path().join("bridge.sock");
     let pid = tmp.path().join("bridge.pid");
 
@@ -74,6 +79,7 @@ async fn flock_prevents_second_server() {
 #[tokio::test]
 async fn socket_file_cleaned_on_server_drop() {
     let tmp = tempdir().unwrap();
+    let _ = std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700));
     let sock = tmp.path().join("cleanup.sock");
     let pid = tmp.path().join("cleanup.pid");
 
@@ -97,6 +103,7 @@ async fn socket_file_cleaned_on_server_drop() {
 #[tokio::test]
 async fn multiple_messages_received_in_order() {
     let tmp = tempdir().unwrap();
+    let _ = std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700));
     let sock = tmp.path().join("order.sock");
     let pid = tmp.path().join("order.pid");
 

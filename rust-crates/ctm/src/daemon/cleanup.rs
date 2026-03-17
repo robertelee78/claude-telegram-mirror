@@ -134,6 +134,13 @@ async fn handle_stale_session_cleanup(
     ctx.session_threads.write().await.remove(&session.id);
     ctx.session_tmux.write().await.remove(&session.id);
     ctx.custom_titles.write().await.remove(&session.id);
+
+    // Clean up transcript state file
+    let state_file = get_config_dir().join(format!(".last_line_{}", session.id));
+    if state_file.exists() {
+        let _ = std::fs::remove_file(&state_file);
+    }
+
     let sid = session.id.clone();
     ctx.db_op(move |sess| {
         let _ = sess.end_session(&sid, "ended");

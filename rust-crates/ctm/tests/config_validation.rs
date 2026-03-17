@@ -109,10 +109,10 @@ fn validate_socket_path_accepts_valid() {
 
 #[test]
 fn validate_socket_path_rejects_too_long() {
-    let long_path = format!("/{}", "a".repeat(256));
+    let long_path = format!("/{}", "a".repeat(104));
     assert!(
         !config::validate_socket_path(&long_path),
-        "Socket paths over 256 chars should be rejected"
+        "Socket paths over 104 bytes should be rejected (AF_UNIX limit)"
     );
 }
 

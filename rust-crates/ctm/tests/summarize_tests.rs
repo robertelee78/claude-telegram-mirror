@@ -2,34 +2,10 @@
 //!
 //! Extracted from `src/summarize.rs` inline `#[cfg(test)]` module (Story 13.6).
 
-use ctm::formatting::short_path;
 use ctm::summarize::{find_meaningful_command, summarize_tool_action, summarize_tool_result};
 use serde_json::json;
 
-// ---- shortPath ----
-
-#[test]
-fn short_path_long() {
-    assert_eq!(
-        short_path("/opt/project/src/utils/config.ts"),
-        ".../utils/config.ts"
-    );
-}
-
-#[test]
-fn short_path_short() {
-    assert_eq!(short_path("/src/file.ts"), "/src/file.ts");
-}
-
-#[test]
-fn short_path_root_level() {
-    assert_eq!(short_path("/file.ts"), "/file.ts");
-}
-
-#[test]
-fn short_path_three_components() {
-    assert_eq!(short_path("/opt/project/file.ts"), ".../project/file.ts");
-}
+// short_path tests live in formatting_tests.rs — no duplication.
 
 // ---- findMeaningfulCommand ----
 

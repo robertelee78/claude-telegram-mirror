@@ -68,9 +68,21 @@ fn truncate_long() {
 fn truncate_emoji() {
     // 4 emoji chars (each multi-byte in UTF-8)
     let emoji = "\u{1F600}\u{1F601}\u{1F602}\u{1F603}";
+
+    // max_len < 4: return what fits without ellipsis (can't fit content + "...")
     let result = truncate(emoji, 3);
-    // Should not panic and should end with "..."
+    assert_eq!(result.chars().count(), 3);
+    assert!(!result.ends_with("..."));
+
+    // max_len = 4: text is exactly 4 chars, fits without truncation
+    let result = truncate(emoji, 4);
+    assert_eq!(result, emoji);
+
+    // max_len = 5 with longer input: truncates with ellipsis
+    let longer = "\u{1F600}\u{1F601}\u{1F602}\u{1F603}\u{1F604}\u{1F605}";
+    let result = truncate(longer, 5);
     assert!(result.ends_with("..."));
+    assert_eq!(result.chars().count(), 5);
 }
 
 // ---- short_path ----

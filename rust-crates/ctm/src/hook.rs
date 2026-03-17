@@ -356,6 +356,12 @@ async fn build_messages(
             // H2.1: Send session_end after turn_complete for wire protocol consumers.
             // External socket consumers expect a session_end message on Stop events.
             messages.push(make_message(MessageType::SessionEnd, session_id, "", meta));
+
+            // Clean up transcript state file (tracks last processed JSONL line).
+            let state_file = cfg.config_dir.join(format!(".last_line_{}", session_id));
+            if state_file.exists() {
+                let _ = std::fs::remove_file(&state_file);
+            }
         }
         HookEvent::SubagentStop(_) => {
             // Recognized but no message sent

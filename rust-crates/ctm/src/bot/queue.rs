@@ -3,9 +3,24 @@
 use super::*;
 
 impl TelegramBot {
+    /// Maximum queued messages before oldest are dropped. Prevents OOM under
+    /// sustained send failures (e.g. network outage + rapid hook events).
+    const MAX_QUEUE_SIZE: usize = 500;
+
     /// Enqueue a message and start processing if not already running.
     pub(super) async fn enqueue(&self, msg: QueuedMessage) {
-        self.queue.lock().await.push_back(msg);
+        let mut q = self.queue.lock().await;
+        if q.len() >= Self::MAX_QUEUE_SIZE {
+            tracing::warn!(
+                dropped = q.len() - Self::MAX_QUEUE_SIZE + 1,
+                "Message queue full, dropping oldest"
+            );
+            while q.len() >= Self::MAX_QUEUE_SIZE {
+                q.pop_front();
+            }
+        }
+        q.push_back(msg);
+        drop(q);
         self.process_queue().await;
     }
 
@@ -38,7 +53,7 @@ impl TelegramBot {
                     if item.retries < 3 {
                         let mut retry = item.clone();
                         retry.retries += 1;
-                        let delay_ms = 1000 * (1u64 << retry.retries);
+                        let delay_ms = 1000u64.saturating_mul(1u64 << retry.retries.min(10));
                         tracing::warn!(
                             retries = retry.retries,
                             delay_ms,

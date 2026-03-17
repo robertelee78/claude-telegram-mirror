@@ -4,7 +4,7 @@
 //!
 //! ## Server
 //! - `flock(2)` PID locking via `nix::fcntl::Flock`
-//! - `umask(0o177)` before bind → socket file gets `0o600`
+//! - `chmod(0o600)` on the socket file after bind
 //! - Stale socket detection (check flock, not TOCTOU PID file)
 //! - 64 max concurrent connections
 //! - 1 MiB max NDJSON line
@@ -16,7 +16,6 @@ use crate::config;
 use crate::error::{AppError, Result};
 use crate::types::BridgeMessage;
 use nix::fcntl::Flock;
-use nix::sys::stat::Mode;
 use std::collections::HashMap;
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
@@ -150,13 +149,22 @@ impl SocketServer {
             let _ = std::fs::remove_file(&self.socket_path);
         }
 
-        // Step 4: Bind with restricted umask so the socket file is 0o600.
-        let old_mask = nix::sys::stat::umask(Mode::from_bits_truncate(0o177));
+        // Step 4: Bind, then restrict the socket file to 0o600.
+        //
+        // Previous implementation used process-global umask(0o177) around bind(),
+        // but umask is per-process (not per-thread), causing race conditions in
+        // tests and any multi-threaded context. Instead, we bind normally and
+        // chmod the socket file immediately after creation.
         let listener = UnixListener::bind(&self.socket_path).map_err(|e| {
-            nix::sys::stat::umask(old_mask);
             AppError::Socket(format!("Failed to bind socket: {e}"))
         })?;
-        nix::sys::stat::umask(old_mask);
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(
+                &self.socket_path,
+                std::fs::Permissions::from_mode(0o600),
+            );
+        }
 
         // Write PID file after lock acquired.
         let _ = std::fs::write(&self.pid_path, std::process::id().to_string());
@@ -498,6 +506,7 @@ mod tests {
     #[tokio::test]
     async fn server_client_roundtrip() {
         let tmp = tempfile::TempDir::new().unwrap();
+        let _ = std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700));
         let sock = tmp.path().join("test.sock");
         let pid = tmp.path().join("test.pid");
 
@@ -536,6 +545,7 @@ mod tests {
     #[tokio::test]
     async fn connection_limit_enforced() {
         let tmp = tempfile::TempDir::new().unwrap();
+        let _ = std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700));
         let sock = tmp.path().join("limit.sock");
         let pid = tmp.path().join("limit.pid");
 

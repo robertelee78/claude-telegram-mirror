@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 ## [0.2.0] - 2026-03-17
 
+### Polish (ADR-009)
+
+- **Eliminated process-global umask race** — socket permissions now set via `chmod` instead of `umask`, fixing thread-safety issue that caused intermittent test failures and could affect multi-threaded deployments
+- **Socket path validation tightened to AF_UNIX limit** — 256 → 104 bytes to match actual kernel limit
+- **Topic creation race condition fixed** — atomic check-and-insert prevents duplicate forum topics under concurrent session starts
+- **Message queue bounded** — capped at 500 messages with oldest-eviction to prevent OOM under sustained send failures
+- **Rate limiter clamped** — `[1, 30]` msgs/sec to stay within Telegram's API limits
+- **Config parse logging** — invalid env var values now warn instead of silently falling back to defaults
+- **Mirror status write errors logged** — previously silently discarded
+- **Consistent char-count measurement** — `estimate_chunks`, `needs_chunking`, and `truncate` all use character count (not byte length)
+- **Transcript state file cleanup** — `.last_line_*` files cleaned up on session end instead of accumulating indefinitely
+- **Removed duplicate code** — consolidated `truncate_path` → `short_path`, removed duplicate test coverage
+- **Retry backoff overflow-safe** — `saturating_mul` prevents integer overflow at high retry counts
+
 ### Breaking Changes
 
 - **TypeScript source removed** — the package now ships a pre-compiled native binary; there are no `.js` or `.ts` files to import

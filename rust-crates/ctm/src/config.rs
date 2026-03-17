@@ -37,17 +37,29 @@ pub fn write_mirror_status(config_dir: &std::path::Path, enabled: bool, pid: Opt
         toggled_at: chrono::Utc::now().to_rfc3339(),
     };
     let path = status_file_path(config_dir);
-    if let Ok(json) = serde_json::to_string_pretty(&status) {
-        use std::os::unix::fs::OpenOptionsExt;
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&path)
-        {
+    let json = match serde_json::to_string_pretty(&status) {
+        Ok(j) => j,
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to serialize mirror status");
+            return;
+        }
+    };
+    use std::os::unix::fs::OpenOptionsExt;
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&path)
+    {
+        Ok(mut file) => {
             use std::io::Write;
-            let _ = file.write_all(json.as_bytes());
+            if let Err(e) = file.write_all(json.as_bytes()) {
+                tracing::warn!(path = %path.display(), error = %e, "Failed to write mirror status");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "Failed to open mirror status file");
         }
     }
 }
@@ -170,9 +182,13 @@ pub fn ensure_config_dir(dir: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-/// Validate a socket path for safety
+/// Validate a socket path for safety.
+///
+/// The length limit of 104 bytes matches the AF_UNIX `sun_path` field size on
+/// Linux (108 minus the leading byte and null terminator). Paths longer than
+/// this will fail at `bind(2)` with ENAMETOOLONG.
 pub fn validate_socket_path(path: &str) -> bool {
-    !path.is_empty() && !path.contains("..") && path.starts_with('/') && path.len() <= 256
+    !path.is_empty() && !path.contains("..") && path.starts_with('/') && path.len() <= 104
 }
 
 fn parse_bool(val: &str) -> bool {
@@ -180,15 +196,24 @@ fn parse_bool(val: &str) -> bool {
 }
 
 fn parse_u32(val: &str, default: u32) -> u32 {
-    val.trim().parse().unwrap_or(default)
+    val.trim().parse().unwrap_or_else(|_| {
+        tracing::warn!(value = val, default, "Invalid u32, using default");
+        default
+    })
 }
 
 fn parse_usize(val: &str, default: usize) -> usize {
-    val.trim().parse().unwrap_or(default)
+    val.trim().parse().unwrap_or_else(|_| {
+        tracing::warn!(value = val, default, "Invalid usize, using default");
+        default
+    })
 }
 
 fn parse_i64(val: &str, default: i64) -> i64 {
-    val.trim().parse().unwrap_or(default)
+    val.trim().parse().unwrap_or_else(|_| {
+        tracing::warn!(value = val, default, "Invalid i64, using default");
+        default
+    })
 }
 
 /// Load configuration with priority: env vars > config file > defaults
@@ -377,7 +402,7 @@ mod tests {
         assert!(!validate_socket_path(""));
         assert!(!validate_socket_path("relative/path.sock"));
         assert!(!validate_socket_path("/tmp/../etc/evil.sock"));
-        assert!(!validate_socket_path(&format!("/{}", "a".repeat(256))));
+        assert!(!validate_socket_path(&format!("/{}", "a".repeat(104))));
     }
 
     #[test]

@@ -23,12 +23,9 @@ pub struct TelegramBot {
 
 impl TelegramBot {
     pub fn new(config: &Config) -> Result<Self> {
-        // Rate limiter: use config.rate_limit msgs/sec (default 20 if 0)
-        let rate = if config.rate_limit == 0 {
-            20
-        } else {
-            config.rate_limit
-        };
+        // Rate limiter: use config.rate_limit msgs/sec, clamped to [1, 30].
+        // Telegram enforces ~30 msgs/sec per bot; values above that cause 429 errors.
+        let rate = config.rate_limit.clamp(1, 30);
         let quota = Quota::per_second(NonZeroU32::new(rate).unwrap());
         let limiter = RateLimiter::direct(quota);
 
@@ -658,10 +655,9 @@ mod tests {
     fn new_with_zero_rate_limit_defaults_to_20() {
         let mut config = test_config();
         config.rate_limit = 0;
-        // Should not panic — zero rate_limit is treated as 20
-        let bot = TelegramBot::new(&config).expect("rate_limit=0 should default to 20");
-        // We can't directly inspect the governor quota, but construction succeeding
-        // proves NonZeroU32::new(20) was used instead of NonZeroU32::new(0).
+        // Should not panic — zero rate_limit is clamped to 1
+        let bot = TelegramBot::new(&config).expect("rate_limit=0 should clamp to 1");
+        // Construction succeeding proves NonZeroU32::new(1) was used.
         assert_eq!(bot.chat_id, config.chat_id);
     }
 

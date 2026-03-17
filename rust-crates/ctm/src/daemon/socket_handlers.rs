@@ -764,14 +764,14 @@ pub(super) async fn handle_ask_user_question(ctx: &HandlerContext, msg: &BridgeM
     for (q_idx, q) in questions.iter().enumerate() {
         let mut text = format!(
             "\u{2753} *{}*\n\n{}\n",
-            escape_markdown(&q.header),
-            escape_markdown(&q.question)
+            escape_markdown_v1(&q.header),
+            escape_markdown_v1(&q.question)
         );
         for opt in &q.options {
             text.push_str(&format!(
                 "\n\u{2022} *{}* \u{2014} {}",
-                escape_markdown(&opt.label),
-                escape_markdown(&opt.description)
+                escape_markdown_v1(&opt.label),
+                escape_markdown_v1(&opt.description)
             ));
         }
         text.push_str("\n\n_Or type your answer in this topic_");
@@ -882,8 +882,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_escape_markdown() {
-        assert_eq!(escape_markdown("hello `world`"), "hello 'world'");
+    fn test_escape_markdown_v1() {
+        assert_eq!(escape_markdown_v1("hello `world`"), "hello 'world'");
     }
 
     #[test]

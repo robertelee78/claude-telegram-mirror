@@ -492,14 +492,6 @@ impl HandlerContext {
         }
     }
 
-    /// Truncate a file path to show basename and parent.
-    fn truncate_path(path: &str) -> String {
-        let parts: Vec<&str> = path.split('/').collect();
-        if parts.len() <= 3 {
-            return path.to_string();
-        }
-        format!(".../{}", parts[parts.len() - 2..].join("/"))
-    }
 }
 
 // ====================================================================== socket handler
@@ -717,9 +709,11 @@ async fn ensure_session_exists(ctx: &HandlerContext, msg: &BridgeMessage) {
         return;
     }
 
-    // BUG-002/BUG-010: Check if another call is already creating this session
+    // BUG-002/BUG-010: Atomically check-and-insert the topic creation lock.
+    // Using a write lock for the entire check+insert prevents two callers from
+    // both seeing "no lock" and racing to create duplicate topics.
     {
-        let locks = ctx.topic_locks.read().await;
+        let mut locks = ctx.topic_locks.write().await;
         if let Some(state) = locks.get(&msg.session_id) {
             let notify = Arc::clone(&state.notify);
             drop(locks);
@@ -727,17 +721,13 @@ async fn ensure_session_exists(ctx: &HandlerContext, msg: &BridgeMessage) {
                 tokio::time::timeout(tokio::time::Duration::from_secs(5), notify.notified()).await;
             return;
         }
-    }
-
-    // Create lock for concurrent callers
-    if ctx.config.use_threads {
-        let state = Arc::new(TopicCreationState {
-            notify: Arc::new(tokio::sync::Notify::new()),
-        });
-        ctx.topic_locks
-            .write()
-            .await
-            .insert(msg.session_id.clone(), state);
+        // Insert lock before releasing — concurrent callers will wait above.
+        if ctx.config.use_threads {
+            let state = Arc::new(TopicCreationState {
+                notify: Arc::new(tokio::sync::Notify::new()),
+            });
+            locks.insert(msg.session_id.clone(), state);
+        }
     }
 
     // Create session on-the-fly
@@ -773,7 +763,7 @@ fn format_tool_preview(tool_name: &str, input: &serde_json::Value) -> String {
         "Read" | "Write" | "Edit" => {
             let fp = s("file_path");
             if !fp.is_empty() {
-                format!(" `{}`", HandlerContext::truncate_path(fp))
+                format!(" `{}`", crate::formatting::short_path(fp))
             } else {
                 String::new()
             }
@@ -834,7 +824,7 @@ fn format_tool_preview(tool_name: &str, input: &serde_json::Value) -> String {
 /// For MarkdownV2 mode, use `formatting::escape_markdown_v2()` which escapes
 /// all 19 special characters.  The two functions are intentionally separate
 /// because their escape requirements differ by parse mode.
-fn escape_markdown(text: &str) -> String {
+fn escape_markdown_v1(text: &str) -> String {
     text.replace('`', "'")
 }
 
@@ -874,7 +864,9 @@ fn is_kill_command(text: &str) -> bool {
 
 /// Add an echo prevention key with TTL.
 async fn add_echo_key(ctx: &HandlerContext, session_id: &str, text: &str) {
-    let key = format!("{session_id}:{text}");
+    // Use \0 as separator — cannot appear in session IDs (alphanumeric + . _ -)
+    // or in UTF-8 text, preventing key collisions.
+    let key = format!("{session_id}\0{text}");
     ctx.recent_inputs.write().await.insert(key.clone());
 
     let inputs = Arc::clone(&ctx.recent_inputs);
@@ -951,12 +943,4 @@ mod tests {
         assert!(name.contains("project"));
     }
 
-    #[test]
-    fn test_truncate_path() {
-        assert_eq!(
-            HandlerContext::truncate_path("/opt/project/src/file.rs"),
-            ".../src/file.rs"
-        );
-        assert_eq!(HandlerContext::truncate_path("/a/b"), "/a/b");
-    }
 }
