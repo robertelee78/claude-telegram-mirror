@@ -330,7 +330,7 @@ pub fn detect_language(content: &str) -> &'static str {
             t.starts_with("#include ") || t.starts_with("int main(") || t.starts_with("void ")
         }),
         ("bash", |t| {
-            t.starts_with("$ ") || t.starts_with("#!") || t.contains("bash")
+            t.starts_with("$ ") || t.starts_with("#!") || (t.starts_with('#') && t.contains("bash"))
         }),
         ("json", |t| {
             (t.starts_with('{') && t.ends_with('}')) || (t.starts_with('[') && t.ends_with(']'))

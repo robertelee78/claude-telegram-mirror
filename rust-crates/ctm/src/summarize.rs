@@ -281,6 +281,15 @@ fn summarize_bash_command(raw_command: &str) -> String {
 
         "docker" => {
             let sub = parts.get(1).copied().unwrap_or("");
+            // Handle "docker compose" (two-word modern syntax)
+            if sub == "compose" {
+                let compose_sub = parts.get(2).copied().unwrap_or("");
+                return if compose_sub == "up" {
+                    "Starting containers".to_string()
+                } else {
+                    format!("Running `docker compose {compose_sub}`")
+                };
+            }
             match sub {
                 "build" => "Building Docker image".to_string(),
                 "run" => "Running container".to_string(),

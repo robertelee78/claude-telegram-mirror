@@ -847,12 +847,18 @@ async fn handle_tool_start(ctx: &HandlerContext, msg: &BridgeMessage) {
     // Format brief preview
     let preview = format_tool_preview(tool_name, &tool_input);
 
-    // Generate unique tool use ID and cache input
-    let tool_use_id = format!(
-        "tool_{}_{}",
-        chrono::Utc::now().timestamp_millis(),
-        &uuid::Uuid::new_v4().simple().to_string()[..8]
-    );
+    // Use hook-provided toolUseId if present, otherwise generate one
+    let tool_use_id = meta
+        .and_then(|m| m.get("toolUseId"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| {
+            format!(
+                "tool_{}_{}",
+                chrono::Utc::now().timestamp_millis(),
+                &uuid::Uuid::new_v4().simple().to_string()[..8]
+            )
+        });
     {
         let mut cache = ctx.tool_cache.write().await;
         cache.insert(

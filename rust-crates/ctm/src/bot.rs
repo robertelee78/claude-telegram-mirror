@@ -183,8 +183,13 @@ pub struct TelegramBot {
 #[allow(dead_code)]
 impl TelegramBot {
     pub fn new(config: &Config) -> Self {
-        // Rate limiter: 25 msgs/sec bucket
-        let quota = Quota::per_second(NonZeroU32::new(25).unwrap());
+        // Rate limiter: use config.rate_limit msgs/sec (default 20 if 0)
+        let rate = if config.rate_limit == 0 {
+            20
+        } else {
+            config.rate_limit
+        };
+        let quota = Quota::per_second(NonZeroU32::new(rate).unwrap());
         let limiter = RateLimiter::direct(quota);
 
         Self {
