@@ -175,10 +175,17 @@ async fn main() -> anyhow::Result<()> {
     // to stderr. This is a global defence-in-depth layer: even if a code path
     // interpolates a raw API URL into a log message the token never reaches
     // the terminal or log files.
+    // H3.1: Fall back to LOG_LEVEL env var when RUST_LOG is not set.
+    let env_filter = EnvFilter::try_from_default_env()
+        .or_else(|_| {
+            std::env::var("LOG_LEVEL")
+                .map(|level| EnvFilter::new(&level))
+                .map_err(|e| e.into())
+        })
+        .unwrap_or_else(|_: Box<dyn std::error::Error>| EnvFilter::new("info"));
+
     tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
+        .with_env_filter(env_filter)
         .with_target(false)
         .with_writer(ScrubWriter)
         .compact()
@@ -220,9 +227,17 @@ async fn cmd_start(verbose: bool) -> anyhow::Result<()> {
         cfg.verbose = true;
     }
 
-    let (_errors, warnings) = config::validate_config(&cfg);
+    // C3.3: Exit on validation errors instead of silently ignoring them.
+    let (errors, warnings) = config::validate_config(&cfg);
     for w in &warnings {
-        println!("Warning: {w}");
+        eprintln!("  Warning: {}", w);
+    }
+    if !errors.is_empty() {
+        for e in &errors {
+            eprintln!("  Error: {}", e);
+        }
+        eprintln!("\nFix the errors above before starting.");
+        std::process::exit(1);
     }
 
     let mut daemon = daemon::Daemon::new(cfg)?;

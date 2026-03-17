@@ -559,7 +559,11 @@ async fn handle_socket_message(ctx: HandlerContext, msg: BridgeMessage) {
         msg_type_str,
         "approval_request" | "approval_response" | "command"
     );
-    if !is_always_active && !ctx.mirroring_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+    if !is_always_active
+        && !ctx
+            .mirroring_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+    {
         tracing::debug!(msg_type = %msg.msg_type, "Mirroring disabled, dropping message");
         return;
     }
@@ -769,6 +773,35 @@ async fn handle_session_start(ctx: &HandlerContext, msg: &BridgeMessage) {
     // Remove auto-pin
     if let Some(tid) = thread_id {
         let _ = ctx.bot.unpin_all_topic_messages(tid).await;
+    }
+
+    // H3.2: Broadcast session_start back to socket clients so hook processes
+    // can discover their session's assigned threadId.
+    {
+        let mut broadcast_meta = serde_json::Map::new();
+        if let Some(tid) = thread_id {
+            broadcast_meta.insert(
+                "threadId".into(),
+                serde_json::Value::Number(serde_json::Number::from(tid)),
+            );
+        }
+        if let Some(h) = hostname {
+            broadcast_meta.insert("hostname".into(), serde_json::Value::String(h.to_string()));
+        }
+        if let Some(d) = project_dir {
+            broadcast_meta.insert(
+                "projectDir".into(),
+                serde_json::Value::String(d.to_string()),
+            );
+        }
+        let broadcast_msg = BridgeMessage {
+            msg_type: "session_start".into(),
+            session_id: msg.session_id.clone(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            content: "session_start".into(),
+            metadata: Some(broadcast_meta),
+        };
+        broadcast_to_clients(&ctx.socket_clients, &broadcast_msg).await;
     }
 }
 
@@ -1163,7 +1196,9 @@ async fn handle_error(ctx: &HandlerContext, msg: &BridgeMessage) {
 async fn handle_command(ctx: &HandlerContext, msg: &BridgeMessage) {
     let cmd = msg.content.trim().to_lowercase();
     let new_state = match cmd.as_str() {
-        "toggle" => !ctx.mirroring_enabled.load(std::sync::atomic::Ordering::Relaxed),
+        "toggle" => !ctx
+            .mirroring_enabled
+            .load(std::sync::atomic::Ordering::Relaxed),
         "enable" | "on" => true,
         "disable" | "off" => false,
         _ => {
@@ -2232,6 +2267,9 @@ async fn handle_bot_command(ctx: &HandlerContext, msg: &TgMessage, text: &str) {
                     last_activity: 0,
                 });
                 state.attached_session_id = Some(matched_id.clone());
+                // C3.2: Reset muted on attach so the user always receives
+                // updates from the newly-attached session.
+                state.muted = false;
                 state.last_activity = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
@@ -2339,6 +2377,7 @@ async fn handle_bot_command(ctx: &HandlerContext, msg: &TgMessage, text: &str) {
             }
         }
         "/abort" => {
+            // C3.4: Immediate abort — no confirmation dialog.
             let thread_id = msg.message_thread_id;
             let key = thread_id.unwrap_or(msg.chat.id);
             let attached = {
@@ -2356,25 +2395,62 @@ async fn handle_bot_command(ctx: &HandlerContext, msg: &TgMessage, text: &str) {
                         .await;
                 }
                 Some(session_id) => {
-                    ctx.bot
-                        .send_with_buttons(
-                            &format!(
-                                "\u{26A0}\u{FE0F} *Abort Session?*\n\nThis will terminate session `{session_id}`.\n\nAre you sure?"
-                            ),
-                            vec![
-                                InlineButton {
-                                    text: "\u{1F6D1} Confirm Abort".into(),
-                                    callback_data: format!("confirm_abort:{session_id}"),
-                                },
-                                InlineButton {
-                                    text: "\u{274C} Cancel".into(),
-                                    callback_data: "cancel_abort".into(),
-                                },
-                            ],
-                            Some(&opts),
-                            thread_id,
+                    // Mark session as aborted in DB
+                    let aborted = {
+                        let sess = ctx.sessions.lock().await;
+                        sess.end_session(&session_id, "aborted").is_ok()
+                    };
+
+                    if aborted {
+                        // Send Escape key via tmux to gracefully interrupt
+                        let tmux_target = ctx.session_tmux.read().await.get(&session_id).cloned();
+                        if let Some(target) = tmux_target {
+                            let socket = {
+                                let sess = ctx.sessions.lock().await;
+                                sess.get_session(&session_id)
+                                    .ok()
+                                    .flatten()
+                                    .and_then(|s| s.tmux_socket)
+                            };
+                            let mut inj = ctx.injector.lock().await;
+                            inj.set_target(&target, socket.as_deref());
+                            let _ = inj.send_key("Escape");
+                        }
+
+                        // Broadcast abort command to socket clients (matches TS behaviour)
+                        broadcast_to_clients(
+                            &ctx.socket_clients,
+                            &BridgeMessage {
+                                msg_type: "command".into(),
+                                session_id: session_id.clone(),
+                                timestamp: chrono::Utc::now().to_rfc3339(),
+                                content: "abort".into(),
+                                metadata: None,
+                            },
                         )
                         .await;
+
+                        // Clear attached session state
+                        {
+                            let mut bs = ctx.bot_sessions.write().await;
+                            if let Some(state) = bs.get_mut(&key) {
+                                state.attached_session_id = None;
+                            }
+                        }
+                        ctx.session_tmux.write().await.remove(&session_id);
+
+                        ctx.bot
+                            .send_message(
+                                &format!("\u{1F6D1} Session `{session_id}` aborted."),
+                                Some(&opts),
+                                thread_id,
+                            )
+                            .await;
+                    } else {
+                        ctx.bot
+                            .send_message("\u{274C} Failed to abort session.", None, thread_id)
+                            .await;
+                    }
                 }
             }
         }
@@ -2384,7 +2460,8 @@ async fn handle_bot_command(ctx: &HandlerContext, msg: &TgMessage, text: &str) {
             } else if args == "off" {
                 false
             } else {
-                !ctx.mirroring_enabled.load(std::sync::atomic::Ordering::Relaxed)
+                !ctx.mirroring_enabled
+                    .load(std::sync::atomic::Ordering::Relaxed)
             };
             ctx.mirroring_enabled
                 .store(new_state, std::sync::atomic::Ordering::Relaxed);

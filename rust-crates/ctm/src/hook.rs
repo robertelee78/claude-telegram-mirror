@@ -203,6 +203,17 @@ async fn build_messages(
     let meta = build_metadata(tmux_info, hostname, transcript_path, project_dir);
     let mut messages = Vec::new();
 
+    // C3.1: Always send session_start as the first message in every batch.
+    // The daemon's ensure_session_exists / create_session handles dedup — if
+    // the session already exists this is a no-op update.  This guarantees the
+    // daemon knows about the session even on the very first hook invocation.
+    messages.push(make_message(
+        "session_start",
+        session_id,
+        "Claude Code session started",
+        meta.clone(),
+    ));
+
     match event {
         HookEvent::PreToolUse(e) => {
             // Send tool_start (fire-and-forget preview)
