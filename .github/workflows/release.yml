@@ -168,6 +168,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      id-token: write
     steps:
       - uses: actions/checkout@v4
 
@@ -180,23 +181,6 @@ jobs:
           node-version: '20.x'
           registry-url: 'https://registry.npmjs.org'
 
-      - name: Debug npm auth
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          echo "=== .npmrc location ==="
-          echo "NPM_CONFIG_USERCONFIG=$NPM_CONFIG_USERCONFIG"
-          cat "$NPM_CONFIG_USERCONFIG" | sed 's/_authToken=.*/_authToken=<REDACTED>/'
-          echo ""
-          echo "=== Token length ==="
-          echo "${#NODE_AUTH_TOKEN}"
-          echo "=== Token prefix ==="
-          echo "${NODE_AUTH_TOKEN:0:4}"
-          echo "=== npm config list ==="
-          npm config list
-          echo "=== npm whoami ==="
-          npm whoami
-
       - name: Publish platform packages to npm
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
@@ -206,7 +190,7 @@ jobs:
             tgz=$(find artifacts/$pkg -name "*.tgz" | head -1)
             if [ -n "$tgz" ]; then
               echo "Publishing $pkg..."
-              if ! npm publish "$tgz" --access public 2>&1 | tee /tmp/npm-publish-$pkg.log; then
+              if ! npm publish "$tgz" --access public --provenance 2>&1 | tee /tmp/npm-publish-$pkg.log; then
                 if grep -q 'EPUBLISHCONFLICT\|You cannot publish over the previously published versions' /tmp/npm-publish-$pkg.log; then
                   echo "  $pkg already published at this version — skipping"
                 else
@@ -245,7 +229,7 @@ jobs:
           fi
 
           # Publish the main package
-          npm publish --access public
+          npm publish --access public --provenance
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
