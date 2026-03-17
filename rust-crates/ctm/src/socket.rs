@@ -155,15 +155,12 @@ impl SocketServer {
         // but umask is per-process (not per-thread), causing race conditions in
         // tests and any multi-threaded context. Instead, we bind normally and
         // chmod the socket file immediately after creation.
-        let listener = UnixListener::bind(&self.socket_path).map_err(|e| {
-            AppError::Socket(format!("Failed to bind socket: {e}"))
-        })?;
+        let listener = UnixListener::bind(&self.socket_path)
+            .map_err(|e| AppError::Socket(format!("Failed to bind socket: {e}")))?;
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(
-                &self.socket_path,
-                std::fs::Permissions::from_mode(0o600),
-            );
+            let _ =
+                std::fs::set_permissions(&self.socket_path, std::fs::Permissions::from_mode(0o600));
         }
 
         // Write PID file after lock acquired.

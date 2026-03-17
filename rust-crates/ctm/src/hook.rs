@@ -603,10 +603,7 @@ fn extract_transcript_text(
     use std::io::BufRead;
 
     // S-1: Validate path before opening (prevents path traversal)
-    let path = match validate_transcript_path(transcript_path) {
-        Some(p) => p,
-        None => return None,
-    };
+    let path = validate_transcript_path(transcript_path)?;
 
     if !path.exists() {
         return None;

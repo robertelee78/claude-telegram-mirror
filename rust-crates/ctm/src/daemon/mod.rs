@@ -504,7 +504,6 @@ impl HandlerContext {
             parts.join(" \u{2022} ")
         }
     }
-
 }
 
 // ====================================================================== socket handler
@@ -901,7 +900,9 @@ async fn get_tmux_target(
     }
     // Fallback to DB
     let sid = session_id.to_string();
-    let tmux_info = ctx.db_op(move |sess| sess.get_tmux_info(&sid).ok().flatten()).await;
+    let tmux_info = ctx
+        .db_op(move |sess| sess.get_tmux_info(&sid).ok().flatten())
+        .await;
     if let Some((target, _socket)) = tmux_info {
         ctx.session_tmux
             .write()
@@ -955,5 +956,4 @@ mod tests {
         let name = HandlerContext::format_topic_name("session-xyz", None, Some("/opt/project"));
         assert!(name.contains("project"));
     }
-
 }

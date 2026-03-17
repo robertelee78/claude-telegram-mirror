@@ -228,7 +228,8 @@ pub const MAX_SESSION_ID_LEN: usize = 128;
 pub const VALID_SESSION_STATUSES: &[&str] = &["active", "ended", "aborted"];
 
 /// Valid status values for approvals.
-pub const VALID_APPROVAL_STATUSES: &[&str] = &["pending", "approved", "denied", "rejected", "expired"];
+pub const VALID_APPROVAL_STATUSES: &[&str] =
+    &["pending", "approved", "denied", "rejected", "expired"];
 
 /// Returns true if `s` is a recognized session status.
 pub fn is_valid_session_status(s: &str) -> bool {

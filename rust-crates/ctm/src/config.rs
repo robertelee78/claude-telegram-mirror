@@ -105,9 +105,15 @@ impl fmt::Debug for Config {
             .field("chunk_size", &self.chunk_size)
             .field("rate_limit", &self.rate_limit)
             .field("session_timeout", &self.session_timeout)
-            .field("stale_session_timeout_hours", &self.stale_session_timeout_hours)
+            .field(
+                "stale_session_timeout_hours",
+                &self.stale_session_timeout_hours,
+            )
             .field("auto_delete_topics", &self.auto_delete_topics)
-            .field("topic_delete_delay_minutes", &self.topic_delete_delay_minutes)
+            .field(
+                "topic_delete_delay_minutes",
+                &self.topic_delete_delay_minutes,
+            )
             .field("socket_path", &self.socket_path)
             .field("config_dir", &self.config_dir)
             .field("config_path", &self.config_path)
