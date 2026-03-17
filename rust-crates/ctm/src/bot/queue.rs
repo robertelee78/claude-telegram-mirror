@@ -2,6 +2,19 @@
 
 use super::*;
 
+/// RAII guard that resets `queue_processing` to `false` when dropped.
+/// This ensures the flag is cleared even if the processing loop panics or
+/// the future is cancelled.
+struct ProcessingGuard(Arc<Mutex<bool>>);
+
+impl Drop for ProcessingGuard {
+    fn drop(&mut self) {
+        if let Ok(mut g) = self.0.try_lock() {
+            *g = false;
+        }
+    }
+}
+
 impl TelegramBot {
     /// Maximum queued messages before oldest are dropped. Prevents OOM under
     /// sustained send failures (e.g. network outage + rapid hook events).
@@ -33,6 +46,9 @@ impl TelegramBot {
             }
             *processing = true;
         }
+        // Hold the guard for the entire duration of the loop so that
+        // cancellation or a panic always resets the flag via Drop.
+        let _guard = ProcessingGuard(Arc::clone(&self.queue_processing));
 
         loop {
             let item = {
@@ -69,8 +85,7 @@ impl TelegramBot {
                 }
             }
         }
-
-        *self.queue_processing.lock().await = false;
+        // _guard is dropped here, resetting queue_processing to false.
     }
 
     /// Actually send a single queued message to Telegram.
@@ -124,14 +139,17 @@ impl TelegramBot {
                         )
                         .await;
 
-                    // Retry the original message
+                    // Retry the original message; surface any new error directly.
                     let retry_resp: TgResponse<TgMessage> =
                         self.api_call("sendMessage", &body).await?;
                     if retry_resp.ok {
                         return Ok(());
                     }
+                    let retry_desc = retry_resp.description.unwrap_or_default();
+                    return Err(AppError::Telegram(self.scrub_token(&retry_desc)));
                 }
                 tracing::error!(thread_id = tid, "Failed to reopen topic");
+                return Err(AppError::Telegram(self.scrub_token(&desc)));
             }
         }
 
