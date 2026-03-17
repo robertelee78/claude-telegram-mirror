@@ -25,7 +25,7 @@ use crate::config::{get_config_dir, Config};
 use crate::error::Result;
 use crate::formatting::{
     format_agent_response, format_approval_request, format_error, format_session_end,
-    format_session_start, format_tool_details, format_tool_execution,
+    format_session_start, format_tool_details, format_tool_execution, truncate,
 };
 use crate::injector::InputInjector;
 use crate::session::SessionManager;
@@ -47,18 +47,20 @@ const QUESTION_TTL_SECS: u64 = 10 * 60; // 10 minutes
 const DOWNLOAD_MAX_AGE_SECS: u64 = 24 * 60 * 60; // 24 hours
 const TMUX_SESSION_TIMEOUT_HOURS: u32 = 24;
 const NO_TMUX_SESSION_TIMEOUT_HOURS: u32 = 1;
+/// FR32: Maximum characters allowed in a single text injection to tmux.
+const MAX_INJECT_CHARS: usize = 8192;
 
 // ---------------------------------------------------------------- types
 
 /// Cached tool input for the "Details" button.
-struct CachedToolInput {
+pub(super) struct CachedToolInput {
     tool: String,
     input: serde_json::Value,
     timestamp: std::time::Instant,
 }
 
 /// Pending AskUserQuestion state.
-struct PendingQuestion {
+pub(super) struct PendingQuestion {
     session_id: String,
     questions: Vec<QuestionDef>,
     answered: Vec<bool>,
@@ -84,19 +86,17 @@ struct QuestionDef {
 #[derive(Clone)]
 struct OptionDef {
     label: String,
-    // Intentional: preserved for future question-detail display
     description: String,
 }
 
 /// Topic creation lock for BUG-002 prevention.
 /// When a session is being created, concurrent handlers wait on this.
-struct TopicCreationState {
+pub(super) struct TopicCreationState {
     notify: Arc<tokio::sync::Notify>,
-    resolved: bool,
 }
 
 /// Per-thread bot session state (mirrors grammY session in TypeScript).
-struct BotSessionState {
+pub(super) struct BotSessionState {
     attached_session_id: Option<String>,
     muted: bool,
     last_activity: u64,
@@ -104,35 +104,46 @@ struct BotSessionState {
 
 // ---------------------------------------------------------------- daemon
 
-/// Bridge Daemon — orchestrates all components.
-pub struct Daemon {
-    config: Config,
-    bot: Arc<TelegramBot>,
-    sessions: Arc<Mutex<SessionManager>>,
-    injector: Arc<Mutex<InputInjector>>,
-    socket: Option<SocketServer>,
+/// FR43: Consolidated shared state for the daemon.
+///
+/// All fields that were previously individual `Arc<…>` on `Daemon` are now
+/// grouped here and wrapped in a single `Arc<DaemonState>`. This reduces
+/// clone overhead and simplifies the `run_event_loop` signature.
+pub(super) struct DaemonState {
+    pub(super) bot: Arc<TelegramBot>,
+    pub(super) sessions: Arc<Mutex<SessionManager>>,
+    pub(super) injector: Arc<Mutex<InputInjector>>,
 
     // In-memory caches
-    session_threads: Arc<RwLock<HashMap<String, i64>>>,
-    session_tmux_targets: Arc<RwLock<HashMap<String, String>>>,
-    recent_telegram_inputs: Arc<RwLock<HashSet<String>>>,
-    tool_input_cache: Arc<RwLock<HashMap<String, CachedToolInput>>>,
-    compacting_sessions: Arc<RwLock<HashSet<String>>>,
-    pending_deletions: Arc<RwLock<HashMap<String, tokio::task::JoinHandle<()>>>>,
-    session_custom_titles: Arc<RwLock<HashMap<String, String>>>,
-    pending_questions: Arc<RwLock<HashMap<String, PendingQuestion>>>,
+    pub(super) session_threads: Arc<RwLock<HashMap<String, i64>>>,
+    pub(super) session_tmux_targets: Arc<RwLock<HashMap<String, String>>>,
+    pub(super) recent_telegram_inputs: Arc<RwLock<HashSet<String>>>,
+    pub(super) tool_input_cache: Arc<RwLock<HashMap<String, CachedToolInput>>>,
+    pub(super) compacting_sessions: Arc<RwLock<HashSet<String>>>,
+    pub(super) pending_deletions: Arc<RwLock<HashMap<String, tokio::task::JoinHandle<()>>>>,
+    pub(super) session_custom_titles: Arc<RwLock<HashMap<String, String>>>,
+    pub(super) pending_questions: Arc<RwLock<HashMap<String, PendingQuestion>>>,
 
     // BUG-002: Topic creation locks
-    topic_creation_locks: Arc<RwLock<HashMap<String, Arc<TopicCreationState>>>>,
+    pub(super) topic_creation_locks: Arc<RwLock<HashMap<String, Arc<TopicCreationState>>>>,
 
     // Per-thread bot session state (keyed by thread_id / message_thread_id)
-    bot_sessions: Arc<RwLock<HashMap<i64, BotSessionState>>>,
+    pub(super) bot_sessions: Arc<RwLock<HashMap<i64, BotSessionState>>>,
 
     // Epic 1: Runtime mirroring toggle
-    mirroring_enabled: Arc<std::sync::atomic::AtomicBool>,
+    pub(super) mirroring_enabled: Arc<std::sync::atomic::AtomicBool>,
+
+    pub(super) config: Arc<Config>,
 
     // L3.2: Track running state
-    running: Arc<std::sync::atomic::AtomicBool>,
+    pub(super) running: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Bridge Daemon — orchestrates all components.
+pub struct Daemon {
+    /// FR43: Single Arc holding all shared daemon state.
+    state: Arc<DaemonState>,
+    socket: Option<SocketServer>,
 }
 
 /// L3.2: Programmatic daemon status.
@@ -148,18 +159,16 @@ pub struct DaemonStatus {
 
 impl Daemon {
     pub fn new(config: Config) -> Result<Self> {
-        let bot = Arc::new(TelegramBot::new(&config));
+        let bot = Arc::new(TelegramBot::new(&config)?);
         let sessions = SessionManager::new(&config.config_dir, config.session_timeout)?;
         let mirroring_enabled = Arc::new(std::sync::atomic::AtomicBool::new(
             crate::config::read_mirror_status(&config.config_dir),
         ));
 
-        Ok(Self {
-            config,
+        let state = Arc::new(DaemonState {
             bot,
             sessions: Arc::new(Mutex::new(sessions)),
             injector: Arc::new(Mutex::new(InputInjector::new())),
-            socket: None,
             session_threads: Arc::new(RwLock::new(HashMap::new())),
             session_tmux_targets: Arc::new(RwLock::new(HashMap::new())),
             recent_telegram_inputs: Arc::new(RwLock::new(HashSet::new())),
@@ -171,14 +180,22 @@ impl Daemon {
             topic_creation_locks: Arc::new(RwLock::new(HashMap::new())),
             bot_sessions: Arc::new(RwLock::new(HashMap::new())),
             mirroring_enabled,
+            config: Arc::new(config),
             running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        });
+
+        Ok(Self {
+            state,
+            socket: None,
         })
     }
 
     /// L3.2: Check if the daemon is currently running.
     #[allow(dead_code)] // Library API
     pub fn is_running(&self) -> bool {
-        self.running.load(std::sync::atomic::Ordering::Relaxed)
+        self.state
+            .running
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// L3.2: Get programmatic daemon status.
@@ -188,7 +205,7 @@ impl Daemon {
             Some(s) => s.clients_ref().lock().await.len(),
             None => 0,
         };
-        let sessions_ref = Arc::clone(&self.sessions);
+        let sessions_ref = Arc::clone(&self.state.sessions);
         let sessions = tokio::task::spawn_blocking(move || {
             sessions_ref
                 .blocking_lock()
@@ -224,22 +241,26 @@ impl Daemon {
     /// Start the daemon. Runs until shutdown signal.
     pub async fn start(&mut self) -> Result<()> {
         // L4.1: Double-start guard — prevent re-entering start() if already running.
-        if self.running.load(std::sync::atomic::Ordering::Relaxed) {
+        if self
+            .state
+            .running
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
             tracing::warn!("Daemon already running, ignoring start()");
             return Ok(());
         }
         tracing::info!("Starting bridge daemon...");
 
         // Start socket server
-        let pid_path = self.config.config_dir.join("bridge.pid");
-        let mut socket = SocketServer::new(&self.config.socket_path, &pid_path);
+        let pid_path = self.state.config.config_dir.join("bridge.pid");
+        let mut socket = SocketServer::new(&self.state.config.socket_path, &pid_path);
         socket.listen().await?;
         let socket_rx = socket.subscribe();
         let daemon_socket_clients = socket.clients_ref();
         self.socket = Some(socket);
 
         // Verify bot connectivity
-        match self.bot.get_me().await {
+        match self.state.bot.get_me().await {
             Ok(me) => {
                 tracing::info!(
                     username = ?me.username,
@@ -254,7 +275,7 @@ impl Daemon {
 
         // H9: Auto-detect tmux session at startup
         {
-            let mut inj = self.injector.lock().await;
+            let mut inj = self.state.injector.lock().await;
             if let Some(info) = InputInjector::detect_tmux_session() {
                 inj.set_target(&info.target, info.socket.as_deref());
                 tracing::info!(
@@ -276,7 +297,8 @@ impl Daemon {
         }
 
         // Send startup notification
-        self.bot
+        self.state
+            .bot
             .send_message(
                 "\u{1F7E2} *Bridge Daemon Started*\n\nClaude Code sessions will now be mirrored here.",
                 Some(&SendOptions {
@@ -287,47 +309,15 @@ impl Daemon {
             )
             .await;
 
-        // Spawn main event loop
-        let daemon_bot = Arc::clone(&self.bot);
-        let daemon_sessions = Arc::clone(&self.sessions);
-        let daemon_injector = Arc::clone(&self.injector);
-        let daemon_session_threads = Arc::clone(&self.session_threads);
-        let daemon_session_tmux = Arc::clone(&self.session_tmux_targets);
-        let daemon_recent_inputs = Arc::clone(&self.recent_telegram_inputs);
-        let daemon_tool_cache = Arc::clone(&self.tool_input_cache);
-        let daemon_compacting = Arc::clone(&self.compacting_sessions);
-        let daemon_pending_del = Arc::clone(&self.pending_deletions);
-        let daemon_custom_titles = Arc::clone(&self.session_custom_titles);
-        let daemon_pending_q = Arc::clone(&self.pending_questions);
-        let daemon_topic_locks = Arc::clone(&self.topic_creation_locks);
-        let daemon_bot_sessions = Arc::clone(&self.bot_sessions);
-        let daemon_mirroring_enabled = Arc::clone(&self.mirroring_enabled);
-        let daemon_config = Arc::new(self.config.clone());
+        // FR43: Spawn main event loop with consolidated state.
+        let daemon_state = Arc::clone(&self.state);
 
         tokio::spawn(async move {
-            event_loop::run_event_loop(
-                socket_rx,
-                daemon_bot,
-                daemon_sessions,
-                daemon_injector,
-                daemon_session_threads,
-                daemon_session_tmux,
-                daemon_recent_inputs,
-                daemon_tool_cache,
-                daemon_compacting,
-                daemon_pending_del,
-                daemon_custom_titles,
-                daemon_pending_q,
-                daemon_topic_locks,
-                daemon_bot_sessions,
-                daemon_mirroring_enabled,
-                daemon_config,
-                daemon_socket_clients,
-            )
-            .await;
+            event_loop::run_event_loop(socket_rx, daemon_state, daemon_socket_clients).await;
         });
 
-        self.running
+        self.state
+            .running
             .store(true, std::sync::atomic::Ordering::Relaxed);
         tracing::info!("Bridge daemon started");
         Ok(())
@@ -338,7 +328,8 @@ impl Daemon {
         tracing::info!("Stopping bridge daemon...");
 
         // Send shutdown notification
-        self.bot
+        self.state
+            .bot
             .send_message(
                 "\u{1F534} *Bridge Daemon Stopped*\n\nSession mirroring is now disabled.",
                 Some(&SendOptions {
@@ -354,7 +345,8 @@ impl Daemon {
             socket.close().await;
         }
 
-        self.running
+        self.state
+            .running
             .store(false, std::sync::atomic::Ordering::Relaxed);
         tracing::info!("Bridge daemon stopped");
     }
@@ -419,7 +411,12 @@ impl HandlerContext {
             f(&guard)
         })
         .await
-        .expect("spawn_blocking panicked")
+        .unwrap_or_else(|e| {
+            // Log the JoinError (task panic or runtime shutdown) before propagating.
+            // Cannot gracefully recover because R is generic with no Default bound.
+            tracing::error!(error = %e, "db_op: spawn_blocking task failed");
+            panic!("db_op: spawn_blocking task was cancelled or panicked: {e}");
+        })
     }
 
     /// Get thread ID for a session (memory cache -> DB fallback).
@@ -459,14 +456,12 @@ impl HandlerContext {
         };
 
         if let Some(state) = lock {
-            if !state.resolved {
-                // Wait up to 5 seconds
-                let _ = tokio::time::timeout(
-                    tokio::time::Duration::from_secs(5),
-                    state.notify.notified(),
-                )
-                .await;
-            }
+            // Wait up to 5 seconds
+            let _ = tokio::time::timeout(
+                tokio::time::Duration::from_secs(5),
+                state.notify.notified(),
+            )
+            .await;
             // Check again after notification
             return self.get_thread_id(session_id).await;
         }
@@ -609,9 +604,7 @@ async fn handle_socket_message(ctx: HandlerContext, msg: BridgeMessage) {
     // After processing, check transcript for custom-title rename (Epic 5)
     if let Some(meta) = &msg.metadata {
         if let Some(tp) = meta.get("transcript_path").and_then(|v| v.as_str()) {
-            if let Some(title) =
-                socket_handlers::check_for_session_rename(tp, &msg.session_id, &ctx.custom_titles)
-            {
+            if let Some(title) = socket_handlers::check_for_session_rename(tp) {
                 socket_handlers::handle_session_rename(&ctx, &msg.session_id, &title).await;
             }
         }
@@ -730,14 +723,12 @@ async fn ensure_session_exists(ctx: &HandlerContext, msg: &BridgeMessage) {
     {
         let locks = ctx.topic_locks.read().await;
         if let Some(state) = locks.get(&msg.session_id) {
-            if !state.resolved {
-                let notify = Arc::clone(&state.notify);
-                drop(locks);
-                let _ =
-                    tokio::time::timeout(tokio::time::Duration::from_secs(5), notify.notified())
-                        .await;
-                return;
-            }
+            let notify = Arc::clone(&state.notify);
+            drop(locks);
+            let _ =
+                tokio::time::timeout(tokio::time::Duration::from_secs(5), notify.notified())
+                    .await;
+            return;
         }
     }
 
@@ -745,7 +736,6 @@ async fn ensure_session_exists(ctx: &HandlerContext, msg: &BridgeMessage) {
     if ctx.config.use_threads {
         let state = Arc::new(TopicCreationState {
             notify: Arc::new(tokio::sync::Notify::new()),
-            resolved: false,
         });
         ctx.topic_locks
             .write()
@@ -794,9 +784,8 @@ fn format_tool_preview(tool_name: &str, input: &serde_json::Value) -> String {
         "Bash" => {
             let cmd = s("command");
             if !cmd.is_empty() {
-                let truncated = &cmd[..std::cmp::min(50, cmd.len())];
-                let suffix = if cmd.len() > 50 { "..." } else { "" };
-                format!("\n`{truncated}{suffix}`")
+                let truncated = truncate(cmd, 50);
+                format!("\n`{truncated}`")
             } else {
                 String::new()
             }
@@ -820,7 +809,7 @@ fn format_tool_preview(tool_name: &str, input: &serde_json::Value) -> String {
         "WebFetch" => {
             let url = s("url");
             if !url.is_empty() {
-                let truncated = &url[..std::cmp::min(40, url.len())];
+                let truncated: String = url.chars().take(40).collect();
                 format!(" `{truncated}...`")
             } else {
                 String::new()

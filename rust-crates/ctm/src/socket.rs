@@ -326,6 +326,7 @@ fn acquire_flock(pid_path: &Path) -> Result<Flock<OwnedFd>> {
     let file = OpenOptions::new()
         .create(true)
         .truncate(false)
+        .read(true)
         .write(true)
         .open(pid_path)
         .map_err(|e| AppError::Lock(format!("Cannot open PID file: {e}")))?;
@@ -428,6 +429,14 @@ impl SocketClient {
                     return Err(AppError::Socket("Connection closed".into()));
                 }
 
+                // FR31: Bound client read to MAX_LINE_BYTES
+                if line.len() > MAX_LINE_BYTES {
+                    return Err(AppError::Socket(format!(
+                        "Response line too large ({} bytes, max {MAX_LINE_BYTES})",
+                        line.len()
+                    )));
+                }
+
                 if let Ok(msg) = serde_json::from_str::<BridgeMessage>(line.trim()) {
                     if msg.session_id == *session_id {
                         return Ok(msg);
@@ -458,10 +467,12 @@ impl SocketClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn flock_rejects_double_lock() {
         let tmp = tempfile::TempDir::new().unwrap();
+        let _ = std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700));
         let pid = tmp.path().join("test.pid");
 
         let _lock1 = acquire_flock(&pid).expect("First lock should succeed");
@@ -472,6 +483,9 @@ mod tests {
     #[test]
     fn flock_released_on_drop() {
         let tmp = tempfile::TempDir::new().unwrap();
+        // Ensure the temp dir is traversable even if another test's umask(0o177)
+        // raced with TempDir creation (umask is process-wide).
+        let _ = std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700));
         let pid = tmp.path().join("test2.pid");
 
         {

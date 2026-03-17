@@ -25,7 +25,10 @@ impl TelegramBot {
                 if q.is_empty() {
                     break;
                 }
-                q.pop_front().unwrap()
+                match q.pop_front() {
+                    Some(m) => m,
+                    None => break,
+                }
             };
 
             match self.send_item(&item).await {
@@ -143,5 +146,166 @@ impl TelegramBot {
         }
 
         Err(AppError::Telegram(self.scrub_token(&desc)))
+    }
+}
+
+// ===================================================================== tests
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use std::path::PathBuf;
+
+    fn test_config() -> Config {
+        Config {
+            bot_token: "999:FAKE-TOKEN-for-queue-tests".to_string(),
+            chat_id: -100999,
+            enabled: true,
+            verbose: false,
+            approvals: true,
+            use_threads: true,
+            chunk_size: 4000,
+            rate_limit: 20,
+            session_timeout: 30,
+            stale_session_timeout_hours: 72,
+            auto_delete_topics: true,
+            topic_delete_delay_minutes: 1440,
+            socket_path: PathBuf::from("/tmp/test.sock"),
+            config_dir: PathBuf::from("/tmp"),
+            config_path: PathBuf::from("/tmp/config.json"),
+            forum_enabled: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn queue_drains_fifo_order() {
+        let config = test_config();
+        let bot = TelegramBot::new(&config).unwrap();
+
+        // Manually push items into the raw queue (bypassing enqueue which
+        // triggers process_queue and would attempt HTTP calls).
+        {
+            let mut q = bot.queue.lock().await;
+            for i in 0..5 {
+                q.push_back(QueuedMessage {
+                    chat_id: -100999,
+                    text: format!("msg-{}", i),
+                    thread_id: None,
+                    buttons: None,
+                    parse_mode: None,
+                    disable_notification: None,
+                    reply_to_message_id: None,
+                    retries: 0,
+                    created_at: 0,
+                });
+            }
+        }
+
+        // Drain and verify FIFO order
+        let mut q = bot.queue.lock().await;
+        for i in 0..5 {
+            let item = q.pop_front().expect("queue should have items");
+            assert_eq!(item.text, format!("msg-{}", i));
+        }
+        assert!(q.pop_front().is_none(), "queue should be empty after drain");
+    }
+
+    #[tokio::test]
+    async fn empty_queue_pop_returns_none() {
+        let config = test_config();
+        let bot = TelegramBot::new(&config).unwrap();
+
+        let mut q = bot.queue.lock().await;
+        assert!(q.is_empty());
+        assert!(q.pop_front().is_none(), "pop_front on empty queue returns None, no panic");
+    }
+
+    #[tokio::test]
+    async fn queue_push_back_and_push_front() {
+        let config = test_config();
+        let bot = TelegramBot::new(&config).unwrap();
+
+        let make_msg = |text: &str| QueuedMessage {
+            chat_id: -100999,
+            text: text.to_string(),
+            thread_id: None,
+            buttons: None,
+            parse_mode: None,
+            disable_notification: None,
+            reply_to_message_id: None,
+            retries: 0,
+            created_at: 0,
+        };
+
+        {
+            let mut q = bot.queue.lock().await;
+            q.push_back(make_msg("first"));
+            q.push_back(make_msg("second"));
+            // Simulate retry: push_front puts it at head
+            q.push_front(make_msg("retry"));
+        }
+
+        let mut q = bot.queue.lock().await;
+        assert_eq!(q.pop_front().unwrap().text, "retry");
+        assert_eq!(q.pop_front().unwrap().text, "first");
+        assert_eq!(q.pop_front().unwrap().text, "second");
+        assert!(q.pop_front().is_none());
+    }
+
+    #[tokio::test]
+    async fn concurrent_push_pop_safety() {
+        let config = test_config();
+        let bot = TelegramBot::new(&config).unwrap();
+        let queue = Arc::clone(&bot.queue);
+
+        let make_msg = |text: String| QueuedMessage {
+            chat_id: -100999,
+            text,
+            thread_id: None,
+            buttons: None,
+            parse_mode: None,
+            disable_notification: None,
+            reply_to_message_id: None,
+            retries: 0,
+            created_at: 0,
+        };
+
+        // Spawn 10 tasks that each push a message
+        let mut handles = Vec::new();
+        for i in 0..10 {
+            let q = Arc::clone(&queue);
+            handles.push(tokio::spawn(async move {
+                let mut locked = q.lock().await;
+                locked.push_back(make_msg(format!("concurrent-{}", i)));
+            }));
+        }
+
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        // All 10 messages should be present
+        let mut q = queue.lock().await;
+        assert_eq!(q.len(), 10);
+
+        // Drain all
+        let mut texts: Vec<String> = Vec::new();
+        while let Some(item) = q.pop_front() {
+            texts.push(item.text);
+        }
+        assert_eq!(texts.len(), 10);
+        // All should start with "concurrent-"
+        for t in &texts {
+            assert!(t.starts_with("concurrent-"));
+        }
+    }
+
+    #[tokio::test]
+    async fn queue_processing_flag_starts_false() {
+        let config = test_config();
+        let bot = TelegramBot::new(&config).unwrap();
+        let processing = bot.queue_processing.lock().await;
+        assert!(!*processing);
     }
 }

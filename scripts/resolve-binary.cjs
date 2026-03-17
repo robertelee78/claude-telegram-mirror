@@ -122,8 +122,8 @@ function verifyBinaryIntegrity(binaryPath) {
 /**
  * Resolve the native CTM binary path using multiple search strategies.
  *
- * After resolution, verifies the binary's SHA-256 checksum against checksums.json
- * if present. See ADR-006 L3.8.
+ * Does NOT verify binary integrity. Callers should call
+ * verifyBinaryIntegrity() separately after resolution. See ADR-006 L3.8.
  *
  * @returns {{ binary: string, packageDir: string } | null}
  */

@@ -319,7 +319,8 @@ impl InputInjector {
             let stdout = String::from_utf8_lossy(&output.stdout);
             for line in stdout.lines() {
                 if let Some((session, command)) = line.split_once(':') {
-                    if command.contains("claude") || command.contains("node") {
+                    // "node" match removed — was legacy from when ctm was a Node.js process
+                    if command.contains("claude") {
                         return Some(session.to_string());
                     }
                 }

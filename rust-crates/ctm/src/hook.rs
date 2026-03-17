@@ -1,5 +1,6 @@
 use crate::config;
 use crate::error::{AppError, Result};
+use crate::formatting;
 use crate::injector::{self, InputInjector};
 use crate::types::{self, BridgeMessage, HookEvent, MessageType, MAX_LINE_BYTES, SAFE_COMMANDS};
 use std::io::Read;
@@ -489,11 +490,7 @@ fn format_tool_approval_prompt(tool_name: &str, tool_input: &serde_json::Value) 
                 .get("content")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let preview = if content.len() > 500 {
-                format!("{}...", &content[..500])
-            } else {
-                content.to_string()
-            };
+            let preview = formatting::truncate(content, 500);
             desc.push_str(&format!(
                 "\u{1F4DD} **File:** `{file_path}`\n**Content preview:**\n```\n{preview}\n```"
             ));
@@ -505,19 +502,11 @@ fn format_tool_approval_prompt(tool_name: &str, tool_input: &serde_json::Value) 
                 .unwrap_or("<unknown>");
             desc.push_str(&format!("\u{270F}\u{FE0F} **File:** `{file_path}`"));
             if let Some(old) = tool_input.get("old_string").and_then(|v| v.as_str()) {
-                let snip = if old.len() > 200 {
-                    format!("{}...", &old[..200])
-                } else {
-                    old.to_string()
-                };
+                let snip = formatting::truncate(old, 200);
                 desc.push_str(&format!("\n**Old:** ```{snip}```"));
             }
             if let Some(new) = tool_input.get("new_string").and_then(|v| v.as_str()) {
-                let snip = if new.len() > 200 {
-                    format!("{}...", &new[..200])
-                } else {
-                    new.to_string()
-                };
+                let snip = formatting::truncate(new, 200);
                 desc.push_str(&format!("\n**New:** ```{snip}```"));
             }
         }
@@ -526,20 +515,12 @@ fn format_tool_approval_prompt(tool_name: &str, tool_input: &serde_json::Value) 
                 .get("command")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let cmd = if command.len() > 200 {
-                format!("{}...", &command[..200])
-            } else {
-                command.to_string()
-            };
+            let cmd = formatting::truncate(command, 200);
             desc.push_str(&format!("\u{1F4BB} **Command:**\n```bash\n{cmd}\n```"));
         }
         _ => {
             let json = serde_json::to_string_pretty(tool_input).unwrap_or_default();
-            let truncated = if json.len() > 500 {
-                format!("{}...", &json[..500])
-            } else {
-                json
-            };
+            let truncated = formatting::truncate(&json, 500);
             desc.push_str(&format!("**Input:**\n```json\n{truncated}\n```"));
         }
     }
@@ -722,6 +703,14 @@ async fn send_and_wait(
 
             if bytes == 0 {
                 return Err(AppError::Socket("Connection closed".into()));
+            }
+
+            // FR31: Bound client read to MAX_LINE_BYTES
+            if line.len() > MAX_LINE_BYTES {
+                return Err(AppError::Socket(format!(
+                    "Response line too large ({} bytes, max {MAX_LINE_BYTES})",
+                    line.len()
+                )));
             }
 
             if let Ok(msg) = serde_json::from_str::<BridgeMessage>(line.trim()) {

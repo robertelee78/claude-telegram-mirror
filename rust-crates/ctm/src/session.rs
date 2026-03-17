@@ -76,7 +76,7 @@ fn radix36(mut n: u64) -> String {
         n /= 36;
     }
     buf.reverse();
-    String::from_utf8(buf).unwrap()
+    String::from_utf8(buf).expect("radix36 CHARS table is entirely ASCII")
 }
 
 fn now_iso() -> String {
@@ -480,7 +480,8 @@ impl SessionManager {
         let now = chrono::Utc::now();
         let created = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
         let expires = (now
-            + chrono::TimeDelta::try_milliseconds(self.approval_timeout_ms).unwrap())
+            + chrono::TimeDelta::try_milliseconds(self.approval_timeout_ms)
+                .unwrap_or(chrono::TimeDelta::zero()))
         .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
 
         self.conn
@@ -566,8 +567,9 @@ impl SessionManager {
     // -------------------------------------------------------------- cleanup
 
     pub fn get_stale_session_candidates(&self, timeout_hours: u32) -> Result<Vec<Session>> {
-        let cutoff =
-            chrono::Utc::now() - chrono::TimeDelta::try_hours(i64::from(timeout_hours)).unwrap();
+        let cutoff = chrono::Utc::now()
+            - chrono::TimeDelta::try_hours(i64::from(timeout_hours))
+                .unwrap_or(chrono::TimeDelta::hours(24));
         let cutoff_iso = cutoff.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
 
         let mut stmt = self
@@ -634,10 +636,27 @@ impl SessionManager {
         Ok(rows.next().is_some())
     }
 
+    /// Test helper: overwrite `last_activity` for a session via raw SQL.
+    ///
+    /// This exists so that integration tests can simulate stale sessions
+    /// without accessing the private `conn` field.
+    #[doc(hidden)]
+    #[allow(dead_code)] // Used by integration tests only
+    pub fn test_set_last_activity(&self, session_id: &str, iso_timestamp: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE sessions SET last_activity = ?1 WHERE id = ?2",
+                params![iso_timestamp, session_id],
+            )
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        Ok(())
+    }
+
     #[allow(dead_code)] // Library API
     pub fn cleanup_old_sessions(&self, max_age_days: u32) -> Result<usize> {
-        let cutoff =
-            chrono::Utc::now() - chrono::TimeDelta::try_days(i64::from(max_age_days)).unwrap();
+        let cutoff = chrono::Utc::now()
+            - chrono::TimeDelta::try_days(i64::from(max_age_days))
+                .unwrap_or(chrono::TimeDelta::days(30));
         let cutoff_iso = cutoff.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
 
         // Delete old approvals first (foreign key)
@@ -682,7 +701,10 @@ impl SessionManager {
             )
             .map_err(|e| AppError::Database(e.to_string()))?;
 
-        Ok((active as usize, pending as usize))
+        Ok((
+            usize::try_from(active).unwrap_or(0),
+            usize::try_from(pending).unwrap_or(0),
+        ))
     }
 }
 
@@ -716,309 +738,3 @@ fn row_to_approval(row: &rusqlite::Row<'_>) -> rusqlite::Result<PendingApproval>
     })
 }
 
-// ===================================================================== tests
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::TempDir;
-
-    fn make_mgr() -> (SessionManager, TempDir) {
-        let tmp = TempDir::new().unwrap();
-        let mgr = SessionManager::new(tmp.path(), 5).unwrap();
-        (mgr, tmp)
-    }
-
-    // ---- session lifecycle ----
-
-    #[test]
-    fn create_and_get_session() {
-        let (mgr, _tmp) = make_mgr();
-        let id = mgr
-            .create_session(
-                "sess-1",
-                42,
-                Some("myhost"),
-                Some("/project"),
-                None,
-                None,
-                None,
-            )
-            .unwrap();
-        assert_eq!(id, "sess-1");
-
-        let sess = mgr.get_session("sess-1").unwrap().unwrap();
-        assert_eq!(sess.chat_id, 42);
-        assert_eq!(sess.hostname.as_deref(), Some("myhost"));
-        assert_eq!(sess.project_dir.as_deref(), Some("/project"));
-        assert_eq!(sess.status, "active");
-    }
-
-    #[test]
-    fn create_session_all_fields_atomic() {
-        // M2.12: verify all fields are persisted in the single INSERT.
-        let (mgr, _tmp) = make_mgr();
-        mgr.create_session(
-            "full-sess",
-            100,
-            Some("builder"),
-            Some("/workspace"),
-            Some(42),
-            Some("s0:0.1"),
-            Some("/tmp/tmux-1234/default"),
-        )
-        .unwrap();
-
-        let sess = mgr.get_session("full-sess").unwrap().unwrap();
-        assert_eq!(sess.chat_id, 100);
-        assert_eq!(sess.hostname.as_deref(), Some("builder"));
-        assert_eq!(sess.project_dir.as_deref(), Some("/workspace"));
-        assert_eq!(sess.thread_id, Some(42));
-        assert_eq!(sess.tmux_target.as_deref(), Some("s0:0.1"));
-        assert_eq!(sess.tmux_socket.as_deref(), Some("/tmp/tmux-1234/default"));
-        assert_eq!(sess.status, "active");
-    }
-
-    #[test]
-    fn duplicate_create_updates_activity() {
-        let (mgr, _tmp) = make_mgr();
-        mgr.create_session("sess-dup", 1, None, None, None, None, None)
-            .unwrap();
-        let s1 = mgr.get_session("sess-dup").unwrap().unwrap();
-
-        // small delay is not needed — create again returns same id
-        let id2 = mgr
-            .create_session("sess-dup", 1, None, None, None, None, None)
-            .unwrap();
-        assert_eq!(id2, "sess-dup");
-
-        let s2 = mgr.get_session("sess-dup").unwrap().unwrap();
-        assert!(s2.last_activity >= s1.last_activity);
-    }
-
-    #[test]
-    fn set_and_get_thread_id() {
-        let (mgr, _tmp) = make_mgr();
-        mgr.create_session("sess-t", 1, None, None, None, None, None)
-            .unwrap();
-        mgr.set_session_thread("sess-t", 999).unwrap();
-
-        let sess = mgr.get_session_by_thread_id(999).unwrap().unwrap();
-        assert_eq!(sess.id, "sess-t");
-    }
-
-    #[test]
-    fn clear_thread_id_works() {
-        let (mgr, _tmp) = make_mgr();
-        mgr.create_session("sess-ct", 1, None, None, None, None, None)
-            .unwrap();
-        mgr.set_session_thread("sess-ct", 777).unwrap();
-        mgr.clear_thread_id("sess-ct").unwrap();
-
-        assert!(mgr.get_session_by_thread_id(777).unwrap().is_none());
-    }
-
-    #[test]
-    fn get_session_thread_works() {
-        let (mgr, _tmp) = make_mgr();
-        mgr.create_session("sess-gst", 1, None, None, None, None, None)
-            .unwrap();
-
-        // No thread_id set yet
-        assert_eq!(mgr.get_session_thread("sess-gst").unwrap(), None);
-
-        mgr.set_session_thread("sess-gst", 555).unwrap();
-        assert_eq!(mgr.get_session_thread("sess-gst").unwrap(), Some(555));
-
-        // Non-existent session returns None
-        assert_eq!(mgr.get_session_thread("no-such").unwrap(), None);
-    }
-
-    #[test]
-    fn get_session_by_chat_id() {
-        let (mgr, _tmp) = make_mgr();
-        mgr.create_session("sess-chat", 55, None, None, None, None, None)
-            .unwrap();
-
-        let sess = mgr.get_session_by_chat_id(55).unwrap().unwrap();
-        assert_eq!(sess.id, "sess-chat");
-
-        assert!(mgr.get_session_by_chat_id(999).unwrap().is_none());
-    }
-
-    #[test]
-    fn get_active_sessions() {
-        let (mgr, _tmp) = make_mgr();
-        mgr.create_session("a1", 1, None, None, None, None, None)
-            .unwrap();
-        mgr.create_session("a2", 1, None, None, None, None, None)
-            .unwrap();
-        mgr.end_session("a1", "ended").unwrap();
-
-        let active = mgr.get_active_sessions().unwrap();
-        assert_eq!(active.len(), 1);
-        assert_eq!(active[0].id, "a2");
-    }
-
-    #[test]
-    fn end_session_expires_approvals() {
-        let (mgr, _tmp) = make_mgr();
-        mgr.create_session("sess-end", 1, None, None, None, None, None)
-            .unwrap();
-        let aid = mgr
-            .create_approval("sess-end", "Allow write?", None)
-            .unwrap();
-
-        mgr.end_session("sess-end", "ended").unwrap();
-
-        let approval = mgr.get_approval(&aid).unwrap().unwrap();
-        assert_eq!(approval.status, "expired");
-    }
-
-    #[test]
-    fn reactivate_session() {
-        let (mgr, _tmp) = make_mgr();
-        mgr.create_session("sess-react", 1, None, None, None, None, None)
-            .unwrap();
-        mgr.end_session("sess-react", "ended").unwrap();
-
-        let s = mgr.get_session("sess-react").unwrap().unwrap();
-        assert_eq!(s.status, "ended");
-
-        mgr.reactivate_session("sess-react").unwrap();
-        let s = mgr.get_session("sess-react").unwrap().unwrap();
-        assert_eq!(s.status, "active");
-    }
-
-    #[test]
-    fn tmux_info_roundtrip() {
-        let (mgr, _tmp) = make_mgr();
-        mgr.create_session("sess-tmux", 1, None, None, None, None, None)
-            .unwrap();
-        mgr.set_tmux_info("sess-tmux", Some("s:0.0"), Some("/tmp/tmux-1000/default"))
-            .unwrap();
-
-        let (target, socket) = mgr.get_tmux_info("sess-tmux").unwrap().unwrap();
-        assert_eq!(target, "s:0.0");
-        assert_eq!(socket.as_deref(), Some("/tmp/tmux-1000/default"));
-    }
-
-    #[test]
-    fn tmux_target_ownership() {
-        let (mgr, _tmp) = make_mgr();
-        mgr.create_session("s1", 1, None, None, None, None, None)
-            .unwrap();
-        mgr.create_session("s2", 1, None, None, None, None, None)
-            .unwrap();
-        mgr.set_tmux_info("s1", Some("target:0.0"), None).unwrap();
-
-        assert!(mgr
-            .is_tmux_target_owned_by_other("target:0.0", "s2")
-            .unwrap());
-        assert!(!mgr
-            .is_tmux_target_owned_by_other("target:0.0", "s1")
-            .unwrap());
-    }
-
-    // ---- approval lifecycle ----
-
-    #[test]
-    fn approval_lifecycle() {
-        let (mgr, _tmp) = make_mgr();
-        mgr.create_session("sess-appr", 1, None, None, None, None, None)
-            .unwrap();
-
-        let aid = mgr
-            .create_approval("sess-appr", "Allow Bash?", Some(123))
-            .unwrap();
-        assert!(aid.starts_with("approval-"));
-
-        let a = mgr.get_approval(&aid).unwrap().unwrap();
-        assert_eq!(a.status, "pending");
-        assert_eq!(a.message_id, Some(123));
-
-        let pending = mgr.get_pending_approvals("sess-appr").unwrap();
-        assert_eq!(pending.len(), 1);
-
-        let resolved = mgr.resolve_approval(&aid, "approved").unwrap();
-        assert!(resolved);
-
-        let a2 = mgr.get_approval(&aid).unwrap().unwrap();
-        assert_eq!(a2.status, "approved");
-
-        // Cannot resolve again
-        let re_resolve = mgr.resolve_approval(&aid, "rejected").unwrap();
-        assert!(!re_resolve);
-    }
-
-    // ---- stale candidates ----
-
-    #[test]
-    fn stale_candidates_returns_old_sessions() {
-        let (mgr, _tmp) = make_mgr();
-        mgr.create_session("old-1", 1, None, None, None, None, None)
-            .unwrap();
-
-        // Manually set last_activity to the past
-        mgr.conn
-            .execute(
-                "UPDATE sessions SET last_activity = '2020-01-01T00:00:00.000Z' WHERE id = 'old-1'",
-                [],
-            )
-            .unwrap();
-
-        let stale = mgr.get_stale_session_candidates(1).unwrap();
-        assert_eq!(stale.len(), 1);
-        assert_eq!(stale[0].id, "old-1");
-    }
-
-    // ---- orphaned threads ----
-
-    #[test]
-    fn orphaned_thread_sessions() {
-        let (mgr, _tmp) = make_mgr();
-        mgr.create_session("orph-1", 1, None, None, None, None, None)
-            .unwrap();
-        mgr.set_session_thread("orph-1", 888).unwrap();
-        mgr.end_session("orph-1", "ended").unwrap();
-
-        let orphans = mgr.get_orphaned_thread_sessions().unwrap();
-        assert_eq!(orphans.len(), 1);
-        assert_eq!(orphans[0].id, "orph-1");
-    }
-
-    // ---- stats ----
-
-    #[test]
-    fn get_stats_counts() {
-        let (mgr, _tmp) = make_mgr();
-        mgr.create_session("st-1", 1, None, None, None, None, None)
-            .unwrap();
-        mgr.create_session("st-2", 1, None, None, None, None, None)
-            .unwrap();
-        mgr.create_approval("st-1", "approve?", None).unwrap();
-
-        let (active, pending) = mgr.get_stats().unwrap();
-        assert_eq!(active, 2);
-        assert_eq!(pending, 1);
-    }
-
-    // ---- cleanup ----
-
-    #[test]
-    fn cleanup_old_sessions_removes_ancient() {
-        let (mgr, _tmp) = make_mgr();
-        mgr.create_session("ancient", 1, None, None, None, None, None)
-            .unwrap();
-        mgr.conn
-            .execute(
-                "UPDATE sessions SET last_activity = '2020-01-01T00:00:00.000Z' WHERE id = 'ancient'",
-                [],
-            )
-            .unwrap();
-
-        let removed = mgr.cleanup_old_sessions(7).unwrap();
-        assert_eq!(removed, 1);
-        assert!(mgr.get_session("ancient").unwrap().is_none());
-    }
-}

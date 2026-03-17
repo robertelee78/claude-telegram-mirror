@@ -2,25 +2,12 @@
 
 use super::*;
 
-/// Main event loop multiplexing socket messages, Telegram updates, and cleanup timer.
-#[allow(clippy::too_many_arguments)]
+/// FR43: Main event loop multiplexing socket messages, Telegram updates, and cleanup timer.
+///
+/// Takes a consolidated `Arc<DaemonState>` instead of individual Arc fields.
 pub(super) async fn run_event_loop(
     mut socket_rx: tokio::sync::broadcast::Receiver<BridgeMessage>,
-    bot: Arc<TelegramBot>,
-    sessions: Arc<Mutex<SessionManager>>,
-    injector: Arc<Mutex<InputInjector>>,
-    session_threads: Arc<RwLock<HashMap<String, i64>>>,
-    session_tmux: Arc<RwLock<HashMap<String, String>>>,
-    recent_inputs: Arc<RwLock<HashSet<String>>>,
-    tool_cache: Arc<RwLock<HashMap<String, CachedToolInput>>>,
-    compacting: Arc<RwLock<HashSet<String>>>,
-    pending_del: Arc<RwLock<HashMap<String, tokio::task::JoinHandle<()>>>>,
-    custom_titles: Arc<RwLock<HashMap<String, String>>>,
-    pending_q: Arc<RwLock<HashMap<String, PendingQuestion>>>,
-    topic_locks: Arc<RwLock<HashMap<String, Arc<TopicCreationState>>>>,
-    bot_sessions: Arc<RwLock<HashMap<i64, BotSessionState>>>,
-    mirroring_enabled: Arc<std::sync::atomic::AtomicBool>,
-    config: Arc<Config>,
+    state: Arc<DaemonState>,
     socket_clients: SocketClients,
 ) {
     let mut cleanup_interval =
@@ -31,21 +18,21 @@ pub(super) async fn run_event_loop(
 
     // Pre-construct a single HandlerContext; .clone() is cheap (Arc refcount bumps).
     let base_ctx = HandlerContext {
-        bot,
-        sessions,
-        injector,
-        session_threads,
-        session_tmux,
-        recent_inputs,
-        tool_cache,
-        compacting,
-        pending_del,
-        custom_titles,
-        pending_q,
-        topic_locks,
-        bot_sessions,
-        mirroring_enabled,
-        config,
+        bot: Arc::clone(&state.bot),
+        sessions: Arc::clone(&state.sessions),
+        injector: Arc::clone(&state.injector),
+        session_threads: Arc::clone(&state.session_threads),
+        session_tmux: Arc::clone(&state.session_tmux_targets),
+        recent_inputs: Arc::clone(&state.recent_telegram_inputs),
+        tool_cache: Arc::clone(&state.tool_input_cache),
+        compacting: Arc::clone(&state.compacting_sessions),
+        pending_del: Arc::clone(&state.pending_deletions),
+        custom_titles: Arc::clone(&state.session_custom_titles),
+        pending_q: Arc::clone(&state.pending_questions),
+        topic_locks: Arc::clone(&state.topic_creation_locks),
+        bot_sessions: Arc::clone(&state.bot_sessions),
+        mirroring_enabled: Arc::clone(&state.mirroring_enabled),
+        config: Arc::clone(&state.config),
         socket_clients,
     };
 

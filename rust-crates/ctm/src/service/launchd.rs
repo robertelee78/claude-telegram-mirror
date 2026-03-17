@@ -10,16 +10,14 @@ fn get_macos_path() -> String {
         "/bin".into(),
         "/usr/sbin".into(),
         "/sbin".into(),
-        format!("{}/.nvm/versions/node/*/bin", home.display()),
         "/opt/homebrew/bin".into(),
-        "/usr/local/opt/node/bin".into(),
         format!("{}/.local/bin", home.display()),
     ];
 
-    // Merge with current PATH
+    // Merge with current PATH, excluding NVM paths (legacy Node.js artifact)
     if let Ok(current) = std::env::var("PATH") {
         for dir in current.split(':') {
-            if !dir.is_empty() && !paths.contains(&dir.to_string()) {
+            if !dir.is_empty() && !dir.contains(".nvm") && !paths.contains(&dir.to_string()) {
                 paths.push(dir.to_string());
             }
         }
@@ -47,11 +45,9 @@ pub(super) fn generate_launchd_plist() -> String {
         "        <key>PATH</key>\n        <string>{}</string>",
         escape_xml(&get_macos_path())
     ));
-    env_lines.push("        <key>NODE_ENV</key>\n        <string>production</string>".to_string());
-
     // User-defined env vars from ~/.telegram-env
     for (key, value) in &env_vars {
-        if key == "HOME" || key == "PATH" || key == "NODE_ENV" {
+        if key == "HOME" || key == "PATH" {
             continue;
         }
         env_lines.push(format!(
@@ -252,5 +248,20 @@ mod tests {
         assert!(content.contains("<integer>10</integer>"));
         assert!(content.contains("<key>StandardOutPath</key>"));
         assert!(content.contains("<key>StandardErrorPath</key>"));
+    }
+
+    #[test]
+    fn test_generate_launchd_plist_no_node_artifacts() {
+        let content = generate_launchd_plist();
+        // NODE_ENV was a TypeScript artifact — should not be in the Rust plist
+        assert!(
+            !content.contains("NODE_ENV"),
+            "plist should not contain NODE_ENV"
+        );
+        // NVM paths are not needed for the Rust binary
+        assert!(
+            !content.contains(".nvm"),
+            "plist should not contain NVM paths"
+        );
     }
 }

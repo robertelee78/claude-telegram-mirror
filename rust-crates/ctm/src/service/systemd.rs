@@ -186,20 +186,18 @@ pub(super) fn restart_systemd_service() -> ServiceResult {
 }
 
 pub(super) fn get_systemd_status() -> ServiceStatus {
-    let running = Command::new("sh")
-        .args([
-            "-c",
-            &format!("systemctl --user is-active {SERVICE_NAME}.service 2>/dev/null || true"),
-        ])
+    let running = Command::new("systemctl")
+        .args(["--user", "is-active", &format!("{SERVICE_NAME}.service")])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "active")
         .unwrap_or(false);
 
-    let enabled = Command::new("sh")
-        .args([
-            "-c",
-            &format!("systemctl --user is-enabled {SERVICE_NAME}.service 2>/dev/null || true"),
-        ])
+    let enabled = Command::new("systemctl")
+        .args(["--user", "is-enabled", &format!("{SERVICE_NAME}.service")])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "enabled")
         .unwrap_or(false);

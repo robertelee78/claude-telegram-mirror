@@ -7,10 +7,12 @@ const fs = require('fs');
 
 // Try native Rust binary first
 let binary = null;
+let verifyBinaryIntegrity = null;
 try {
-  const { resolveBinary } = require('./resolve-binary.cjs');
-  const result = resolveBinary();
+  const resolveMod = require('./resolve-binary.cjs');
+  const result = resolveMod.resolveBinary();
   if (result) binary = result.binary;
+  verifyBinaryIntegrity = resolveMod.verifyBinaryIntegrity;
 } catch {
   // resolve-binary not available or failed — fall through
 }
@@ -40,6 +42,14 @@ if (!binary) {
   console.error('');
   console.error('To build from source: cd rust-crates && cargo build --release');
   process.exit(1);
+}
+
+// Verify binary integrity before execution (ADR-006 L3.8)
+if (verifyBinaryIntegrity) {
+  if (!verifyBinaryIntegrity(binary)) {
+    console.error('Error: Binary integrity verification failed. Aborting.');
+    process.exit(1);
+  }
 }
 
 // Spawn Rust binary with all CLI args forwarded

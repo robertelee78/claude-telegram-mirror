@@ -568,11 +568,7 @@ pub(super) async fn handle_compact_complete(ctx: &HandlerContext, session_id: &s
 // ====================================================================== session rename (Epic 5)
 
 /// Check transcript JSONL for custom-title record.
-pub(super) fn check_for_session_rename(
-    transcript_path: &str,
-    session_id: &str,
-    custom_titles: &Arc<RwLock<HashMap<String, String>>>,
-) -> Option<String> {
+pub(super) fn check_for_session_rename(transcript_path: &str) -> Option<String> {
     use std::fs;
     use std::io::{Read, Seek, SeekFrom};
 
@@ -595,9 +591,6 @@ pub(super) fn check_for_session_rename(
         if let Ok(record) = serde_json::from_str::<serde_json::Value>(line) {
             if record.get("type").and_then(|t| t.as_str()) == Some("custom-title") {
                 if let Some(title) = record.get("customTitle").and_then(|t| t.as_str()) {
-                    // Dedup is handled by handle_session_rename (H8)
-                    let _ = session_id;
-                    let _ = custom_titles;
                     return Some(title.to_string());
                 }
             }

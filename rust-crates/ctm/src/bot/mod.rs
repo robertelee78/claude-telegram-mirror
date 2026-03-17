@@ -242,4 +242,72 @@ mod tests {
         // Blue first
         assert_eq!(TOPIC_COLORS[0], 0x6FB9F0);
     }
+
+    #[test]
+    fn test_create_approval_keyboard_layout() {
+        let keyboard = create_approval_keyboard("test-approval-123");
+        // Two rows: [Approve, Reject] and [Abort Session]
+        assert_eq!(keyboard.len(), 2);
+        assert_eq!(keyboard[0].len(), 2);
+        assert_eq!(keyboard[1].len(), 1);
+
+        assert!(keyboard[0][0].callback_data.starts_with("approve:"));
+        assert!(keyboard[0][1].callback_data.starts_with("reject:"));
+        assert!(keyboard[1][0].callback_data.starts_with("abort:"));
+
+        // Verify approval_id is embedded
+        assert_eq!(keyboard[0][0].callback_data, "approve:test-approval-123");
+        assert_eq!(keyboard[0][1].callback_data, "reject:test-approval-123");
+        assert_eq!(keyboard[1][0].callback_data, "abort:test-approval-123");
+    }
+
+    #[test]
+    fn test_sanitize_upload_filename_with_slashes_in_name() {
+        use std::path::Path;
+        // A filename that itself contains slash replacements
+        assert_eq!(
+            sanitize_upload_filename(Path::new("/tmp/some_file.txt")),
+            "some_file.txt"
+        );
+    }
+
+    #[test]
+    fn test_strip_markdown_combined() {
+        assert_eq!(
+            strip_markdown("**Hello** _world_ `code` *italic*"),
+            "Hello world 'code' italic"
+        );
+    }
+
+    #[test]
+    fn test_strip_markdown_empty() {
+        assert_eq!(strip_markdown(""), "");
+    }
+
+    #[test]
+    fn test_build_inline_keyboard_empty() {
+        let buttons: Vec<InlineButton> = vec![];
+        let kb = build_inline_keyboard(&buttons);
+        let rows = kb["inline_keyboard"].as_array().unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn test_build_inline_keyboard_single_button() {
+        let buttons = vec![InlineButton {
+            text: "Only".into(),
+            callback_data: "only".into(),
+        }];
+        let kb = build_inline_keyboard(&buttons);
+        let rows = kb["inline_keyboard"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_epoch_millis_positive() {
+        let ms = epoch_millis();
+        // Should be after 2024-01-01 (1704067200000)
+        assert!(ms > 1_704_067_200_000);
+    }
 }

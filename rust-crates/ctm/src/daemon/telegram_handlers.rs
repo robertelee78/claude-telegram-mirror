@@ -156,10 +156,29 @@ async fn handle_telegram_text(ctx: &HandlerContext, msg: &TgMessage, text: &str)
     // BUG-011: Track for echo prevention
     add_echo_key(ctx, &session.id, text.trim()).await;
 
+    // FR32: Cap text injection length to prevent oversized tmux payloads
+    let inject_text: std::borrow::Cow<'_, str> = if text.chars().count() > MAX_INJECT_CHARS {
+        tracing::warn!(
+            chars = text.chars().count(),
+            max = MAX_INJECT_CHARS,
+            "Telegram text truncated before injection"
+        );
+        ctx.bot
+            .send_message(
+                &format!("Message truncated to {MAX_INJECT_CHARS} characters"),
+                None,
+                Some(thread_id),
+            )
+            .await;
+        std::borrow::Cow::Owned(truncate(text, MAX_INJECT_CHARS))
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    };
+
     // Inject into CLI via tmux
     let injected = {
         let inj = ctx.injector.lock().await;
-        inj.inject(text).unwrap_or(false)
+        inj.inject(&inject_text).unwrap_or(false)
     };
 
     if !injected {

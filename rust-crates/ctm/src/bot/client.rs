@@ -22,7 +22,7 @@ pub struct TelegramBot {
 }
 
 impl TelegramBot {
-    pub fn new(config: &Config) -> Self {
+    pub fn new(config: &Config) -> Result<Self> {
         // Rate limiter: use config.rate_limit msgs/sec (default 20 if 0)
         let rate = if config.rate_limit == 0 {
             20
@@ -32,19 +32,21 @@ impl TelegramBot {
         let quota = Quota::per_second(NonZeroU32::new(rate).unwrap());
         let limiter = RateLimiter::direct(quota);
 
-        Self {
+        let client = Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|e| AppError::Telegram(format!("Failed to build reqwest Client: {e}")))?;
+
+        Ok(Self {
             token: config.bot_token.clone(),
             chat_id: config.chat_id,
-            client: Client::builder()
-                .timeout(std::time::Duration::from_secs(30))
-                .build()
-                .expect("Failed to build reqwest Client"),
+            client,
             rate_limiter: Arc::new(limiter),
             queue: Arc::new(Mutex::new(VecDeque::new())),
             queue_processing: Arc::new(Mutex::new(false)),
             chunk_size: config.chunk_size,
             running: Arc::new(AtomicBool::new(false)),
-        }
+        })
     }
 
     /// Get the configured chat ID.
@@ -610,5 +612,160 @@ impl TelegramBot {
         }
         let _: TgResponse<bool> = self.api_call("answerCallbackQuery", &body).await?;
         Ok(())
+    }
+}
+
+// ===================================================================== tests
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use std::path::PathBuf;
+
+    /// Build a minimal Config suitable for unit-testing TelegramBot construction.
+    fn test_config() -> Config {
+        Config {
+            bot_token: "123456:ABC-DEF_test-token".to_string(),
+            chat_id: -1001234567890,
+            enabled: true,
+            verbose: false,
+            approvals: true,
+            use_threads: true,
+            chunk_size: 4000,
+            rate_limit: 20,
+            session_timeout: 30,
+            stale_session_timeout_hours: 72,
+            auto_delete_topics: true,
+            topic_delete_delay_minutes: 1440,
+            socket_path: PathBuf::from("/tmp/test.sock"),
+            config_dir: PathBuf::from("/tmp"),
+            config_path: PathBuf::from("/tmp/config.json"),
+            forum_enabled: false,
+        }
+    }
+
+    #[test]
+    fn new_succeeds_with_valid_config() {
+        let config = test_config();
+        let bot = TelegramBot::new(&config).expect("TelegramBot::new should succeed");
+        assert_eq!(bot.token, config.bot_token);
+        assert_eq!(bot.chat_id, config.chat_id);
+        assert_eq!(bot.chunk_size, 4000);
+    }
+
+    #[test]
+    fn new_with_zero_rate_limit_defaults_to_20() {
+        let mut config = test_config();
+        config.rate_limit = 0;
+        // Should not panic — zero rate_limit is treated as 20
+        let bot = TelegramBot::new(&config).expect("rate_limit=0 should default to 20");
+        // We can't directly inspect the governor quota, but construction succeeding
+        // proves NonZeroU32::new(20) was used instead of NonZeroU32::new(0).
+        assert_eq!(bot.chat_id, config.chat_id);
+    }
+
+    #[test]
+    fn new_with_custom_rate_limit() {
+        let mut config = test_config();
+        config.rate_limit = 5;
+        let bot = TelegramBot::new(&config).expect("rate_limit=5 should succeed");
+        assert_eq!(bot.chat_id, config.chat_id);
+    }
+
+    #[test]
+    fn chat_id_getter() {
+        let config = test_config();
+        let bot = TelegramBot::new(&config).unwrap();
+        assert_eq!(bot.chat_id(), -1001234567890);
+    }
+
+    #[test]
+    fn is_running_default_false() {
+        let config = test_config();
+        let bot = TelegramBot::new(&config).unwrap();
+        assert!(!bot.is_running());
+    }
+
+    #[test]
+    fn set_running_toggles_flag() {
+        let config = test_config();
+        let bot = TelegramBot::new(&config).unwrap();
+        assert!(!bot.is_running());
+
+        bot.set_running(true);
+        assert!(bot.is_running());
+
+        bot.set_running(false);
+        assert!(!bot.is_running());
+    }
+
+    #[test]
+    fn get_session_always_returns_none() {
+        let config = test_config();
+        let bot = TelegramBot::new(&config).unwrap();
+        assert!(bot.get_session(12345).is_none());
+        assert!(bot.get_session(bot.chat_id()).is_none());
+    }
+
+    #[test]
+    fn api_url_construction() {
+        let config = test_config();
+        let bot = TelegramBot::new(&config).unwrap();
+        let url = bot.api_url("sendMessage");
+        assert_eq!(
+            url,
+            "https://api.telegram.org/bot123456:ABC-DEF_test-token/sendMessage"
+        );
+    }
+
+    #[test]
+    fn api_url_get_me() {
+        let config = test_config();
+        let bot = TelegramBot::new(&config).unwrap();
+        let url = bot.api_url("getMe");
+        assert!(url.ends_with("/getMe"));
+        assert!(url.starts_with("https://api.telegram.org/bot"));
+    }
+
+    #[test]
+    fn scrub_token_removes_token_from_text() {
+        let config = test_config();
+        let bot = TelegramBot::new(&config).unwrap();
+        let error_msg = "POST https://api.telegram.org/bot123456:ABC-DEF_test-token/sendMessage failed";
+        let scrubbed = bot.scrub_token(error_msg);
+        assert!(!scrubbed.contains("123456:ABC-DEF_test-token"));
+        assert!(scrubbed.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn scrub_token_preserves_safe_text() {
+        let config = test_config();
+        let bot = TelegramBot::new(&config).unwrap();
+        let safe_msg = "Network timeout after 30 seconds";
+        assert_eq!(bot.scrub_token(safe_msg), safe_msg);
+    }
+
+    #[test]
+    fn queue_starts_empty() {
+        let config = test_config();
+        let bot = TelegramBot::new(&config).unwrap();
+        // The queue is wrapped in Arc<Mutex>, so we verify via the type system
+        // that it was initialized. The VecDeque should be empty.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let q = bot.queue.lock().await;
+            assert!(q.is_empty());
+        });
+    }
+
+    #[test]
+    fn chunk_size_from_config() {
+        let mut config = test_config();
+        config.chunk_size = 2000;
+        let bot = TelegramBot::new(&config).unwrap();
+        assert_eq!(bot.chunk_size, 2000);
     }
 }

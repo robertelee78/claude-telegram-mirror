@@ -661,6 +661,7 @@ pub async fn run_setup() -> anyhow::Result<()> {
     );
     let env_path = env_file();
     fs::write(&env_path, env_content)?;
+    fs::set_permissions(&env_path, fs::Permissions::from_mode(0o600))?;
     println!(
         "{} Saved environment to {}",
         green("OK"),

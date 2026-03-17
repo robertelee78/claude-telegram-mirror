@@ -220,3 +220,121 @@ fn create_session_with_all_fields() {
     assert_eq!(session.tmux_target.as_deref(), Some("s0:0.1"));
     assert_eq!(session.tmux_socket.as_deref(), Some("/tmp/tmux-1234/default"));
 }
+
+// ---- tests merged from inline #[cfg(test)] module (Story 13.6) ----
+
+#[test]
+fn duplicate_create_updates_activity() {
+    let (mgr, _tmp) = make_mgr();
+    mgr.create_session("sess-dup", 1, None, None, None, None, None)
+        .unwrap();
+    let s1 = mgr.get_session("sess-dup").unwrap().unwrap();
+
+    // create again returns same id
+    let id2 = mgr
+        .create_session("sess-dup", 1, None, None, None, None, None)
+        .unwrap();
+    assert_eq!(id2, "sess-dup");
+
+    let s2 = mgr.get_session("sess-dup").unwrap().unwrap();
+    assert!(s2.last_activity >= s1.last_activity);
+}
+
+#[test]
+fn clear_thread_id_works() {
+    let (mgr, _tmp) = make_mgr();
+    mgr.create_session("sess-ct", 1, None, None, None, None, None)
+        .unwrap();
+    mgr.set_session_thread("sess-ct", 777).unwrap();
+    mgr.clear_thread_id("sess-ct").unwrap();
+
+    assert!(mgr.get_session_by_thread_id(777).unwrap().is_none());
+}
+
+#[test]
+fn get_session_thread_none_then_set() {
+    let (mgr, _tmp) = make_mgr();
+    mgr.create_session("sess-gst", 1, None, None, None, None, None)
+        .unwrap();
+
+    // No thread_id set yet
+    assert_eq!(mgr.get_session_thread("sess-gst").unwrap(), None);
+
+    mgr.set_session_thread("sess-gst", 555).unwrap();
+    assert_eq!(mgr.get_session_thread("sess-gst").unwrap(), Some(555));
+
+    // Non-existent session returns None
+    assert_eq!(mgr.get_session_thread("no-such").unwrap(), None);
+}
+
+#[test]
+fn get_session_by_chat_id() {
+    let (mgr, _tmp) = make_mgr();
+    mgr.create_session("sess-chat", 55, None, None, None, None, None)
+        .unwrap();
+
+    let sess = mgr.get_session_by_chat_id(55).unwrap().unwrap();
+    assert_eq!(sess.id, "sess-chat");
+
+    assert!(mgr.get_session_by_chat_id(999).unwrap().is_none());
+}
+
+#[test]
+fn tmux_target_ownership() {
+    let (mgr, _tmp) = make_mgr();
+    mgr.create_session("s1", 1, None, None, None, None, None)
+        .unwrap();
+    mgr.create_session("s2", 1, None, None, None, None, None)
+        .unwrap();
+    mgr.set_tmux_info("s1", Some("target:0.0"), None).unwrap();
+
+    assert!(mgr
+        .is_tmux_target_owned_by_other("target:0.0", "s2")
+        .unwrap());
+    assert!(!mgr
+        .is_tmux_target_owned_by_other("target:0.0", "s1")
+        .unwrap());
+}
+
+#[test]
+fn stale_candidates_returns_old_sessions() {
+    let (mgr, _tmp) = make_mgr();
+    mgr.create_session("old-1", 1, None, None, None, None, None)
+        .unwrap();
+
+    // Use test helper to set last_activity to the past
+    mgr.test_set_last_activity("old-1", "2020-01-01T00:00:00.000Z")
+        .unwrap();
+
+    let stale = mgr.get_stale_session_candidates(1).unwrap();
+    assert_eq!(stale.len(), 1);
+    assert_eq!(stale[0].id, "old-1");
+}
+
+#[test]
+fn orphaned_thread_sessions() {
+    let (mgr, _tmp) = make_mgr();
+    mgr.create_session("orph-1", 1, None, None, None, None, None)
+        .unwrap();
+    mgr.set_session_thread("orph-1", 888).unwrap();
+    mgr.end_session("orph-1", "ended").unwrap();
+
+    let orphans = mgr.get_orphaned_thread_sessions().unwrap();
+    assert_eq!(orphans.len(), 1);
+    assert_eq!(orphans[0].id, "orph-1");
+}
+
+#[test]
+fn cleanup_old_sessions_removes_ancient() {
+    let (mgr, _tmp) = make_mgr();
+    mgr.create_session("ancient", 1, None, None, None, None, None)
+        .unwrap();
+
+    // Use test helper to set last_activity to the past
+    mgr.test_set_last_activity("ancient", "2020-01-01T00:00:00.000Z")
+        .unwrap();
+
+    let removed = mgr.cleanup_old_sessions(7).unwrap();
+    assert_eq!(removed, 1);
+    assert!(mgr.get_session("ancient").unwrap().is_none());
+}

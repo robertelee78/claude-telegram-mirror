@@ -185,7 +185,15 @@ jobs:
             tgz=$(find artifacts/$pkg -name "*.tgz" | head -1)
             if [ -n "$tgz" ]; then
               echo "Publishing $pkg..."
-              npm publish "$tgz" --access public --provenance || true
+              if ! npm publish "$tgz" --access public --provenance 2>&1 | tee /tmp/npm-publish-$pkg.log; then
+                if grep -q 'EPUBLISHCONFLICT\|You cannot publish over the previously published versions' /tmp/npm-publish-$pkg.log; then
+                  echo "  $pkg already published at this version — skipping"
+                else
+                  echo "  ERROR: $pkg publish failed with unexpected error"
+                  cat /tmp/npm-publish-$pkg.log
+                  exit 1
+                fi
+              fi
             fi
           done
 
@@ -193,8 +201,15 @@ jobs:
           VERSION=$(node -p "require('./package.json').version")
           echo "Waiting for npm registry propagation (v${VERSION})..."
           for i in $(seq 1 30); do
-            if npm view @agidreams/ctm-linux-x64@${VERSION} version 2>/dev/null; then
-              echo "Package available on registry"
+            ALL_AVAILABLE=true
+            for pkg in ctm-linux-x64 ctm-linux-arm64 ctm-darwin-arm64 ctm-darwin-x64; do
+              if ! npm view @agidreams/${pkg}@${VERSION} version 2>/dev/null; then
+                ALL_AVAILABLE=false
+                break
+              fi
+            done
+            if [ "$ALL_AVAILABLE" = true ]; then
+              echo "All platform packages available on registry"
               break
             fi
             echo "Attempt $i/30 — waiting 5s..."

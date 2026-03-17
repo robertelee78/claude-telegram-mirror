@@ -40,8 +40,9 @@ async fn cleanup_stale_sessions(ctx: &HandlerContext) {
     }
 
     let now = chrono::Utc::now();
-    let tmux_cutoff =
-        now - chrono::TimeDelta::try_hours(i64::from(TMUX_SESSION_TIMEOUT_HOURS)).unwrap();
+    let tmux_cutoff = now
+        - chrono::TimeDelta::try_hours(i64::from(TMUX_SESSION_TIMEOUT_HOURS))
+            .unwrap_or(chrono::TimeDelta::hours(24));
 
     for session in &candidates {
         let tmux_target = &session.tmux_target;
