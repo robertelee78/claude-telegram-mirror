@@ -88,14 +88,16 @@ fn is_ctm_command(cmd: &str) -> bool {
     // Extract the binary name: the part of the first token (up to the first space)
     // after the last '/'.
     let first_token = cmd.split_whitespace().next().unwrap_or("");
-    let bin_name = first_token
-        .rsplit('/')
-        .next()
-        .unwrap_or(first_token);
+    let bin_name = first_token.rsplit('/').next().unwrap_or(first_token);
 
-    // Accept if the binary name is exactly "ctm" or starts with "ctm-" (Rust test binary
-    // naming convention: "ctm-<hash>").
-    if bin_name == "ctm" || bin_name.starts_with("ctm-") {
+    // Accept if the binary name is "ctm", starts with "ctm-" (Rust test binary naming),
+    // or matches the full binary name "claude-telegram-mirror" / "claude_telegram_mirror".
+    if bin_name == "ctm"
+        || bin_name.starts_with("ctm-")
+        || bin_name == "claude-telegram-mirror"
+        || bin_name.starts_with("claude_telegram_mirror")
+        || bin_name.starts_with("claude-telegram-mirror")
+    {
         return true;
     }
 
@@ -640,10 +642,18 @@ mod tests {
     #[test]
     fn test_determine_change_status_exact_match() {
         let cmd = ctm_hook_command();
+        // Test with plain entry
         let expected = create_hook_entry(&cmd);
         let existing = Value::Array(vec![expected.clone()]);
         assert_eq!(
             determine_change_status(Some(&existing), &expected),
+            HookChangeStatus::Unchanged
+        );
+        // Test with timeout entry (PreToolUse)
+        let expected_timeout = create_hook_entry_with_timeout(&cmd, 310);
+        let existing_timeout = Value::Array(vec![expected_timeout.clone()]);
+        assert_eq!(
+            determine_change_status(Some(&existing_timeout), &expected_timeout),
             HookChangeStatus::Unchanged
         );
     }
