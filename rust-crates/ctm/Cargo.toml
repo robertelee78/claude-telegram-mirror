@@ -10,6 +10,10 @@ authors = ["Robert E. Lee <robert@agidreams.us>"]
 name = "ctm"
 path = "src/main.rs"
 
+[[bin]]
+name = "claude-telegram-mirror"
+path = "src/main.rs"
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }

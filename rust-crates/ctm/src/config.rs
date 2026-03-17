@@ -22,6 +22,8 @@ pub struct Config {
     pub config_dir: PathBuf,
     /// Resolved path to config.json (may not exist if config was provided via env vars only)
     pub config_path: PathBuf,
+    /// Whether forum (topics) mode is enabled (default: false)
+    pub forum_enabled: bool,
 }
 
 /// Config file structure (supports both camelCase and snake_case)
@@ -246,7 +248,35 @@ pub fn load_config(require_auth: bool) -> Result<Config> {
         socket_path,
         config_dir,
         config_path,
+        forum_enabled: false,
     })
+}
+
+/// Validate a loaded Config and return (errors, warnings).
+///
+/// Returns `(errors, warnings)` where errors are fatal misconfigurations
+/// and warnings are non-fatal but potentially problematic settings.
+pub fn validate_config(config: &Config) -> (Vec<String>, Vec<String>) {
+    let mut errors = Vec::new();
+    let mut warnings = Vec::new();
+
+    if config.bot_token.is_empty() {
+        errors.push("TELEGRAM_BOT_TOKEN is not set".into());
+    }
+    if config.chat_id == 0 {
+        errors.push("TELEGRAM_CHAT_ID is not set".into());
+    }
+    if !config.enabled {
+        warnings.push("TELEGRAM_MIRROR is not enabled (set to true)".into());
+    }
+    if config.chunk_size < 1000 || config.chunk_size > 4096 {
+        warnings.push(format!(
+            "TELEGRAM_CHUNK_SIZE ({}) is outside recommended range (1000-4096)",
+            config.chunk_size
+        ));
+    }
+
+    (errors, warnings)
 }
 
 #[cfg(test)]

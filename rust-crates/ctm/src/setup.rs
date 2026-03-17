@@ -160,7 +160,8 @@ async fn test_chat_send(
         ))
         .json(&serde_json::json!({
             "chat_id": chat_id,
-            "text": "Claude Telegram Mirror - Setup test successful!\n\nIf you see this, your bot configuration is correct.",
+            "text": "\u{1F916} Claude Telegram Mirror - Setup test successful!\n\nIf you see this, your bot configuration is correct.",
+            "parse_mode": "Markdown",
         }))
         .send()
         .await

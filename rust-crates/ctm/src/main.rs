@@ -207,6 +207,11 @@ async fn cmd_start(verbose: bool) -> anyhow::Result<()> {
         cfg.verbose = true;
     }
 
+    let (_errors, warnings) = config::validate_config(&cfg);
+    for w in &warnings {
+        println!("Warning: {w}");
+    }
+
     let mut daemon = daemon::Daemon::new(cfg)?;
 
     // Handle shutdown signals

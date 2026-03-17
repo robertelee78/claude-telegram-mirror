@@ -993,7 +993,7 @@ async fn handle_tool_result(ctx: &HandlerContext, msg: &BridgeMessage) {
     let tool_input_owned: Option<String> = meta.and_then(|m| m.get("input")).map(|v| {
         v.as_str()
             .map(|s| s.to_string())
-            .unwrap_or_else(|| v.to_string())
+            .unwrap_or_else(|| serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string()))
     });
     let tool_input = tool_input_owned.as_deref();
 
@@ -2157,7 +2157,7 @@ async fn handle_bot_command(ctx: &HandlerContext, msg: &TgMessage, text: &str) {
             }
             ctx.bot
                 .send_message(
-                    &format!("\u{2705} Attached to session `{matched_id}`"),
+                    &format!("\u{2705} Attached to session `{matched_id}`\nYou will now receive updates from this session.\nReply with text to send input."),
                     Some(&opts),
                     thread_id,
                 )
@@ -2179,7 +2179,7 @@ async fn handle_bot_command(ctx: &HandlerContext, msg: &TgMessage, text: &str) {
                 Some(sid) => {
                     ctx.bot
                         .send_message(
-                            &format!("\u{1F50C} Detached from session `{sid}`"),
+                            &format!("\u{1F50C} Detached from session `{sid}`\nYou will no longer receive updates."),
                             Some(&opts),
                             thread_id,
                         )

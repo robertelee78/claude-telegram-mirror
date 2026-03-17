@@ -341,11 +341,51 @@ fn check_hooks(fix: bool) -> CheckResult {
             if installed == check_types.len() {
                 CheckResult::pass("Claude Code Hooks", "All hooks installed")
             } else if installed > 0 {
-                let r = CheckResult::warn(
-                    "Claude Code Hooks",
-                    &format!("{installed}/{} hooks installed", check_types.len()),
-                )
-                .with_details("Run: ctm install-hooks");
+                // Detect legacy 3-hook installs (PreToolUse + PostToolUse + Notification only)
+                let legacy_hooks = ["PreToolUse", "PostToolUse", "Notification"];
+                let is_legacy = installed == 3
+                    && legacy_hooks.iter().all(|&ht| {
+                        hooks
+                            .and_then(|h| h.get(ht))
+                            .and_then(|v| v.as_array())
+                            .map(|arr| {
+                                arr.iter().any(|item| {
+                                    item.get("hooks")
+                                        .and_then(|h| h.as_array())
+                                        .map(|hooks| {
+                                            hooks.iter().any(|h| {
+                                                h.get("command")
+                                                    .and_then(|c| c.as_str())
+                                                    .map(|c| {
+                                                        c.contains("telegram-hook")
+                                                            || c.contains("ctm")
+                                                    })
+                                                    .unwrap_or(false)
+                                            })
+                                        })
+                                        .unwrap_or(false)
+                                        || item
+                                            .get("command")
+                                            .and_then(|c| c.as_str())
+                                            .map(|c| {
+                                                c.contains("telegram-hook") || c.contains("ctm")
+                                            })
+                                            .unwrap_or(false)
+                                })
+                            })
+                            .unwrap_or(false)
+                    });
+
+                let msg = if is_legacy {
+                    format!(
+                        "{installed}/{} hooks installed (legacy \u{2014} run `ctm install-hooks` to update)",
+                        check_types.len()
+                    )
+                } else {
+                    format!("{installed}/{} hooks installed", check_types.len())
+                };
+                let r = CheckResult::warn("Claude Code Hooks", &msg)
+                    .with_details("Run: ctm install-hooks");
                 if fix {
                     println!(
                         "    {}",
