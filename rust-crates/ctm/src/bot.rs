@@ -17,6 +17,7 @@ use regex::Regex;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::num::NonZeroU32;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
 use tokio::sync::Mutex;
 
@@ -53,6 +54,8 @@ struct QueuedMessage {
     disable_notification: Option<bool>,
     reply_to_message_id: Option<i64>,
     retries: u32,
+    /// Epoch millis when this item was first enqueued (for staleness tracking).
+    created_at: u64,
 }
 
 /// Telegram API response wrapper.
@@ -183,6 +186,7 @@ pub struct TelegramBot {
     queue: Arc<Mutex<Vec<QueuedMessage>>>,
     queue_processing: Arc<Mutex<bool>>,
     chunk_size: usize,
+    running: Arc<AtomicBool>,
 }
 
 #[allow(dead_code)]
@@ -205,12 +209,30 @@ impl TelegramBot {
             queue: Arc::new(Mutex::new(Vec::new())),
             queue_processing: Arc::new(Mutex::new(false)),
             chunk_size: config.chunk_size,
+            running: Arc::new(AtomicBool::new(false)),
         }
     }
 
     /// Get the configured chat ID.
     pub fn chat_id(&self) -> i64 {
         self.chat_id
+    }
+
+    /// Whether the bot is currently running (started and not yet stopped).
+    pub fn is_running(&self) -> bool {
+        self.running.load(Ordering::Relaxed)
+    }
+
+    /// Mark the bot as running. Called when the daemon starts.
+    pub fn set_running(&self, running: bool) {
+        self.running.store(running, Ordering::Relaxed);
+    }
+
+    /// Get session state for a chat. Returns `None` — session state is managed
+    /// by the daemon layer (`BotSessionState`), not the bot itself. This stub
+    /// matches the TS `getSession()` interface for API compatibility.
+    pub fn get_session(&self, _chat_id: i64) -> Option<()> {
+        None
     }
 
     /// Scrub the bot token from error messages.
@@ -287,6 +309,7 @@ impl TelegramBot {
                 disable_notification,
                 reply_to_message_id: reply_id,
                 retries: 0,
+                created_at: epoch_millis(),
             })
             .await;
         }
@@ -315,6 +338,7 @@ impl TelegramBot {
             disable_notification,
             reply_to_message_id,
             retries: 0,
+            created_at: epoch_millis(),
         })
         .await;
     }
@@ -773,8 +797,7 @@ impl TelegramBot {
 
         let file_name = sanitize_upload_filename(path);
         let file_bytes = std::fs::read(path)?;
-        let part = reqwest::multipart::Part::bytes(file_bytes)
-            .file_name(file_name);
+        let part = reqwest::multipart::Part::bytes(file_bytes).file_name(file_name);
 
         let mut form = reqwest::multipart::Form::new()
             .text("chat_id", self.chat_id.to_string())
@@ -787,19 +810,22 @@ impl TelegramBot {
             form = form.text("message_thread_id", tid.to_string());
         }
 
-        let resp = self.client
+        let resp = self
+            .client
             .post(self.api_url("sendPhoto"))
             .multipart(form)
             .send()
             .await
             .map_err(|e| AppError::Telegram(self.scrub_token(&e.to_string())))?;
 
-        let tg: TgResponse<TgMessage> = resp.json().await
+        let tg: TgResponse<TgMessage> = resp
+            .json()
+            .await
             .map_err(|e| AppError::Telegram(self.scrub_token(&e.to_string())))?;
 
         if !tg.ok {
             return Err(AppError::Telegram(
-                tg.description.unwrap_or_else(|| "sendPhoto failed".into())
+                tg.description.unwrap_or_else(|| "sendPhoto failed".into()),
             ));
         }
         Ok(())
@@ -816,8 +842,7 @@ impl TelegramBot {
 
         let file_name = sanitize_upload_filename(path);
         let file_bytes = std::fs::read(path)?;
-        let part = reqwest::multipart::Part::bytes(file_bytes)
-            .file_name(file_name);
+        let part = reqwest::multipart::Part::bytes(file_bytes).file_name(file_name);
 
         let mut form = reqwest::multipart::Form::new()
             .text("chat_id", self.chat_id.to_string())
@@ -830,19 +855,23 @@ impl TelegramBot {
             form = form.text("message_thread_id", tid.to_string());
         }
 
-        let resp = self.client
+        let resp = self
+            .client
             .post(self.api_url("sendDocument"))
             .multipart(form)
             .send()
             .await
             .map_err(|e| AppError::Telegram(self.scrub_token(&e.to_string())))?;
 
-        let tg: TgResponse<TgMessage> = resp.json().await
+        let tg: TgResponse<TgMessage> = resp
+            .json()
+            .await
             .map_err(|e| AppError::Telegram(self.scrub_token(&e.to_string())))?;
 
         if !tg.ok {
             return Err(AppError::Telegram(
-                tg.description.unwrap_or_else(|| "sendDocument failed".into())
+                tg.description
+                    .unwrap_or_else(|| "sendDocument failed".into()),
             ));
         }
         Ok(())
@@ -882,6 +911,38 @@ impl TelegramBot {
 }
 
 // ---------------------------------------------------------------- helpers
+
+/// Current epoch time in milliseconds.
+fn epoch_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+/// Create the standard approval keyboard buttons for an approval request.
+///
+/// Returns a list of rows, where each row is a list of `(text, callback_data)` tuples.
+/// The layout matches the TypeScript implementation: Approve + Reject on one row,
+/// Abort Session on its own row.
+pub fn create_approval_keyboard(approval_id: &str) -> Vec<Vec<InlineButton>> {
+    vec![
+        vec![
+            InlineButton {
+                text: "\u{2705} Approve".into(),
+                callback_data: format!("approve:{}", approval_id),
+            },
+            InlineButton {
+                text: "\u{274C} Reject".into(),
+                callback_data: format!("reject:{}", approval_id),
+            },
+        ],
+        vec![InlineButton {
+            text: "\u{1F6D1} Abort Session".into(),
+            callback_data: format!("abort:{}", approval_id),
+        }],
+    ]
+}
 
 /// Sanitize a file path to a safe upload filename (basename only).
 fn sanitize_upload_filename(path: &std::path::Path) -> String {
@@ -926,9 +987,12 @@ fn strip_markdown(text: &str) -> String {
 
 /// Scrub bot token from log messages to prevent leaking.
 ///
-/// Applies a regex `bot\d+:[A-Za-z0-9_-]+/` globally, matching any Telegram
-/// API URL token regardless of whether the runtime token is known. This matches
-/// the TypeScript winston format pipeline behavior.
+/// Applies a regex `bot\d+:[A-Za-z0-9_-]+/` globally, matching **any** Telegram
+/// API URL token regardless of whether the runtime token is known. This is an
+/// intentional improvement over the TypeScript implementation which only replaced
+/// the literal configured token value. The regex approach catches tokens from
+/// any source (e.g. error messages from third-party libraries that interpolate
+/// different tokens) and does not require the runtime token to be available.
 pub fn scrub_bot_token(text: &str) -> String {
     BOT_TOKEN_REGEX
         .replace_all(text, "bot[REDACTED]/")
@@ -944,8 +1008,14 @@ mod tests {
     #[test]
     fn test_sanitize_upload_filename() {
         use std::path::Path;
-        assert_eq!(sanitize_upload_filename(Path::new("/tmp/photo.png")), "photo.png");
-        assert_eq!(sanitize_upload_filename(Path::new("/a/b/c/doc.pdf")), "doc.pdf");
+        assert_eq!(
+            sanitize_upload_filename(Path::new("/tmp/photo.png")),
+            "photo.png"
+        );
+        assert_eq!(
+            sanitize_upload_filename(Path::new("/a/b/c/doc.pdf")),
+            "doc.pdf"
+        );
         assert_eq!(sanitize_upload_filename(Path::new("/tmp/file")), "file");
         assert_eq!(sanitize_upload_filename(Path::new("/")), "file"); // root has no filename
     }

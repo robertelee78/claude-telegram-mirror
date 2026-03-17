@@ -5,6 +5,10 @@
 use regex::Regex;
 use std::sync::LazyLock;
 
+/// Default maximum message length for Telegram (characters).
+/// Telegram's hard limit is 4096 but we use 4000 to leave room for part headers.
+pub const DEFAULT_MAX_LENGTH: usize = 4000;
+
 // ------------------------------------------------------------------- ANSI
 
 static ANSI_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\x1b\[[0-9;]*[a-zA-Z]").unwrap());
@@ -366,7 +370,25 @@ pub fn truncate(text: &str, max_len: usize) -> String {
     format!("{truncated}...")
 }
 
+/// Estimate the number of chunks needed to fit `text` within `max_length`.
+pub fn estimate_chunks(text: &str, max_length: usize) -> usize {
+    if text.len() <= max_length {
+        1
+    } else {
+        text.len().div_ceil(max_length)
+    }
+}
+
+/// Returns `true` if `text` exceeds `max_length` and will need chunking.
+pub fn needs_chunking(text: &str, max_length: usize) -> bool {
+    text.len() > max_length
+}
+
 /// Last 2 path components with `.../` prefix.
+///
+/// Empty path components (e.g. from `//foo/bar`) are filtered out, which is an
+/// intentional improvement over the TypeScript version that did not handle
+/// consecutive separators gracefully.
 pub fn short_path(path: &str) -> String {
     let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     if parts.len() <= 2 {
@@ -724,5 +746,36 @@ mod tests {
         let s = format_status(true, Some("s1"), Some(true));
         assert!(s.contains("s1"));
         assert!(s.contains("Muted"));
+    }
+
+    // ---- estimate_chunks / needs_chunking ----
+
+    #[test]
+    fn estimate_chunks_short() {
+        assert_eq!(estimate_chunks("hello", 4000), 1);
+    }
+
+    #[test]
+    fn estimate_chunks_long() {
+        let text = "x".repeat(10000);
+        assert_eq!(estimate_chunks(&text, 4000), 3);
+    }
+
+    #[test]
+    fn needs_chunking_false() {
+        assert!(!needs_chunking("hello", 4000));
+    }
+
+    #[test]
+    fn needs_chunking_true() {
+        let text = "x".repeat(5000);
+        assert!(needs_chunking(&text, 4000));
+    }
+
+    // ---- DEFAULT_MAX_LENGTH ----
+
+    #[test]
+    fn default_max_length_value() {
+        assert_eq!(DEFAULT_MAX_LENGTH, 4000);
     }
 }

@@ -431,7 +431,8 @@ struct HandlerContext {
     topic_locks: Arc<RwLock<HashMap<String, Arc<TopicCreationState>>>>,
     /// Per-thread bot session state (keyed by thread_id).
     bot_sessions: Arc<RwLock<HashMap<i64, BotSessionState>>>,
-    /// Epic 1: Runtime mirroring toggle.
+    /// Runtime mirroring toggle (used by future Epic handlers).
+    #[allow(dead_code)]
     mirroring_enabled: Arc<std::sync::atomic::AtomicBool>,
     config: Config,
     /// Shared reference to the socket's connected-client map for outbound broadcasts.
@@ -772,6 +773,11 @@ async fn handle_session_start(ctx: &HandlerContext, msg: &BridgeMessage) {
 }
 
 /// Handler 2: session_end
+///
+/// Explicit session teardown: marks the session as ended, sends a summary to
+/// Telegram, and schedules topic deletion when auto-delete is enabled. This is
+/// the Rust equivalent of the TypeScript `handleSessionEnd()`.  See also
+/// `ensure_session_exists` which handles the start (creation) side.
 async fn handle_session_end(ctx: &HandlerContext, msg: &BridgeMessage) {
     let session_opt = ctx
         .sessions
@@ -1119,23 +1125,13 @@ async fn handle_approval_request(ctx: &HandlerContext, msg: &BridgeMessage) {
         return;
     }
 
+    let keyboard = crate::bot::create_approval_keyboard(&approval_id);
+    let buttons: Vec<InlineButton> = keyboard.into_iter().flatten().collect();
+
     ctx.bot
         .send_with_buttons(
             &format_approval_request(&msg.content),
-            vec![
-                InlineButton {
-                    text: "\u{2705} Approve".into(),
-                    callback_data: format!("approve:{approval_id}"),
-                },
-                InlineButton {
-                    text: "\u{274C} Reject".into(),
-                    callback_data: format!("reject:{approval_id}"),
-                },
-                InlineButton {
-                    text: "\u{1F6D1} Abort".into(),
-                    callback_data: format!("abort:{approval_id}"),
-                },
-            ],
+            buttons,
             Some(&SendOptions {
                 parse_mode: Some("Markdown".into()),
                 ..Default::default()
@@ -1249,6 +1245,15 @@ async fn handle_compact_complete(ctx: &HandlerContext, session_id: &str) {
 // ====================================================================== session lifecycle
 
 /// BUG-009/BUG-010: Ensure a session exists, creating on-the-fly if needed.
+///
+/// This is the Rust equivalent of the TypeScript `handleSessionStart()` for
+/// on-demand creation. The Rust architecture uses lazy session creation:
+/// instead of requiring an explicit `session_start` message before any other
+/// message can be processed, `ensure_session_exists` is called by every
+/// handler that needs a session. If the session does not exist, it is created
+/// transparently — including forum topic creation when threads are enabled.
+/// This differs from the TS design where `handleSessionStart` and
+/// `handleSessionEnd` were standalone entry points.
 async fn ensure_session_exists(ctx: &HandlerContext, msg: &BridgeMessage) {
     let existing = ctx
         .sessions

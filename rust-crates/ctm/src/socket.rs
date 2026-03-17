@@ -12,6 +12,7 @@
 //! ## Client
 //! - Connect, send, send-and-wait with correlation on `session_id`
 
+use crate::config;
 use crate::error::{AppError, Result};
 use crate::types::BridgeMessage;
 use nix::fcntl::Flock;
@@ -30,6 +31,32 @@ const MAX_CONNECTIONS: usize = 64;
 
 /// Maximum bytes in a single NDJSON line (1 MiB).
 const MAX_LINE_BYTES: usize = 1_048_576;
+
+/// Default socket path: `~/.config/claude-telegram-mirror/bridge.sock`.
+pub fn default_socket_path() -> std::path::PathBuf {
+    config::get_config_dir().join("bridge.sock")
+}
+
+/// Directory containing the socket file.
+pub fn socket_dir() -> std::path::PathBuf {
+    config::get_config_dir()
+}
+
+/// Probe the status of a Unix domain socket file.
+///
+/// Returns:
+/// - `"none"` if the file does not exist.
+/// - `"active"` if a connection to the socket succeeds (daemon is running).
+/// - `"stale"` if the file exists but the connection is refused (orphaned socket).
+pub fn check_socket_status(socket_path: &std::path::Path) -> &'static str {
+    if !socket_path.exists() {
+        return "none";
+    }
+    match std::os::unix::net::UnixStream::connect(socket_path) {
+        Ok(_) => "active",
+        Err(_) => "stale",
+    }
+}
 
 // ====================================================================== server
 

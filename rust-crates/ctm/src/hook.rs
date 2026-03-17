@@ -181,7 +181,16 @@ fn make_message(
     }
 }
 
-/// Build bridge messages for the given hook event
+/// Build bridge messages for the given hook event.
+///
+/// This function serves as the Rust equivalent of both `buildMessages()` and
+/// `handleAgentResponse()` from the TypeScript implementation. In TS, agent
+/// responses were handled by a dedicated method; here, `build_messages` generates
+/// `agent_response` messages from any source — `transcript_summary`,
+/// `last_assistant_message`, or JSONL transcript file I/O — as part of the
+/// unified message construction pipeline.  No standalone `handle_agent_response`
+/// method is needed because the Rust architecture builds all messages in a
+/// single pass rather than dispatching to separate per-type handlers.
 async fn build_messages(
     event: &HookEvent,
     session_id: &str,
