@@ -1,7 +1,56 @@
 use crate::error::{AppError, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
+
+// ---------------------------------------------------------------- mirror status
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MirrorStatus {
+    pub enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    pub toggled_at: String,
+}
+
+pub fn status_file_path(config_dir: &std::path::Path) -> std::path::PathBuf {
+    config_dir.join("status.json")
+}
+
+/// Read the current mirroring enabled state from status.json.
+/// Returns `true` (default) if the file doesn't exist or can't be parsed.
+pub fn read_mirror_status(config_dir: &std::path::Path) -> bool {
+    let path = status_file_path(config_dir);
+    match std::fs::read_to_string(&path) {
+        Ok(content) => serde_json::from_str::<MirrorStatus>(&content)
+            .map(|s| s.enabled)
+            .unwrap_or(true),
+        Err(_) => true,
+    }
+}
+
+/// Write the mirroring status file with secure permissions (0o600).
+pub fn write_mirror_status(config_dir: &std::path::Path, enabled: bool, pid: Option<u32>) {
+    let status = MirrorStatus {
+        enabled,
+        pid,
+        toggled_at: chrono::Utc::now().to_rfc3339(),
+    };
+    let path = status_file_path(config_dir);
+    if let Ok(json) = serde_json::to_string_pretty(&status) {
+        use std::os::unix::fs::OpenOptionsExt;
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)
+        {
+            use std::io::Write;
+            let _ = file.write_all(json.as_bytes());
+        }
+    }
+}
 
 /// CTM configuration loaded from env vars > config file > defaults
 #[derive(Debug, Clone)]
@@ -301,6 +350,28 @@ mod tests {
         assert!(!parse_bool("false"));
         assert!(!parse_bool("0"));
         assert!(!parse_bool("anything"));
+    }
+
+    #[test]
+    fn test_read_mirror_status_missing_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(read_mirror_status(tmp.path()));
+    }
+
+    #[test]
+    fn test_mirror_status_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_mirror_status(tmp.path(), false, Some(1234));
+        assert!(!read_mirror_status(tmp.path()));
+        write_mirror_status(tmp.path(), true, None);
+        assert!(read_mirror_status(tmp.path()));
+    }
+
+    #[test]
+    fn test_read_mirror_status_corrupt() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("status.json"), "not json").unwrap();
+        assert!(read_mirror_status(tmp.path()));
     }
 
     #[test]

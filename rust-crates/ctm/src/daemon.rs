@@ -113,12 +113,18 @@ pub struct Daemon {
 
     // Per-thread bot session state (keyed by thread_id / message_thread_id)
     bot_sessions: Arc<RwLock<HashMap<i64, BotSessionState>>>,
+
+    // Epic 1: Runtime mirroring toggle
+    mirroring_enabled: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Daemon {
     pub fn new(config: Config) -> Result<Self> {
         let bot = Arc::new(TelegramBot::new(&config));
         let sessions = SessionManager::new(&config.config_dir, config.session_timeout)?;
+        let mirroring_enabled = Arc::new(std::sync::atomic::AtomicBool::new(
+            crate::config::read_mirror_status(&config.config_dir),
+        ));
 
         Ok(Self {
             config,
@@ -136,6 +142,7 @@ impl Daemon {
             pending_questions: Arc::new(RwLock::new(HashMap::new())),
             topic_creation_locks: Arc::new(RwLock::new(HashMap::new())),
             bot_sessions: Arc::new(RwLock::new(HashMap::new())),
+            mirroring_enabled,
         })
     }
 
@@ -214,6 +221,7 @@ impl Daemon {
         let daemon_pending_q = Arc::clone(&self.pending_questions);
         let daemon_topic_locks = Arc::clone(&self.topic_creation_locks);
         let daemon_bot_sessions = Arc::clone(&self.bot_sessions);
+        let daemon_mirroring_enabled = Arc::clone(&self.mirroring_enabled);
         let daemon_config = self.config.clone();
 
         tokio::spawn(async move {
@@ -232,6 +240,7 @@ impl Daemon {
                 daemon_pending_q,
                 daemon_topic_locks,
                 daemon_bot_sessions,
+                daemon_mirroring_enabled,
                 daemon_config,
                 daemon_socket_clients,
             )
@@ -286,6 +295,7 @@ async fn run_event_loop(
     pending_q: Arc<RwLock<HashMap<String, PendingQuestion>>>,
     topic_locks: Arc<RwLock<HashMap<String, Arc<TopicCreationState>>>>,
     bot_sessions: Arc<RwLock<HashMap<i64, BotSessionState>>>,
+    mirroring_enabled: Arc<std::sync::atomic::AtomicBool>,
     config: Config,
     socket_clients: SocketClients,
 ) {
@@ -315,6 +325,7 @@ async fn run_event_loop(
                             pending_q: Arc::clone(&pending_q),
                             topic_locks: Arc::clone(&topic_locks),
                             bot_sessions: Arc::clone(&bot_sessions),
+                            mirroring_enabled: Arc::clone(&mirroring_enabled),
                             config: config.clone(),
                             socket_clients: Arc::clone(&socket_clients),
                         };

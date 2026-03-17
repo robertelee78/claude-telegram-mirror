@@ -742,6 +742,94 @@ impl TelegramBot {
         Ok(Some(dest_path.to_string()))
     }
 
+    // -------------------------------------------------------- file upload
+
+    /// Upload a photo to Telegram.
+    pub async fn send_photo(
+        &self,
+        path: &std::path::Path,
+        caption: Option<&str>,
+        thread_id: Option<i64>,
+    ) -> Result<()> {
+        self.rate_limiter.until_ready().await;
+
+        let file_name = sanitize_upload_filename(path);
+        let file_bytes = std::fs::read(path)?;
+        let part = reqwest::multipart::Part::bytes(file_bytes)
+            .file_name(file_name);
+
+        let mut form = reqwest::multipart::Form::new()
+            .text("chat_id", self.chat_id.to_string())
+            .part("photo", part);
+
+        if let Some(cap) = caption {
+            form = form.text("caption", cap.to_string());
+        }
+        if let Some(tid) = thread_id {
+            form = form.text("message_thread_id", tid.to_string());
+        }
+
+        let resp = self.client
+            .post(self.api_url("sendPhoto"))
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|e| AppError::Telegram(self.scrub_token(&e.to_string())))?;
+
+        let tg: TgResponse<TgMessage> = resp.json().await
+            .map_err(|e| AppError::Telegram(self.scrub_token(&e.to_string())))?;
+
+        if !tg.ok {
+            return Err(AppError::Telegram(
+                tg.description.unwrap_or_else(|| "sendPhoto failed".into())
+            ));
+        }
+        Ok(())
+    }
+
+    /// Upload a document to Telegram.
+    pub async fn send_document(
+        &self,
+        path: &std::path::Path,
+        caption: Option<&str>,
+        thread_id: Option<i64>,
+    ) -> Result<()> {
+        self.rate_limiter.until_ready().await;
+
+        let file_name = sanitize_upload_filename(path);
+        let file_bytes = std::fs::read(path)?;
+        let part = reqwest::multipart::Part::bytes(file_bytes)
+            .file_name(file_name);
+
+        let mut form = reqwest::multipart::Form::new()
+            .text("chat_id", self.chat_id.to_string())
+            .part("document", part);
+
+        if let Some(cap) = caption {
+            form = form.text("caption", cap.to_string());
+        }
+        if let Some(tid) = thread_id {
+            form = form.text("message_thread_id", tid.to_string());
+        }
+
+        let resp = self.client
+            .post(self.api_url("sendDocument"))
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|e| AppError::Telegram(self.scrub_token(&e.to_string())))?;
+
+        let tg: TgResponse<TgMessage> = resp.json().await
+            .map_err(|e| AppError::Telegram(self.scrub_token(&e.to_string())))?;
+
+        if !tg.ok {
+            return Err(AppError::Telegram(
+                tg.description.unwrap_or_else(|| "sendDocument failed".into())
+            ));
+        }
+        Ok(())
+    }
+
     // -------------------------------------------------------- long polling
 
     /// Get updates via long polling.
@@ -776,6 +864,14 @@ impl TelegramBot {
 }
 
 // ---------------------------------------------------------------- helpers
+
+/// Sanitize a file path to a safe upload filename (basename only).
+fn sanitize_upload_filename(path: &std::path::Path) -> String {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("file")
+        .replace(['/', '\\'], "_")
+}
 
 /// Build an inline keyboard JSON structure from our button list.
 /// Layout: two buttons per row, matching TypeScript's `if (idx + 1) % 2 === 0 keyboard.row()`.
@@ -826,6 +922,15 @@ pub fn scrub_bot_token(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_sanitize_upload_filename() {
+        use std::path::Path;
+        assert_eq!(sanitize_upload_filename(Path::new("/tmp/photo.png")), "photo.png");
+        assert_eq!(sanitize_upload_filename(Path::new("/a/b/c/doc.pdf")), "doc.pdf");
+        assert_eq!(sanitize_upload_filename(Path::new("/tmp/file")), "file");
+        assert_eq!(sanitize_upload_filename(Path::new("/")), "file"); // root has no filename
+    }
 
     #[test]
     fn test_strip_markdown() {

@@ -114,6 +114,7 @@ pub enum MessageType {
     TurnComplete,
     PreCompact,
     SessionRename,
+    SendImage,
 }
 
 /// Bridge message sent over the Unix domain socket
