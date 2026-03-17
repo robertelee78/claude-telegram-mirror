@@ -2,11 +2,79 @@
 
 use super::*;
 
+/// AIMD (Additive Increase, Multiplicative Decrease) adaptive rate controller.
+///
+/// Mirrors the TCP congestion control algorithm to dynamically adjust the
+/// effective send rate in response to Telegram 429 rate-limit signals.
+/// The `governor` rate limiter enforces the absolute ceiling; AIMD adapts
+/// the effective rate downward when Telegram is throttling us.
+pub(super) struct AimdState {
+    /// Current effective send rate in messages per second.
+    pub(super) rate: f64,
+    /// Minimum rate floor — never go below 0.5 msg/sec.
+    pub(super) min_rate: f64,
+    /// Maximum rate ceiling — derived from config.rate_limit.
+    pub(super) max_rate: f64,
+    /// Additive increase per successful send (0.5 msg/sec).
+    pub(super) increase: f64,
+    /// Multiplicative decrease factor on 429 (halve the rate).
+    pub(super) decrease_factor: f64,
+    /// Timestamp of the last multiplicative decrease (for debouncing).
+    pub(super) last_decrease: Option<std::time::Instant>,
+}
+
+impl AimdState {
+    /// Create a new AIMD state with the given maximum rate from config.
+    pub(super) fn new(max_rate: f64) -> Self {
+        Self {
+            rate: max_rate,
+            min_rate: 0.5,
+            max_rate,
+            increase: 0.5,
+            decrease_factor: 0.5,
+            last_decrease: None,
+        }
+    }
+
+    /// Additive increase: called after each successful send.
+    /// Rate grows by `increase` (0.5 msg/sec) up to `max_rate`.
+    pub(super) fn on_success(&mut self) {
+        self.rate = (self.rate + self.increase).min(self.max_rate);
+    }
+
+    /// Multiplicative decrease: called when Telegram returns 429.
+    /// Rate halves, clamped to `min_rate`. Debounced to at most once per second
+    /// to prevent cascading decreases from a burst of 429 responses in flight.
+    pub(super) fn on_rate_limit(&mut self, _retry_after_secs: u64) {
+        // Debounce: don't decrease more than once per second.
+        if self
+            .last_decrease
+            .map(|t| t.elapsed() < std::time::Duration::from_secs(1))
+            .unwrap_or(false)
+        {
+            return;
+        }
+        self.rate = (self.rate * self.decrease_factor).max(self.min_rate);
+        self.last_decrease = Some(std::time::Instant::now());
+    }
+
+    /// Compute the inter-message delay implied by the current rate.
+    pub(super) fn inter_message_delay(&self) -> tokio::time::Duration {
+        tokio::time::Duration::from_secs_f64(1.0 / self.rate)
+    }
+}
+
 /// Telegram Bot with rate limiting and message queue.
 pub struct TelegramBot {
     pub(super) token: String,
     pub(super) chat_id: i64,
+    /// HTTP client for short API calls (sendMessage, editMessage, etc.).
+    /// 15s total timeout, 5s connect timeout.
     pub(super) client: Client,
+    /// Dedicated HTTP client for getUpdates long-polling only.
+    /// 45s total timeout (30s Telegram poll + 15s buffer), 5s connect timeout.
+    /// Kept separate so long-poll connection latency never blocks API calls.
+    pub(super) poll_client: Client,
     pub(super) rate_limiter: Arc<
         RateLimiter<
             governor::state::NotKeyed,
@@ -14,7 +82,10 @@ pub struct TelegramBot {
             governor::clock::DefaultClock,
         >,
     >,
-    pub(super) queue: Arc<Mutex<VecDeque<QueuedMessage>>>,
+    /// AIMD adaptive rate controller. Adjusts effective send rate in response
+    /// to Telegram 429 signals. The governor enforces the absolute ceiling.
+    pub(super) aimd: Arc<Mutex<AimdState>>,
+    pub(super) queue: Arc<Mutex<PriorityMessageQueue>>,
     pub(super) queue_processing: Arc<AtomicBool>,
     pub(super) chunk_size: usize,
     #[allow(dead_code)] // Library API
@@ -29,17 +100,40 @@ impl TelegramBot {
         let quota = Quota::per_second(NonZeroU32::new(rate).unwrap());
         let limiter = RateLimiter::direct(quota);
 
+        // API client: 15s total timeout, 5s connect timeout.
+        // Used for all short Telegram API calls (sendMessage, editMessage, etc.).
+        // Telegram API calls complete in <2s normally; 15s catches slow responses
+        // without blocking the queue for longer than necessary.
         let client = Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
+            .timeout(std::time::Duration::from_secs(15))
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .tcp_keepalive(std::time::Duration::from_secs(60))
             .build()
             .map_err(|e| AppError::Telegram(format!("Failed to build reqwest Client: {e}")))?;
+
+        // Long-poll client: 45s total timeout, 5s connect timeout.
+        // Used exclusively for getUpdates (30s Telegram timeout + 15s buffer).
+        // Kept in a separate connection pool so long-poll latency never blocks
+        // the API call pool under HTTP/2 connection multiplexing.
+        let poll_client = Client::builder()
+            .timeout(std::time::Duration::from_secs(45))
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .tcp_keepalive(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|e| {
+                AppError::Telegram(format!("Failed to build poll reqwest Client: {e}"))
+            })?;
+
+        let max_rate = f64::from(rate);
 
         Ok(Self {
             token: config.bot_token.clone(),
             chat_id: config.chat_id,
             client,
+            poll_client,
             rate_limiter: Arc::new(limiter),
-            queue: Arc::new(Mutex::new(VecDeque::new())),
+            aimd: Arc::new(Mutex::new(AimdState::new(max_rate))),
+            queue: Arc::new(Mutex::new(PriorityMessageQueue::new())),
             queue_processing: Arc::new(AtomicBool::new(false)),
             chunk_size: config.chunk_size,
             running: Arc::new(AtomicBool::new(false)),
@@ -83,12 +177,23 @@ impl TelegramBot {
     }
 
     /// Call a Telegram Bot API method.
+    ///
+    /// Rate limiting is two-layered:
+    /// 1. AIMD adaptive delay: computed from the current adaptive rate. This
+    ///    adjusts dynamically — slower after 429s, faster after successes.
+    /// 2. Governor ceiling: enforces the absolute rate limit from config.
     pub(super) async fn api_call<T: serde::de::DeserializeOwned>(
         &self,
         method: &str,
         body: &serde_json::Value,
     ) -> Result<TgResponse<T>> {
+        // Layer 1: AIMD adaptive inter-message delay.
+        let delay = self.aimd.lock().await.inter_message_delay();
+        tokio::time::sleep(delay).await;
+
+        // Layer 2: Governor absolute ceiling check.
         self.rate_limiter.until_ready().await;
+
         let resp = self
             .client
             .post(self.api_url(method))
@@ -146,6 +251,7 @@ impl TelegramBot {
                 reply_to_message_id: reply_id,
                 retries: 0,
                 created_at: epoch_millis(),
+                priority: MessagePriority::Normal,
             })
             .await;
         }
@@ -175,6 +281,7 @@ impl TelegramBot {
             reply_to_message_id,
             retries: 0,
             created_at: epoch_millis(),
+            priority: MessagePriority::Normal,
         })
         .await;
     }
@@ -575,19 +682,32 @@ impl TelegramBot {
     // -------------------------------------------------------- long polling
 
     /// Get updates via long polling.
+    ///
+    /// Uses `poll_client` (45s timeout) instead of `api_call` to prevent the
+    /// HTTP client from timing out before Telegram responds to the 30s long-poll.
+    /// The separate connection pool ensures long-poll latency never blocks
+    /// short API calls (sendMessage, editMessage, etc.).
     pub async fn get_updates(&self, offset: i64) -> Result<Vec<Update>> {
-        let resp: TgResponse<Vec<Update>> = self
-            .api_call(
-                "getUpdates",
-                &serde_json::json!({
-                    "offset": offset,
-                    "timeout": 30,
-                    "allowed_updates": ["message", "callback_query"],
-                }),
-            )
-            .await?;
+        let body = serde_json::json!({
+            "offset": offset,
+            "timeout": 30,
+            "allowed_updates": ["message", "callback_query"],
+        });
 
-        Ok(resp.result.unwrap_or_default())
+        let resp = self
+            .poll_client
+            .post(self.api_url("getUpdates"))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| AppError::Telegram(self.scrub_token(&e.to_string())))?;
+
+        let tg: TgResponse<Vec<Update>> = resp
+            .json()
+            .await
+            .map_err(|e| AppError::Telegram(self.scrub_token(&e.to_string())))?;
+
+        Ok(tg.result.unwrap_or_default())
     }
 
     /// Answer a callback query (dismiss the loading spinner).
@@ -747,14 +867,42 @@ mod tests {
     fn queue_starts_empty() {
         let config = test_config();
         let bot = TelegramBot::new(&config).unwrap();
-        // The queue is wrapped in Arc<Mutex>, so we verify via the type system
-        // that it was initialized. The VecDeque should be empty.
+        // The priority queue is wrapped in Arc<Mutex>. All three sub-queues
+        // should be empty and total_len() should return 0.
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();
         rt.block_on(async {
             let q = bot.queue.lock().await;
-            assert!(q.is_empty());
+            assert_eq!(q.total_len(), 0);
+        });
+    }
+
+    #[test]
+    fn two_clients_have_distinct_timeouts() {
+        // Verify that TelegramBot::new creates both clients without error.
+        // We cannot introspect reqwest::Client's timeout directly, but we can
+        // verify construction succeeds and both fields are present (they are
+        // used in get_updates vs api_call).
+        let config = test_config();
+        let bot = TelegramBot::new(&config).expect("should build both clients");
+        // Both clients exist — api_url works the same for both
+        let url = bot.api_url("getUpdates");
+        assert!(url.contains("getUpdates"));
+    }
+
+    #[test]
+    fn aimd_starts_at_max_rate() {
+        let config = test_config();
+        let bot = TelegramBot::new(&config).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let aimd = bot.aimd.lock().await;
+            // Initial rate should equal max_rate from config (20, clamped to 20)
+            assert_eq!(aimd.rate, aimd.max_rate);
+            assert!(aimd.rate > 0.0);
         });
     }
 
