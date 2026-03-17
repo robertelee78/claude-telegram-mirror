@@ -224,6 +224,22 @@ pub const ALLOWED_TMUX_KEYS: &[&str] = &[
 /// Maximum session ID length
 pub const MAX_SESSION_ID_LEN: usize = 128;
 
+/// Valid status values for sessions.
+pub const VALID_SESSION_STATUSES: &[&str] = &["active", "ended", "aborted"];
+
+/// Valid status values for approvals.
+pub const VALID_APPROVAL_STATUSES: &[&str] = &["pending", "approved", "denied", "rejected", "expired"];
+
+/// Returns true if `s` is a recognized session status.
+pub fn is_valid_session_status(s: &str) -> bool {
+    VALID_SESSION_STATUSES.contains(&s)
+}
+
+/// Returns true if `s` is a recognized approval status.
+pub fn is_valid_approval_status(s: &str) -> bool {
+    VALID_APPROVAL_STATUSES.contains(&s)
+}
+
 /// Maximum stdin/NDJSON line size (1 MiB)
 pub const MAX_LINE_BYTES: usize = 1_048_576;
 

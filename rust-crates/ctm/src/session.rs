@@ -213,6 +213,13 @@ impl SessionManager {
         tmux_target: Option<&str>,
         tmux_socket: Option<&str>,
     ) -> Result<String> {
+        if !crate::types::is_valid_session_id(session_id) {
+            return Err(AppError::Config(format!(
+                "invalid session_id: {}",
+                session_id
+            )));
+        }
+
         let now = now_iso();
 
         // If the session already exists, touch its activity timestamp and return.
@@ -377,25 +384,55 @@ impl SessionManager {
     }
 
     /// End a session and expire its pending approvals.
+    ///
+    /// Both SQL statements execute inside a single transaction so that a crash
+    /// between them cannot leave the session marked ended while its approvals
+    /// remain pending (C-4 atomicity fix).
     pub fn end_session(&self, session_id: &str, status: &str) -> Result<()> {
+        if !crate::types::is_valid_session_status(status) {
+            return Err(AppError::Config(format!(
+                "invalid session status: {}",
+                status
+            )));
+        }
+
         let now = now_iso();
         self.conn
-            .execute(
-                "UPDATE sessions SET status = ?1, last_activity = ?2 WHERE id = ?3",
-                params![status, now, session_id],
-            )
+            .execute_batch("BEGIN")
             .map_err(|e| AppError::Database(e.to_string()))?;
 
-        self.conn
-            .execute(
-                "UPDATE pending_approvals
-                 SET status = 'expired'
-                 WHERE session_id = ?1 AND status = 'pending'",
-                params![session_id],
-            )
-            .map_err(|e| AppError::Database(e.to_string()))?;
+        let result = (|| -> Result<()> {
+            self.conn
+                .execute(
+                    "UPDATE sessions SET status = ?1, last_activity = ?2 WHERE id = ?3",
+                    params![status, now, session_id],
+                )
+                .map_err(|e| AppError::Database(e.to_string()))?;
 
-        Ok(())
+            self.conn
+                .execute(
+                    "UPDATE pending_approvals
+                     SET status = 'expired'
+                     WHERE session_id = ?1 AND status = 'pending'",
+                    params![session_id],
+                )
+                .map_err(|e| AppError::Database(e.to_string()))?;
+
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                self.conn
+                    .execute_batch("COMMIT")
+                    .map_err(|e| AppError::Database(e.to_string()))?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
     }
 
     /// BUG-009: Reactivate an ended/aborted session.
@@ -476,6 +513,13 @@ impl SessionManager {
         prompt: &str,
         message_id: Option<i64>,
     ) -> Result<String> {
+        if !crate::types::is_valid_session_id(session_id) {
+            return Err(AppError::Config(format!(
+                "invalid session_id: {}",
+                session_id
+            )));
+        }
+
         let id = generate_id("approval");
         let now = chrono::Utc::now();
         let created = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
@@ -537,6 +581,13 @@ impl SessionManager {
 
     /// Resolve an approval; returns true if a row was actually updated.
     pub fn resolve_approval(&self, approval_id: &str, status: &str) -> Result<bool> {
+        if !crate::types::is_valid_approval_status(status) {
+            return Err(AppError::Config(format!(
+                "invalid approval status: {}",
+                status
+            )));
+        }
+
         let changed = self
             .conn
             .execute(
