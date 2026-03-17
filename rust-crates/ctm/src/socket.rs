@@ -42,6 +42,24 @@ pub fn socket_dir() -> std::path::PathBuf {
     config::get_config_dir()
 }
 
+/// L6.5: Check if a process with the given PID is running.
+///
+/// Uses `kill(pid, 0)` which checks for process existence without sending a
+/// signal.  Returns `false` if the process does not exist.  Returns `true` if
+/// the process exists (even if we lack permission to signal it -- EPERM).
+pub fn is_pid_running(pid: u32) -> bool {
+    use nix::sys::signal::kill;
+    use nix::unistd::Pid;
+
+    // Signal 0 (None) does not actually send a signal; it just checks
+    // permissions and process existence.
+    match kill(Pid::from_raw(pid as i32), None) {
+        Ok(()) => true,
+        Err(nix::errno::Errno::EPERM) => true, // process exists, no permission
+        Err(_) => false,                       // ESRCH or other error
+    }
+}
+
 /// Probe the status of a Unix domain socket file.
 ///
 /// Returns:
@@ -518,5 +536,18 @@ mod tests {
     #[test]
     fn max_line_bytes_constant() {
         assert_eq!(MAX_LINE_BYTES, 1_048_576);
+    }
+
+    #[test]
+    fn is_pid_running_self() {
+        // Our own process should be running.
+        let pid = std::process::id();
+        assert!(super::is_pid_running(pid));
+    }
+
+    #[test]
+    fn is_pid_running_nonexistent() {
+        // PID 4294967 is almost certainly not running on any system.
+        assert!(!super::is_pid_running(4_294_967));
     }
 }

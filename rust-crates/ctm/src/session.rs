@@ -76,6 +76,12 @@ fn now_iso() -> String {
 }
 
 /// Manages session and approval lifecycle in SQLite.
+///
+/// L6.9 (INTENTIONAL): There is no explicit `close()` method.  Rust uses RAII:
+/// when a `SessionManager` is dropped, the inner `rusqlite::Connection` is
+/// automatically closed via its `Drop` implementation, which flushes any
+/// pending WAL frames and releases file locks.  An explicit `close()` would be
+/// redundant and would require consuming `self`, complicating ownership.
 pub struct SessionManager {
     conn: Connection,
     approval_timeout_ms: i64,
@@ -239,6 +245,27 @@ impl SessionManager {
         Ok(())
     }
 
+    /// L6.11: Retrieve the thread_id for a session directly, without loading
+    /// the full `Session` struct.  Returns `None` if the session does not exist
+    /// or has no thread_id set.
+    pub fn get_session_thread(&self, session_id: &str) -> Result<Option<i64>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT thread_id FROM sessions WHERE id = ?1")
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        let mut rows = stmt
+            .query_map(params![session_id], |row| row.get::<_, Option<i64>>(0))
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        match rows.next() {
+            Some(Ok(tid)) => Ok(tid),
+            Some(Err(e)) => Err(AppError::Database(e.to_string())),
+            None => Ok(None),
+        }
+    }
+
+    /// L6.10: Clear the thread_id for a session.
     pub fn clear_thread_id(&self, session_id: &str) -> Result<()> {
         self.conn
             .execute(
@@ -774,6 +801,22 @@ mod tests {
         mgr.clear_thread_id("sess-ct").unwrap();
 
         assert!(mgr.get_session_by_thread_id(777).unwrap().is_none());
+    }
+
+    #[test]
+    fn get_session_thread_works() {
+        let (mgr, _tmp) = make_mgr();
+        mgr.create_session("sess-gst", 1, None, None, None, None, None)
+            .unwrap();
+
+        // No thread_id set yet
+        assert_eq!(mgr.get_session_thread("sess-gst").unwrap(), None);
+
+        mgr.set_session_thread("sess-gst", 555).unwrap();
+        assert_eq!(mgr.get_session_thread("sess-gst").unwrap(), Some(555));
+
+        // Non-existent session returns None
+        assert_eq!(mgr.get_session_thread("no-such").unwrap(), None);
     }
 
     #[test]

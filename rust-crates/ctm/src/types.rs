@@ -51,6 +51,10 @@ pub struct SubagentStopEvent {
     /// instead of causing a parse failure.
     #[serde(default)]
     pub subagent_id: Option<String>,
+    /// L6.2: Optional result text from the subagent, mirroring the TS type's
+    /// `result?: string` field.
+    #[serde(default)]
+    pub result: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -85,6 +89,10 @@ pub struct NotificationEvent {
     pub base: HookEventBase,
     #[serde(default)]
     pub message: String,
+    /// L6.3 (INTENTIONAL): `level` is a free-form `Option<String>` rather than a
+    /// Rust enum.  The TypeScript type is `"info" | "warning" | "error"` but serde
+    /// cannot enforce string enum unions from JSON without a custom deserializer.
+    /// Runtime string comparison (`level.as_deref() == Some("error")`) is sufficient.
     #[serde(default)]
     pub level: Option<String>,
     #[serde(default)]
@@ -160,6 +168,11 @@ pub struct SocketClientInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HookResult {
     /// The permission decision: "allow", "deny", or "ask".
+    ///
+    /// L6.12 (INTENTIONAL): `decision` is a free-form `Option<String>` rather than
+    /// a Rust enum.  The TypeScript type is `"allow" | "deny" | "ask"` but serde
+    /// string matching works at runtime without a custom deserializer.  Hook callers
+    /// compare via `decision.as_deref() == Some("allow")` etc.
     pub decision: Option<String>,
     /// Human-readable reason for the decision.
     pub reason: Option<String>,

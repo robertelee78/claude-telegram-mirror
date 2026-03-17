@@ -1651,8 +1651,10 @@ async fn handle_ask_user_question(ctx: &HandlerContext, msg: &BridgeMessage) {
         });
     }
 
+    // H6.1: Use full session_id as the pending_key to avoid collisions.
+    // The short prefix is only used in callback_data (Telegram's 64-byte limit).
     let short_session_id = &msg.session_id[..std::cmp::min(20, msg.session_id.len())];
-    let pending_key = short_session_id.to_string();
+    let pending_key = msg.session_id.clone();
 
     {
         let mut pq = ctx.pending_q.write().await;
@@ -1739,7 +1741,16 @@ async fn handle_ask_user_question(ctx: &HandlerContext, msg: &BridgeMessage) {
     }
 }
 
-/// Escape markdown for Telegram v1 mode.
+/// Escape markdown for Telegram Markdown v1 mode.
+///
+/// M6.1 (INTENTIONAL): This function only escapes backticks because the call
+/// sites use `parse_mode: "Markdown"` (v1), not `"MarkdownV2"`.  In v1 mode,
+/// the only user-supplied text that can break parsing is backticks (which start
+/// code spans).  Replacing them with single quotes is sufficient.
+///
+/// For MarkdownV2 mode, use `formatting::escape_markdown_v2()` which escapes
+/// all 19 special characters.  The two functions are intentionally separate
+/// because their escape requirements differ by parse mode.
 fn escape_markdown(text: &str) -> String {
     text.replace('`', "'")
 }
@@ -1755,6 +1766,15 @@ async fn cleanup_pending_questions(ctx: &HandlerContext, session_id: &str) {
     for k in keys_to_remove {
         pq.remove(&k);
     }
+}
+
+/// H6.1: Resolve a short session_id prefix (from callback_data) to the full
+/// session_id key in the pending_questions map. Returns `None` if no match.
+fn resolve_pending_key<'a>(
+    pq: &'a HashMap<String, PendingQuestion>,
+    short_key: &str,
+) -> Option<&'a String> {
+    pq.keys().find(|k| k.starts_with(short_key))
 }
 
 // ====================================================================== Telegram update handler
@@ -2896,12 +2916,12 @@ async fn handle_answer_callback(ctx: &HandlerContext, data: &str, cb: &CallbackQ
         .bot
         .answer_callback_query(&cb.id, Some("Selected"), false)
         .await;
-    // Format: answer:{sessionId}:{questionIndex}:{optionIndex}
+    // Format: answer:{shortSessionId}:{questionIndex}:{optionIndex}
     let parts: Vec<&str> = data.splitn(4, ':').collect();
     if parts.len() != 4 {
         return;
     }
-    let session_key = parts[1];
+    let short_key = parts[1];
     let q_idx: usize = match parts[2].parse() {
         Ok(v) => v,
         Err(_) => return,
@@ -2912,7 +2932,12 @@ async fn handle_answer_callback(ctx: &HandlerContext, data: &str, cb: &CallbackQ
     };
 
     let mut pq = ctx.pending_q.write().await;
-    let pending = match pq.get_mut(session_key) {
+    // H6.1: Resolve short callback key to full session_id key.
+    let full_key = match resolve_pending_key(&pq, short_key) {
+        Some(k) => k.clone(),
+        None => return,
+    };
+    let pending = match pq.get_mut(&full_key) {
         Some(p) => p,
         None => return,
     };
@@ -2967,9 +2992,8 @@ async fn handle_answer_callback(ctx: &HandlerContext, data: &str, cb: &CallbackQ
 
     // Clean up if all answered
     if pending.answered.iter().all(|a| *a) {
-        let key = session_key.to_string();
         drop(pq);
-        ctx.pending_q.write().await.remove(&key);
+        ctx.pending_q.write().await.remove(&full_key);
     }
 }
 
@@ -2985,7 +3009,7 @@ async fn handle_toggle_callback(ctx: &HandlerContext, data: &str, cb: &CallbackQ
     if parts.len() != 4 {
         return;
     }
-    let session_key = parts[1];
+    let short_key = parts[1];
     let q_idx: usize = match parts[2].parse() {
         Ok(v) => v,
         Err(_) => return,
@@ -2996,7 +3020,12 @@ async fn handle_toggle_callback(ctx: &HandlerContext, data: &str, cb: &CallbackQ
     };
 
     let mut pq = ctx.pending_q.write().await;
-    let pending = match pq.get_mut(session_key) {
+    // H6.1: Resolve short callback key to full session_id key.
+    let full_key = match resolve_pending_key(&pq, short_key) {
+        Some(k) => k.clone(),
+        None => return,
+    };
+    let pending = match pq.get_mut(&full_key) {
         Some(p) => p,
         None => return,
     };
@@ -3027,13 +3056,13 @@ async fn handle_toggle_callback(ctx: &HandlerContext, data: &str, cb: &CallbackQ
                 };
                 InlineButton {
                     text: label,
-                    callback_data: format!("toggle:{session_key}:{q_idx}:{idx}"),
+                    callback_data: format!("toggle:{short_key}:{q_idx}:{idx}"),
                 }
             })
             .collect();
         buttons.push(InlineButton {
             text: "\u{2705} Submit".into(),
-            callback_data: format!("submit:{session_key}:{q_idx}"),
+            callback_data: format!("submit:{short_key}:{q_idx}"),
         });
 
         if let Some(msg) = &cb.message {
@@ -3060,14 +3089,19 @@ async fn handle_submit_callback(ctx: &HandlerContext, data: &str, cb: &CallbackQ
     if parts.len() != 3 {
         return;
     }
-    let session_key = parts[1];
+    let short_key = parts[1];
     let q_idx: usize = match parts[2].parse() {
         Ok(v) => v,
         Err(_) => return,
     };
 
     let mut pq = ctx.pending_q.write().await;
-    let pending = match pq.get_mut(session_key) {
+    // H6.1: Resolve short callback key to full session_id key.
+    let full_key = match resolve_pending_key(&pq, short_key) {
+        Some(k) => k.clone(),
+        None => return,
+    };
+    let pending = match pq.get_mut(&full_key) {
         Some(p) => p,
         None => return,
     };
@@ -3136,9 +3170,8 @@ async fn handle_submit_callback(ctx: &HandlerContext, data: &str, cb: &CallbackQ
     }
 
     if pending.answered.iter().all(|a| *a) {
-        let key = session_key.to_string();
         drop(pq);
-        ctx.pending_q.write().await.remove(&key);
+        ctx.pending_q.write().await.remove(&full_key);
     }
 }
 

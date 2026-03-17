@@ -41,7 +41,13 @@ pub async fn process_hook() -> anyhow::Result<()> {
         }
     };
 
-    // Get session ID and validate
+    // Get session ID and validate.
+    //
+    // L6.4 (INTENTIONAL): Events with missing or invalid session IDs are dropped
+    // rather than generating a synthetic fallback ID.  This is more correct than
+    // the TypeScript implementation which fabricated IDs like `unknown-<timestamp>`,
+    // because synthetic IDs cannot be correlated back to real sessions and produce
+    // orphaned database rows.  Dropping is safe: the event simply goes unmirrored.
     let session_id = get_session_id(&event);
     if !types::is_valid_session_id(&session_id) {
         tracing::warn!(

@@ -38,6 +38,25 @@ fn separator() {
     println!("{}", gray(&"-".repeat(60)));
 }
 
+/// L6.7: Print a text block inside a Unicode box-drawing frame.
+///
+/// Each line of `text` (split on `\n`) is padded to `width` characters and
+/// wrapped in vertical box-drawing characters.  The box is 52 columns wide by
+/// default (inner width 50).
+pub fn print_box(text: &str) {
+    let inner_width = 50;
+    let top = format!("\u{250C}{}\u{2510}", "\u{2500}".repeat(inner_width));
+    let bottom = format!("\u{2514}{}\u{2518}", "\u{2500}".repeat(inner_width));
+
+    println!("{top}");
+    for line in text.lines() {
+        let display_len = line.chars().count();
+        let padding = inner_width.saturating_sub(display_len);
+        println!("\u{2502}{line}{}\u{2502}", " ".repeat(padding));
+    }
+    println!("{bottom}");
+}
+
 // ---------------------------------------------------------------------------
 // Path helpers
 // ---------------------------------------------------------------------------
@@ -113,6 +132,12 @@ async fn test_bot_token(client: &reqwest::Client, token: &str) -> Result<String,
     }
 }
 
+/// L6.8 (INTENTIONAL): `detect_groups` is not exported as a public API.  It is
+/// tightly coupled to the setup wizard flow -- it requires an authenticated
+/// `reqwest::Client` and a bot token, and returns Telegram-specific types that
+/// are private to this module.  Extracting it would require exposing internal
+/// types (`TelegramChat`, `TelegramResponse`, `TelegramUpdate`) with no
+/// external consumer.  It remains `pub(crate)` for testability if needed.
 async fn detect_groups(client: &reqwest::Client, token: &str) -> Vec<TelegramChat> {
     let resp = match client
         .get(format!(
@@ -874,13 +899,15 @@ pub async fn run_setup() -> anyhow::Result<()> {
     );
     println!();
 
-    // L3.7: Project-hooks reminder box
-    println!("\n\u{250C}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2510}");
-    println!("\u{2502}  REMEMBER: If your project has .claude/settings  \u{2502}");
-    println!("\u{2502}  that override global hooks, run:                \u{2502}");
-    println!("\u{2502}    ctm install-hooks -p                          \u{2502}");
-    println!("\u{2502}  from your project directory.                    \u{2502}");
-    println!("\u{2514}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2518}\n");
+    // L3.7: Project-hooks reminder box (L6.7: uses reusable print_box)
+    println!();
+    print_box(
+        "  REMEMBER: If your project has .claude/settings  \n\
+         \x20 that override global hooks, run:                \n\
+         \x20   ctm install-hooks -p                          \n\
+         \x20 from your project directory.                    ",
+    );
+    println!();
 
     Ok(())
 }

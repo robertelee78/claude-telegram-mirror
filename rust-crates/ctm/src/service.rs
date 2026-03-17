@@ -869,6 +869,22 @@ mod tests {
         assert_eq!(strip_inline_comment("no_comment"), "no_comment");
     }
 
+    /// L6.6: Verify parse_env_file handles `KEY="value # not a comment" # real comment`.
+    #[test]
+    fn test_parse_env_file_quoted_inline_comment() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("env");
+        fs::write(
+            &path,
+            "KEY=\"value # not a comment\" # real comment\n\
+             SINGLE='also # not a comment' # real\n",
+        )
+        .unwrap();
+        let vars = parse_env_file(&path);
+        assert_eq!(vars.get("KEY").unwrap(), "value # not a comment");
+        assert_eq!(vars.get("SINGLE").unwrap(), "also # not a comment");
+    }
+
     #[test]
     fn test_escape_xml() {
         assert_eq!(
