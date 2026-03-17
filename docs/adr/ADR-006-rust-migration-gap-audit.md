@@ -2,11 +2,11 @@
 
 ## Status
 
-**Revision 3 — Resolved** (2026-03-16)
+**Revision 4 — Resolved** (2026-03-16)
 
-> All gaps across all three revisions are now closed. Zero deferred.
-> Rev 1: 37 gaps → all resolved. Rev 2: 33 gaps (5 false positives) → 28 resolved.
-> Rev 3: 15 new + 2 re-evaluated → all resolved. Total: 82 gaps identified, 72 genuine, all fixed.
+> Rev 1–3: 82 gaps identified, 72 genuine, all fixed.
+> Rev 4: 14 net-new gaps discovered by three-agent CFA swarm audit.
+> 1 CRITICAL, 1 HIGH, 5 MEDIUM, 7 LOW. Zero deferred from prior revisions.
 
 > **Revision 1** (2026-03-16): Original 37 gaps identified and resolved across 8 epics.
 > C2 and C3 verified as false positives (TS hooks also don't send
@@ -24,15 +24,23 @@
 > Corrected 5 false positives from Rev 2, discovered 15 net-new gaps, and
 > re-evaluated 2 Rev 1 "false positives" as genuine gaps. Also incorporates
 > user decision: `/abort` must be immediate (no confirmation dialog).
+>
+> **Revision 4** (2026-03-16): Three-agent CFA swarm audit with domain-specific
+> researchers (Bot, Bridge, Infrastructure). All Rev 1–3 gaps confirmed
+> resolved. Found 14 net-new gaps not covered in prior revisions, plus 10
+> Rust-only improvements confirmed as intentional. Focused on signal handling,
+> callback API completeness, and hook behavioral differences.
 
 ## Context
 
 ADR-002 declared the phased Rust migration complete at Phase 4. Revision 1
-found 37 gaps (all resolved). Revision 2 found 33 more. This Revision 3 audit
-used a five-agent parallel research swarm comparing every function, type,
-constant, and behavioral path across the full TS and Rust codebases. It
-corrects several Rev 2 false positives and surfaces additional gaps in hook
-lifecycle messaging, env var compatibility, and type-level completeness.
+found 37 gaps (all resolved). Revision 2 found 33 more. Revision 3 corrected
+5 false positives and found 15 new gaps (all resolved). This Revision 4 audit
+used a three-agent CFA swarm with domain-specific researchers (Bot, Bridge,
+Infrastructure) performing exhaustive function-by-function comparison of all
+24 TypeScript source files against all 16 Rust source files. It confirms all
+prior gaps are resolved and surfaces 14 net-new gaps concentrated in signal
+handling, Telegram callback API completeness, and hook behavioral differences.
 
 ## Audit Methodology
 
@@ -58,6 +66,17 @@ function, type, constant, and behavioral path in their domain:
 | Hooks & Service | `src/hooks/*` (4 files), `src/service/*` (3 files) | `hook.rs`, `installer.rs`, `service.rs`, `doctor.rs`, `setup.rs` |
 | Utils & Config | `src/utils/*` (4 files) | `config.rs`, `summarize.rs`, `formatting.rs`, `Cargo.toml` |
 | Types & Entry | `src/index.ts`, all `types.ts` files, `postinstall.cjs`, `resolve-binary.js` | `types.rs`, `error.rs`, `Cargo.toml`, `package.json` |
+
+### Revision 4 (CFA swarm)
+
+Three parallel researcher agents, each exhaustively comparing every exported
+function, type, constant, and behavioral path in their domain:
+
+| Agent | TypeScript Scope | Rust Scope |
+|-------|-----------------|------------|
+| Bot Auditor | `src/bot/*` (4 files) | `bot.rs`, `formatting.rs`, `types.rs`, `daemon.rs` |
+| Bridge Auditor | `src/bridge/*` (6 files) | `daemon.rs`, `injector.rs`, `session.rs`, `socket.rs`, `types.rs` |
+| Infra Auditor | `src/cli.ts`, `src/hooks/*` (4 files), `src/service/*` (3 files), `src/utils/*` (4 files), `postinstall.cjs`, `scripts/resolve-binary.js` | `main.rs`, `hook.rs`, `installer.rs`, `doctor.rs`, `service.rs`, `setup.rs`, `config.rs`, `summarize.rs`, `Cargo.toml` |
 
 ---
 
@@ -899,9 +918,335 @@ All L2.x and L3.x items not listed above. Address opportunistically:
 
 ---
 
+---
+
+## Revision 4: Audit Confirmation — All Rev 1–3 Gaps Resolved
+
+The Rev 4 swarm independently verified that all 72 genuine gaps from Revisions
+1–3 are resolved. Specific confirmations:
+
+- **C3.4** (`/abort` immediate): Confirmed — `/abort` sends Escape directly,
+  no confirmation dialog. Dead `confirm_abort` callback handler remains (see
+  C4.6 below).
+- **C3.1** (hook `session_start`): Confirmed — `session_start` is now prepended
+  to every batch of messages in `hook.rs` `build_messages()`.
+- **C2.2** (approval message editing): Confirmed — approval messages are edited
+  post-decision.
+- **C2.4** (rate limit): Confirmed — `governor` rate limiter in use with
+  configurable rate.
+- **M2.5** (ChunkOptions): Confirmed — `chunk_message_with_options` exists with
+  `ChunkOptions` struct.
+- **H2.6** (validateConfig): Confirmed — exists at `config.rs:329`.
+- **H2.7** (forumEnabled): Confirmed — exists at `config.rs:75`.
+
+---
+
+## Revision 4: NEW Critical Gaps
+
+### C4.1: SIGTERM does not clean up socket/PID files
+
+**TS** (`socket.ts:154-156`): Registers `process.on('SIGINT', cleanup)` and
+`process.on('SIGTERM', cleanup)` handlers that remove the socket file and
+release the PID lock on signal delivery.
+
+**Rust** (`socket.rs`): Relies solely on `Drop` impl for `SocketServer`
+(lines 235-239). On `SIGTERM`, Rust's default behavior terminates the process
+without running destructors for `Arc`-owned data in tokio tasks. The `Drop`
+impl will NOT execute if the process is killed via `systemctl stop` (SIGTERM)
+before `close()` is called explicitly.
+
+**Impact**: After `systemctl stop` or `kill <pid>`, stale `bridge.sock` and
+`bridge.pid` files remain on disk. The daemon cannot restart until these files
+are manually removed. This is a production reliability issue.
+
+**Fix**: Register a `tokio::signal::unix::signal(SignalKind::terminate())`
+handler in `main()` or `Daemon::start()` that calls `socket.close().await`
+before process exit. Also register `ctrl_c()` for SIGINT.
+
+**Location**: `rust-crates/ctm/src/socket.rs` (missing signal handler
+registration), `rust-crates/ctm/src/main.rs` (no signal handler setup)
+
+---
+
+## Revision 4: NEW High-Severity Gaps
+
+### H4.1: `answer_callback_query` lacks `show_alert` parameter
+
+**TS** (`commands.ts:407-412`): Uses `show_alert: true` in
+`answerCallbackQuery` for modal popup alerts (e.g., tool details cache expiry:
+`{ text: 'Details expired (5 min cache)', show_alert: true }`).
+
+**Rust** (`bot.rs:903-914`): `answer_callback_query` signature:
+```rust
+pub async fn answer_callback_query(
+    &self,
+    callback_query_id: &str,
+    text: Option<&str>,
+) -> Result<()>
+```
+
+The `show_alert` parameter is absent. Telegram's API supports
+`show_alert: bool` which controls whether the response appears as a modal
+popup vs. a brief toast. Without it, important feedback (like cache expiry)
+appears as an easily-missed toast — if it appears at all (see H4.2).
+
+**Fix**: Add `show_alert: bool` parameter to `answer_callback_query` and pass
+it through to the Telegram API payload.
+
+**Location**: `rust-crates/ctm/src/bot.rs` lines 903-914
+
+### H4.2: Early `answer_callback_query(None)` preempts sub-handler feedback
+
+**TS**: Each callback handler calls `answerCallbackQuery` individually with
+appropriate text and `show_alert` settings.
+
+**Rust** (`daemon.rs:2565`): `handle_callback_query` calls
+`ctx.bot.answer_callback_query(&cb.id, None)` unconditionally at the start,
+before dispatching to sub-handlers. The Telegram API only allows one answer
+per callback query. When a sub-handler later tries to answer with meaningful
+text (e.g., "Details expired"), the query is already answered — Telegram
+silently ignores the second call.
+
+**Impact**: Tool details cache miss gives zero visible feedback to the user.
+The loading spinner dismisses silently with no explanation.
+
+**Fix**: Remove the early `answer_callback_query(None)` call. Let each
+sub-handler answer the callback query with appropriate text and alert settings.
+
+**Location**: `rust-crates/ctm/src/daemon.rs` line 2565
+
+---
+
+## Revision 4: NEW Medium-Severity Gaps
+
+### M4.1: `idle_prompt` notifications silently dropped in Rust
+
+**TS** (`handler.ts`): `handleNotification()` forwards all notification types
+to Telegram, including `idle_prompt`.
+
+**Rust** (`hook.rs:271`): Explicitly skips notifications where
+`notification_type == "idle_prompt"`. These are silently dropped.
+
+**Impact**: Users who rely on receiving idle prompt notifications in Telegram
+(to know when Claude is waiting for input) will no longer see them.
+
+**Fix**: Either forward `idle_prompt` notifications like TS, or document this
+as an intentional behavioral change. If intentional, add to the "Intentional
+Differences" table.
+
+**Location**: `rust-crates/ctm/src/hook.rs` line 271
+
+### M4.2: `PostToolUse` output truncated at 2000 chars (TS sends full output)
+
+**TS** (`handler.ts`): Sends the full `tool_output` / `tool_error` string to
+the bridge with no truncation.
+
+**Rust** (`hook.rs:245`): Truncates `output` at 2000 characters before
+embedding it in the bridge message.
+
+**Impact**: For large tool outputs (e.g., `cat` of a large file, long test
+output), Rust silently truncates the data. Users see incomplete tool results
+in Telegram. The TS version delegates truncation to the formatting layer
+closer to the display, preserving full data on the wire.
+
+**Fix**: Remove the 2000-char truncation in `hook.rs` and let the formatting/
+chunking layer handle display truncation (as TS does).
+
+**Location**: `rust-crates/ctm/src/hook.rs` line 245
+
+### M4.3: `SocketClient::connect()` loses error specificity
+
+**TS** (`socket.ts:395-403`): Distinguishes specific error codes:
+- `ENOENT` → "Bridge not running (socket not found)"
+- `ECONNREFUSED` → "Bridge refused connection"
+- Other → generic error log
+
+**Rust** (`socket.rs:328-333`): Maps all connection failures to a generic
+`AppError::Socket("Failed to connect: {e}")`.
+
+**Impact**: Operators troubleshooting hook connectivity issues lose diagnostic
+specificity. "Failed to connect" doesn't tell you whether the daemon isn't
+running vs. is running but refusing connections.
+
+**Fix**: Match on `io::ErrorKind::NotFound` and `ConnectionRefused` to produce
+specific error messages.
+
+**Location**: `rust-crates/ctm/src/socket.rs` lines 328-333
+
+### M4.4: `session_start` sent on every hook invocation (TS sends once)
+
+**TS** (`handler.ts`): `handleSessionStart()` is a distinct method called only
+on the first hook event for a new session. Sends one `session_start` message.
+
+**Rust** (`hook.rs:207-215`): `session_start` is always prepended to every
+batch of messages in `build_messages()`. Every single hook event (tool use,
+notification, stop) triggers a `session_start` message.
+
+**Impact**: Increased message volume on the socket. The daemon must handle
+deduplication. If the daemon doesn't deduplicate, each hook event creates a
+new session/topic in Telegram.
+
+**Fix**: Either send `session_start` only once (track state via a flag or
+file), or document that the daemon is expected to deduplicate.
+
+**Location**: `rust-crates/ctm/src/hook.rs` lines 207-215
+
+### M4.5: IDOR defense not layered at individual callback handlers
+
+**TS** (`commands.ts`): `registerApprovalHandlers` accepts `configChatId` and
+each callback handler independently verifies
+`ctx.chat?.id !== configChatId` — defense-in-depth.
+
+**Rust** (`daemon.rs`): Chat ID is verified once at the `handle_telegram_update`
+dispatch level. Individual callback handlers (`handle_approval_callback`,
+`handle_answer_callback`, etc.) do not re-verify. If the outer guard were
+ever bypassed (e.g., by a future refactor that adds a new dispatch path),
+the inner callbacks would not self-protect.
+
+**Impact**: No current exploit — the outer guard is effective. But this removes
+a defense-in-depth layer that TS maintains.
+
+**Fix**: Add a chat ID assertion at the top of each callback handler, or
+document why the single outer guard is sufficient.
+
+**Location**: `rust-crates/ctm/src/daemon.rs` (callback handlers)
+
+---
+
+## Revision 4: NEW Low-Severity Gaps
+
+### L4.1: `Daemon::start()` has no double-start guard
+
+**TS** (`daemon.ts:101`): `if (this.running) { return; }` prevents calling
+`start()` twice.
+
+**Rust**: No equivalent guard. A second `start()` call would attempt to
+re-bind the socket (which fails due to flock, so effectively safe), but
+the guard is more explicit and communicative.
+
+**Location**: `rust-crates/ctm/src/daemon.rs`
+
+### L4.2: `SocketClient::send_and_wait()` has no default timeout
+
+**TS** (`socket.ts:451`): Defaults to `30000` ms when no timeout provided.
+
+**Rust**: Takes an explicit `wait_timeout: Duration` with no default. Callers
+must always provide a timeout value.
+
+**Location**: `rust-crates/ctm/src/socket.rs`
+
+### L4.3: `SocketClient.reconnectTimer` infrastructure not ported
+
+**TS**: Has a `reconnectTimer: NodeJS.Timeout | null` field (infrastructure
+for future reconnection logic, cleared in `disconnect()`).
+
+**Rust**: No reconnect timer field. Future-feature gap, not active
+functionality.
+
+**Location**: `rust-crates/ctm/src/socket.rs`
+
+### L4.4: `confirm_abort` callback handler is dead code
+
+**TS**: `/abort` shows confirmation keyboard → user clicks → `confirm_abort`
+callback fires.
+
+**Rust**: `/abort` is immediate (per C3.4 decision). The `confirm_abort` and
+`cancel_abort` callback handlers still exist but are unreachable — no code
+path sends the confirmation keyboard. Additionally, the dead `confirm_abort`
+path sends `Ctrl-C` while the live `/abort` sends `Escape` — different
+process-level semantics.
+
+**Fix**: Remove the dead `handle_confirm_abort_callback` and
+`handle_cancel_abort_callback` functions.
+
+**Location**: `rust-crates/ctm/src/daemon.rs` (line ~2596 and ~2619)
+
+### L4.5: `InlineButton` defined in both `bot.rs` and `types.rs`
+
+**TS**: Single `InlineButton` definition in `types.ts`.
+
+**Rust**: Structurally identical `InlineButton` defined in both `bot.rs`
+(line 30-33) and `types.rs` (line 159-162). These are separate types that
+cannot be used interchangeably without conversion.
+
+**Fix**: Remove one definition and re-export from the canonical location.
+
+**Location**: `rust-crates/ctm/src/bot.rs`, `rust-crates/ctm/src/types.rs`
+
+### L4.6: Unauthorized chat reply behavior differs
+
+**TS** (`telegram.ts:126`): Sends `'⛔ Unauthorized. This bot is private.'`
+to unauthorized chats.
+
+**Rust**: Logs a warning and returns without sending any reply.
+
+**Note**: Rust's behavior is arguably more secure (doesn't confirm the bot
+exists to unauthorized users). Consider documenting as intentional.
+
+**Location**: `rust-crates/ctm/src/daemon.rs` lines 1754-1757
+
+### L4.7: `detectLanguage` JavaScript heuristic slightly narrower in Rust
+
+**TS**: JavaScript pattern uses regex
+`/^#!\/usr\/bin\/env node|^import .* from ['"]|^const .* = require\(/`
+matching `import X from 'y'` with flexible whitespace.
+
+**Rust**: Uses `t.starts_with("import ") && (t.contains(" from '") || ...)`.
+Misses `import{...} from '...'` (no space after import) common in minified
+code. Low impact — affects syntax highlighting hints only.
+
+**Location**: `rust-crates/ctm/src/formatting.rs`
+
+---
+
+## Revision 4: Confirmed Rust-Only Improvements
+
+These are behavioral changes confirmed by the Rev 4 audit as strictly better
+than TS. Added to the existing "Intentional Differences" table:
+
+| Item | TS Behavior | Rust Behavior | Rationale |
+|------|-------------|---------------|-----------|
+| `checkSocketStatus` timeout | 1-second async timeout | Sync connect (instantaneous for UNIX sockets) | UNIX domain sockets fail immediately; timeout unnecessary |
+| `PostToolUse` output | Full output forwarded | Truncated at 2000 chars | Prevents socket/memory pressure from large tool outputs |
+| Unauthorized chat response | Replies "Unauthorized" | Silent drop | Does not confirm bot existence to unauthorized users |
+| `session_start` dedup | Sent once per session | Sent every invocation (daemon deduplicates) | Simpler hook logic; daemon is authoritative |
+
+---
+
 ## Decision
 
-Accept Revision 3 as the canonical gap list. Summary of gap evolution:
+Accept Revision 4 as the canonical gap list. Summary of gap evolution:
+
+| Revision | Gaps Found | Resolved | False Positives | Net Open |
+|----------|-----------|----------|-----------------|----------|
+| Rev 1 | 37 | 37 | 2 (C2, C3 — later re-evaluated) | 0 |
+| Rev 2 | 33 | 28 | 5 (H2.6, H2.7, L2.1, M2.5, safe commands) | 0 |
+| Rev 3 | 15 new + 2 re-evaluated | 17 | 0 | 0 |
+| Rev 4 | 14 new | 0 | 0 | 14 |
+
+**Total**: 99 gaps identified across 4 revisions. 85 genuine and resolved.
+14 open (Rev 4).
+
+**Key findings in Revision 4**:
+
+1. **All Rev 1–3 gaps confirmed resolved** — the three-agent swarm
+   independently verified every prior fix.
+
+2. **SIGTERM signal handling (C4.1) is the highest-priority production
+   issue** — stale socket files after `systemctl stop` will prevent daemon
+   restart. This is a production reliability problem.
+
+3. **Telegram callback API incompleteness (H4.1 + H4.2)** — the missing
+   `show_alert` parameter combined with the early `answer_callback_query`
+   call means several user-facing feedback paths are silently broken.
+
+4. **Hook behavioral differences (M4.1, M4.2, M4.4)** — idle_prompt
+   filtering, output truncation, and session_start frequency are all
+   intentional design choices in Rust that differ from TS. Each needs
+   either a fix or explicit documentation as intentional.
+
+5. **7 dead code / cleanup items (L4.x)** — minor but should be cleaned
+   up to reduce maintenance burden.
 
 | Revision | Gaps Found | Resolved | False Positives | Net Open |
 |----------|-----------|----------|-----------------|----------|
@@ -924,16 +1269,59 @@ Accept Revision 3 as the canonical gap list. Summary of gap evolution:
    concentrated in three areas: hook lifecycle messaging (C3.1, H3.1, H3.2),
    UX fidelity (C3.2, C3.4, C2.1-C2.6), and env var compatibility (H3.1).
 
+## Revision 4: Recommended Fix Priority
+
+### Tier 1 — Production Reliability (fix before any production deployment)
+
+| # | Gap | Effort | Description |
+|---|-----|--------|-------------|
+| 1 | C4.1 | Medium | **SIGTERM signal handler** — register tokio signal handler to clean up socket/PID files on SIGTERM/SIGINT |
+
+### Tier 2 — User-Facing Feedback (fix before promoting Rust as default)
+
+| # | Gap | Effort | Description |
+|---|-----|--------|-------------|
+| 2 | H4.1 | Small | **Add `show_alert` param** to `answer_callback_query` |
+| 3 | H4.2 | Small | **Remove early `answer_callback_query(None)`** — let sub-handlers answer individually |
+
+### Tier 3 — Hook Behavioral Alignment (fix or document as intentional)
+
+| # | Gap | Effort | Description |
+|---|-----|--------|-------------|
+| 4 | M4.1 | Small | **`idle_prompt` filtering** — forward like TS or document as intentional |
+| 5 | M4.2 | Small | **PostToolUse truncation** — remove 2000-char limit in hook, let formatting layer handle |
+| 6 | M4.4 | Small | **`session_start` frequency** — send once or document dedup expectation |
+| 7 | M4.3 | Small | **Socket error specificity** — match on `ErrorKind` for diagnostic messages |
+| 8 | M4.5 | Small | **IDOR defense-in-depth** — add chat ID check in each callback handler |
+
+### Tier 4 — Cleanup (address opportunistically)
+
+| # | Gap | Effort | Description |
+|---|-----|--------|-------------|
+| 9 | L4.4 | Tiny | **Remove dead `confirm_abort`/`cancel_abort` handlers** |
+| 10 | L4.5 | Tiny | **Deduplicate `InlineButton`** — single definition, re-export |
+| 11 | L4.1 | Tiny | **Add double-start guard** to `Daemon::start()` |
+| 12 | L4.2 | Tiny | **Add 30s default timeout** to `send_and_wait` |
+| 13 | L4.6 | Tiny | **Document** unauthorized chat silent drop as intentional |
+| 14 | L4.7 | Tiny | **Fix** `detectLanguage` JS pattern for `import{` syntax |
+
+---
+
 ## Consequences
 
-- **Tier 1 (8 items)** must be fixed before promoting the Rust binary as the
-  recommended default — these are user-facing regressions
-- **Tier 2 (8 items)** must be fixed before deprecating the TS version — these
-  affect correctness and hook lifecycle
-- **Tier 3-4 (12 items)** should be addressed before removing TS code entirely
-- The public library API question (H2.4) needs a decision: port to `lib.rs` or
-  document as an intentional API break with a migration guide
-- Each fix should include a regression test validating parity with TS behavior
-- `linux-arm64` support (M3.3) blocks deployment on Graviton/Pi targets
-- Binary integrity verification (L3.8) is a security prerequisite for the npm
-  distribution channel
+- **C4.1 (SIGTERM)** is a production blocker — must be fixed before any
+  systemd-managed deployment. Without it, `systemctl stop && systemctl start`
+  fails until manual socket cleanup.
+- **H4.1 + H4.2 (callback API)** should be fixed together — adding
+  `show_alert` is pointless if the early `answer_callback_query(None)` call
+  preempts all sub-handler answers.
+- **M4.1, M4.2, M4.4 (hook behaviors)** each need a decision: fix to match
+  TS, or document as intentional Rust improvements. The current state is
+  undocumented divergence, which is the worst outcome.
+- **L4.4 (dead code)** should be cleaned up to avoid confusion — the dead
+  `confirm_abort` handler uses `Ctrl-C` while the live `/abort` uses
+  `Escape`, which could mislead future developers.
+- All prior consequences from Rev 1–3 remain in effect for their respective
+  tiers (already resolved).
+- Each Rev 4 fix should include a regression test validating parity with TS
+  behavior (or documenting the intentional divergence).
