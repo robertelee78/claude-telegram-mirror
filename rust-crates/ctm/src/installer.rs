@@ -178,9 +178,13 @@ impl std::fmt::Display for HookChangeStatus {
     }
 }
 
+#[allow(dead_code)]
 pub struct HookChangeReport {
     pub hook_type: String,
     pub status: HookChangeStatus,
+    /// Human-readable description of what changed (e.g. "added ctm hook",
+    /// "updated from old path", "no changes").
+    pub details: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -205,26 +209,7 @@ pub fn install_hooks_for_project(project_path: &Path) -> anyhow::Result<()> {
     println!("\nClaude Code Telegram Hook Installation (project)\n");
     println!("Settings: {}\n", settings_path.display());
 
-    let mut any_changed = false;
-    for report in &changes {
-        let icon = match report.status {
-            HookChangeStatus::Added => "+",
-            HookChangeStatus::Updated => "~",
-            HookChangeStatus::Unchanged => " ",
-        };
-        println!("  [{icon}] {}: {}", report.hook_type, report.status);
-        if report.status != HookChangeStatus::Unchanged {
-            any_changed = true;
-        }
-    }
-    println!();
-
-    if any_changed {
-        println!("Hooks installed successfully.");
-    } else {
-        println!("All hooks already up to date.");
-    }
-    println!();
+    print_install_results(&changes);
 
     Ok(())
 }
@@ -233,14 +218,25 @@ pub fn install_hooks_for_project(project_path: &Path) -> anyhow::Result<()> {
 ///
 /// Returns the list of changes made. Idempotent: running twice produces
 /// no changes on the second invocation.
+///
+/// When `custom_path` is provided it is used instead of `current_dir()` for
+/// project-mode installations, avoiding reliance on mutable process state.
 pub fn install_hooks(project: bool) -> anyhow::Result<()> {
+    install_hooks_with_path(project, None)
+}
+
+/// Like `install_hooks` but accepts an optional explicit project directory.
+pub fn install_hooks_with_path(project: bool, custom_path: Option<&Path>) -> anyhow::Result<()> {
     let (settings_path, config_dir) = if project {
-        let cwd = std::env::current_dir()?;
-        let project_dir = cwd.join(".claude");
+        let base = match custom_path {
+            Some(p) => p.to_path_buf(),
+            None => std::env::current_dir()?,
+        };
+        let project_dir = base.join(".claude");
         if !project_dir.exists() {
             anyhow::bail!(
                 "No .claude directory found in {}. Run from a Claude project directory.",
-                cwd.display()
+                base.display()
             );
         }
         (project_dir.join("settings.json"), project_dir)
@@ -255,14 +251,26 @@ pub fn install_hooks(project: bool) -> anyhow::Result<()> {
     println!("\nClaude Code Telegram Hook Installation ({location})\n");
     println!("Settings: {}\n", settings_path.display());
 
+    print_install_results(&changes);
+
+    Ok(())
+}
+
+/// Print install results with emoji indicators and a restart reminder.
+fn print_install_results(changes: &[HookChangeReport]) {
     let mut any_changed = false;
-    for report in &changes {
+    for report in changes {
         let icon = match report.status {
-            HookChangeStatus::Added => "+",
-            HookChangeStatus::Updated => "~",
-            HookChangeStatus::Unchanged => " ",
+            HookChangeStatus::Added => "\u{2705}",     // checkmark
+            HookChangeStatus::Updated => "\u{1F504}",  // arrows
+            HookChangeStatus::Unchanged => "\u{2713}", // simple check
         };
-        println!("  [{icon}] {}: {}", report.hook_type, report.status);
+        let label = match report.status {
+            HookChangeStatus::Added => "Added",
+            HookChangeStatus::Updated => "Updated",
+            HookChangeStatus::Unchanged => "Already correct",
+        };
+        println!("  {icon} {}: {label}", report.hook_type);
         if report.status != HookChangeStatus::Unchanged {
             any_changed = true;
         }
@@ -271,12 +279,11 @@ pub fn install_hooks(project: bool) -> anyhow::Result<()> {
 
     if any_changed {
         println!("Hooks installed successfully.");
+        println!("\u{1F4A1} Restart Claude Code to activate changes.");
     } else {
         println!("All hooks already up to date.");
     }
     println!();
-
-    Ok(())
 }
 
 /// Core logic: install hooks to a specific settings path.
@@ -304,13 +311,15 @@ fn install_hooks_to_path(
         let existing = settings["hooks"].get(hook_type);
 
         let status = determine_change_status(existing, &expected);
+        let details = match &status {
+            HookChangeStatus::Added => "added ctm hook".to_string(),
+            HookChangeStatus::Updated => "updated from old path".to_string(),
+            HookChangeStatus::Unchanged => "no changes".to_string(),
+        };
         changes.push(HookChangeReport {
             hook_type: hook_type.to_string(),
-            status: if status == HookChangeStatus::Unchanged {
-                HookChangeStatus::Unchanged
-            } else {
-                status
-            },
+            status,
+            details,
         });
 
         if changes.last().unwrap().status != HookChangeStatus::Unchanged {
@@ -442,14 +451,54 @@ pub fn uninstall_hooks() -> anyhow::Result<()> {
 // Status
 // ---------------------------------------------------------------------------
 
+/// Programmatic hook status report.
+#[allow(dead_code)]
+pub struct HookStatus {
+    /// Whether all expected hook types are installed.
+    pub installed: bool,
+    /// List of hook types that have a CTM hook installed.
+    pub hook_types: Vec<String>,
+    /// Any errors encountered while checking.
+    pub errors: Vec<String>,
+}
+
+/// Check hook installation status without printing anything.
+pub fn check_hook_status() -> HookStatus {
+    let settings_path = global_settings_path();
+    let settings = read_settings(&settings_path);
+    let mut hook_types = Vec::new();
+    let errors = Vec::new();
+
+    for &hook_type in HOOK_TYPES {
+        let hooks = settings
+            .get("hooks")
+            .and_then(|h| h.get(hook_type))
+            .and_then(|v| v.as_array());
+
+        let has_ctm = hooks
+            .map(|arr| arr.iter().any(item_is_ctm))
+            .unwrap_or(false);
+
+        if has_ctm {
+            hook_types.push(hook_type.to_string());
+        }
+    }
+
+    let installed = hook_types.len() == HOOK_TYPES.len();
+    HookStatus {
+        installed,
+        hook_types,
+        errors,
+    }
+}
+
 pub fn print_hook_status() -> anyhow::Result<()> {
     let settings_path = global_settings_path();
     let settings = read_settings(&settings_path);
+    let status = check_hook_status();
 
     println!("\nClaude Code Telegram Hook Status\n");
     println!("Settings: {}\n", settings_path.display());
-
-    let mut installed_count = 0;
 
     for &hook_type in HOOK_TYPES {
         let hooks = settings
@@ -463,7 +512,6 @@ pub fn print_hook_status() -> anyhow::Result<()> {
 
         let icon = if has_ctm { "OK" } else { "--" };
         let cmd_display = if has_ctm {
-            // Extract the CTM command for display
             let cmd = hooks
                 .and_then(|arr| {
                     arr.iter().find(|item| item_is_ctm(item)).and_then(|item| {
@@ -482,12 +530,10 @@ pub fn print_hook_status() -> anyhow::Result<()> {
         };
 
         println!("  [{icon}] {hook_type}{cmd_display}");
-        if has_ctm {
-            installed_count += 1;
-        }
     }
 
     println!();
+    let installed_count = status.hook_types.len();
     if installed_count == HOOK_TYPES.len() {
         println!("All hooks installed.");
     } else if installed_count > 0 {

@@ -113,6 +113,27 @@ struct ConfigFile {
     socket_path: Option<String>,
 }
 
+/// Fast-path check: is Telegram mirroring enabled based on env vars alone?
+///
+/// Returns `true` only when all three environment variables are set:
+/// `TELEGRAM_MIRROR` is `"true"` or `"1"`, `TELEGRAM_BOT_TOKEN` is non-empty,
+/// and `TELEGRAM_CHAT_ID` is non-empty. This avoids loading config files for
+/// callers that just need a quick guard.
+pub fn is_mirror_enabled() -> bool {
+    std::env::var("TELEGRAM_MIRROR")
+        .ok()
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false)
+        && std::env::var("TELEGRAM_BOT_TOKEN")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .is_some()
+        && std::env::var("TELEGRAM_CHAT_ID")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .is_some()
+}
+
 /// Get the config directory path
 pub fn get_config_dir() -> PathBuf {
     dirs::home_dir()

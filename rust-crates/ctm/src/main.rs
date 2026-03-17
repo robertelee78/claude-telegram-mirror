@@ -184,7 +184,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Stop { force } => cmd_stop(force).await,
         Commands::Restart { verbose } => cmd_restart(verbose).await,
         Commands::Status => cmd_status(),
-        Commands::Config { show: _, test } => cmd_config(test).await,
+        Commands::Config { show, test } => cmd_config(show, test).await,
 
         // Phase 4: Native Rust implementations — no TypeScript delegation
         Commands::InstallHooks { project } => installer::install_hooks(project),
@@ -375,35 +375,35 @@ fn cmd_status() -> anyhow::Result<()> {
     if service::is_service_installed() {
         let svc_status = service::get_service_status();
         if svc_status.running {
-            println!("  Status: Running (via system service)");
+            println!("  \u{1F7E2} Status: Running (via system service)");
             daemon_running = true;
         } else if pid_file.exists() {
             if let Ok(pid_str) = fs::read_to_string(&pid_file) {
                 if let Ok(pid) = pid_str.trim().parse::<i32>() {
                     if is_process_running(pid) {
-                        println!("  Status: Running (PID {pid})");
+                        println!("  \u{1F7E2} Status: Running (PID {pid})");
                         daemon_running = true;
                     } else {
-                        println!("  Status: Not running (stale PID file)");
+                        println!("  \u{1F534} Status: Not running (stale PID file)");
                     }
                 }
             }
         } else {
-            println!("  Status: Not running");
+            println!("  \u{1F534} Status: Not running");
         }
     } else if pid_file.exists() {
         if let Ok(pid_str) = fs::read_to_string(&pid_file) {
             if let Ok(pid) = pid_str.trim().parse::<i32>() {
                 if is_process_running(pid) {
-                    println!("  Status: Running (PID {pid})");
+                    println!("  \u{1F7E2} Status: Running (PID {pid})");
                     daemon_running = true;
                 } else {
-                    println!("  Status: Not running (stale PID file)");
+                    println!("  \u{1F534} Status: Not running (stale PID file)");
                 }
             }
         }
     } else {
-        println!("  Status: Not running");
+        println!("  \u{1F534} Status: Not running");
     }
 
     if socket_file.exists() {
@@ -420,20 +420,27 @@ fn cmd_status() -> anyhow::Result<()> {
     println!(
         "  Bot Token: {}",
         if cfg.bot_token.is_empty() {
-            "Not set"
+            "\u{274C} Not set"
         } else {
-            "Set"
+            "\u{2705} Set"
         }
     );
     println!(
         "  Chat ID: {}",
         if cfg.chat_id == 0 {
-            "Not set".to_string()
+            "\u{274C} Not set".to_string()
         } else {
-            cfg.chat_id.to_string()
+            format!("\u{2705} {}", cfg.chat_id)
         }
     );
-    println!("  Enabled: {}", cfg.enabled);
+    println!(
+        "  Enabled: {}",
+        if cfg.enabled {
+            "\u{2705} true"
+        } else {
+            "\u{274C} false"
+        }
+    );
     println!("  Verbose: {}", cfg.verbose);
     println!();
 
@@ -444,7 +451,11 @@ fn cmd_status() -> anyhow::Result<()> {
 }
 
 /// Show or test configuration.
-async fn cmd_config(test: bool) -> anyhow::Result<()> {
+///
+/// When `--show` is passed the flag is explicitly handled (it triggers the
+/// default config display). Without `--show` the behaviour is identical —
+/// `--show` exists for discoverability and script explicitness.
+async fn cmd_config(show: bool, test: bool) -> anyhow::Result<()> {
     let cfg = config::load_config(false)?;
 
     if test {
@@ -490,7 +501,8 @@ async fn cmd_config(test: bool) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Default: show config
+    // Default: show config (--show flag triggers this explicitly; absence does too)
+    let _ = show; // consumed — both paths display config
     println!("\nConfiguration\n");
     println!("Environment Variables:");
     println!("  TELEGRAM_MIRROR={}", cfg.enabled);

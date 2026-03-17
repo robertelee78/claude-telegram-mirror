@@ -131,6 +131,17 @@ pub struct BridgeMessage {
     pub metadata: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
+/// Information about a connected socket client (mirrors TS `SocketClientInfo`).
+#[derive(Debug, Clone)]
+pub struct SocketClientInfo {
+    /// Unique client identifier (assigned on connect).
+    pub id: String,
+    /// Epoch millis when the client connected.
+    pub connected_at: u64,
+    /// Session ID the client is associated with, if known.
+    pub session_id: Option<String>,
+}
+
 /// Whitelist of safe Bash commands that auto-approve without Telegram confirmation
 pub const SAFE_COMMANDS: &[&str] = &[
     "ls", "pwd", "cat", "head", "tail", "echo", "grep", "find", "which",
