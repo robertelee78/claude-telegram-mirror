@@ -628,6 +628,14 @@ async fn wait_for_exit(pid: i32, timeout_ms: u64) -> bool {
     false
 }
 
+/// Remove stale PID and socket files after a daemon stops or crashes.
+///
+/// NOTE (R2-B6): The socket path is hardcoded to `bridge.sock` here because
+/// `cleanup_stale_files` only receives `config_dir`.  If the operator has
+/// overridden `TELEGRAM_BRIDGE_SOCKET` to point outside of `config_dir`, this
+/// function will not remove the custom socket file.  The PID file flock in
+/// `SocketServer::listen()` prevents a second daemon from starting regardless,
+/// so this is a cleanup-only limitation and does not affect correctness.
 fn cleanup_stale_files(config_dir: &std::path::Path) {
     let pid = config_dir.join("bridge.pid");
     let sock = config_dir.join("bridge.sock");
