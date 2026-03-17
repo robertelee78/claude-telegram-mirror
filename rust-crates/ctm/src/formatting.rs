@@ -486,7 +486,9 @@ impl Default for ChunkOptions {
 /// - Adds "Part N/M" headers when multi-chunk (when `add_part_headers` is true).
 pub fn chunk_message_with_options(text: &str, opts: &ChunkOptions) -> Vec<String> {
     let max_length = opts.max_length;
-    if text.len() <= max_length {
+
+    // Bug 1 fix: use character count, not byte length.
+    if text.chars().count() <= max_length {
         return vec![text.to_string()];
     }
 
@@ -496,20 +498,35 @@ pub fn chunk_message_with_options(text: &str, opts: &ChunkOptions) -> Vec<String
         Vec::new()
     };
 
-    let mut chunks = Vec::new();
+    // Bug 3 fix: reserve space for part headers BEFORE splitting so that
+    // the header does not push any chunk over max_length.
+    // Header format: "📄 *Part N/M*\n\n" — we conservatively reserve 30 chars.
+    // We only apply the overhead when headers are actually requested, and we
+    // do a two-pass approach: first split with effective_max, then add headers.
+    let header_overhead: usize = if opts.add_part_headers { 30 } else { 0 };
+    let effective_max = max_length.saturating_sub(header_overhead);
+
+    let mut chunks: Vec<String> = Vec::new();
     let mut remaining = text;
     let mut offset = 0usize;
 
     while !remaining.is_empty() {
-        if remaining.len() <= max_length {
+        // Bug 1 fix: use character count, not byte length.
+        if remaining.chars().count() <= effective_max {
             chunks.push(remaining.to_string());
             break;
         }
 
-        let split = find_best_split_point(remaining, max_length, &code_blocks, offset);
+        let split = find_best_split_point(remaining, effective_max, &code_blocks, offset);
         let chunk = remaining[..split].trim_end().to_string();
-        remaining = remaining[split..].trim_start();
-        offset += split;
+
+        // Bug 4 fix: account for bytes consumed by trim_start() when advancing offset.
+        let after_split = &remaining[split..];
+        let trimmed = after_split.trim_start();
+        let trim_bytes = after_split.len() - trimmed.len();
+        remaining = trimmed;
+        offset += split + trim_bytes;
+
         chunks.push(chunk);
     }
 
@@ -570,17 +587,40 @@ fn is_inside_code_block(pos: usize, blocks: &[CodeBlock]) -> bool {
     blocks.iter().any(|b| pos > b.start && pos < b.end)
 }
 
+/// Convert a character position to a byte position within `text`.
+///
+/// Returns the byte index at which the character at position `char_pos` starts.
+/// If `char_pos` is beyond the end of `text`, returns `text.len()`.
+fn char_pos_to_byte_pos(text: &str, char_pos: usize) -> usize {
+    text.char_indices()
+        .nth(char_pos)
+        .map(|(byte_idx, _)| byte_idx)
+        .unwrap_or(text.len())
+}
+
+/// Find the best byte-offset split point in `text` near the given `target`
+/// character position.
+///
+/// - `target`        : desired split position in **characters**.
+/// - `blocks`        : code-block byte ranges in the full original text.
+/// - `global_offset` : byte offset of `text` within the original full text.
+///
+/// Returns a **byte** index into `text` that is guaranteed to be on a UTF-8
+/// character boundary and safe to use for slicing.
 fn find_best_split_point(
     text: &str,
     target: usize,
     blocks: &[CodeBlock],
     global_offset: usize,
 ) -> usize {
-    // If target falls inside a code block, split before or after the block.
+    // Convert target character position to a byte position in `text`.
+    let target_byte = char_pos_to_byte_pos(text, target);
+
+    // If target_byte falls inside a code block, split before or after the block.
     for block in blocks {
         let local_start = block.start.saturating_sub(global_offset);
         let local_end = block.end.saturating_sub(global_offset);
-        if target > local_start && target < local_end {
+        if target_byte > local_start && target_byte < local_end {
             if local_start > 100 {
                 return local_start;
             }
@@ -588,19 +628,34 @@ fn find_best_split_point(
         }
     }
 
-    // Search for natural break points near target.
-    let search_start = target.saturating_sub(200);
-    let search_end = std::cmp::min(text.len(), target + 50);
-    let search_text = &text[search_start..search_end];
+    // Search for natural break points near target_byte, but only at char boundaries.
+    // We restrict the search window to [search_start_byte .. search_end_byte].
+    let search_start_char = target.saturating_sub(200);
+    let search_start_byte = char_pos_to_byte_pos(text, search_start_char);
+    let search_end_byte = std::cmp::min(text.len(), char_pos_to_byte_pos(text, target + 50));
 
+    // Guard: search window must be valid.
+    if search_start_byte >= search_end_byte || search_end_byte > text.len() {
+        return target_byte;
+    }
+
+    let search_text = &text[search_start_byte..search_end_byte];
+
+    // Break patterns ordered by preference.  `pat_len` is the byte length of
+    // the portion we want to include *before* the split (i.e. we split after
+    // the delimiter, consuming `after_pat` bytes of the delimiter).
     let break_patterns: &[(&str, usize)] = &[("\n\n", 2), ("\n", 1), (". ", 2), (" ", 1)];
 
-    for &(pat, offset) in break_patterns {
+    for &(pat, after_pat) in break_patterns {
         let mut best: Option<usize> = None;
         for (i, _) in search_text.match_indices(pat) {
-            let abs = search_start + i + offset;
-            if abs <= target && !is_inside_code_block(abs + global_offset, blocks) {
-                best = Some(abs);
+            // `i` is a byte offset within `search_text`, which is a slice of
+            // `text` starting at `search_start_byte`.
+            let abs_byte = search_start_byte + i + after_pat;
+            // Only accept positions at or before target_byte so we never
+            // exceed the character budget.
+            if abs_byte <= target_byte && !is_inside_code_block(abs_byte + global_offset, blocks) {
+                best = Some(abs_byte);
             }
         }
         if let Some(b) = best {
@@ -608,6 +663,6 @@ fn find_best_split_point(
         }
     }
 
-    // Fallback: split at target.
-    target
+    // Fallback: split exactly at the target character boundary (byte-safe).
+    target_byte
 }
