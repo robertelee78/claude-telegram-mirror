@@ -81,10 +81,12 @@ jobs:
           path: '*.tgz'
 
   build-darwin-x64:
-    runs-on: macos-13
+    runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust-crates
@@ -92,13 +94,13 @@ jobs:
       - name: Build release binary
         working-directory: rust-crates
         run: |
-          cargo build --release --bin ctm
-          strip target/release/ctm
-          ls -lh target/release/ctm
+          cargo build --release --target x86_64-apple-darwin --bin ctm
+          strip target/x86_64-apple-darwin/release/ctm
+          ls -lh target/x86_64-apple-darwin/release/ctm
 
       - name: Package binary
         run: |
-          cp rust-crates/target/release/ctm npm-packages/ctm-darwin-x64/bin/ctm
+          cp rust-crates/target/x86_64-apple-darwin/release/ctm npm-packages/ctm-darwin-x64/bin/ctm
           chmod 755 npm-packages/ctm-darwin-x64/bin/ctm
           node -e "
             const crypto = require('crypto');
