@@ -81,6 +81,13 @@ struct TopicCreationState {
     resolved: bool,
 }
 
+/// Per-thread bot session state (mirrors grammY session in TypeScript).
+struct BotSessionState {
+    attached_session_id: Option<String>,
+    muted: bool,
+    last_activity: u64,
+}
+
 // ---------------------------------------------------------------- daemon
 
 /// Bridge Daemon — orchestrates all components.
@@ -103,6 +110,9 @@ pub struct Daemon {
 
     // BUG-002: Topic creation locks
     topic_creation_locks: Arc<RwLock<HashMap<String, Arc<TopicCreationState>>>>,
+
+    // Per-thread bot session state (keyed by thread_id / message_thread_id)
+    bot_sessions: Arc<RwLock<HashMap<i64, BotSessionState>>>,
 }
 
 impl Daemon {
@@ -125,6 +135,7 @@ impl Daemon {
             session_custom_titles: Arc::new(RwLock::new(HashMap::new())),
             pending_questions: Arc::new(RwLock::new(HashMap::new())),
             topic_creation_locks: Arc::new(RwLock::new(HashMap::new())),
+            bot_sessions: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -179,6 +190,7 @@ impl Daemon {
         let daemon_custom_titles = Arc::clone(&self.session_custom_titles);
         let daemon_pending_q = Arc::clone(&self.pending_questions);
         let daemon_topic_locks = Arc::clone(&self.topic_creation_locks);
+        let daemon_bot_sessions = Arc::clone(&self.bot_sessions);
         let daemon_config = self.config.clone();
 
         tokio::spawn(async move {
@@ -196,6 +208,7 @@ impl Daemon {
                 daemon_custom_titles,
                 daemon_pending_q,
                 daemon_topic_locks,
+                daemon_bot_sessions,
                 daemon_config,
                 daemon_socket_clients,
             )
@@ -249,6 +262,7 @@ async fn run_event_loop(
     custom_titles: Arc<RwLock<HashMap<String, String>>>,
     pending_q: Arc<RwLock<HashMap<String, PendingQuestion>>>,
     topic_locks: Arc<RwLock<HashMap<String, Arc<TopicCreationState>>>>,
+    bot_sessions: Arc<RwLock<HashMap<i64, BotSessionState>>>,
     config: Config,
     socket_clients: SocketClients,
 ) {
@@ -277,6 +291,7 @@ async fn run_event_loop(
                             custom_titles: Arc::clone(&custom_titles),
                             pending_q: Arc::clone(&pending_q),
                             topic_locks: Arc::clone(&topic_locks),
+                            bot_sessions: Arc::clone(&bot_sessions),
                             config: config.clone(),
                             socket_clients: Arc::clone(&socket_clients),
                         };
@@ -315,6 +330,7 @@ async fn run_event_loop(
                                 custom_titles: Arc::clone(&custom_titles),
                                 pending_q: Arc::clone(&pending_q),
                                 topic_locks: Arc::clone(&topic_locks),
+                                bot_sessions: Arc::clone(&bot_sessions),
                                 config: config.clone(),
                                 socket_clients: Arc::clone(&socket_clients),
                             };
@@ -345,6 +361,7 @@ async fn run_event_loop(
                     custom_titles: Arc::clone(&custom_titles),
                     pending_q: Arc::clone(&pending_q),
                     topic_locks: Arc::clone(&topic_locks),
+                    bot_sessions: Arc::clone(&bot_sessions),
                     config: config.clone(),
                     socket_clients: Arc::clone(&socket_clients),
                 };
@@ -376,6 +393,8 @@ struct HandlerContext {
     custom_titles: Arc<RwLock<HashMap<String, String>>>,
     pending_q: Arc<RwLock<HashMap<String, PendingQuestion>>>,
     topic_locks: Arc<RwLock<HashMap<String, Arc<TopicCreationState>>>>,
+    /// Per-thread bot session state (keyed by thread_id).
+    bot_sessions: Arc<RwLock<HashMap<i64, BotSessionState>>>,
     config: Config,
     /// Shared reference to the socket's connected-client map for outbound broadcasts.
     socket_clients: SocketClients,
@@ -751,6 +770,16 @@ async fn handle_agent_response(ctx: &HandlerContext, msg: &BridgeMessage) {
         tracing::error!(session_id = %msg.session_id, "Topic creation timeout - dropping agent_response");
         return;
     }
+
+    // Check mute state: if the thread is muted, suppress the message.
+    if let Some(tid) = thread_id {
+        let bs = ctx.bot_sessions.read().await;
+        if bs.get(&tid).map(|s| s.muted).unwrap_or(false) {
+            tracing::debug!(session_id = %msg.session_id, thread_id = tid, "Thread is muted, suppressing agent_response");
+            return;
+        }
+    }
+
     ctx.bot
         .send_message(
             &format_agent_response(&msg.content),
@@ -1980,6 +2009,186 @@ async fn handle_bot_command(ctx: &HandlerContext, msg: &TgMessage, text: &str) {
                     .await;
             }
         }
+        "/attach" => {
+            let thread_id = msg.message_thread_id;
+            if args.is_empty() {
+                ctx.bot
+                    .send_message(
+                        "\u{26A0}\u{FE0F} Please provide a session ID.\n\nUsage: `/attach <session-id>`\n\nUse /sessions to see available sessions.",
+                        Some(&opts),
+                        thread_id,
+                    )
+                    .await;
+                return;
+            }
+            // Look up session by ID or partial match
+            let sessions_list = ctx
+                .sessions
+                .lock()
+                .await
+                .get_active_sessions()
+                .unwrap_or_default();
+            let matched_id = sessions_list
+                .iter()
+                .find(|s| s.id == args || s.id.contains(args))
+                .map(|s| s.id.clone())
+                .unwrap_or_else(|| args.to_string());
+
+            let key = thread_id.unwrap_or(msg.chat.id);
+            {
+                let mut bs = ctx.bot_sessions.write().await;
+                let state = bs.entry(key).or_insert_with(|| BotSessionState {
+                    attached_session_id: None,
+                    muted: false,
+                    last_activity: 0,
+                });
+                state.attached_session_id = Some(matched_id.clone());
+                state.last_activity = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+            }
+            ctx.bot
+                .send_message(
+                    &format!("\u{2705} Attached to session `{matched_id}`"),
+                    Some(&opts),
+                    thread_id,
+                )
+                .await;
+        }
+        "/detach" => {
+            let thread_id = msg.message_thread_id;
+            let key = thread_id.unwrap_or(msg.chat.id);
+            let prev = {
+                let mut bs = ctx.bot_sessions.write().await;
+                let state = bs.entry(key).or_insert_with(|| BotSessionState {
+                    attached_session_id: None,
+                    muted: false,
+                    last_activity: 0,
+                });
+                state.attached_session_id.take()
+            };
+            match prev {
+                Some(sid) => {
+                    ctx.bot
+                        .send_message(
+                            &format!("\u{1F50C} Detached from session `{sid}`"),
+                            Some(&opts),
+                            thread_id,
+                        )
+                        .await;
+                }
+                None => {
+                    ctx.bot
+                        .send_message(
+                            "\u{2139}\u{FE0F} You are not attached to any session.",
+                            None,
+                            thread_id,
+                        )
+                        .await;
+                }
+            }
+        }
+        "/mute" => {
+            let thread_id = msg.message_thread_id;
+            let key = thread_id.unwrap_or(msg.chat.id);
+            let already_muted = {
+                let mut bs = ctx.bot_sessions.write().await;
+                let state = bs.entry(key).or_insert_with(|| BotSessionState {
+                    attached_session_id: None,
+                    muted: false,
+                    last_activity: 0,
+                });
+                let was = state.muted;
+                state.muted = true;
+                state.last_activity = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                was
+            };
+            if already_muted {
+                ctx.bot
+                    .send_message("\u{1F507} Notifications already muted.", None, thread_id)
+                    .await;
+            } else {
+                ctx.bot
+                    .send_message(
+                        "\u{1F507} Session muted \u{2014} agent responses suppressed.\n\nUse /unmute to resume.",
+                        Some(&opts),
+                        thread_id,
+                    )
+                    .await;
+            }
+        }
+        "/unmute" => {
+            let thread_id = msg.message_thread_id;
+            let key = thread_id.unwrap_or(msg.chat.id);
+            let was_muted = {
+                let mut bs = ctx.bot_sessions.write().await;
+                let state = bs.entry(key).or_insert_with(|| BotSessionState {
+                    attached_session_id: None,
+                    muted: false,
+                    last_activity: 0,
+                });
+                let was = state.muted;
+                state.muted = false;
+                state.last_activity = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                was
+            };
+            if was_muted {
+                ctx.bot
+                    .send_message("\u{1F514} Session unmuted.", None, thread_id)
+                    .await;
+            } else {
+                ctx.bot
+                    .send_message("\u{1F514} Notifications already active.", None, thread_id)
+                    .await;
+            }
+        }
+        "/abort" => {
+            let thread_id = msg.message_thread_id;
+            let key = thread_id.unwrap_or(msg.chat.id);
+            let attached = {
+                let bs = ctx.bot_sessions.read().await;
+                bs.get(&key).and_then(|s| s.attached_session_id.clone())
+            };
+            match attached {
+                None => {
+                    ctx.bot
+                        .send_message(
+                            "\u{26A0}\u{FE0F} No session attached. Use /attach first.",
+                            None,
+                            thread_id,
+                        )
+                        .await;
+                }
+                Some(session_id) => {
+                    ctx.bot
+                        .send_with_buttons(
+                            &format!(
+                                "\u{26A0}\u{FE0F} *Abort Session?*\n\nThis will terminate session `{session_id}`.\n\nAre you sure?"
+                            ),
+                            vec![
+                                InlineButton {
+                                    text: "\u{1F6D1} Confirm Abort".into(),
+                                    callback_data: format!("confirm_abort:{session_id}"),
+                                },
+                                InlineButton {
+                                    text: "\u{274C} Cancel".into(),
+                                    callback_data: "cancel_abort".into(),
+                                },
+                            ],
+                            Some(&opts),
+                            thread_id,
+                        )
+                        .await;
+                }
+            }
+        }
         _ => {
             // Unknown command — ignore silently
         }
@@ -1998,8 +2207,14 @@ async fn handle_callback_query(ctx: &HandlerContext, cb: &CallbackQuery) {
     // Answer the callback to dismiss spinner
     let _ = ctx.bot.answer_callback_query(&cb.id, None).await;
 
+    // /abort confirmation callbacks
+    if let Some(session_id) = data.strip_prefix("confirm_abort:") {
+        handle_confirm_abort_callback(ctx, session_id, cb).await;
+    } else if data == "cancel_abort" {
+        handle_cancel_abort_callback(ctx, cb).await;
+    }
     // Approval callbacks
-    if let Some(approval_id) = data.strip_prefix("approve:") {
+    else if let Some(approval_id) = data.strip_prefix("approve:") {
         handle_approval_callback(ctx, approval_id, "approve", cb).await;
     } else if let Some(approval_id) = data.strip_prefix("reject:") {
         handle_approval_callback(ctx, approval_id, "reject", cb).await;
@@ -2017,6 +2232,73 @@ async fn handle_callback_query(ctx: &HandlerContext, cb: &CallbackQuery) {
         handle_toggle_callback(ctx, data, cb).await;
     } else if data.starts_with("submit:") {
         handle_submit_callback(ctx, data).await;
+    }
+}
+
+/// Handle /abort confirmation callback.
+async fn handle_confirm_abort_callback(ctx: &HandlerContext, session_id: &str, cb: &CallbackQuery) {
+    let thread_id = cb.message.as_ref().and_then(|m| m.message_thread_id);
+    let message_id = cb.message.as_ref().map(|m| m.message_id);
+
+    // Mark session as aborted in DB
+    let aborted = {
+        let sess = ctx.sessions.lock().await;
+        sess.end_session(session_id, "aborted").is_ok()
+    };
+
+    if aborted {
+        // Send Ctrl-C via tmux to interrupt the running process
+        let tmux_target = ctx.session_tmux.read().await.get(session_id).cloned();
+        if let Some(target) = tmux_target {
+            let socket = {
+                let sess = ctx.sessions.lock().await;
+                sess.get_session(session_id)
+                    .ok()
+                    .flatten()
+                    .and_then(|s| s.tmux_socket)
+            };
+            let mut inj = ctx.injector.lock().await;
+            inj.set_target(&target, socket.as_deref());
+            let _ = inj.send_key("Ctrl-C");
+        }
+
+        // Clear attached session state for this thread
+        let key = thread_id.unwrap_or_else(|| cb.message.as_ref().map(|m| m.chat.id).unwrap_or(0));
+        {
+            let mut bs = ctx.bot_sessions.write().await;
+            if let Some(state) = bs.get_mut(&key) {
+                state.attached_session_id = None;
+            }
+        }
+        ctx.session_tmux.write().await.remove(session_id);
+
+        // Edit the confirmation message to show outcome
+        if let Some(mid) = message_id {
+            let _ = ctx
+                .bot
+                .edit_message(
+                    mid,
+                    &format!("\u{1F6D1} Session `{session_id}` aborted."),
+                    thread_id,
+                )
+                .await;
+        }
+    } else if let Some(mid) = message_id {
+        let _ = ctx
+            .bot
+            .edit_message(mid, "\u{274C} Failed to abort session.", thread_id)
+            .await;
+    }
+}
+
+/// Handle /abort cancellation callback.
+async fn handle_cancel_abort_callback(ctx: &HandlerContext, cb: &CallbackQuery) {
+    if let Some(mid) = cb.message.as_ref().map(|m| m.message_id) {
+        let thread_id = cb.message.as_ref().and_then(|m| m.message_thread_id);
+        let _ = ctx
+            .bot
+            .edit_message(mid, "\u{2705} Abort cancelled.", thread_id)
+            .await;
     }
 }
 
