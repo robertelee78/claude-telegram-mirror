@@ -758,6 +758,17 @@ async fn check_and_update_tmux_target(ctx: &HandlerContext, msg: &BridgeMessage)
 /// This differs from the TS design where `handleSessionStart` and
 /// `handleSessionEnd` were standalone entry points.
 async fn ensure_session_exists(ctx: &HandlerContext, msg: &BridgeMessage) {
+    // GAP-9: Suppress topic creation for headless daemon tasks.
+    // Headless sessions with no agent_id are standalone background tasks
+    // (e.g., claude-flow daemon), not sub-agents of a user session.
+    let meta = msg.meta();
+    if meta.headless() && meta.agent_id().is_none() {
+        tracing::debug!(
+            session_id = %msg.session_id,
+            "GAP-9: Headless session without agent_id in ensure_session_exists, skipping"
+        );
+        return;
+    }
     let sid = msg.session_id.clone();
     let existing = ctx
         .db_op(move |sess| sess.get_session(&sid).ok().flatten())
