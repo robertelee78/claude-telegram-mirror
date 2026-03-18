@@ -730,9 +730,13 @@ pub(super) async fn handle_ask_user_question(ctx: &HandlerContext, msg: &BridgeM
 
     // ADR-012: Insert PendingQuestion with new tentative-selection model.
     // No TTL — questions persist until Submit All or session end.
-    {
+    //
+    // C4: If a PendingQuestion already exists for this session (second
+    // AskUserQuestion before the first was answered), supersede the old one:
+    // edit its question messages to "Superseded" and delete its summary.
+    let old_entry = {
         let mut pq = ctx.pending_q.write().await;
-        pq.insert(
+        let old = pq.insert(
             pending_key.clone(),
             Arc::new(Mutex::new(PendingQuestion {
                 session_id: msg.session_id.clone(),
@@ -743,6 +747,25 @@ pub(super) async fn handle_ask_user_question(ctx: &HandlerContext, msg: &BridgeM
                 summary_message_id: None,
             })),
         );
+        old
+    };
+    if let Some(old_arc) = old_entry {
+        let old_pq = old_arc.lock().await;
+        tracing::info!(
+            session_id = %msg.session_id,
+            old_questions = old_pq.questions.len(),
+            "Superseding previous AskUserQuestion"
+        );
+        // Dismiss old question messages.
+        for &mid in &old_pq.question_message_ids {
+            if mid != 0 {
+                let _ = ctx.bot.edit_message_text_no_markup(mid, "\u{2B55} Superseded").await;
+            }
+        }
+        // Delete old summary if present.
+        if let Some(mid) = old_pq.summary_message_id {
+            let _ = ctx.bot.delete_message(ctx.config.chat_id, mid).await;
+        }
     }
 
     // ADR-012: Render each question as a separate message, capturing message_ids

@@ -697,20 +697,19 @@ impl TelegramBot {
     }
 
     /// Edit a message's text and remove keyboard (for "Selected" / "Submitted" feedback).
+    ///
+    /// Note: Telegram's `editMessageText` does not accept `message_thread_id` —
+    /// the message is identified by `chat_id` + `message_id` alone.
     pub async fn edit_message_text_no_markup(
         &self,
         message_id: i64,
         text: &str,
-        thread_id: Option<i64>,
     ) -> Result<()> {
-        let mut body = serde_json::json!({
+        let body = serde_json::json!({
             "chat_id": self.chat_id,
             "message_id": message_id,
             "text": text,
         });
-        if let Some(tid) = thread_id {
-            body["message_thread_id"] = serde_json::Value::Number(tid.into());
-        }
         let _: TgResponse<TgMessage> = self.api_call("editMessageText", &body).await?;
         Ok(())
     }

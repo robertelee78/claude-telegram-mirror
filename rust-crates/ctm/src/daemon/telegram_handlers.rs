@@ -945,7 +945,7 @@ pub(super) async fn handle_free_text_answer(
             if q.options.is_empty() {
                 let _ = ctx
                     .bot
-                    .edit_message_text_no_markup(msg_id, &updated_text, None)
+                    .edit_message_text_no_markup(msg_id, &updated_text)
                     .await;
             } else {
                 let short =

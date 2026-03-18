@@ -918,7 +918,7 @@ async fn handle_submitall_callback(ctx: &HandlerContext, data: &str, cb: &Callba
     };
 
     // Phase 2: Per-key mutex for state extraction.
-    let (answers, session_id, question_message_ids, summary_message_id, thread_id) = {
+    let (answers, session_id, question_message_ids, summary_message_id) = {
         let mut pending = entry.lock().await;
 
         // Guard: if already all finalized, reject double-tap.
@@ -991,7 +991,6 @@ async fn handle_submitall_callback(ctx: &HandlerContext, data: &str, cb: &Callba
             pending.session_id.clone(),
             pending.question_message_ids.clone(),
             pending.summary_message_id,
-            cb.message.as_ref().and_then(|m| m.message_thread_id),
         );
         data
         // per-key Mutex drops here
@@ -1036,7 +1035,7 @@ async fn handle_submitall_callback(ctx: &HandlerContext, data: &str, cb: &Callba
         if mid != 0 {
             let _ = ctx
                 .bot
-                .edit_message_text_no_markup(mid, "\u{2705} Submitted", thread_id)
+                .edit_message_text_no_markup(mid, "\u{2705} Submitted")
                 .await;
         }
     }
