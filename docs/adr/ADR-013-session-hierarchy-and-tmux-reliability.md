@@ -156,6 +156,31 @@ Without tmux, Telegram is read-only (Claude→Telegram works via hooks+socket). 
 #### D7: Sub-agent Details via file transfer
 "Details" button sends: summary reply (~500 chars) + `.md` file attachment of full output via `send_document`. No topic sprawl.
 
+### Part E: Session ↔ Topic Lifecycle (from PM Q&A)
+
+#### E1: 1:1 session-to-topic mapping
+Every Claude Code session gets exactly one Telegram topic. Sub-agents route to their parent session's topic (not new topics). Two independent Claude sessions in the same project get separate topics.
+
+#### E2: Stale topic auto-cleanup (two triggers)
+- **Session ended:** Topic deleted 15 minutes after the session ends.
+- **Inactivity:** Topic deleted after 12 hours (720 minutes) of no activity, even if the session is still technically "active" in the DB.
+
+Both thresholds should be configurable.
+
+#### E3: Auto-heal on resume/reactivation
+If a topic was deleted (stale) and the user later resumes the session (`claude --resume`) or a new hook event arrives for that session_id:
+- Create a fresh topic
+- Send a "Session resumed" context message (custom title, duration, last activity from the old session)
+- Re-associate the session with the new thread_id in the DB
+
+This is already partially implemented (ensure_session_exists creates topics on-demand). The enhancement is the context message.
+
+#### E4: Topic title follows Claude Code renames
+Keep existing behavior: when Claude Code assigns a custom title (auto or manual `/rename`), the Telegram topic title updates. Experimental: prepend active sub-agent count (e.g., `"[2 agents] Fix auth bug"`). Can be toggled off if too noisy.
+
+#### E5: Closed vs deleted
+Prefer CLOSE over DELETE for the 15-minute post-session-end window (preserves history, topic is hidden from list). DELETE after the 12-hour inactivity threshold (full cleanup).
+
 ## Implementation Plan
 
 ### Phase 1: tmux Reliability (Fixes F1-F4, F6-F8)
