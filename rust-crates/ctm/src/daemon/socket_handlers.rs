@@ -2,6 +2,27 @@
 
 use super::*;
 
+/// ADR-013 GAP-3: Check if a session is a child (sub-agent) and return its label.
+/// Returns Some("🤖 [Agent: {agent_id}] ") if the session has a parent_session_id.
+async fn get_child_prefix(ctx: &HandlerContext, session_id: &str) -> Option<String> {
+    let sid = session_id.to_string();
+    ctx.db_op(move |sess| {
+        sess.get_session(&sid)
+            .ok()
+            .flatten()
+            .and_then(|s| {
+                s.parent_session_id.as_ref()?; // Only for child sessions
+                let agent_label = s
+                    .agent_type
+                    .as_deref()
+                    .or(s.agent_id.as_deref())
+                    .unwrap_or("sub-agent");
+                Some(format!("\u{1F916} [{}] ", agent_label))
+            })
+    })
+    .await
+}
+
 /// Handler 1: session_start
 pub(super) async fn handle_session_start(ctx: &HandlerContext, msg: &BridgeMessage) {
     let meta = msg.meta();
@@ -56,20 +77,49 @@ pub(super) async fn handle_session_start(ctx: &HandlerContext, msg: &BridgeMessa
     // If this is a child session, look up the parent's thread_id and reuse it.
     let parent_thread_id: Option<i64> = if let Some((ref parent_sid, _)) = parent_info {
         let psid = parent_sid.clone();
-        // Try in-memory cache first, then DB
-        let cached = ctx.session_threads.read().await.get(&psid).copied();
-        if cached.is_some() {
-            cached
-        } else {
+        // ADR-013 GAP-4: Retry parent thread_id lookup with short delays.
+        // In fast swarm spawning, the child session_start may arrive before
+        // the parent's topic is created. Retrying avoids topic sprawl.
+        let mut result = None;
+        for attempt in 0..3u8 {
+            // Check in-memory cache first
+            let cached = ctx.session_threads.read().await.get(&psid).copied();
+            if cached.is_some() {
+                result = cached;
+                break;
+            }
+            // Fall back to DB
             let psid2 = psid.clone();
-            ctx.db_op(move |sess| {
-                sess.get_session(&psid2)
-                    .ok()
-                    .flatten()
-                    .and_then(|s| s.thread_id)
-            })
-            .await
+            let db_result = ctx
+                .db_op(move |sess| {
+                    sess.get_session(&psid2)
+                        .ok()
+                        .flatten()
+                        .and_then(|s| s.thread_id)
+                })
+                .await;
+            if db_result.is_some() {
+                result = db_result;
+                break;
+            }
+            if attempt < 2 {
+                tracing::debug!(
+                    session_id = %msg.session_id,
+                    parent_session_id = %psid,
+                    attempt = attempt + 1,
+                    "ADR-013 GAP-4: Parent thread_id not found, retrying in 500ms"
+                );
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            }
         }
+        if result.is_none() {
+            tracing::warn!(
+                session_id = %msg.session_id,
+                parent_session_id = %psid,
+                "ADR-013 GAP-4: Parent thread_id not found after 3 attempts — child gets own topic"
+            );
+        }
+        result
     } else {
         None
     };
@@ -96,12 +146,27 @@ pub(super) async fn handle_session_start(ctx: &HandlerContext, msg: &BridgeMessa
             let display_id = agent_id
                 .as_deref()
                 .unwrap_or(&msg.session_id[..std::cmp::min(12, msg.session_id.len())]);
+            // ADR-013 GAP-2: Include agent_type in spawn notification if available
+            let agent_type_label = msg
+                .meta()
+                .get("agentType")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let spawn_text = if agent_type_label.is_empty() {
+                format!(
+                    "\u{1F916} *Agent spawned:* `{}`",
+                    escape_markdown_v1(display_id)
+                )
+            } else {
+                format!(
+                    "\u{1F916} *Agent spawned:* `{}` ({})",
+                    escape_markdown_v1(display_id),
+                    escape_markdown_v1(agent_type_label)
+                )
+            };
             ctx.bot
                 .send_message(
-                    &format!(
-                        "\u{1F916} *Agent spawned:* `{}`",
-                        escape_markdown_v1(display_id)
-                    ),
+                    &spawn_text,
                     Some(&SendOptions {
                         parse_mode: Some("Markdown".into()),
                         ..Default::default()
@@ -291,6 +356,30 @@ pub(super) async fn handle_session_end(ctx: &HandlerContext, msg: &BridgeMessage
             let _ = sess.end_session(&sid, crate::types::SessionStatus::Ended);
         })
         .await;
+
+        // ADR-013 GAP-5: Cascade session end to child sub-agent sessions.
+        // When a parent session ends, end all its active children to prevent orphans.
+        let parent_sid = msg.session_id.clone();
+        let children = ctx
+            .db_op(move |sess| sess.get_child_sessions(&parent_sid).unwrap_or_default())
+            .await;
+        if !children.is_empty() {
+            tracing::info!(
+                session_id = %msg.session_id,
+                child_count = children.len(),
+                "ADR-013 GAP-5: Cascading session end to {} child session(s)",
+                children.len()
+            );
+            for child in &children {
+                let child_id = child.id.clone();
+                ctx.db_op(move |sess| {
+                    let _ = sess.end_session(&child_id, crate::types::SessionStatus::Ended);
+                })
+                .await;
+                ctx.session_tmux.write().await.remove(&child.id);
+                ctx.custom_titles.write().await.remove(&child.id);
+            }
+        }
     }
 }
 
@@ -315,6 +404,14 @@ pub(super) async fn handle_agent_response(ctx: &HandlerContext, msg: &BridgeMess
     // SubagentStop hook), write the full output to a temp file and send a
     // one-liner with a "Details" button instead of dumping the raw text.
     if let Some(agent_id) = msg.meta().agent_id() {
+        // ADR-013 GAP-1: Validate agent_id to prevent path traversal.
+        if !crate::types::is_valid_agent_id(agent_id) {
+            tracing::warn!(
+                agent_id,
+                "ADR-013 GAP-1: Invalid agent_id rejected (path traversal prevention)"
+            );
+            return;
+        }
         // Write full output to temp file for the Details callback handler.
         let temp_path = format!("/tmp/ctm-subagent-{agent_id}.md");
         if let Err(e) = std::fs::write(&temp_path, &msg.content) {
@@ -352,9 +449,15 @@ pub(super) async fn handle_agent_response(ctx: &HandlerContext, msg: &BridgeMess
             )
             .await;
     } else {
+        // ADR-013 GAP-3: Prefix child session messages with agent label
+        let content = if let Some(prefix) = get_child_prefix(ctx, &msg.session_id).await {
+            format!("{}{}", prefix, &msg.content)
+        } else {
+            msg.content.clone()
+        };
         ctx.bot
             .send_message(
-                &format_agent_response(&msg.content),
+                &format_agent_response(&content),
                 Some(&SendOptions {
                     parse_mode: Some("Markdown".into()),
                     ..Default::default()
