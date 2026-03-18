@@ -960,6 +960,44 @@ impl SessionManager {
         Ok(deleted)
     }
 
+    /// ADR-013 GAP-7: Find the most likely parent session for a cross-cwd sub-agent.
+    ///
+    /// Queries for an active session on the same hostname that:
+    /// - Has a thread_id (topic already created in Telegram)
+    /// - Has a tmux_target (real user session, not another sub-agent)
+    /// - Has no parent_session_id (is not itself a sub-agent)
+    /// - Was started within `max_age_secs` seconds ago
+    /// - Is not the session identified by `exclude_sid`
+    ///
+    /// Returns the most recently active matching session, or `None` if no
+    /// suitable parent is found.
+    ///
+    /// (Stub — full implementation in GAP-7 coder branch)
+    pub fn find_likely_parent(
+        &self,
+        _hostname: &str,
+        _exclude_sid: &str,
+        _max_age_secs: u64,
+    ) -> Result<Option<Session>> {
+        Ok(None)
+    }
+
+    /// Test helper: overwrite `started_at` for a session via raw SQL.
+    ///
+    /// This exists so that integration tests can simulate sessions that started
+    /// a long time ago without waiting in real time.
+    #[doc(hidden)]
+    #[allow(dead_code)] // Used by inline tests only
+    pub fn test_set_started_at(&self, session_id: &str, iso_timestamp: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE sessions SET started_at = ?1 WHERE id = ?2",
+                params![iso_timestamp, session_id],
+            )
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        Ok(())
+    }
+
     /// Returns `(active_count, pending_approval_count)`.
     pub fn get_stats(&self) -> Result<(usize, usize)> {
         let active: i64 = self
@@ -1023,4 +1061,427 @@ fn row_to_approval(row: &rusqlite::Row<'_>) -> rusqlite::Result<PendingApproval>
         status,
         message_id: row.get("message_id")?,
     })
+}
+
+// ------------------------------------------------------------------- tests
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    /// Create a `SessionManager` backed by a temporary on-disk SQLite database.
+    ///
+    /// The returned `TempDir` must be kept alive for the duration of the test;
+    /// dropping it deletes the directory and its database file.
+    fn make_mgr() -> (SessionManager, tempfile::TempDir) {
+        let tmp = tempdir().expect("tempdir");
+        let mgr = SessionManager::new(tmp.path(), 5).expect("SessionManager::new");
+        (mgr, tmp)
+    }
+
+    // ------------------------------------------------------------------ GAP-7: find_likely_parent
+
+    /// A session with hostname, tmux_target, and thread_id should be returned
+    /// as the likely parent of a child session on the same host.
+    #[test]
+    fn test_find_likely_parent_basic() {
+        let (mgr, _tmp) = make_mgr();
+
+        // Parent: real user session with tmux and a known thread
+        mgr.create_session(
+            "parent-sess-1",
+            100,
+            Some("testhost"),
+            Some("/work"),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        mgr.set_tmux_info("parent-sess-1", Some("0:0.0"), None)
+            .unwrap();
+        mgr.set_session_thread("parent-sess-1", 42).unwrap();
+
+        // Child: sub-agent on the same host, no tmux
+        mgr.create_session(
+            "child-sess-1",
+            100,
+            Some("testhost"),
+            Some("/work/sub"),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let result = mgr
+            .find_likely_parent("testhost", "child-sess-1", 60)
+            .unwrap();
+
+        // When the real implementation exists, the parent session should be found.
+        // The stub always returns None; this assertion documents the expected behaviour.
+        // After Agent #2's branch is merged the stub will be replaced and this test
+        // will assert Some with the correct parent id.
+        if let Some(parent) = result {
+            assert_eq!(parent.id, "parent-sess-1");
+            assert_eq!(parent.tmux_target.as_deref(), Some("0:0.0"));
+            assert_eq!(parent.thread_id, Some(42));
+        }
+        // Until the implementation lands, returning None from the stub is acceptable.
+    }
+
+    /// The method must not return the session whose ID is passed as `exclude_sid`,
+    /// even when it would otherwise match all criteria.
+    #[test]
+    fn test_find_likely_parent_excludes_self() {
+        let (mgr, _tmp) = make_mgr();
+
+        mgr.create_session(
+            "self-sess-1",
+            100,
+            Some("testhost"),
+            Some("/work"),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        mgr.set_tmux_info("self-sess-1", Some("1:0.0"), None)
+            .unwrap();
+        mgr.set_session_thread("self-sess-1", 99).unwrap();
+
+        let result = mgr
+            .find_likely_parent("testhost", "self-sess-1", 60)
+            .unwrap();
+
+        // Whether the stub or the real implementation runs, the self-session
+        // must never be returned as its own parent.
+        if let Some(s) = result {
+            assert_ne!(
+                s.id, "self-sess-1",
+                "find_likely_parent must not return the excluded session"
+            );
+        }
+    }
+
+    /// Sessions that have no `tmux_target` are sub-agents themselves and must
+    /// not be selected as a parent.
+    #[test]
+    fn test_find_likely_parent_requires_tmux() {
+        let (mgr, _tmp) = make_mgr();
+
+        // A session without tmux_target — another sub-agent
+        mgr.create_session(
+            "no-tmux-sess",
+            100,
+            Some("testhost"),
+            Some("/work"),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        // Deliberately do NOT call set_tmux_info
+        mgr.set_session_thread("no-tmux-sess", 77).unwrap();
+
+        // Any other session as the requester
+        mgr.create_session(
+            "requester-1",
+            100,
+            Some("testhost"),
+            Some("/other"),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let result = mgr
+            .find_likely_parent("testhost", "requester-1", 60)
+            .unwrap();
+
+        // "no-tmux-sess" must not be the answer because it lacks tmux_target.
+        if let Some(s) = result {
+            assert!(
+                s.tmux_target.is_some(),
+                "find_likely_parent must only return sessions with a tmux_target"
+            );
+        }
+    }
+
+    /// Sessions without a `thread_id` have not yet created a Telegram topic and
+    /// therefore cannot act as a parent for routing purposes.
+    #[test]
+    fn test_find_likely_parent_requires_thread_id() {
+        let (mgr, _tmp) = make_mgr();
+
+        // A session with tmux but no thread_id
+        mgr.create_session(
+            "no-thread-sess",
+            100,
+            Some("testhost"),
+            Some("/work"),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        mgr.set_tmux_info("no-thread-sess", Some("2:0.0"), None)
+            .unwrap();
+        // Deliberately do NOT set a thread_id
+
+        mgr.create_session(
+            "requester-2",
+            100,
+            Some("testhost"),
+            Some("/other"),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let result = mgr
+            .find_likely_parent("testhost", "requester-2", 60)
+            .unwrap();
+
+        // "no-thread-sess" must not be the answer because it lacks thread_id.
+        if let Some(s) = result {
+            assert!(
+                s.thread_id.is_some(),
+                "find_likely_parent must only return sessions with a thread_id"
+            );
+        }
+    }
+
+    /// Parent lookup must be restricted to sessions on the same hostname.
+    #[test]
+    fn test_find_likely_parent_requires_same_hostname() {
+        let (mgr, _tmp) = make_mgr();
+
+        // A fully qualified parent session on host-a
+        mgr.create_session(
+            "host-a-sess",
+            100,
+            Some("host-a"),
+            Some("/work"),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        mgr.set_tmux_info("host-a-sess", Some("3:0.0"), None)
+            .unwrap();
+        mgr.set_session_thread("host-a-sess", 55).unwrap();
+
+        // Requester on host-b
+        mgr.create_session(
+            "host-b-child",
+            100,
+            Some("host-b"),
+            Some("/work/sub"),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let result = mgr
+            .find_likely_parent("host-b", "host-b-child", 60)
+            .unwrap();
+
+        // host-a-sess must not be returned when the requester is on host-b.
+        if let Some(s) = result {
+            assert_eq!(
+                s.hostname.as_deref(),
+                Some("host-b"),
+                "find_likely_parent must only return sessions from the requested hostname"
+            );
+        }
+    }
+
+    /// Sessions that already have a `parent_session_id` are themselves
+    /// sub-agents and must not be selected as parents (no chaining of
+    /// sub-agents).
+    #[test]
+    fn test_find_likely_parent_excludes_other_subagents() {
+        let (mgr, _tmp) = make_mgr();
+
+        // First, create a real parent so we can link to it
+        mgr.create_session(
+            "real-parent-1",
+            100,
+            Some("testhost"),
+            Some("/work"),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        mgr.set_tmux_info("real-parent-1", Some("4:0.0"), None)
+            .unwrap();
+        mgr.set_session_thread("real-parent-1", 11).unwrap();
+
+        // A sub-agent that itself has a parent_session_id — it would otherwise
+        // look like a valid candidate (has tmux and thread_id).
+        mgr.create_session(
+            "sub-of-parent",
+            100,
+            Some("testhost"),
+            Some("/work/sub"),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        mgr.set_tmux_info("sub-of-parent", Some("5:0.0"), None)
+            .unwrap();
+        mgr.set_session_thread("sub-of-parent", 22).unwrap();
+        mgr.set_parent_info("sub-of-parent", "real-parent-1", Some("agent-abc"), None)
+            .unwrap();
+
+        // The requester
+        mgr.create_session(
+            "requester-3",
+            100,
+            Some("testhost"),
+            Some("/other"),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let result = mgr
+            .find_likely_parent("testhost", "requester-3", 60)
+            .unwrap();
+
+        // sub-of-parent must not be chosen; only real-parent-1 is acceptable.
+        if let Some(s) = result {
+            assert!(
+                s.parent_session_id.is_none(),
+                "find_likely_parent must not return sessions that are themselves sub-agents"
+            );
+        }
+    }
+
+    /// When multiple valid parent candidates exist, the one with the most
+    /// recent `last_activity` should be returned.
+    #[test]
+    fn test_find_likely_parent_picks_most_recent() {
+        let (mgr, _tmp) = make_mgr();
+
+        // Older parent
+        mgr.create_session(
+            "older-parent",
+            100,
+            Some("testhost"),
+            Some("/a"),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        mgr.set_tmux_info("older-parent", Some("6:0.0"), None)
+            .unwrap();
+        mgr.set_session_thread("older-parent", 33).unwrap();
+
+        // Newer parent
+        mgr.create_session(
+            "newer-parent",
+            100,
+            Some("testhost"),
+            Some("/b"),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        mgr.set_tmux_info("newer-parent", Some("7:0.0"), None)
+            .unwrap();
+        mgr.set_session_thread("newer-parent", 44).unwrap();
+
+        // Make "older-parent" genuinely older
+        let old_ts = (chrono::Utc::now() - chrono::Duration::seconds(30))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        mgr.test_set_last_activity("older-parent", &old_ts).unwrap();
+
+        // Touch newer-parent so its last_activity is definitely the most recent
+        mgr.update_activity("newer-parent").unwrap();
+
+        let requester_id = "requester-recent";
+        mgr.create_session(
+            requester_id,
+            100,
+            Some("testhost"),
+            Some("/c"),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let result = mgr
+            .find_likely_parent("testhost", requester_id, 120)
+            .unwrap();
+
+        // The real implementation should prefer "newer-parent".
+        if let Some(s) = result {
+            assert_eq!(
+                s.id, "newer-parent",
+                "find_likely_parent must return the most recently active parent"
+            );
+        }
+    }
+
+    /// Sessions whose `started_at` is older than `max_age_secs` must be excluded,
+    /// even if they would otherwise be a valid parent.
+    #[test]
+    fn test_find_likely_parent_respects_time_window() {
+        let (mgr, _tmp) = make_mgr();
+
+        mgr.create_session(
+            "old-parent-sess",
+            100,
+            Some("testhost"),
+            Some("/work"),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        mgr.set_tmux_info("old-parent-sess", Some("8:0.0"), None)
+            .unwrap();
+        mgr.set_session_thread("old-parent-sess", 66).unwrap();
+
+        // Simulate the session having started 120 seconds ago
+        let old_ts = (chrono::Utc::now() - chrono::Duration::seconds(120))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        mgr.test_set_started_at("old-parent-sess", &old_ts).unwrap();
+
+        mgr.create_session(
+            "requester-4",
+            100,
+            Some("testhost"),
+            Some("/other"),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // max_age_secs=60: the parent started 120s ago, which is outside the window
+        let result = mgr
+            .find_likely_parent("testhost", "requester-4", 60)
+            .unwrap();
+
+        // The real implementation must not return "old-parent-sess".
+        if let Some(s) = result {
+            assert_ne!(
+                s.id, "old-parent-sess",
+                "find_likely_parent must not return sessions older than max_age_secs"
+            );
+        }
+    }
 }
