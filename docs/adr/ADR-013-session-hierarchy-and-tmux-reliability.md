@@ -131,6 +131,31 @@ Each sub-agent is identified by:
 - **PPID equivalent:** `parent_session_id` from the transcript path
 - **Type:** `agent_type` from `SubagentStop` event (e.g., `"Explore"`, `"researcher"`)
 
+### Part D: UX Requirements (from PM Q&A)
+
+#### D1: Silent failure is unacceptable
+When a Telegram reply fails to inject into Claude Code, the user MUST see feedback. No silent drops.
+
+#### D2: Warning on every failed reply
+Every time a Telegram message fails to inject, show: `"⚠️ Reply failed — tmux not detected. Start Claude Code inside tmux for bidirectional chat."`
+
+#### D3: tmux status indicator in session start
+When a session starts, the session info message should include tmux connectivity:
+- `🟢 tmux: connected (0:0.0)` — when tmux_target is known
+- `🔴 tmux: not detected — replies disabled` — when no tmux target
+
+#### D4: Auto-healing
+When the user exits Claude Code, starts tmux, and resumes (`claude --resume`), the next hook event carries `$TMUX`. The daemon updates the target, and subsequent Telegram replies work. The status indicator updates automatically on the next message.
+
+#### D5: Re-detect on cache miss, not proactively
+`get_tmux_target()` checks: in-memory cache → DB → **live detection fallback** (~100ms). Only the cache miss path pays the detection cost. When tmux is cached, zero overhead.
+
+#### D6: No-tmux is view-only with clear warning
+Without tmux, Telegram is read-only (Claude→Telegram works via hooks+socket). The user sees a clear warning, not silence.
+
+#### D7: Sub-agent Details via file transfer
+"Details" button sends: summary reply (~500 chars) + `.md` file attachment of full output via `send_document`. No topic sprawl.
+
 ## Implementation Plan
 
 ### Phase 1: tmux Reliability (Fixes F1-F4, F6-F8)
