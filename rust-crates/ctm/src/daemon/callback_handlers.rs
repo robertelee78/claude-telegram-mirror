@@ -43,6 +43,10 @@ pub(super) async fn handle_callback_query(ctx: &HandlerContext, cb: &CallbackQue
     else if let Some(tool_use_id) = data.strip_prefix("tooldetails:") {
         handle_tool_details_callback(ctx, tool_use_id, cb).await;
     }
+    // ADR-013: Sub-agent details callback
+    else if let Some(agent_id) = data.strip_prefix("subagentdetails:") {
+        handle_subagent_details_callback(ctx, agent_id, cb).await;
+    }
     // AskUserQuestion callbacks
     else if data.starts_with("submitall:") {
         handle_submitall_callback(ctx, data, cb).await;
@@ -367,6 +371,134 @@ async fn handle_tool_details_callback(ctx: &HandlerContext, tool_use_id: &str, c
                 .answer_callback_query(&cb.id, Some("Details expired (5 min cache)"), true)
                 .await;
         }
+    }
+}
+
+/// Handle sub-agent details callback (ADR-013 Part C, D7).
+///
+/// When a user taps the "Details" button on a sub-agent completion one-liner,
+/// this handler reads the sub-agent's full output from a temp file
+/// (`/tmp/ctm-subagent-{agent_id}.md`) and sends:
+/// 1. A reply message with a summary (first ~500 chars)
+/// 2. The full output as a `.md` file attachment via `send_document`
+async fn handle_subagent_details_callback(
+    ctx: &HandlerContext,
+    agent_id: &str,
+    cb: &CallbackQuery,
+) {
+    // Defense-in-depth: verify chat ownership (ADR-006 M4.5)
+    if cb.message.as_ref().map(|m| m.chat.id) != Some(ctx.config.chat_id) {
+        tracing::warn!("IDOR: callback from wrong chat in subagent_details");
+        return;
+    }
+
+    let thread_id = cb.message.as_ref().and_then(|m| m.message_thread_id);
+    let reply_to = cb.message.as_ref().map(|m| m.message_id);
+
+    // Read the sub-agent output from the temp file written by Agent #3 (daemon-core).
+    let temp_path = std::path::PathBuf::from(format!("/tmp/ctm-subagent-{agent_id}.md"));
+    let content = match std::fs::read_to_string(&temp_path) {
+        Ok(c) if !c.is_empty() => c,
+        Ok(_) => {
+            let _ = ctx
+                .bot
+                .answer_callback_query(
+                    &cb.id,
+                    Some("Sub-agent output is empty"),
+                    true,
+                )
+                .await;
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(
+                agent_id,
+                error = %e,
+                "ADR-013 D7: Sub-agent temp file not found or unreadable"
+            );
+            let _ = ctx
+                .bot
+                .answer_callback_query(
+                    &cb.id,
+                    Some("Details not available (output expired or not yet written)"),
+                    true,
+                )
+                .await;
+            return;
+        }
+    };
+
+    let _ = ctx.bot.answer_callback_query(&cb.id, None, false).await;
+
+    // 1. Send a summary reply (first ~500 chars of the output).
+    let summary = if content.chars().count() > 500 {
+        let truncated: String = content.chars().take(500).collect();
+        format!("{truncated}\u{2026}") // ellipsis
+    } else {
+        content.clone()
+    };
+
+    let summary_text = format!(
+        "\u{1F916} *Sub-agent output* (`{}`)\n\n{}",
+        escape_markdown_v1(agent_id),
+        escape_markdown_v1(&summary)
+    );
+
+    if let Some(reply_to_id) = reply_to {
+        let _ = ctx
+            .bot
+            .send_message_reply_to(
+                &summary_text,
+                reply_to_id,
+                Some(&SendOptions {
+                    parse_mode: Some("Markdown".into()),
+                    ..Default::default()
+                }),
+                thread_id,
+            )
+            .await;
+    } else {
+        ctx.bot
+            .send_message(
+                &summary_text,
+                Some(&SendOptions {
+                    parse_mode: Some("Markdown".into()),
+                    ..Default::default()
+                }),
+                thread_id,
+            )
+            .await;
+    }
+
+    // 2. Send the full output as a .md file attachment via send_document.
+    if let Err(e) = ctx
+        .bot
+        .send_document(
+            &temp_path,
+            Some(&format!("Full output for sub-agent {agent_id}")),
+            thread_id,
+        )
+        .await
+    {
+        tracing::warn!(
+            agent_id,
+            error = %e,
+            "ADR-013 D7: Failed to send sub-agent output as document"
+        );
+        // Fall back to a text message indicating the file couldn't be sent.
+        ctx.bot
+            .send_message(
+                &format!(
+                    "_Could not send file attachment: {}_",
+                    escape_markdown_v1(&e.to_string())
+                ),
+                Some(&SendOptions {
+                    parse_mode: Some("Markdown".into()),
+                    ..Default::default()
+                }),
+                thread_id,
+            )
+            .await;
     }
 }
 
@@ -1020,7 +1152,9 @@ async fn handle_submitall_callback(ctx: &HandlerContext, data: &str, cb: &Callba
     let chat_id = ctx.config.chat_id;
 
     // Inject each answer into tmux.
+    // ADR-013 D1/D2: Warn when tmux is unavailable. Every failed attempt gets a warning.
     let tmux_target = ctx.session_tmux.read().await.get(&session_id).cloned();
+    let thread_id = cb.message.as_ref().and_then(|m| m.message_thread_id);
     if let Some(target) = tmux_target {
         let sid = session_id.clone();
         let socket = ctx
@@ -1049,19 +1183,40 @@ async fn handle_submitall_callback(ctx: &HandlerContext, data: &str, cb: &Callba
                     //   Down  = move to next option
                     //   Enter = confirm selections
                     // The cursor starts on option 0.
+                    //
+                    // A small delay between keypresses is needed — the TUI
+                    // processes key events asynchronously and drops rapid-fire
+                    // inputs that arrive before the previous one is handled.
+                    let key_delay = tokio::time::Duration::from_millis(50);
                     for option_idx in 0..*total_options {
                         if selected_indices.contains(&option_idx) {
                             let _ = inj.send_key("Space");
+                            tokio::time::sleep(key_delay).await;
                         }
                         // Move down to next option (skip after the last one).
                         if option_idx + 1 < *total_options {
                             let _ = inj.send_key("Down");
+                            tokio::time::sleep(key_delay).await;
                         }
                     }
+                    tokio::time::sleep(key_delay).await;
                     let _ = inj.send_key("Enter");
                 }
             }
         }
+    } else {
+        // ADR-013 D1/D2: tmux not available — warn the user in the topic.
+        tracing::warn!(
+            session_id = %session_id,
+            "ADR-013 D1: tmux not detected during submitall, answers cannot be injected"
+        );
+        ctx.bot
+            .send_message(
+                "\u{26A0}\u{FE0F} Answers could not be submitted \u{2014} tmux not detected. Please answer at the terminal.",
+                None,
+                thread_id,
+            )
+            .await;
     }
 
     // Edit each question message to show "Submitted" and strip keyboard.

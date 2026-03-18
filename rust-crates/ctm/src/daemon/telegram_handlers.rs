@@ -94,6 +94,30 @@ async fn handle_telegram_text(ctx: &HandlerContext, msg: &TgMessage, text: &str)
         inj.set_target(target, socket);
     }
 
+    // ADR-013 D1/D2: If no tmux target is available, warn the user immediately
+    // on every attempt (D2: no suppression after first occurrence). Commands
+    // that depend on tmux injection (cc, interrupt, kill, free-text injection)
+    // all short-circuit here.
+    if tmux_target.is_none() {
+        // Check for pending AskUserQuestion free-text answer first — those
+        // are stored as tentative answers and don't require tmux injection yet.
+        if handle_free_text_answer(ctx, &session.id, text).await {
+            return;
+        }
+        tracing::warn!(
+            session_id = %session.id,
+            "ADR-013 D1: tmux not detected, cannot inject Telegram reply"
+        );
+        ctx.bot
+            .send_message(
+                "\u{26A0}\u{FE0F} Reply failed \u{2014} tmux not detected. Start Claude Code inside tmux for bidirectional chat.",
+                None,
+                Some(thread_id),
+            )
+            .await;
+        return;
+    }
+
     // cc command prefix: "cc clear" -> "/clear"
     if text.to_lowercase().starts_with("cc ") {
         let command = format!("/{}", text[3..].trim());
@@ -182,21 +206,17 @@ async fn handle_telegram_text(ctx: &HandlerContext, msg: &TgMessage, text: &str)
     };
 
     if !injected {
-        // BUG-001: Clear, actionable error message
-        let inj = ctx.injector.lock().await;
-        let error_msg = match inj.validate_target() {
-            Ok(()) => "\u{26A0}\u{FE0F} *Could not send input to CLI*\n\nNo tmux session found. Make sure Claude Code is running in tmux.",
-            Err(reason) => &format!(
-                "\u{26A0}\u{FE0F} *Could not send input to CLI*\n\n{reason}\n\n_Send any command in Claude to refresh the connection._"
-            ),
-        };
+        // ADR-013 D1/D2: Warn on every failed injection attempt (no suppression).
+        // This covers inject() returning Ok(false) or Err — the tmux_target was
+        // present (we passed the None check above) but injection still failed.
+        tracing::warn!(
+            session_id = %session.id,
+            "ADR-013 D1: tmux injection failed despite having a target"
+        );
         ctx.bot
             .send_message(
-                error_msg,
-                Some(&SendOptions {
-                    parse_mode: Some("Markdown".into()),
-                    ..Default::default()
-                }),
+                "\u{26A0}\u{FE0F} Reply failed \u{2014} tmux not detected. Start Claude Code inside tmux for bidirectional chat.",
+                None,
                 Some(thread_id),
             )
             .await;
@@ -375,6 +395,9 @@ async fn handle_telegram_document(ctx: &HandlerContext, msg: &TgMessage) {
 }
 
 /// Inject text into a session's tmux pane.
+///
+/// ADR-013 D1/D2: If tmux is unavailable or injection fails, warns the user
+/// every time with a clear message. No silent drops.
 async fn inject_to_session(
     ctx: &HandlerContext,
     session: &crate::session::Session,
@@ -388,16 +411,35 @@ async fn inject_to_session(
         let mut inj = ctx.injector.lock().await;
         inj.set_target(&target, session.tmux_socket.as_deref());
         let ok = inj.inject(text).unwrap_or(false);
-        let msg = if ok {
-            format!("{what} sent to Claude")
+        if ok {
+            ctx.bot
+                .send_message(&format!("{what} sent to Claude"), None, Some(thread_id))
+                .await;
         } else {
-            format!("Failed to inject {what} path into session")
-        };
-        ctx.bot.send_message(&msg, None, Some(thread_id)).await;
+            // ADR-013 D1/D2: Injection failed despite having a target.
+            tracing::warn!(
+                session_id = %session.id,
+                what,
+                "ADR-013 D1: tmux injection failed for file/photo"
+            );
+            ctx.bot
+                .send_message(
+                    "\u{26A0}\u{FE0F} Reply failed \u{2014} tmux not detected. Start Claude Code inside tmux for bidirectional chat.",
+                    None,
+                    Some(thread_id),
+                )
+                .await;
+        }
     } else {
+        // ADR-013 D1/D2: No tmux target found.
+        tracing::warn!(
+            session_id = %session.id,
+            what,
+            "ADR-013 D1: tmux not detected for file/photo injection"
+        );
         ctx.bot
             .send_message(
-                "No tmux session found for this topic",
+                "\u{26A0}\u{FE0F} Reply failed \u{2014} tmux not detected. Start Claude Code inside tmux for bidirectional chat.",
                 None,
                 Some(thread_id),
             )
