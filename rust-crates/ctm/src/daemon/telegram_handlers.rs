@@ -879,20 +879,13 @@ pub(super) async fn handle_free_text_answer(
     text: &str,
 ) -> bool {
     // Phase 1: Find the pending entry for this session under a brief read lock.
+    // The map key IS the session_id, so we can look it up directly without
+    // locking the per-entry Mutex (which would require try_lock and could
+    // silently skip the entry if contended by a concurrent button handler).
     let (pending_key, entry) = {
         let pq = ctx.pending_q.read().await;
-        let found = pq.iter().find(|(_, v)| {
-            // We need to check session_id, but the value is behind a Mutex.
-            // Use try_lock to avoid blocking; if contended, another handler is
-            // active on this entry and we should skip (the user is tapping buttons).
-            if let Ok(p) = v.try_lock() {
-                p.session_id == session_id
-            } else {
-                false
-            }
-        });
-        match found {
-            Some((k, v)) => (k.clone(), Arc::clone(v)),
+        match pq.get(session_id) {
+            Some(arc) => (session_id.to_string(), Arc::clone(arc)),
             None => return false,
         }
     };
@@ -981,9 +974,11 @@ pub(super) async fn handle_free_text_answer(
     }
 
     if all_answered {
+        let session_id_for_thread = pending.session_id.clone();
         drop(pending);
+        let thread_id = ctx.get_thread_id(&session_id_for_thread).await;
         let _ =
-            callback_handlers::send_or_update_summary(ctx, &pending_key, None).await;
+            callback_handlers::send_or_update_summary(ctx, &pending_key, thread_id).await;
     }
 
     true

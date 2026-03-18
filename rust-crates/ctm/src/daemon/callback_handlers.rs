@@ -930,6 +930,20 @@ async fn handle_submitall_callback(ctx: &HandlerContext, data: &str, cb: &Callba
             return;
         }
 
+        // Guard: reject if any question is unanswered (can happen if
+        // "Change QN" races with "Submit All").
+        if pending.tentative.len() != pending.questions.len() {
+            let _ = ctx
+                .bot
+                .answer_callback_query(
+                    &cb.id,
+                    Some("Please answer all questions first"),
+                    true,
+                )
+                .await;
+            return;
+        }
+
         // Collect all answers in question order.
         let mut answers: Vec<(usize, String)> = Vec::new();
         for (q_idx, _q) in pending.questions.iter().enumerate() {
