@@ -90,6 +90,26 @@ pub(super) async fn handle_session_start(ctx: &HandlerContext, msg: &BridgeMessa
             parent_thread_id = ?parent_thread_id,
             "ADR-013: Child session detected, routing to parent topic"
         );
+
+        // ADR-013 Part C: Send "Agent spawned" one-liner to parent topic.
+        if let Some(ptid) = parent_thread_id {
+            let display_id = agent_id
+                .as_deref()
+                .unwrap_or(&msg.session_id[..std::cmp::min(12, msg.session_id.len())]);
+            ctx.bot
+                .send_message(
+                    &format!(
+                        "\u{1F916} *Agent spawned:* `{}`",
+                        escape_markdown_v1(display_id)
+                    ),
+                    Some(&SendOptions {
+                        parse_mode: Some("Markdown".into()),
+                        ..Default::default()
+                    }),
+                    Some(ptid),
+                )
+                .await;
+        }
     }
 
     // Check if session already has a thread (daemon restart scenario)
@@ -291,16 +311,58 @@ pub(super) async fn handle_agent_response(ctx: &HandlerContext, msg: &BridgeMess
         }
     }
 
-    ctx.bot
-        .send_message(
-            &format_agent_response(&msg.content),
-            Some(&SendOptions {
-                parse_mode: Some("Markdown".into()),
-                ..Default::default()
-            }),
-            thread_id,
-        )
-        .await;
+    // ADR-013 Part C: If this agent_response carries agentId metadata (from a
+    // SubagentStop hook), write the full output to a temp file and send a
+    // one-liner with a "Details" button instead of dumping the raw text.
+    if let Some(agent_id) = msg.meta().agent_id() {
+        // Write full output to temp file for the Details callback handler.
+        let temp_path = format!("/tmp/ctm-subagent-{agent_id}.md");
+        if let Err(e) = std::fs::write(&temp_path, &msg.content) {
+            tracing::warn!(
+                agent_id,
+                error = %e,
+                "ADR-013: Failed to write sub-agent temp file"
+            );
+        }
+
+        // Send one-liner with Details button.
+        let summary = if msg.content.chars().count() > 120 {
+            let truncated: String = msg.content.chars().take(120).collect();
+            format!("{truncated}\u{2026}")
+        } else {
+            msg.content.clone()
+        };
+        let one_liner = format!(
+            "\u{2705} *Agent completed:* `{}`\n\n_{}_",
+            escape_markdown_v1(agent_id),
+            escape_markdown_v1(&summary)
+        );
+        ctx.bot
+            .send_with_buttons(
+                &one_liner,
+                vec![InlineButton {
+                    text: "\u{1F4CB} Details".into(),
+                    callback_data: format!("subagentdetails:{agent_id}"),
+                }],
+                Some(&SendOptions {
+                    parse_mode: Some("Markdown".into()),
+                    ..Default::default()
+                }),
+                thread_id,
+            )
+            .await;
+    } else {
+        ctx.bot
+            .send_message(
+                &format_agent_response(&msg.content),
+                Some(&SendOptions {
+                    parse_mode: Some("Markdown".into()),
+                    ..Default::default()
+                }),
+                thread_id,
+            )
+            .await;
+    }
 }
 
 /// Handler 4: tool_start

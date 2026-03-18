@@ -278,6 +278,11 @@ impl<'a> MessageMetadata<'a> {
         self.str_field("caption")
     }
 
+    /// ADR-013: Sub-agent identifier (`"agentId"`).
+    pub fn agent_id(&self) -> Option<&'a str> {
+        self.str_field("agentId")
+    }
+
     /// Approval identifier (`"approvalId"`).
     #[allow(dead_code)] // Public API — used in tests and available for callers
     pub fn approval_id(&self) -> Option<&'a str> {
