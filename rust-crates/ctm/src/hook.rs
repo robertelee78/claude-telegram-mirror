@@ -377,9 +377,12 @@ async fn build_messages(
                 .as_deref()
                 .unwrap_or(agent_id);
 
-            let content = format!(
-                "\u{2705} Agent completed: {display_agent_id}\n\n{result_text}"
-            );
+            let agent_type_str = e.agent_type.as_deref().unwrap_or("");
+            let content = if agent_type_str.is_empty() {
+                format!("\u{2705} Agent completed: {display_agent_id}\n\n{result_text}")
+            } else {
+                format!("\u{2705} Agent completed: {display_agent_id} ({agent_type_str})\n\n{result_text}")
+            };
 
             let mut agent_meta = meta.clone();
             agent_meta.insert(
@@ -391,6 +394,14 @@ async fn build_messages(
                 agent_meta.insert(
                     "subagentId".into(),
                     serde_json::Value::String(sub_id.clone()),
+                );
+            }
+            // ADR-013 GAP-2: Include agent_type in metadata for spawn notification and message labeling.
+            // The SubagentStopEvent may carry agent_type from upstream. If not, we cannot infer it.
+            if let Some(ref agent_type) = e.agent_type {
+                agent_meta.insert(
+                    "agentType".into(),
+                    serde_json::Value::String(agent_type.clone()),
                 );
             }
 
