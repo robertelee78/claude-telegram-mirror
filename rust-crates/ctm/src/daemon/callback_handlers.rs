@@ -2,6 +2,18 @@
 
 use super::*;
 
+/// Collected answer for tmux injection, preserving type information
+/// so multi-select can be injected as key sequences instead of text.
+enum CollectedAnswer {
+    /// Single-select or free-text: inject as literal text + Enter.
+    Text(String),
+    /// Multi-select: inject as Space/Down key sequences for the checkbox TUI.
+    MultiSelect {
+        selected_indices: Vec<usize>,
+        total_options: usize,
+    },
+}
+
 /// Handle callback queries (button presses).
 ///
 /// H4.2: Each sub-handler answers the callback individually with appropriate
@@ -944,39 +956,37 @@ async fn handle_submitall_callback(ctx: &HandlerContext, data: &str, cb: &Callba
             return;
         }
 
-        // Collect all answers in question order.
-        let mut answers: Vec<(usize, String)> = Vec::new();
+        // Collect all answers in question order, preserving type info
+        // so multi-select can be injected as key sequences.
+        let mut answers: Vec<(usize, CollectedAnswer)> = Vec::new();
         for (q_idx, _q) in pending.questions.iter().enumerate() {
-            let text = match pending.tentative.get(&q_idx) {
-                Some(TentativeAnswer::Option(o_idx)) => pending
-                    .questions
-                    .get(q_idx)
-                    .and_then(|q| q.options.get(*o_idx))
-                    .map(|o| o.label.clone())
-                    .unwrap_or_else(|| format!("{}", o_idx + 1)),
+            let answer = match pending.tentative.get(&q_idx) {
+                Some(TentativeAnswer::Option(o_idx)) => {
+                    let label = pending
+                        .questions
+                        .get(q_idx)
+                        .and_then(|q| q.options.get(*o_idx))
+                        .map(|o| o.label.clone())
+                        .unwrap_or_else(|| format!("{}", o_idx + 1));
+                    CollectedAnswer::Text(label)
+                }
                 Some(TentativeAnswer::MultiOption(set)) => {
+                    let total_options = pending
+                        .questions
+                        .get(q_idx)
+                        .map(|q| q.options.len())
+                        .unwrap_or(0);
                     let mut sorted: Vec<usize> = set.iter().copied().collect();
                     sorted.sort();
-                    let labels: Vec<String> = sorted
-                        .iter()
-                        .filter_map(|&idx| {
-                            pending
-                                .questions
-                                .get(q_idx)
-                                .and_then(|q| q.options.get(idx))
-                                .map(|o| o.label.clone())
-                        })
-                        .collect();
-                    if labels.is_empty() {
-                        String::new()
-                    } else {
-                        labels.join(", ")
+                    CollectedAnswer::MultiSelect {
+                        selected_indices: sorted,
+                        total_options,
                     }
                 }
-                Some(TentativeAnswer::FreeText(s)) => s.clone(),
+                Some(TentativeAnswer::FreeText(s)) => CollectedAnswer::Text(s.clone()),
                 None => continue,
             };
-            answers.push((q_idx, text));
+            answers.push((q_idx, answer));
         }
 
         // Mark all as finalized.
@@ -1024,8 +1034,33 @@ async fn handle_submitall_callback(ctx: &HandlerContext, data: &str, cb: &Callba
 
         let mut inj = ctx.injector.lock().await;
         inj.set_target(&target, socket.as_deref());
-        for (_, answer_text) in &answers {
-            let _ = inj.inject(answer_text);
+        for (_, answer) in &answers {
+            match answer {
+                CollectedAnswer::Text(text) => {
+                    let _ = inj.inject(text);
+                }
+                CollectedAnswer::MultiSelect {
+                    selected_indices,
+                    total_options,
+                } => {
+                    // Claude Code's multi-select uses an interactive checkbox
+                    // TUI (like @inquirer/checkbox). It requires key sequences:
+                    //   Space = toggle current option
+                    //   Down  = move to next option
+                    //   Enter = confirm selections
+                    // The cursor starts on option 0.
+                    for option_idx in 0..*total_options {
+                        if selected_indices.contains(&option_idx) {
+                            let _ = inj.send_key("Space");
+                        }
+                        // Move down to next option (skip after the last one).
+                        if option_idx + 1 < *total_options {
+                            let _ = inj.send_key("Down");
+                        }
+                    }
+                    let _ = inj.send_key("Enter");
+                }
+            }
         }
     }
 

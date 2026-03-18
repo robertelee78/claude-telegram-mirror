@@ -327,7 +327,8 @@ pub const SAFE_COMMANDS: &[&str] = &[
 
 /// Whitelist of allowed tmux special keys
 pub const ALLOWED_TMUX_KEYS: &[&str] = &[
-    "Enter", "Escape", "Tab", "C-c", "C-u", "C-d", "C-l", "Up", "Down", "Left", "Right", "BSpace",
+    "Enter", "Escape", "Tab", "Space", "C-c", "C-u", "C-d", "C-l", "Up", "Down", "Left", "Right",
+    "BSpace",
 ];
 
 /// Maximum session ID length
