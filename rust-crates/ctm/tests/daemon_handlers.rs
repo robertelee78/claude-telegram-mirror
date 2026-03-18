@@ -1157,8 +1157,10 @@ fn duplicate_session_creation_idempotent() {
         s2.last_activity >= s1.last_activity,
         "Activity should be updated"
     );
-    // Original fields should NOT be overwritten
-    assert_eq!(s2.hostname.as_deref(), Some("host1"));
+    // ADR-013 F3: When new metadata is provided, it auto-heals the existing session.
+    // hostname/project_dir are updated to the latest values (not discarded).
+    assert_eq!(s2.hostname.as_deref(), Some("host2"));
+    assert_eq!(s2.project_dir.as_deref(), Some("/proj2"));
 }
 
 // ======================================================================

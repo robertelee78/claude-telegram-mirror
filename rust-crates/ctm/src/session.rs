@@ -32,6 +32,12 @@ pub struct Session {
     pub project_dir: Option<String>,
     #[allow(dead_code)] // Deserialized from DB; Library API
     pub metadata: Option<String>,
+    /// ADR-013: Parent session ID for sub-agent sessions (extracted from transcript_path).
+    #[allow(dead_code)] // Deserialized from DB; Library API — used by daemon routing (ADR-013)
+    pub parent_session_id: Option<String>,
+    /// ADR-013: Agent ID for sub-agent sessions (e.g. "agent-abc123").
+    #[allow(dead_code)] // Deserialized from DB; Library API — used by daemon routing (ADR-013)
+    pub agent_id: Option<String>,
 }
 
 /// A pending tool-approval request.
@@ -131,17 +137,19 @@ impl SessionManager {
             .execute_batch(
                 "
             CREATE TABLE IF NOT EXISTS sessions (
-                id            TEXT PRIMARY KEY,
-                chat_id       INTEGER NOT NULL,
-                thread_id     INTEGER,
-                hostname      TEXT,
-                tmux_target   TEXT,
-                tmux_socket   TEXT,
-                started_at    TEXT NOT NULL,
-                last_activity TEXT NOT NULL,
-                status        TEXT DEFAULT 'active',
-                project_dir   TEXT,
-                metadata      TEXT
+                id                TEXT PRIMARY KEY,
+                chat_id           INTEGER NOT NULL,
+                thread_id         INTEGER,
+                hostname          TEXT,
+                tmux_target       TEXT,
+                tmux_socket       TEXT,
+                started_at        TEXT NOT NULL,
+                last_activity     TEXT NOT NULL,
+                status            TEXT DEFAULT 'active',
+                project_dir       TEXT,
+                metadata          TEXT,
+                parent_session_id TEXT,
+                agent_id          TEXT
             );
 
             CREATE TABLE IF NOT EXISTS pending_approvals (
@@ -164,6 +172,7 @@ impl SessionManager {
             .map_err(|e| AppError::Database(e.to_string()))?;
 
         self.migrate_add_tmux_columns()?;
+        self.migrate_add_parent_columns()?;
         Ok(())
     }
 
@@ -189,6 +198,51 @@ impl SessionManager {
             self.conn
                 .execute_batch("ALTER TABLE sessions ADD COLUMN tmux_socket TEXT")
                 .map_err(|e| AppError::Database(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// ADR-013 Migration: add parent_session_id / agent_id if upgrading from an older DB.
+    ///
+    /// For new databases these columns are included in the CREATE TABLE statement,
+    /// so this migration is a no-op. For databases created before ADR-013, the ALTER
+    /// TABLE adds the missing columns. The "duplicate column name" error is caught
+    /// to handle concurrent migrations racing on the same DB file.
+    fn migrate_add_parent_columns(&self) -> Result<()> {
+        let mut stmt = self
+            .conn
+            .prepare("PRAGMA table_info(sessions)")
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        let columns: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|e| AppError::Database(e.to_string()))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        if !columns.iter().any(|c| c == "parent_session_id") {
+            match self
+                .conn
+                .execute_batch("ALTER TABLE sessions ADD COLUMN parent_session_id TEXT")
+            {
+                Ok(()) => {}
+                Err(e) if e.to_string().contains("duplicate column name") => {
+                    // Another connection already added this column concurrently — safe to ignore.
+                }
+                Err(e) => return Err(AppError::Database(e.to_string())),
+            }
+        }
+        if !columns.iter().any(|c| c == "agent_id") {
+            match self
+                .conn
+                .execute_batch("ALTER TABLE sessions ADD COLUMN agent_id TEXT")
+            {
+                Ok(()) => {}
+                Err(e) if e.to_string().contains("duplicate column name") => {
+                    // Another connection already added this column concurrently — safe to ignore.
+                }
+                Err(e) => return Err(AppError::Database(e.to_string())),
+            }
         }
         Ok(())
     }
@@ -223,9 +277,45 @@ impl SessionManager {
 
         let now = now_iso();
 
-        // If the session already exists, touch its activity timestamp and return.
+        // If the session already exists, touch its activity timestamp and
+        // auto-heal any tmux/hostname/project_dir metadata that was provided
+        // (ADR-013 F3: idempotency guard no longer discards metadata).
         if self.get_session(session_id)?.is_some() {
             self.update_activity(session_id)?;
+
+            // Auto-heal: update tmux info if provided
+            if tmux_target.is_some() || tmux_socket.is_some() {
+                self.set_tmux_info(session_id, tmux_target, tmux_socket)?;
+            }
+
+            // Auto-heal: update hostname/project_dir if provided
+            if hostname.is_some() || project_dir.is_some() {
+                let mut updates = Vec::new();
+                let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+                if let Some(h) = hostname {
+                    updates.push("hostname = ?");
+                    param_values.push(Box::new(h.to_string()));
+                }
+                if let Some(p) = project_dir {
+                    updates.push("project_dir = ?");
+                    param_values.push(Box::new(p.to_string()));
+                }
+
+                if !updates.is_empty() {
+                    let sql = format!(
+                        "UPDATE sessions SET {} WHERE id = ?",
+                        updates.join(", ")
+                    );
+                    param_values.push(Box::new(session_id.to_string()));
+                    let params: Vec<&dyn rusqlite::types::ToSql> =
+                        param_values.iter().map(|p| p.as_ref()).collect();
+                    self.conn
+                        .execute(&sql, params.as_slice())
+                        .map_err(|e| AppError::Database(e.to_string()))?;
+                }
+            }
+
             return Ok(session_id.to_string());
         }
 
@@ -467,20 +557,23 @@ impl SessionManager {
         Ok(())
     }
 
+    /// ADR-013 F2: Update tmux info for a session.  Checks that the UPDATE
+    /// affected at least 1 row; logs a warning if the session row does not
+    /// exist (the row should exist by now if `create_session` ran first).
     pub fn set_tmux_info(
         &self,
         session_id: &str,
         tmux_target: Option<&str>,
         tmux_socket: Option<&str>,
     ) -> Result<()> {
-        match (tmux_target, tmux_socket) {
+        let rows_changed = match (tmux_target, tmux_socket) {
             (Some(t), Some(s)) => {
                 self.conn
                     .execute(
                         "UPDATE sessions SET tmux_target = ?1, tmux_socket = ?2 WHERE id = ?3",
                         params![t, s, session_id],
                     )
-                    .map_err(|e| AppError::Database(e.to_string()))?;
+                    .map_err(|e| AppError::Database(e.to_string()))?
             }
             (Some(t), None) => {
                 self.conn
@@ -488,7 +581,7 @@ impl SessionManager {
                         "UPDATE sessions SET tmux_target = ?1 WHERE id = ?2",
                         params![t, session_id],
                     )
-                    .map_err(|e| AppError::Database(e.to_string()))?;
+                    .map_err(|e| AppError::Database(e.to_string()))?
             }
             (None, Some(s)) => {
                 self.conn
@@ -496,9 +589,16 @@ impl SessionManager {
                         "UPDATE sessions SET tmux_socket = ?1 WHERE id = ?2",
                         params![s, session_id],
                     )
-                    .map_err(|e| AppError::Database(e.to_string()))?;
+                    .map_err(|e| AppError::Database(e.to_string()))?
             }
-            (None, None) => {}
+            (None, None) => return Ok(()),
+        };
+
+        if rows_changed == 0 {
+            tracing::warn!(
+                session_id = %session_id,
+                "set_tmux_info: UPDATE affected 0 rows — session row does not exist yet"
+            );
         }
         Ok(())
     }
@@ -523,6 +623,62 @@ impl SessionManager {
             Some(Err(e)) => Err(AppError::Database(e.to_string())),
             None => Ok(None),
         }
+    }
+
+    /// ADR-013 F8: Return all active sessions that have a non-NULL tmux_target.
+    /// Used by the daemon on startup to warm the in-memory session_tmux_targets cache.
+    ///
+    /// Returns `Vec<(session_id, tmux_target, tmux_socket)>`.
+    #[allow(dead_code)] // Library API — used by daemon startup (ADR-013 F8)
+    pub fn get_active_sessions_with_tmux(&self) -> Result<Vec<(String, String, Option<String>)>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, tmux_target, tmux_socket FROM sessions
+                 WHERE status = 'active' AND tmux_target IS NOT NULL",
+            )
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                let id: String = row.get(0)?;
+                let target: String = row.get(1)?;
+                let socket: Option<String> = row.get(2)?;
+                Ok((id, target, socket))
+            })
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(|e| AppError::Database(e.to_string()))?);
+        }
+        Ok(out)
+    }
+
+    /// ADR-013: Store parent_session_id and agent_id for a child (sub-agent) session.
+    #[allow(dead_code)] // Library API — used by daemon routing (ADR-013)
+    pub fn set_parent_info(
+        &self,
+        session_id: &str,
+        parent_session_id: &str,
+        agent_id: Option<&str>,
+    ) -> Result<()> {
+        let rows_changed = self
+            .conn
+            .execute(
+                "UPDATE sessions SET parent_session_id = ?1, agent_id = ?2 WHERE id = ?3",
+                params![parent_session_id, agent_id, session_id],
+            )
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        if rows_changed == 0 {
+            tracing::warn!(
+                session_id = %session_id,
+                parent_session_id = %parent_session_id,
+                "set_parent_info: UPDATE affected 0 rows — session row does not exist"
+            );
+        }
+        Ok(())
     }
 
     // ------------------------------------------------------------ approvals
@@ -790,6 +946,9 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
         status,
         project_dir: row.get("project_dir")?,
         metadata: row.get("metadata")?,
+        // ADR-013: Parent-child session fields (migrated columns, always present after init_schema)
+        parent_session_id: row.get("parent_session_id")?,
+        agent_id: row.get("agent_id")?,
     })
 }
 

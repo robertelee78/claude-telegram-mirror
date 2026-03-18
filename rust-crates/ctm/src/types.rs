@@ -508,6 +508,47 @@ pub fn is_valid_slash_command(command: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | ' ' | '/'))
 }
 
+/// ADR-013: Extract the parent session ID from a sub-agent transcript path.
+///
+/// Sub-agent transcripts follow the pattern:
+/// `~/.claude/projects/{project}/{parentSessionId}/subagents/agent-{agentId}.jsonl`
+///
+/// Splits on `/subagents/`, takes the left side, and returns the last path component
+/// (which is the parent session ID).
+///
+/// Returns `None` if the path does not contain `/subagents/` or has no parent component.
+#[allow(dead_code)] // Library API — used by daemon routing (ADR-013)
+pub fn extract_parent_session_id(transcript_path: &str) -> Option<String> {
+    let (parent_part, _) = transcript_path.split_once("/subagents/")?;
+    let last_component = parent_part.rsplit('/').next()?;
+    if last_component.is_empty() {
+        return None;
+    }
+    Some(last_component.to_string())
+}
+
+/// ADR-013: Extract the agent ID from a sub-agent transcript path.
+///
+/// Sub-agent transcripts follow the pattern:
+/// `~/.claude/projects/{project}/{parentSessionId}/subagents/agent-{agentId}.jsonl`
+///
+/// Splits on `/subagents/`, takes the right side, strips the `.jsonl` extension,
+/// and returns the filename (e.g. `"agent-abc123"`).
+///
+/// Returns `None` if the path does not contain `/subagents/` or has no agent component.
+#[allow(dead_code)] // Library API — used by daemon routing (ADR-013)
+pub fn extract_agent_id(transcript_path: &str) -> Option<String> {
+    let (_, agent_part) = transcript_path.split_once("/subagents/")?;
+    // The agent_part may contain further path segments; take only the filename
+    let filename = agent_part.rsplit('/').next()?;
+    // Strip .jsonl extension if present
+    let name = filename.strip_suffix(".jsonl").unwrap_or(filename);
+    if name.is_empty() {
+        return None;
+    }
+    Some(name.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -669,5 +710,72 @@ mod tests {
         assert_eq!(json, serde_json::Value::String("approved".into()));
         let parsed: ApprovalStatus = serde_json::from_value(json).unwrap();
         assert_eq!(parsed, ApprovalStatus::Approved);
+    }
+
+    // ADR-013: extract_parent_session_id tests
+
+    #[test]
+    fn test_extract_parent_session_id_typical() {
+        let path = "/home/user/.claude/projects/myproj/sess-abc123/subagents/agent-def456.jsonl";
+        assert_eq!(
+            extract_parent_session_id(path),
+            Some("sess-abc123".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_parent_session_id_no_subagents() {
+        let path = "/home/user/.claude/projects/myproj/sess-abc123/transcript.jsonl";
+        assert_eq!(extract_parent_session_id(path), None);
+    }
+
+    #[test]
+    fn test_extract_parent_session_id_empty_parent() {
+        // Edge case: /subagents/ at the start
+        let path = "/subagents/agent-def456.jsonl";
+        // parent_part = "", rsplit('/').next() = "" => None
+        assert_eq!(extract_parent_session_id(path), None);
+    }
+
+    #[test]
+    fn test_extract_parent_session_id_nested_path() {
+        let path = "/home/user/.claude/projects/deep/nested/path/parent-id/subagents/agent-x.jsonl";
+        assert_eq!(
+            extract_parent_session_id(path),
+            Some("parent-id".to_string())
+        );
+    }
+
+    // ADR-013: extract_agent_id tests
+
+    #[test]
+    fn test_extract_agent_id_typical() {
+        let path = "/home/user/.claude/projects/myproj/sess-abc123/subagents/agent-def456.jsonl";
+        assert_eq!(
+            extract_agent_id(path),
+            Some("agent-def456".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_agent_id_no_extension() {
+        let path = "/some/path/sess/subagents/agent-xyz";
+        assert_eq!(
+            extract_agent_id(path),
+            Some("agent-xyz".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_agent_id_no_subagents() {
+        let path = "/home/user/.claude/projects/myproj/transcript.jsonl";
+        assert_eq!(extract_agent_id(path), None);
+    }
+
+    #[test]
+    fn test_extract_agent_id_empty() {
+        let path = "/some/path/subagents/";
+        // agent_part = "", rsplit('/').next() = "" => stripped = "" => None
+        assert_eq!(extract_agent_id(path), None);
     }
 }
