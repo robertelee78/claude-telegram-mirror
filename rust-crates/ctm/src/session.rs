@@ -960,28 +960,6 @@ impl SessionManager {
         Ok(deleted)
     }
 
-    /// ADR-013 GAP-7: Find the most likely parent session for a cross-cwd sub-agent.
-    ///
-    /// Queries for an active session on the same hostname that:
-    /// - Has a thread_id (topic already created in Telegram)
-    /// - Has a tmux_target (real user session, not another sub-agent)
-    /// - Has no parent_session_id (is not itself a sub-agent)
-    /// - Was started within `max_age_secs` seconds ago
-    /// - Is not the session identified by `exclude_sid`
-    ///
-    /// Returns the most recently active matching session, or `None` if no
-    /// suitable parent is found.
-    ///
-    /// (Stub — full implementation in GAP-7 coder branch)
-    pub fn find_likely_parent(
-        &self,
-        _hostname: &str,
-        _exclude_sid: &str,
-        _max_age_secs: u64,
-    ) -> Result<Option<Session>> {
-        Ok(None)
-    }
-
     /// Test helper: overwrite `started_at` for a session via raw SQL.
     ///
     /// This exists so that integration tests can simulate sessions that started
