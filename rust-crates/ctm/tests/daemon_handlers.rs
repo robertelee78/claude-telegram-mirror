@@ -813,6 +813,7 @@ fn config_validation_missing_credentials() {
         config_dir: PathBuf::from("/tmp"),
         config_path: PathBuf::from("/tmp/config.json"),
         forum_enabled: false,
+        subagent_detection_window_secs: 60,
     };
 
     let (errors, warnings) = ctm::config::validate_config(&config);
@@ -844,6 +845,7 @@ fn config_validation_bad_chunk_size() {
         config_dir: PathBuf::from("/tmp"),
         config_path: PathBuf::from("/tmp/config.json"),
         forum_enabled: false,
+        subagent_detection_window_secs: 60,
     };
 
     let (errors, warnings) = ctm::config::validate_config(&config);

@@ -68,61 +68,95 @@ pub(super) async fn handle_session_start(ctx: &HandlerContext, msg: &BridgeMessa
     // Check if this session is a child of an existing session by examining
     // the transcript_path for a /subagents/ pattern.
     let transcript_path = meta.transcript_path();
-    let parent_info: Option<(String, Option<String>)> = transcript_path.and_then(|tp| {
+    let path_parent_info: Option<(String, Option<String>)> = transcript_path.and_then(|tp| {
         let parent_id = crate::types::extract_parent_session_id(tp)?;
         let agent_id = crate::types::extract_agent_id(tp);
         Some((parent_id.to_string(), agent_id.map(|s| s.to_string())))
     });
 
-    // If this is a child session, look up the parent's thread_id and reuse it.
-    let parent_thread_id: Option<i64> = if let Some((ref parent_sid, _)) = parent_info {
-        let psid = parent_sid.clone();
-        // ADR-013 GAP-4: Retry parent thread_id lookup with short delays.
-        // In fast swarm spawning, the child session_start may arrive before
-        // the parent's topic is created. Retrying avoids topic sprawl.
-        let mut result = None;
-        for attempt in 0..3u8 {
-            // Check in-memory cache first
-            let cached = ctx.session_threads.read().await.get(&psid).copied();
-            if cached.is_some() {
-                result = cached;
-                break;
+    // Resolve parent_info and parent_thread_id together.
+    // Strategy:
+    //   1. If transcript_path heuristic found a parent, use GAP-4 retry logic for thread_id.
+    //   2. Else if no tmux (likely a sub-agent), try GAP-7 temporal correlation.
+    //   3. Otherwise, no parent.
+    let (parent_info, parent_thread_id): (Option<(String, Option<String>)>, Option<i64>) =
+        if let Some((ref parent_sid, ref agent_id)) = path_parent_info {
+            // Path heuristic succeeded — use GAP-4 retry logic for parent thread_id.
+            let psid = parent_sid.clone();
+            let mut result = None;
+            for attempt in 0..3u8 {
+                // Check in-memory cache first
+                let cached = ctx.session_threads.read().await.get(&psid).copied();
+                if cached.is_some() {
+                    result = cached;
+                    break;
+                }
+                // Fall back to DB
+                let psid2 = psid.clone();
+                let db_result = ctx
+                    .db_op(move |sess| {
+                        sess.get_session(&psid2)
+                            .ok()
+                            .flatten()
+                            .and_then(|s| s.thread_id)
+                    })
+                    .await;
+                if db_result.is_some() {
+                    result = db_result;
+                    break;
+                }
+                if attempt < 2 {
+                    tracing::debug!(
+                        session_id = %msg.session_id,
+                        parent_session_id = %psid,
+                        attempt = attempt + 1,
+                        "ADR-013 GAP-4: Parent thread_id not found, retrying in 500ms"
+                    );
+                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                }
             }
-            // Fall back to DB
-            let psid2 = psid.clone();
-            let db_result = ctx
-                .db_op(move |sess| {
-                    sess.get_session(&psid2)
-                        .ok()
-                        .flatten()
-                        .and_then(|s| s.thread_id)
-                })
-                .await;
-            if db_result.is_some() {
-                result = db_result;
-                break;
-            }
-            if attempt < 2 {
-                tracing::debug!(
+            if result.is_none() {
+                tracing::warn!(
                     session_id = %msg.session_id,
                     parent_session_id = %psid,
-                    attempt = attempt + 1,
-                    "ADR-013 GAP-4: Parent thread_id not found, retrying in 500ms"
+                    "ADR-013 GAP-4: Parent thread_id not found after 3 attempts — child gets own topic"
                 );
-                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
             }
-        }
-        if result.is_none() {
-            tracing::warn!(
-                session_id = %msg.session_id,
-                parent_session_id = %psid,
-                "ADR-013 GAP-4: Parent thread_id not found after 3 attempts — child gets own topic"
-            );
-        }
-        result
-    } else {
-        None
-    };
+            (
+                Some((parent_sid.clone(), agent_id.clone())),
+                result,
+            )
+        } else if tmux_target.is_none() {
+            // ADR-013 GAP-7: Temporal correlation fallback for cross-cwd sub-agents.
+            // No /subagents/ in path AND no tmux → likely a cross-cwd sub-agent.
+            // Look for a plausible parent: same host, has tmux, active, recent.
+            if let Some(host) = hostname {
+                let h = host.to_string();
+                let sid = msg.session_id.clone();
+                let window = ctx.config.subagent_detection_window_secs;
+                let maybe_parent = ctx
+                    .db_op(move |sess| sess.find_likely_parent(&h, &sid, window).ok().flatten())
+                    .await;
+
+                if let Some(parent) = maybe_parent {
+                    let psid = parent.id.clone();
+                    let ptid = parent.thread_id;
+                    tracing::info!(
+                        session_id = %msg.session_id,
+                        parent_session_id = %psid,
+                        parent_thread_id = ?ptid,
+                        "ADR-013 GAP-7: Cross-cwd sub-agent detected via temporal correlation"
+                    );
+                    (Some((psid, None)), ptid)
+                } else {
+                    (None, None)
+                }
+            } else {
+                (None, None)
+            }
+        } else {
+            (None, None)
+        };
 
     // Store parent info in DB if this is a child session
     if let Some((ref parent_sid, ref agent_id)) = parent_info {

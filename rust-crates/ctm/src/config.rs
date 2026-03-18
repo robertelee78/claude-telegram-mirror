@@ -92,6 +92,10 @@ pub struct Config {
     /// Whether forum (topics) mode is enabled (default: false)
     #[allow(dead_code)] // Library API
     pub forum_enabled: bool,
+    /// ADR-013 GAP-7: Time window (seconds) for temporal parent detection fallback.
+    /// Sub-agents detected within this window of an active parent session on the
+    /// same host will be treated as children. Default: 60 seconds.
+    pub subagent_detection_window_secs: u64,
 }
 
 /// S-4: Manual Debug impl that redacts bot_token to prevent accidental log exposure.
@@ -124,6 +128,10 @@ impl fmt::Debug for Config {
             .field("config_dir", &self.config_dir)
             .field("config_path", &self.config_path)
             .field("forum_enabled", &self.forum_enabled)
+            .field(
+                "subagent_detection_window_secs",
+                &self.subagent_detection_window_secs,
+            )
             .finish()
     }
 }
@@ -169,6 +177,11 @@ struct ConfigFile {
     inactivity_delete_threshold_minutes: Option<u32>,
     #[serde(alias = "socketPath", alias = "socket_path")]
     socket_path: Option<String>,
+    #[serde(
+        alias = "subagentDetectionWindowSecs",
+        alias = "subagent_detection_window_secs"
+    )]
+    subagent_detection_window_secs: Option<u64>,
 }
 
 /// Fast-path check: is Telegram mirroring enabled based on env vars alone?
@@ -247,6 +260,13 @@ fn parse_u32(val: &str, default: u32) -> u32 {
 fn parse_usize(val: &str, default: usize) -> usize {
     val.trim().parse().unwrap_or_else(|_| {
         tracing::warn!(value = val, default, "Invalid usize, using default");
+        default
+    })
+}
+
+fn parse_u64(val: &str, default: u64) -> u64 {
+    val.trim().parse().unwrap_or_else(|_| {
+        tracing::warn!(value = val, default, "Invalid u64, using default");
         default
     })
 }
@@ -366,6 +386,13 @@ pub fn load_config(require_auth: bool) -> Result<Config> {
             .or(file_config.inactivity_delete_threshold_minutes)
             .unwrap_or(720);
 
+    let subagent_detection_window_secs =
+        std::env::var("TELEGRAM_SUBAGENT_DETECTION_WINDOW_SECS")
+            .ok()
+            .map(|v| parse_u64(&v, 60))
+            .or(file_config.subagent_detection_window_secs)
+            .unwrap_or(60);
+
     // Socket path with validation
     let socket_path = std::env::var("TELEGRAM_BRIDGE_SOCKET")
         .ok()
@@ -411,6 +438,7 @@ pub fn load_config(require_auth: bool) -> Result<Config> {
         config_dir,
         config_path,
         forum_enabled: false,
+        subagent_detection_window_secs,
     })
 }
 

@@ -666,6 +666,57 @@ impl SessionManager {
         Ok(())
     }
 
+    /// ADR-013 GAP-7: Find the most likely parent session for a cross-cwd sub-agent.
+    ///
+    /// When the transcript_path heuristic fails (no `/subagents/` segment), this
+    /// uses temporal + host correlation as a fallback:
+    /// - Same hostname as the new session
+    /// - Active status
+    /// - Has a thread_id (topic already created)
+    /// - Has a tmux_target (real user session, not another sub-agent)
+    /// - Has no parent_session_id (not itself a sub-agent)
+    /// - Started within `max_age_secs` seconds ago
+    /// - Not the session itself (exclude_sid)
+    ///
+    /// Returns the most recently active matching session, or None.
+    pub fn find_likely_parent(
+        &self,
+        hostname: &str,
+        exclude_sid: &str,
+        max_age_secs: u64,
+    ) -> Result<Option<Session>> {
+        let cutoff = chrono::Utc::now()
+            - chrono::TimeDelta::try_seconds(max_age_secs as i64)
+                .unwrap_or(chrono::TimeDelta::seconds(60));
+        let cutoff_iso = cutoff.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT * FROM sessions
+                 WHERE hostname = ?1
+                   AND id != ?2
+                   AND status = 'active'
+                   AND thread_id IS NOT NULL
+                   AND tmux_target IS NOT NULL
+                   AND parent_session_id IS NULL
+                   AND started_at >= ?3
+                 ORDER BY last_activity DESC
+                 LIMIT 1",
+            )
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        let mut rows = stmt
+            .query_map(params![hostname, exclude_sid, cutoff_iso], row_to_session)
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        match rows.next() {
+            Some(Ok(s)) => Ok(Some(s)),
+            Some(Err(e)) => Err(AppError::Database(e.to_string())),
+            None => Ok(None),
+        }
+    }
+
     /// ADR-013 GAP-5: Get all active child sessions for a parent session.
     /// Used by handle_session_end to cascade session end to children.
     #[allow(dead_code)]

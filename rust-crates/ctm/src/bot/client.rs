@@ -948,6 +948,7 @@ mod tests {
             config_dir: PathBuf::from("/tmp"),
             config_path: PathBuf::from("/tmp/config.json"),
             forum_enabled: false,
+            subagent_detection_window_secs: 60,
         }
     }
 
