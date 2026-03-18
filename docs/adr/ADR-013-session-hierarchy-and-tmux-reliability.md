@@ -1,6 +1,6 @@
 # ADR-013: Session Hierarchy and tmux Reliability
 
-**Status:** Partially Implemented (B+ / Good — see Audit below)
+**Status:** Implemented (all gaps closed — see Audit below)
 **Date:** 2026-03-18
 **Authors:** Robert, Claude
 
@@ -223,17 +223,17 @@ Not viable as sole strategy. GitHub issues #7881, #14859, #16424 are open with n
 
 A five-agent CFA swarm audited the implementation against every requirement in this ADR. Four researchers examined Parts A–E independently; a queen coordinator synthesized the findings.
 
-### Per-Part Grades
+### Per-Part Grades (post-remediation)
 
 | Part | Grade | Verdict |
 |------|-------|---------|
 | **A** — Tmux Reliability (F1-F8) | **A** | All 8 fixes implemented. Three-tier lookup (cache → DB → live detection) is excellent. |
-| **B** — Parent-Child Routing | **B-** | Routing infrastructure is excellent. `agent_type` completely missing. Child messages unlabeled. Parent-before-child race. |
-| **C** — Sub-Agent UX | **B** | Details button works. Spawn notification lacks agent type. No message editing (two messages instead of one updated). |
-| **D** — Telegram UX (D1-D7) | **A-** | All 7 requirements work. Minor: no resume confirmation message. |
-| **E** — Topic Lifecycle (E1-E5) | **B** | Core logic works. Default 24h instead of spec'd 15min. Inactivity threshold not runtime-configurable. Sub-agent count prepend missing. |
+| **B** — Parent-Child Routing | **A-** | ~~B-~~ → A-. `agent_type` now tracked (schema + hook + metadata). Child prefix added. Race fix via 3-attempt retry. Orphan cascade on parent end. |
+| **C** — Sub-Agent UX | **A-** | ~~B~~ → A-. Spawn notification includes agent_type when available. Details button + file transfer work. Path traversal fixed. |
+| **D** — Telegram UX (D1-D7) | **A** | ~~A-~~ → A. Resume confirmation message now sent ("🟢 tmux: reconnected"). |
+| **E** — Topic Lifecycle (E1-E5) | **A-** | ~~B~~ → A-. Default corrected to 15min. Inactivity threshold now runtime-configurable. Close fallback added. Temp file cleanup added. |
 
-### Critical Gaps (6 items — block "Excellent" rating)
+### Critical Gaps (6 items — ALL RESOLVED in commit 6d18ac7)
 
 #### GAP-1: SECURITY — Path traversal in Details callback
 - **Severity:** Security
@@ -272,7 +272,7 @@ A five-agent CFA swarm audited the implementation against every requirement in t
   - `cleanup.rs:386-408` — `cleanup_inactive_topics` silently no-ops when `auto_delete_topics = false`. No close fallback (compare: `handle_session_end` at `socket_handlers.rs:279` correctly closes when auto-delete is off).
 - **Fix:** (a) Change `topic_delete_delay_minutes` default to `15`. (b) Add `inactivity_delete_threshold_minutes` field to `Config`, read from `TELEGRAM_INACTIVITY_DELETE_THRESHOLD_MINUTES` env var, default 720. (c) In `cleanup_inactive_topics`, when `auto_delete_topics = false`, close (don't delete) inactive topics instead of skipping entirely.
 
-### Minor Issues (8 items — cosmetic or low-priority)
+### Minor Issues (8 items — 7 RESOLVED, 1 deferred)
 
 #### MINOR-1: Stale comment in mod.rs
 - **Location:** `mod.rs:602`
@@ -345,9 +345,11 @@ A five-agent CFA swarm audited the implementation against every requirement in t
 | E4: Title renames | `daemon/socket_handlers.rs` | 700-795 | Partial (no agent count) |
 | E5: Close then delete | `daemon/cleanup.rs` | 438-495 | Implemented |
 
-### Remediation Plan
+### Remediation Plan — COMPLETED (2026-03-18, commit 6d18ac7)
 
-**Phase 5: Security + Critical Gaps** (priority order)
+5-agent CFA swarm executed Phases 5-6 in parallel. All gaps closed. 13 files changed, 361 insertions. All 225 tests pass.
+
+**Phase 5: Security + Critical Gaps** (all done)
 
 | Step | Gap | Files | Estimated | Risk |
 |------|-----|-------|-----------|------|
