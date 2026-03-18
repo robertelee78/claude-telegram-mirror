@@ -364,8 +364,42 @@ async fn build_messages(
             // which fires exactly once when the session actually terminates.
             // Stale session detection in cleanup.rs serves as a fallback.
         }
-        HookEvent::SubagentStop(_) => {
-            // Recognized but no message sent
+        HookEvent::SubagentStop(e) => {
+            // ADR-013 Part C: Generate an agent_response message for sub-agent completion.
+            // This flows through to Telegram as a message in the parent topic.
+            let agent_id = e.subagent_id.as_deref().unwrap_or("unknown");
+            let result_text = e.result.as_deref().unwrap_or("(no result summary)");
+
+            // Extract agent_id and agent_type from the transcript_path if available
+            let transcript_agent_id = transcript_path
+                .and_then(|tp| crate::types::extract_agent_id(tp));
+            let display_agent_id = transcript_agent_id
+                .as_deref()
+                .unwrap_or(agent_id);
+
+            let content = format!(
+                "\u{2705} Agent completed: {display_agent_id}\n\n{result_text}"
+            );
+
+            let mut agent_meta = meta.clone();
+            agent_meta.insert(
+                "agentId".into(),
+                serde_json::Value::String(display_agent_id.to_string()),
+            );
+            // Include the subagent_id from the event if present
+            if let Some(ref sub_id) = e.subagent_id {
+                agent_meta.insert(
+                    "subagentId".into(),
+                    serde_json::Value::String(sub_id.clone()),
+                );
+            }
+
+            messages.push(make_message(
+                MessageType::AgentResponse,
+                session_id,
+                &content,
+                agent_meta,
+            ));
         }
         HookEvent::PreCompact(_) => {
             messages.push(make_message(MessageType::PreCompact, session_id, "", meta));

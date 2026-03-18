@@ -43,6 +43,55 @@ pub(super) async fn handle_session_start(ctx: &HandlerContext, msg: &BridgeMessa
     // BUG-012: Cancel pending topic deletion if session resumes
     cleanup::cancel_pending_topic_deletion(ctx, &msg.session_id).await;
 
+    // ADR-013 Part B: Parent-child session routing.
+    // Check if this session is a child of an existing session by examining
+    // the transcript_path for a /subagents/ pattern.
+    let transcript_path = meta.transcript_path();
+    let parent_info: Option<(String, Option<String>)> = transcript_path.and_then(|tp| {
+        let parent_id = crate::types::extract_parent_session_id(tp)?;
+        let agent_id = crate::types::extract_agent_id(tp);
+        Some((parent_id.to_string(), agent_id.map(|s| s.to_string())))
+    });
+
+    // If this is a child session, look up the parent's thread_id and reuse it.
+    let parent_thread_id: Option<i64> = if let Some((ref parent_sid, _)) = parent_info {
+        let psid = parent_sid.clone();
+        // Try in-memory cache first, then DB
+        let cached = ctx.session_threads.read().await.get(&psid).copied();
+        if cached.is_some() {
+            cached
+        } else {
+            let psid2 = psid.clone();
+            ctx.db_op(move |sess| {
+                sess.get_session(&psid2)
+                    .ok()
+                    .flatten()
+                    .and_then(|s| s.thread_id)
+            })
+            .await
+        }
+    } else {
+        None
+    };
+
+    // Store parent info in DB if this is a child session
+    if let Some((ref parent_sid, ref agent_id)) = parent_info {
+        let sid = msg.session_id.clone();
+        let psid = parent_sid.clone();
+        let aid = agent_id.clone();
+        ctx.db_op(move |sess| {
+            let _ = sess.set_parent_info(&sid, &psid, aid.as_deref());
+        })
+        .await;
+        tracing::info!(
+            session_id = %msg.session_id,
+            parent_session_id = %parent_sid,
+            agent_id = ?agent_id,
+            parent_thread_id = ?parent_thread_id,
+            "ADR-013: Child session detected, routing to parent topic"
+        );
+    }
+
     // Check if session already has a thread (daemon restart scenario)
     let existing_thread = {
         let sid = msg.session_id.clone();
@@ -55,7 +104,25 @@ pub(super) async fn handle_session_start(ctx: &HandlerContext, msg: &BridgeMessa
         .await
     };
 
-    let thread_id = if let Some(tid) = existing_thread {
+    // ADR-013: If parent_thread_id is available, use it instead of creating a new topic.
+    let thread_id = if let Some(ptid) = parent_thread_id {
+        // Reuse parent's thread — store it for this child session too
+        let sid = msg.session_id.clone();
+        ctx.db_op(move |sess| {
+            let _ = sess.set_session_thread(&sid, ptid);
+        })
+        .await;
+        ctx.session_threads
+            .write()
+            .await
+            .insert(msg.session_id.clone(), ptid);
+        tracing::info!(
+            session_id = %msg.session_id,
+            thread_id = ptid,
+            "ADR-013: Reusing parent session's thread for child"
+        );
+        Some(ptid)
+    } else if let Some(tid) = existing_thread {
         ctx.session_threads
             .write()
             .await
@@ -98,10 +165,12 @@ pub(super) async fn handle_session_start(ctx: &HandlerContext, msg: &BridgeMessa
     }
     ctx.topic_locks.write().await.remove(&msg.session_id);
 
-    // Build and send session info
+    // ADR-013 D3: Build session info with tmux status indicator.
     let mut session_info = format_session_start(&msg.session_id, project_dir, hostname);
     if let Some(target) = tmux_target {
-        session_info.push_str(&format!("\n\u{1F4FA} tmux: `{target}`"));
+        session_info.push_str(&format!("\n\u{1F7E2} tmux: connected (`{target}`)"));
+    } else {
+        session_info.push_str("\n\u{1F534} tmux: not detected \u{2014} replies disabled");
     }
 
     ctx.bot

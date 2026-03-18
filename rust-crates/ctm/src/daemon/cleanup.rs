@@ -7,6 +7,11 @@ use super::*;
 const MAX_SESSION_CACHE: usize = 200;
 const MAX_TOOL_CACHE: usize = 500;
 
+/// ADR-013 E2: Default inactivity threshold for topic deletion (12 hours).
+/// Topics are CLOSED after `topic_delete_delay_minutes` (stage 1, typically 15 min),
+/// then DELETED after this inactivity threshold (stage 2).
+const INACTIVITY_DELETE_THRESHOLD_MINUTES: u64 = 720;
+
 /// BUG-003: Periodic cleanup of stale sessions, orphaned threads, expired caches, old downloads.
 pub(super) async fn run_cleanup(ctx: HandlerContext) {
     // Expire old approvals
@@ -29,6 +34,11 @@ pub(super) async fn run_cleanup(ctx: HandlerContext) {
 
     // ADR-011 Fix #7: Enforce cache size limits.
     enforce_cache_size_limits(&ctx).await;
+
+    // ADR-013 E2: Inactivity-based topic cleanup sweep.
+    // Close topics for sessions inactive > topic_delete_delay_minutes (stage 1).
+    // Delete topics for sessions inactive > INACTIVITY_DELETE_THRESHOLD_MINUTES (stage 2).
+    cleanup_inactive_topics(&ctx).await;
 
     // Clean old downloads
     cleanup_old_downloads();
@@ -320,6 +330,117 @@ fn cleanup_old_downloads() {
     }
 }
 
+/// ADR-013 E2: Sweep active sessions for inactivity-based topic cleanup.
+///
+/// Two stages:
+/// - Stage 2 (>720 min inactivity): DELETE the topic (full cleanup).
+///
+/// Stage 1 (close after session end) is handled by `schedule_topic_deletion`.
+/// This sweep catches sessions that are technically still "active" in the DB
+/// but have been idle for a long time (e.g. user walked away without ending).
+async fn cleanup_inactive_topics(ctx: &HandlerContext) {
+    let active_sessions = ctx
+        .db_op(|sess| sess.get_active_sessions().unwrap_or_default())
+        .await;
+
+    if active_sessions.is_empty() {
+        return;
+    }
+
+    let now = chrono::Utc::now();
+    let delete_cutoff = now
+        - chrono::TimeDelta::try_minutes(INACTIVITY_DELETE_THRESHOLD_MINUTES as i64)
+            .unwrap_or(chrono::TimeDelta::hours(12));
+
+    let mut cleaned = 0u32;
+    for session in &active_sessions {
+        let last_activity = match chrono::DateTime::parse_from_rfc3339(&session.last_activity).ok()
+        {
+            Some(la) => la.to_utc(),
+            None => continue,
+        };
+
+        // Only process sessions that are past the delete threshold
+        if last_activity >= delete_cutoff {
+            continue;
+        }
+
+        let thread_id = match session.thread_id {
+            Some(tid) => tid,
+            None => continue,
+        };
+
+        // Skip sessions with pending deletions already scheduled
+        if ctx.pending_del.read().await.contains_key(&session.id) {
+            continue;
+        }
+
+        let hours_inactive = (now - last_activity).num_hours();
+        tracing::info!(
+            session_id = %session.id,
+            hours_inactive,
+            thread_id,
+            "ADR-013 E2: Deleting topic for inactive session (>12h)"
+        );
+
+        // Stage 2: Delete the topic
+        if ctx.config.auto_delete_topics {
+            match ctx.bot.delete_forum_topic(thread_id).await {
+                Ok(true) => {
+                    let sid = session.id.clone();
+                    ctx.db_op(move |sess| {
+                        let _ = sess.clear_thread_id(&sid);
+                    })
+                    .await;
+                    ctx.session_threads.write().await.remove(&session.id);
+                }
+                _ => {
+                    // Fallback: close if delete fails
+                    let _ = ctx.bot.close_forum_topic(thread_id).await;
+                    let sid = session.id.clone();
+                    ctx.db_op(move |sess| {
+                        let _ = sess.clear_thread_id(&sid);
+                    })
+                    .await;
+                    ctx.session_threads.write().await.remove(&session.id);
+                }
+            }
+        }
+
+        // End the session in DB
+        let sid = session.id.clone();
+        ctx.db_op(move |sess| {
+            let _ = sess.end_session(&sid, crate::types::SessionStatus::Ended);
+        })
+        .await;
+
+        // Clean caches
+        ctx.session_tmux.write().await.remove(&session.id);
+        ctx.custom_titles.write().await.remove(&session.id);
+
+        cleaned += 1;
+        if cleaned >= 10 {
+            break; // Rate limit: max 10 per cleanup cycle
+        }
+
+        // Rate limit between Telegram API calls
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+    }
+
+    if cleaned > 0 {
+        tracing::info!(
+            cleaned,
+            "ADR-013 E2: Completed inactivity cleanup sweep"
+        );
+    }
+}
+
+/// ADR-013 E2/E5: Schedule topic lifecycle with two stages.
+///
+/// - **Stage 1** (after `delay_ms`): CLOSE the topic (hides from list, preserves history).
+/// - **Stage 2** (after 12 hours total): DELETE the topic (full cleanup).
+///
+/// This replaces the previous behavior that deleted immediately after the delay.
 /// Schedule topic deletion with delay (allows for session resume).
 pub(super) async fn schedule_topic_deletion(
     ctx: &HandlerContext,
@@ -332,30 +453,39 @@ pub(super) async fn schedule_topic_deletion(
     let session_threads = Arc::clone(&ctx.session_threads);
     let sid = session_id.to_string();
 
+    // ADR-013 E5: Two-stage lifecycle.
+    // Stage 1: CLOSE the topic after delay_ms (preserves history, hides from list).
+    // Stage 2: DELETE the topic after INACTIVITY_DELETE_THRESHOLD_MINUTES total.
+    let stage2_delay_ms = INACTIVITY_DELETE_THRESHOLD_MINUTES * 60 * 1000;
+
     let handle = tokio::spawn(async move {
+        // Stage 1: Wait for the configured delay, then CLOSE the topic.
         tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+        tracing::info!(session_id = %sid, thread_id, "ADR-013 E5 Stage 1: Closing forum topic");
+        let _ = bot.close_forum_topic(thread_id).await;
+
+        // Stage 2: Wait for the remaining time until the full deletion threshold,
+        // then DELETE the topic. The remaining time is (stage2 - stage1).
+        let remaining_ms = stage2_delay_ms.saturating_sub(delay_ms);
+        if remaining_ms > 0 {
+            tokio::time::sleep(tokio::time::Duration::from_millis(remaining_ms)).await;
+        }
+
+        tracing::info!(session_id = %sid, thread_id, "ADR-013 E5 Stage 2: Deleting forum topic");
         let deleted = bot.delete_forum_topic(thread_id).await.unwrap_or(false);
         if deleted {
-            tracing::info!(session_id = %sid, thread_id, "Auto-deleted forum topic");
-            session_threads.write().await.remove(&sid);
-            let sid2 = sid.clone();
-            let sess = sessions.clone();
-            let _ =
-                tokio::task::spawn_blocking(move || sess.blocking_lock().clear_thread_id(&sid2))
-                    .await;
+            tracing::info!(session_id = %sid, thread_id, "Auto-deleted forum topic (stage 2)");
         } else {
-            tracing::warn!(session_id = %sid, thread_id, "Failed to delete topic, falling back to close");
-            let _ = bot.close_forum_topic(thread_id).await;
-            session_threads.write().await.remove(&sid);
-            // Clear thread_id so orphaned cleanup doesn't retry endlessly
-            // on a closed-but-not-deleted topic.
-            let session_id_clone = sid.clone();
-            let sess = sessions.clone();
-            let _ = tokio::task::spawn_blocking(move || {
-                sess.blocking_lock().clear_thread_id(&session_id_clone)
-            })
-            .await;
+            tracing::warn!(session_id = %sid, thread_id, "Failed to delete topic in stage 2");
         }
+        // Clear thread_id and cache regardless of delete success,
+        // to prevent orphaned cleanup retrying endlessly.
+        session_threads.write().await.remove(&sid);
+        let sid2 = sid.clone();
+        let sess = sessions.clone();
+        let _ =
+            tokio::task::spawn_blocking(move || sess.blocking_lock().clear_thread_id(&sid2))
+                .await;
     });
 
     ctx.pending_del

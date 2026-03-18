@@ -319,6 +319,31 @@ impl Daemon {
             }
         }
 
+        // ADR-013 F8: Warm session_tmux_targets cache from DB on startup.
+        // After a daemon restart, the in-memory cache is empty. Populate it from
+        // any active sessions that have stored tmux_target values in the DB.
+        {
+            let active_sessions = {
+                let sessions = self.state.sessions.lock().await;
+                sessions.get_active_sessions().unwrap_or_default()
+            };
+            let mut tmux_cache = self.state.session_tmux_targets.write().await;
+            let mut warmed = 0u32;
+            for session in &active_sessions {
+                if let Some(ref target) = session.tmux_target {
+                    tmux_cache.insert(session.id.clone(), target.clone());
+                    warmed += 1;
+                }
+            }
+            if warmed > 0 {
+                tracing::info!(
+                    warmed,
+                    total_active = active_sessions.len(),
+                    "ADR-013 F8: Warmed tmux cache from DB on startup"
+                );
+            }
+        }
+
         // Send startup notification
         self.state
             .bot
@@ -766,9 +791,49 @@ async fn ensure_session_exists(ctx: &HandlerContext, msg: &BridgeMessage) {
                     .write()
                     .await
                     .insert(msg.session_id.clone(), tid);
+                // ADR-013 E3: Enhanced session resume context message.
+                // Include custom title and inactivity duration if available.
+                let resume_msg = {
+                    let custom_title = ctx.custom_titles.read().await.get(&msg.session_id).cloned();
+                    let inactivity_str = {
+                        let la = chrono::DateTime::parse_from_rfc3339(&session.last_activity).ok();
+                        la.map(|t| {
+                            let elapsed = chrono::Utc::now() - t.to_utc();
+                            let total_mins = elapsed.num_minutes().max(0);
+                            if total_mins < 60 {
+                                format!("{}m", total_mins)
+                            } else {
+                                let hours = total_mins / 60;
+                                let mins = total_mins % 60;
+                                format!("{}h {}m", hours, mins)
+                            }
+                        })
+                    };
+
+                    match (custom_title, inactivity_str) {
+                        (Some(title), Some(dur)) => {
+                            format!(
+                                "\u{1F504} Session resumed: {title}\n_Inactive for {dur}. Previous topic was auto-deleted._"
+                            )
+                        }
+                        (Some(title), None) => {
+                            format!(
+                                "\u{1F504} Session resumed: {title}\n_Previous topic was auto-deleted._"
+                            )
+                        }
+                        (None, Some(dur)) => {
+                            format!(
+                                "\u{1F504} *Session resumed*\n_Inactive for {dur}. Previous topic was auto-deleted._"
+                            )
+                        }
+                        (None, None) => {
+                            "\u{1F504} *Session resumed*\n\n_Previous topic was auto-deleted. New topic created._".to_string()
+                        }
+                    }
+                };
                 ctx.bot
                     .send_message(
-                        "\u{1F504} *Session resumed*\n\n_Previous topic was auto-deleted. New topic created._",
+                        &resume_msg,
                         Some(&SendOptions {
                             parse_mode: Some("Markdown".into()),
                             ..Default::default()
@@ -980,17 +1045,26 @@ async fn add_echo_key(ctx: &HandlerContext, session_id: &str, text: &str) {
     });
 }
 
-/// Get tmux target for a session (cache -> DB).
+/// Get tmux target for a session (cache -> DB -> live detection fallback).
+///
+/// ADR-013 F6/D5: Three-tier lookup:
+///   1. In-memory cache (zero cost)
+///   2. Database (cheap SQLite query)
+///   3. Live detection via tmux CLI (~100ms, only on cache miss)
+///
+/// When live detection succeeds, the result is stored in both cache and DB
+/// so subsequent lookups hit tier 1.
 async fn get_tmux_target(
     ctx: &HandlerContext,
     session_id: &str,
     _tmux_socket: Option<&str>,
 ) -> Option<String> {
-    // Check cache
+    // Tier 1: Check in-memory cache
     if let Some(target) = ctx.session_tmux.read().await.get(session_id) {
         return Some(target.clone());
     }
-    // Fallback to DB
+
+    // Tier 2: Fallback to DB
     let sid = session_id.to_string();
     let tmux_info = ctx
         .db_op(move |sess| sess.get_tmux_info(&sid).ok().flatten())
@@ -1002,6 +1076,58 @@ async fn get_tmux_target(
             .insert(session_id.to_string(), target.clone());
         return Some(target);
     }
+
+    // Tier 3: ADR-013 F6 — Live detection fallback (~100ms).
+    // Try detect_tmux_session first (uses $TMUX env), then find_claude_code_session
+    // (scans all tmux panes for a "claude" process).
+    if let Some(info) = InputInjector::detect_tmux_session() {
+        let target = info.target.clone();
+        let socket = info.socket.clone();
+        tracing::info!(
+            session_id,
+            target = %target,
+            "ADR-013 F6: Live tmux detection succeeded (detect_tmux_session)"
+        );
+        // Store in cache
+        ctx.session_tmux
+            .write()
+            .await
+            .insert(session_id.to_string(), target.clone());
+        // Store in DB
+        let sid = session_id.to_string();
+        let t = target.clone();
+        let s = socket.clone();
+        ctx.db_op(move |sess| {
+            let _ = sess.set_tmux_info(&sid, Some(&t), s.as_deref());
+        })
+        .await;
+        return Some(target);
+    }
+
+    if let Some(session_name) = InputInjector::find_claude_code_session() {
+        // find_claude_code_session returns just a session name, not a full target.
+        // Use "session_name:0.0" as the target (first window, first pane).
+        let target = format!("{session_name}:0.0");
+        tracing::info!(
+            session_id,
+            target = %target,
+            "ADR-013 F6: Live tmux detection succeeded (find_claude_code_session)"
+        );
+        // Store in cache
+        ctx.session_tmux
+            .write()
+            .await
+            .insert(session_id.to_string(), target.clone());
+        // Store in DB
+        let sid = session_id.to_string();
+        let t = target.clone();
+        ctx.db_op(move |sess| {
+            let _ = sess.set_tmux_info(&sid, Some(&t), None);
+        })
+        .await;
+        return Some(target);
+    }
+
     None
 }
 
