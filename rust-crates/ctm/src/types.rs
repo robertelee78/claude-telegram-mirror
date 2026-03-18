@@ -60,6 +60,10 @@ pub struct SubagentStopEvent {
     #[serde(default)]
     #[allow(dead_code)] // Deserialized from JSON
     pub result: Option<String>,
+    /// ADR-013 GAP-2: Agent type label (e.g. "coder", "researcher") for display
+    /// and metadata routing. Optional — upstream may not always provide it.
+    #[serde(default)]
+    pub agent_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
