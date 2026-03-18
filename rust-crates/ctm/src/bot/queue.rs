@@ -228,7 +228,10 @@ impl TelegramBot {
             body["reply_markup"] = keyboard;
         }
 
-        let resp: TgResponse<TgMessage> = self.api_call("sendMessage", &body).await?;
+        let resp: TgResponse<TgMessage> = match self.api_call("sendMessage", &body).await {
+            Ok(r) => r,
+            Err(e) => return Err(e), // Network/5xx errors — let process_queue retry
+        };
 
         if resp.ok {
             return Ok(());
@@ -325,6 +328,9 @@ impl TelegramBot {
             if let Some(tid) = item.thread_id {
                 plain_body["message_thread_id"] = serde_json::Value::Number(tid.into());
             }
+            if let Some(reply_id) = item.reply_to_message_id {
+                plain_body["reply_parameters"] = serde_json::json!({ "message_id": reply_id });
+            }
             if let Some(buttons) = &item.buttons {
                 plain_body["reply_markup"] = build_inline_keyboard(buttons);
             }
@@ -334,6 +340,14 @@ impl TelegramBot {
             if plain_resp.ok {
                 return Ok(());
             }
+            // Plain text fallback also failed — return immediately with the
+            // secondary error so process_queue does not retry with the original
+            // broken Markdown body.
+            let plain_desc = plain_resp.description.unwrap_or_default();
+            return Err(AppError::Telegram(format!(
+                "Plain text fallback also failed: {}",
+                self.scrub_token(&plain_desc)
+            )));
         }
 
         Err(AppError::Telegram(self.scrub_token(&desc)))

@@ -250,7 +250,14 @@ impl TelegramBot {
                 return Ok(tg);
             }
 
-            // All other API errors: propagate.
+            // HTTP 400 errors: return the response for caller-side classification.
+            // send_item() has specialized handlers for TOPIC_CLOSED, can't parse
+            // entities, TOPIC_ID_INVALID, message thread not found, etc.
+            if code == 400 {
+                return Ok(tg);
+            }
+
+            // 5xx / other errors: propagate as Err for generic retry.
             return Err(AppError::Telegram(format!("{method}: {desc}")));
         }
 
