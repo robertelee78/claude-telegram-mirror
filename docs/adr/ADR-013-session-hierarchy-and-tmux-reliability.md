@@ -1,8 +1,10 @@
 # ADR-013: Session Hierarchy and tmux Reliability
 
-**Status:** Proposed
+**Status:** Partially Implemented (B+ / Good — see Audit below)
 **Date:** 2026-03-18
 **Authors:** Robert, Claude
+
+DO NOT BE LAZY. We have plenty of time to do it right. No short cuts. Never make assumptions. Always dive deep and ensure you know the problem you're solving. Make use of search as needed.  Measure 3x, cut once.  No fallback. No stub (todo later) code.  Just pure excellence, done the right way the entire time. Also recall Chesterton's fence; always understand current fully before changing it.
 
 ## Context
 
@@ -216,6 +218,170 @@ Rejected. Causes the exact topic sprawl the user complained about. Telegram topi
 
 ### Wait for upstream `parent_session_id`
 Not viable as sole strategy. GitHub issues #7881, #14859, #16424 are open with no timeline. The transcript_path approach works today.
+
+## Implementation Audit (2026-03-18)
+
+A five-agent CFA swarm audited the implementation against every requirement in this ADR. Four researchers examined Parts A–E independently; a queen coordinator synthesized the findings.
+
+### Per-Part Grades
+
+| Part | Grade | Verdict |
+|------|-------|---------|
+| **A** — Tmux Reliability (F1-F8) | **A** | All 8 fixes implemented. Three-tier lookup (cache → DB → live detection) is excellent. |
+| **B** — Parent-Child Routing | **B-** | Routing infrastructure is excellent. `agent_type` completely missing. Child messages unlabeled. Parent-before-child race. |
+| **C** — Sub-Agent UX | **B** | Details button works. Spawn notification lacks agent type. No message editing (two messages instead of one updated). |
+| **D** — Telegram UX (D1-D7) | **A-** | All 7 requirements work. Minor: no resume confirmation message. |
+| **E** — Topic Lifecycle (E1-E5) | **B** | Core logic works. Default 24h instead of spec'd 15min. Inactivity threshold not runtime-configurable. Sub-agent count prepend missing. |
+
+### Critical Gaps (6 items — block "Excellent" rating)
+
+#### GAP-1: SECURITY — Path traversal in Details callback
+- **Severity:** Security
+- **Location:** `callback_handlers.rs` — `handle_subagent_details_callback`
+- **Problem:** `agent_id` from Telegram callback_data is used directly to construct `/tmp/ctm-subagent-{agent_id}.md` file path. An authorized group member could craft callback data like `subagentdetails:../../etc/passwd` to read arbitrary files accessible to the daemon process. The write side in `socket_handlers.rs` uses hook-sourced (trusted) agent_id, but the read side uses user-controlled callback_data.
+- **Fix:** Validate `agent_id` against path-safe character whitelist (e.g., `is_valid_session_id()` or reject any `/` chars) before constructing the file path. Apply on both read and write paths.
+
+#### GAP-2: `agent_type` not tracked anywhere
+- **Severity:** Functional gap (Part B + C)
+- **Problem:** The ADR specifies a three-key identity model: `agent_id` + `parent_session_id` + `agent_type`. The `agent_type` dimension is completely absent — not in the DB schema, not in hook metadata, not in any struct. `SubagentStopEvent` has no `agent_type` field. Hook messages carry `agentId` but no `agentType`.
+- **Fix:** Add `agent_type TEXT` column to sessions table. Populate from hook metadata (requires adding `agent_type` to `SubagentStop` event or inferring from transcript path structure). Display in spawn notifications and child message prefixes.
+
+#### GAP-3: Child messages not prefixed with agent label
+- **Severity:** Functional gap (Part B)
+- **Location:** `socket_handlers.rs` — all handlers (`handle_agent_response`, `handle_tool_start`, etc.)
+- **Problem:** The ADR Part B "Message Routing" section explicitly requires: "Prefix messages with a sub-agent label: `🤖 [Agent: {agent_type}] {content}`". Only the `SubagentStop` completion message has any labeling. Regular in-progress messages (tool calls, partial responses) arrive in the parent topic with no visual distinction from the parent session's own messages.
+- **Fix:** In each handler, check if the session has a `parent_session_id`. If so, prepend the agent label to the message content. Depends on GAP-2 for agent_type; can use agent_id alone as interim.
+
+#### GAP-4: Parent-before-child race condition
+- **Severity:** Correctness (Part B)
+- **Location:** `socket_handlers.rs:57-75` — parent thread_id lookup
+- **Problem:** If a child session's `session_start` arrives before the parent's topic is created (parent session row exists but `thread_id = NULL`), `parent_thread_id` resolves to `None`. The child falls through to `create_forum_topic`, creating its own independent topic — exactly the topic sprawl ADR-013 is designed to prevent. This race is real in fast swarm spawning scenarios (e.g., CFA launches 8 agents simultaneously).
+- **Fix:** Options: (a) if parent exists but has no thread_id, trigger parent topic creation on behalf of the parent before proceeding; (b) queue the child's session_start and retry after a short delay; (c) use a per-parent mutex/condvar so children block until the parent's topic is ready.
+
+#### GAP-5: Orphan child sessions on parent end
+- **Severity:** Correctness (Part B)
+- **Location:** `socket_handlers.rs` — `handle_session_end`
+- **Problem:** When a parent session ends, child sub-agent sessions remain in `active` status with no cascade, warning, or cleanup. Children with the parent's `thread_id` may post to a now-closed topic (silently fails at Telegram API layer). They eventually age out via stale session cleanup (hours later).
+- **Fix:** In `handle_session_end`, query child sessions by `parent_session_id`. Either end them explicitly (`end_session`), or log a warning and let them age out naturally. At minimum, send a "Parent session ended" notification in the topic.
+
+#### GAP-6: Lifecycle defaults don't match spec
+- **Severity:** Spec violation (Part E)
+- **Locations:**
+  - `config.rs:347` — `topic_delete_delay_minutes` defaults to `1440` (24 hours). ADR specifies 15 minutes for the stage-1 close.
+  - `cleanup.rs:13` — `INACTIVITY_DELETE_THRESHOLD_MINUTES = 720` is a compile-time `const`. ADR says "Both thresholds should be configurable."
+  - `cleanup.rs:386-408` — `cleanup_inactive_topics` silently no-ops when `auto_delete_topics = false`. No close fallback (compare: `handle_session_end` at `socket_handlers.rs:279` correctly closes when auto-delete is off).
+- **Fix:** (a) Change `topic_delete_delay_minutes` default to `15`. (b) Add `inactivity_delete_threshold_minutes` field to `Config`, read from `TELEGRAM_INACTIVITY_DELETE_THRESHOLD_MINUTES` env var, default 720. (c) In `cleanup_inactive_topics`, when `auto_delete_topics = false`, close (don't delete) inactive topics instead of skipping entirely.
+
+### Minor Issues (8 items — cosmetic or low-priority)
+
+#### MINOR-1: Stale comment in mod.rs
+- **Location:** `mod.rs:602`
+- **Problem:** Comment references "lines 528-539" but the actual code lives at lines 680+. Logic is correct; only the comment reference is stale.
+
+#### MINOR-2: Unused helper dead code
+- **Location:** `session.rs` — `get_active_sessions_with_tmux()`
+- **Problem:** Specialized helper for F8 cache warming exists but is never called. Startup uses `get_active_sessions()` and filters inline instead.
+
+#### MINOR-3: No tmux confirmation on session resume (D4 visual gap)
+- **Location:** `mod.rs:600-617` — dedup guard
+- **Problem:** When a session auto-heals via `claude --resume`, the dedup guard prevents re-running `handle_session_start`, so no fresh "🟢 tmux: connected" message is sent. Functional healing works; only the confirmation is absent.
+
+#### MINOR-4: Spawn/completion as two messages instead of edit
+- **Location:** `socket_handlers.rs:94-113` (spawn), `socket_handlers.rs:335-353` (completion)
+- **Problem:** ADR specifies spawn message should be edited to become the completion message. Implementation sends two separate messages because spawn message_id is not tracked. Cosmetic deviation, not functional.
+
+#### MINOR-5: Temp file accumulation
+- **Location:** `socket_handlers.rs:319` — writes `/tmp/ctm-subagent-{agent_id}.md`
+- **Problem:** Files are never cleaned up. Long-running daemon accumulates stale files in `/tmp` indefinitely. The existing `cleanup_old_downloads` function handles downloads but not sub-agent temp files.
+- **Fix:** Add cleanup for `/tmp/ctm-subagent-*.md` files with a 24-48 hour TTL.
+
+#### MINOR-6: Fragile `.unwrap()` in cleanup
+- **Location:** `cleanup.rs:175`
+- **Problem:** `tmux_target.as_deref().unwrap()` is guarded by an early-continue 17 lines above, but the guard and unwrap are far enough apart to be a maintenance hazard.
+- **Fix:** Replace with `let Some(target) = tmux_target.as_deref() else { continue; };`
+
+#### MINOR-7: Stage-2 deletion cache leak
+- **Location:** `cleanup.rs:483-487`
+- **Problem:** Stage-2 topic deletion removes `session_threads` cache entry but not `session_tmux` or `custom_titles`. Compare: `handle_stale_session_cleanup` (lines 251-253) correctly clears all three. Entries persist in memory until next cleanup cycle.
+
+#### MINOR-8: No integration tests for new functionality
+- **Problem:** Only unit tests exist (`extract_parent_session_id`, `extract_agent_id` in `types.rs`). No integration tests for:
+  - Parent-child topic routing end-to-end
+  - `handle_subagent_details_callback` (Details button flow)
+  - F8 startup cache warm-up from DB
+  - Two-stage topic lifecycle (close then delete)
+  - Orphan session behavior
+
+### Implementation Evidence (file locations)
+
+| Requirement | File | Lines | Status |
+|-------------|------|-------|--------|
+| F1: Runtime fallback | `daemon/mod.rs` | 1083-1128 | Implemented |
+| F2: UPDATE race | `daemon/mod.rs` | 581; `session.rs` 563-604 | Implemented |
+| F3: Idempotency guard | `session.rs` | 283-319 | Implemented |
+| F4: Dedup mitigation | `daemon/mod.rs` | 600-617, 679-715 | Implemented (via F2/F3) |
+| F5: Cache clear on end | `daemon/socket_handlers.rs` | 285 | Implemented |
+| F6: Live detection | `daemon/mod.rs` | 1080-1131 | Implemented |
+| F7: No stale global default | `daemon/mod.rs` | 299-320 | Implemented |
+| F8: Startup cache warm | `daemon/mod.rs` | 322-345 | Implemented |
+| B: Parent-child schema | `session.rs` | 151-153, 211-248 | Implemented |
+| B: extract_parent_session_id | `types.rs` | 526-533 | Implemented |
+| B: Parent thread_id reuse | `daemon/socket_handlers.rs` | 57-75, 127-144 | Implemented |
+| B: Child message prefix | — | — | **MISSING (GAP-3)** |
+| B: agent_type tracking | — | — | **MISSING (GAP-2)** |
+| C: Spawn notification | `daemon/socket_handlers.rs` | 94-113 | Partial (no type) |
+| C: Completion + Details button | `daemon/socket_handlers.rs` | 317-353 | Implemented |
+| C: Details summary + file | `daemon/callback_handlers.rs` | 384-502 | Implemented |
+| D1: No silent drops | `daemon/telegram_handlers.rs` | 97-119, 208-223 | Implemented |
+| D2: Warning every failure | `daemon/telegram_handlers.rs` | 111-118, 215-223 | Implemented |
+| D3: tmux status indicator | `daemon/socket_handlers.rs` | 188-194 | Implemented |
+| D4: Auto-healing | `daemon/mod.rs` | 679-715 | Implemented |
+| D5: Cache-miss-only detect | `daemon/mod.rs` | 1057-1132 | Implemented |
+| D6: View-only warning | `daemon/telegram_handlers.rs` | 101-119 | Implemented |
+| D7: Details file transfer | `daemon/callback_handlers.rs` | 473-502 | Implemented |
+| E1: 1:1 mapping | `daemon/socket_handlers.rs` | 49-177 | Implemented |
+| E2: Two-trigger cleanup | `daemon/cleanup.rs` | 341-495 | Partial (GAP-6) |
+| E3: Auto-heal on resume | `daemon/mod.rs` | 727-878 | Implemented |
+| E4: Title renames | `daemon/socket_handlers.rs` | 700-795 | Partial (no agent count) |
+| E5: Close then delete | `daemon/cleanup.rs` | 438-495 | Implemented |
+
+### Remediation Plan
+
+**Phase 5: Security + Critical Gaps** (priority order)
+
+| Step | Gap | Files | Estimated | Risk |
+|------|-----|-------|-----------|------|
+| 5a | GAP-1: Path traversal fix | `callback_handlers.rs`, `socket_handlers.rs` | ~10 lines | Low |
+| 5b | GAP-2: `agent_type` schema + tracking | `session.rs`, `types.rs`, `hook.rs` | ~60 lines | Low |
+| 5c | GAP-3: Child message prefix | `socket_handlers.rs` (all handlers) | ~40 lines | Low |
+| 5d | GAP-6: Lifecycle defaults + configurability | `config.rs`, `cleanup.rs` | ~30 lines | Low |
+| 5e | GAP-4: Parent-before-child race | `socket_handlers.rs` | ~40 lines | Medium |
+| 5f | GAP-5: Orphan child cascade | `socket_handlers.rs` | ~30 lines | Medium |
+
+**Phase 6: Minor Cleanup**
+
+| Step | Minor | Files | Estimated |
+|------|-------|-------|-----------|
+| 6a | MINOR-1: Fix stale comment | `mod.rs` | 1 line |
+| 6b | MINOR-2: Remove dead code | `session.rs` | ~20 lines removed |
+| 6c | MINOR-5: Temp file cleanup | `cleanup.rs` | ~20 lines |
+| 6d | MINOR-6: Replace unwrap | `cleanup.rs` | 1 line |
+| 6e | MINOR-7: Stage-2 cache clear | `cleanup.rs` | ~5 lines |
+| 6f | MINOR-4: Message edit pattern | `socket_handlers.rs` | ~30 lines |
+| 6g | MINOR-3: Resume tmux confirmation | `mod.rs` or `socket_handlers.rs` | ~15 lines |
+
+**Phase 7: Test Coverage**
+
+| Test | Scope |
+|------|-------|
+| Integration: parent-child routing | Simulate parent + child session_start, verify shared thread_id |
+| Integration: Details callback | Simulate callback with valid and invalid agent_ids |
+| Integration: F8 cache warm-up | Create sessions with tmux_target, restart, verify cache populated |
+| Integration: two-stage lifecycle | End session, verify close at stage-1 and delete at stage-2 |
+| Integration: orphan behavior | End parent, verify child cascade |
+| Security: path traversal rejection | Callback with `../` in agent_id, verify rejection |
+
+Completing Phases 5-6 would bring the grade to **A-**. Completing all three phases would bring it to **A / Excellent**.
 
 ## References
 

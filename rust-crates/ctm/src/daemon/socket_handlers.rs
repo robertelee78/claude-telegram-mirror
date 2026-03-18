@@ -147,11 +147,7 @@ pub(super) async fn handle_session_start(ctx: &HandlerContext, msg: &BridgeMessa
                 .as_deref()
                 .unwrap_or(&msg.session_id[..std::cmp::min(12, msg.session_id.len())]);
             // ADR-013 GAP-2: Include agent_type in spawn notification if available
-            let agent_type_label = msg
-                .meta()
-                .get("agentType")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let agent_type_label = msg.meta().agent_type().unwrap_or("");
             let spawn_text = if agent_type_label.is_empty() {
                 format!(
                     "\u{1F916} *Agent spawned:* `{}`",

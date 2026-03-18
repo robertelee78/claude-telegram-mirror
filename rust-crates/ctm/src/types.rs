@@ -287,6 +287,11 @@ impl<'a> MessageMetadata<'a> {
         self.str_field("agentId")
     }
 
+    /// ADR-013 GAP-2: Sub-agent type label (`"agentType"`).
+    pub fn agent_type(&self) -> Option<&'a str> {
+        self.str_field("agentType")
+    }
+
     /// Approval identifier (`"approvalId"`).
     #[allow(dead_code)] // Public API — used in tests and available for callers
     pub fn approval_id(&self) -> Option<&'a str> {
