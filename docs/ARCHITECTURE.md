@@ -121,7 +121,7 @@ Each platform package contains a single pre-compiled `ctm` binary. The wrapper r
 6. The daemon broadcasts them via `tokio::sync::broadcast`.
 7. The event loop spawns a handler task (bounded by `Semaphore(50)`).
 8. `handle_socket_message()` validates the session ID, updates activity timestamps, auto-refreshes the tmux target, checks the mirroring toggle, and dispatches.
-9. `ensure_session_exists()` creates session and topic on-the-fly with `TopicCreationState`/`Notify` to prevent duplicate topics. For child sessions (ADR-013), it reuses the parent's topic via two detection strategies: (a) `extract_parent_session_id` from `/subagents/` in transcript_path (same-cwd), or (b) `find_likely_parent` temporal correlation (cross-cwd — same host, no tmux, within 60s).
+9. `ensure_session_exists()` creates session and topic on-the-fly with `TopicCreationState`/`Notify` to prevent duplicate topics. Sub-agent hooks carry `agent_id` in the base event and share the parent's `session_id` — no new session or topic is created. Headless daemon tasks (detected via `CLAUDE_CODE_HEADLESS` env var) are suppressed entirely.
 10. The handler formats and sends the message to the correct forum topic. Child session messages are prefixed with an agent label via `get_child_prefix`.
 
 ### Telegram to CLI path
@@ -159,10 +159,7 @@ Sessions are created lazily via `ensure_session_exists()`. When the first event 
 1. Check SQLite. If found and active, return immediately.
 2. If found but ended/aborted, reactivate (status set to `active`, cancel pending topic deletion).
 3. If not found, acquire a topic creation lock (`TopicCreationState` with `Notify`) and create both the SQLite row and Telegram forum topic.
-4. For child sessions (ADR-013), two parent detection strategies are tried in order:
-   - **Path heuristic:** if `transcript_path` contains `/subagents/`, extract the parent session ID via `extract_parent_session_id()` (works when sub-agent shares the parent's cwd).
-   - **Temporal correlation (GAP-7):** if the path heuristic fails AND the session has no tmux target, call `find_likely_parent()` to find the most recent active session on the same hostname with tmux and a thread_id, within a configurable time window (default 60s, env `TELEGRAM_SUBAGENT_DETECTION_WINDOW_SECS`).
-   If either succeeds, reuse the parent's `thread_id` instead of creating a new topic. Store `parent_session_id`, `agent_id`, and `agent_type` in the child's DB row.
+4. Sub-agent detection (ADR-013 Phase 9): Claude Code's hook events carry `agent_id` in the base fields for sub-agents, and sub-agents share the parent's `session_id`. When `agent_id` is present, the daemon knows this is a sub-agent — no new session or topic is created. The path heuristic (`/subagents/` in `transcript_path`) is retained as a secondary signal. Headless sessions without `agent_id` (claude-flow daemon tasks) are suppressed — no topic created.
 
 ### Active
 
