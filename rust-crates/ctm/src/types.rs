@@ -359,6 +359,8 @@ pub const SAFE_COMMANDS: &[&str] = &[
 pub const ALLOWED_TMUX_KEYS: &[&str] = &[
     "Enter", "Escape", "Tab", "Space", "C-c", "C-u", "C-d", "C-l", "Up", "Down", "Left", "Right",
     "BSpace",
+    // Digit keys for Claude Code's multi-select TUI (toggle option by 1-based index).
+    "1", "2", "3", "4", "5", "6", "7", "8", "9",
 ];
 
 /// Maximum session ID length

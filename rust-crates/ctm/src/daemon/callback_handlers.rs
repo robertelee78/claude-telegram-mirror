@@ -1191,29 +1191,36 @@ async fn handle_submitall_callback(ctx: &HandlerContext, data: &str, cb: &Callba
                     selected_indices,
                     total_options,
                 } => {
-                    // Claude Code's multi-select uses an interactive checkbox
-                    // TUI (like @inquirer/checkbox). It requires key sequences:
-                    //   Space = toggle current option
-                    //   Down  = move to next option
-                    //   Enter = confirm selections
-                    // The cursor starts on option 0.
+                    // Claude Code's multi-select is a custom Ink (React CLI)
+                    // checkbox TUI. Key bindings (from cli.js source):
+                    //   Number keys (1-9) = toggle option by 1-based index
+                    //   Down/Tab = move cursor; past last option focuses Submit
+                    //   Enter/Space on option = toggle (NOT submit)
+                    //   Enter on Submit button = submit selections
                     //
-                    // A small delay between keypresses is needed — the TUI
-                    // processes key events asynchronously and drops rapid-fire
-                    // inputs that arrive before the previous one is handled.
-                    let key_delay = tokio::time::Duration::from_millis(50);
-                    for option_idx in 0..*total_options {
-                        if selected_indices.contains(&option_idx) {
-                            let _ = inj.send_key("Space");
-                            tokio::time::sleep(key_delay).await;
-                        }
-                        // Move down to next option (skip after the last one).
-                        if option_idx + 1 < *total_options {
-                            let _ = inj.send_key("Down");
-                            tokio::time::sleep(key_delay).await;
-                        }
+                    // Strategy: use number keys to toggle desired options (no
+                    // cursor movement needed), then Down past all options +
+                    // "Other" to focus the Submit button, then Enter.
+                    let key_delay = tokio::time::Duration::from_millis(300);
+
+                    // Step 1: Toggle desired options by 1-based index.
+                    for &idx in selected_indices {
+                        let digit = format!("{}", idx + 1);
+                        let _ = inj.send_key(&digit);
+                        tokio::time::sleep(key_delay).await;
                     }
-                    tokio::time::sleep(key_delay).await;
+
+                    // Step 2: Navigate to Submit button. The TUI has
+                    // total_options items + "Other" (type-in) = total_options+1
+                    // items. Down from any position past the last item focuses
+                    // Submit. Send enough Downs to guarantee we reach it.
+                    let downs_needed = total_options + 2; // options + Other + 1
+                    for _ in 0..downs_needed {
+                        let _ = inj.send_key("Down");
+                        tokio::time::sleep(key_delay).await;
+                    }
+
+                    // Step 3: Press Enter on the focused Submit button.
                     let _ = inj.send_key("Enter");
                 }
             }
@@ -1422,10 +1429,11 @@ async fn handle_change_callback(ctx: &HandlerContext, data: &str, cb: &CallbackQ
 /// then injects "1" to auto-select "Submit answers" so the user doesn't
 /// have to switch back to the console.
 pub(super) async fn auto_submit_answers(ctx: &HandlerContext, session_id: &str) {
-    // Brief delay for Claude Code to transition from the last question
-    // to the review screen. Without this, the "1" arrives before the
-    // review prompt is displayed and gets swallowed.
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    // Wait for Claude Code to transition from the last question to the
+    // review screen. Multi-select injection takes several seconds (300ms
+    // per key × N keys), so the review screen may not appear for a while.
+    // 2s is enough for the single-question → review transition.
+    tokio::time::sleep(tokio::time::Duration::from_millis(2000)).await;
 
     let tmux_target = ctx.session_tmux.read().await.get(session_id).cloned();
     if let Some(target) = tmux_target {
@@ -1441,7 +1449,10 @@ pub(super) async fn auto_submit_answers(ctx: &HandlerContext, session_id: &str) 
 
         let mut inj = ctx.injector.lock().await;
         inj.set_target(&target, socket.as_deref());
-        let _ = inj.inject("1");
+        // "Submit answers" is already focused (option 1). Send Enter to
+        // confirm it. Using inject("1") would work but leaves a stray "1"
+        // in the input buffer after the review screen dismisses.
+        let _ = inj.send_key("Enter");
         tracing::info!(session_id, "Auto-submitted AskUserQuestion review screen");
     }
 }
