@@ -20,6 +20,7 @@ pub(super) async fn run_event_loop(
     mut socket_rx: tokio::sync::broadcast::Receiver<BridgeMessage>,
     state: Arc<DaemonState>,
     socket_clients: SocketClients,
+    mut topic_invalidated_rx: tokio::sync::mpsc::UnboundedReceiver<i64>,
 ) {
     let mut cleanup_interval =
         tokio::time::interval(tokio::time::Duration::from_secs(CLEANUP_INTERVAL_SECS));
@@ -116,6 +117,16 @@ pub(super) async fn run_event_loop(
                 }
             }
 
+            // Topic invalidation — a Telegram topic was permanently deleted.
+            // Clear the stale thread_id from cache and DB so ensure_session_exists
+            // creates a new topic on the next message.
+            Some(invalidated_tid) = topic_invalidated_rx.recv() => {
+                let ctx = base_ctx.clone();
+                tokio::spawn(async move {
+                    handle_topic_invalidated(ctx, invalidated_tid).await;
+                });
+            }
+
             // Cleanup timer — exempt from semaphore so it always runs.
             _ = cleanup_interval.tick() => {
                 let ctx = base_ctx.clone();
@@ -125,4 +136,66 @@ pub(super) async fn run_event_loop(
             }
         }
     }
+}
+
+/// Handle a permanently deleted Telegram topic by clearing the stale thread_id
+/// from both the in-memory cache and the database. This allows
+/// `ensure_session_exists` to create a replacement topic on the next message.
+async fn handle_topic_invalidated(ctx: HandlerContext, thread_id: i64) {
+    // Reverse lookup: find which session owns this thread_id
+    let session_id = {
+        let threads = ctx.session_threads.read().await;
+        threads
+            .iter()
+            .find(|(_, &tid)| tid == thread_id)
+            .map(|(sid, _)| sid.clone())
+    };
+
+    let Some(session_id) = session_id else {
+        // Not in cache — try DB
+        let tid = thread_id;
+        let found = ctx
+            .db_op(move |sess| {
+                sess.get_session_by_thread_id(tid)
+                    .ok()
+                    .flatten()
+                    .map(|s| s.id)
+            })
+            .await;
+        if let Some(sid) = found {
+            // Clear from DB
+            let sid_clone = sid.clone();
+            ctx.db_op(move |sess| {
+                let _ = sess.clear_thread_id(&sid_clone);
+            })
+            .await;
+            tracing::info!(
+                session_id = %sid,
+                thread_id,
+                "Cleared stale thread_id from DB (topic permanently deleted)"
+            );
+        } else {
+            tracing::debug!(
+                thread_id,
+                "No session found for invalidated thread_id"
+            );
+        }
+        return;
+    };
+
+    // Clear from in-memory cache
+    ctx.session_threads.write().await.remove(&session_id);
+
+    // Clear from DB
+    let sid = session_id.clone();
+    ctx.db_op(move |sess| {
+        let _ = sess.clear_thread_id(&sid);
+    })
+    .await;
+
+    tracing::info!(
+        session_id = %session_id,
+        thread_id,
+        "Cleared stale thread_id from cache and DB (topic permanently deleted)"
+    );
 }

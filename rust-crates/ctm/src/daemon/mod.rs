@@ -357,11 +357,25 @@ impl Daemon {
             )
             .await;
 
+        // Take the topic-invalidation receiver before spawning the event loop.
+        let topic_invalidated_rx = self
+            .state
+            .bot
+            .take_topic_invalidated_rx()
+            .await
+            .expect("topic_invalidated_rx already taken");
+
         // FR43: Spawn main event loop with consolidated state.
         let daemon_state = Arc::clone(&self.state);
 
         tokio::spawn(async move {
-            event_loop::run_event_loop(socket_rx, daemon_state, daemon_socket_clients).await;
+            event_loop::run_event_loop(
+                socket_rx,
+                daemon_state,
+                daemon_socket_clients,
+                topic_invalidated_rx,
+            )
+            .await;
         });
 
         self.state

@@ -1,6 +1,6 @@
 {
   "name": "claude-telegram-mirror",
-  "version": "0.2.10",
+  "version": "0.2.11",
   "description": "Bidirectional Telegram integration for Claude Code CLI - monitor and control your Claude Code sessions from Telegram",
   "bin": {
     "claude-telegram-mirror": "./scripts/ctm-wrapper.cjs",
@@ -49,10 +49,10 @@
     "access": "public"
   },
   "optionalDependencies": {
-    "@agidreams/ctm-linux-x64": "0.2.10",
-    "@agidreams/ctm-linux-arm64": "0.2.10",
-    "@agidreams/ctm-darwin-arm64": "0.2.10",
-    "@agidreams/ctm-darwin-x64": "0.2.10"
+    "@agidreams/ctm-linux-x64": "0.2.11",
+    "@agidreams/ctm-linux-arm64": "0.2.11",
+    "@agidreams/ctm-darwin-arm64": "0.2.11",
+    "@agidreams/ctm-darwin-x64": "0.2.11"
   },
   "engines": {
     "node": ">=18.0.0"

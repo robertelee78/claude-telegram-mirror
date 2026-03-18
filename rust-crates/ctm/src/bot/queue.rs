@@ -295,22 +295,30 @@ impl TelegramBot {
         }
 
         // TOPIC_ID_INVALID: topic has been permanently deleted, don't retry.
+        // Notify the daemon to clear the stale thread_id so a new topic is created.
         if code == 400 && desc.contains("TOPIC_ID_INVALID") {
-            tracing::warn!(
-                thread_id = ?item.thread_id,
-                "Topic no longer exists (TOPIC_ID_INVALID), dropping message"
-            );
+            if let Some(tid) = item.thread_id {
+                tracing::warn!(
+                    thread_id = tid,
+                    "Topic permanently deleted (TOPIC_ID_INVALID), clearing stale mapping"
+                );
+                let _ = self.topic_invalidated_tx.send(tid);
+            }
             return Err(AppError::Telegram("Topic deleted".into()));
         }
 
         // "message thread not found": stale thread_id or Telegram state inconsistency.
         // Retrying with the same thread_id will fail identically — don't retry.
-        // Let ensure_session_exists create a new topic on the next message.
+        // Notify the daemon to clear the stale thread_id so ensure_session_exists
+        // creates a new topic on the next message.
         if code == 400 && desc.contains("message thread not found") {
-            tracing::warn!(
-                thread_id = ?item.thread_id,
-                "Topic not found (stale thread_id or Telegram state inconsistency), dropping message"
-            );
+            if let Some(tid) = item.thread_id {
+                tracing::warn!(
+                    thread_id = tid,
+                    "Topic not found (stale thread_id), clearing stale mapping"
+                );
+                let _ = self.topic_invalidated_tx.send(tid);
+            }
             return Err(AppError::Telegram("Topic not found".into()));
         }
 

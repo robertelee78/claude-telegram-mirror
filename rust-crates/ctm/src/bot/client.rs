@@ -90,6 +90,12 @@ pub struct TelegramBot {
     pub(super) chunk_size: usize,
     #[allow(dead_code)] // Library API
     pub(super) running: Arc<AtomicBool>,
+    /// Channel to notify the daemon when a Telegram topic has been permanently
+    /// deleted (TOPIC_ID_INVALID or "message thread not found"). The daemon
+    /// clears the stale thread_id from cache and DB so a new topic is created.
+    pub(super) topic_invalidated_tx: tokio::sync::mpsc::UnboundedSender<i64>,
+    /// Receiver end — taken once by the daemon via `take_topic_invalidated_rx`.
+    topic_invalidated_rx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<i64>>>>,
 }
 
 impl TelegramBot {
@@ -124,6 +130,8 @@ impl TelegramBot {
 
         let max_rate = f64::from(rate);
 
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+
         Ok(Self {
             token: config.bot_token.clone(),
             chat_id: config.chat_id,
@@ -135,6 +143,8 @@ impl TelegramBot {
             queue_processing: Arc::new(AtomicBool::new(false)),
             chunk_size: config.chunk_size,
             running: Arc::new(AtomicBool::new(false)),
+            topic_invalidated_tx: tx,
+            topic_invalidated_rx: Arc::new(Mutex::new(Some(rx))),
         })
     }
 
@@ -147,6 +157,16 @@ impl TelegramBot {
     #[allow(dead_code)] // Library API
     pub fn is_running(&self) -> bool {
         self.running.load(Ordering::Relaxed)
+    }
+
+    /// Take the receiver for topic invalidation events.
+    ///
+    /// Called once by the daemon to listen for permanently deleted topics.
+    /// Returns `None` if already taken.
+    pub async fn take_topic_invalidated_rx(
+        &self,
+    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<i64>> {
+        self.topic_invalidated_rx.lock().await.take()
     }
 
     /// Mark the bot as running. Called when the daemon starts.
