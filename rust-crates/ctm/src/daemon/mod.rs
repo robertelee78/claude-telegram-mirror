@@ -578,7 +578,7 @@ async fn handle_socket_message(ctx: HandlerContext, msg: BridgeMessage) {
     }
 
     // BUG-001: Auto-update tmux target
-    check_and_update_tmux_target(&ctx, &msg).await;
+    let tmux_updated = check_and_update_tmux_target(&ctx, &msg).await;
 
     // Epic 1: Toggle gating — skip outbound messages when mirroring is disabled.
     // Safety-critical paths (approvals, commands) always proceed.
@@ -598,10 +598,10 @@ async fn handle_socket_message(ctx: HandlerContext, msg: BridgeMessage) {
     match msg.msg_type {
         MessageType::SessionStart => {
             // Dedup: skip full handler if session already exists and is active.
-            // Activity and tmux target are already updated above (lines 528-539),
-            // so an early return here is safe — we only need the full handler
-            // (topic creation, Telegram "Session started" message) on the first
-            // occurrence for this session.
+            // Activity and tmux target are already updated by check_and_update_tmux_target
+            // (called unconditionally above), so an early return here is safe — we only
+            // need the full handler (topic creation, Telegram "Session started" message)
+            // on the first occurrence for this session.
             let sid = msg.session_id.clone();
             let is_active = ctx
                 .db_op(move |sess| {
@@ -614,6 +614,33 @@ async fn handle_socket_message(ctx: HandlerContext, msg: BridgeMessage) {
                 .await;
             if !is_active {
                 socket_handlers::handle_session_start(&ctx, &msg).await;
+            } else if tmux_updated {
+                // ADR-013 MINOR-3: tmux target was just updated on a resumed session.
+                // Send a brief confirmation so the user knows replies now work via tmux.
+                // check_and_update_tmux_target (above) already stored the target.
+                let thread_id = ctx.get_thread_id(&msg.session_id).await;
+                if let Some(tid) = thread_id {
+                    let target = ctx
+                        .session_tmux
+                        .read()
+                        .await
+                        .get(&msg.session_id)
+                        .cloned()
+                        .unwrap_or_default();
+                    ctx.bot
+                        .send_message(
+                            &format!(
+                                "\u{1F7E2} tmux: reconnected (`{}`)",
+                                escape_markdown_v1(&target)
+                            ),
+                            Some(&crate::daemon::SendOptions {
+                                parse_mode: Some("Markdown".into()),
+                                ..Default::default()
+                            }),
+                            Some(tid),
+                        )
+                        .await;
+                }
             }
         }
         MessageType::SessionEnd => socket_handlers::handle_session_end(&ctx, &msg).await,
@@ -677,18 +704,22 @@ async fn handle_socket_message(ctx: HandlerContext, msg: BridgeMessage) {
 // ====================================================================== shared helpers
 
 /// BUG-001: Auto-update tmux target on every message.
-async fn check_and_update_tmux_target(ctx: &HandlerContext, msg: &BridgeMessage) {
+///
+/// Returns `true` if the tmux target was newly set or changed, `false` if it
+/// was already up-to-date or absent. Callers can use this to decide whether to
+/// send a "reconnected" notification.
+async fn check_and_update_tmux_target(ctx: &HandlerContext, msg: &BridgeMessage) -> bool {
     let meta = msg.meta();
 
     let new_target = match meta.tmux_target() {
         Some(t) => t,
-        None => return,
+        None => return false,
     };
     let new_socket = meta.tmux_socket();
 
     let current = ctx.session_tmux.read().await.get(&msg.session_id).cloned();
     if current.as_deref() == Some(new_target) {
-        return;
+        return false;
     }
 
     tracing::info!(
@@ -712,6 +743,8 @@ async fn check_and_update_tmux_target(ctx: &HandlerContext, msg: &BridgeMessage)
         })
         .await;
     }
+
+    true
 }
 
 /// BUG-009/BUG-010: Ensure a session exists, creating on-the-fly if needed.
