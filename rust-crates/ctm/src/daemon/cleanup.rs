@@ -10,6 +10,8 @@ const MAX_TOOL_CACHE: usize = 500;
 /// ADR-013 E2: Default inactivity threshold for topic deletion (12 hours).
 /// Topics are CLOSED after `topic_delete_delay_minutes` (stage 1, typically 15 min),
 /// then DELETED after this inactivity threshold (stage 2).
+/// ADR-013 GAP-6: Now read from ctx.config.inactivity_delete_threshold_minutes at runtime.
+#[allow(dead_code)]
 const INACTIVITY_DELETE_THRESHOLD_MINUTES: u64 = 720;
 
 /// BUG-003: Periodic cleanup of stale sessions, orphaned threads, expired caches, old downloads.
@@ -42,6 +44,9 @@ pub(super) async fn run_cleanup(ctx: HandlerContext) {
 
     // Clean old downloads
     cleanup_old_downloads();
+
+    // ADR-013 MINOR-5: Clean up stale sub-agent temp files
+    cleanup_subagent_temp_files().await;
 }
 
 /// ADR-011 Fix #7: Evict excess entries from the session-keyed caches.
@@ -172,7 +177,7 @@ async fn cleanup_stale_sessions(ctx: &HandlerContext) {
         }
 
         // Check if pane is still alive
-        let target = tmux_target.as_deref().unwrap();
+        let Some(target) = tmux_target.as_deref() else { continue; };
         let pane_alive = InputInjector::is_pane_alive(target, session.tmux_socket.as_deref());
         let t = target.to_string();
         let sid = session.id.clone();
@@ -348,8 +353,9 @@ async fn cleanup_inactive_topics(ctx: &HandlerContext) {
     }
 
     let now = chrono::Utc::now();
+    let threshold_minutes = ctx.config.inactivity_delete_threshold_minutes as i64;
     let delete_cutoff = now
-        - chrono::TimeDelta::try_minutes(INACTIVITY_DELETE_THRESHOLD_MINUTES as i64)
+        - chrono::TimeDelta::try_minutes(threshold_minutes)
             .unwrap_or(chrono::TimeDelta::hours(12));
 
     let mut cleaned = 0u32;
@@ -405,6 +411,10 @@ async fn cleanup_inactive_topics(ctx: &HandlerContext) {
                     ctx.session_threads.write().await.remove(&session.id);
                 }
             }
+        } else {
+            // ADR-013 GAP-6: Close (don't delete) inactive topics when auto_delete is off.
+            let _ = ctx.bot.close_forum_topic(thread_id).await;
+            ctx.session_threads.write().await.remove(&session.id);
         }
 
         // End the session in DB
@@ -451,12 +461,17 @@ pub(super) async fn schedule_topic_deletion(
     let bot = Arc::clone(&ctx.bot);
     let sessions = Arc::clone(&ctx.sessions);
     let session_threads = Arc::clone(&ctx.session_threads);
+    // ADR-013 MINOR-7: Capture additional caches for full cleanup on stage-2 deletion.
+    let session_tmux = Arc::clone(&ctx.session_tmux);
+    let custom_titles = Arc::clone(&ctx.custom_titles);
     let sid = session_id.to_string();
 
     // ADR-013 E5: Two-stage lifecycle.
     // Stage 1: CLOSE the topic after delay_ms (preserves history, hides from list).
-    // Stage 2: DELETE the topic after INACTIVITY_DELETE_THRESHOLD_MINUTES total.
-    let stage2_delay_ms = INACTIVITY_DELETE_THRESHOLD_MINUTES * 60 * 1000;
+    // Stage 2: DELETE the topic after inactivity_delete_threshold_minutes total.
+    let inactivity_threshold_ms =
+        ctx.config.inactivity_delete_threshold_minutes as u64 * 60 * 1000;
+    let stage2_delay_ms = inactivity_threshold_ms;
 
     let handle = tokio::spawn(async move {
         // Stage 1: Wait for the configured delay, then CLOSE the topic.
@@ -481,6 +496,10 @@ pub(super) async fn schedule_topic_deletion(
         // Clear thread_id and cache regardless of delete success,
         // to prevent orphaned cleanup retrying endlessly.
         session_threads.write().await.remove(&sid);
+        // ADR-013 MINOR-7: Also clear tmux and custom_titles caches on stage-2 deletion.
+        // Previously only session_threads was cleared, leaving stale entries.
+        session_tmux.write().await.remove(&sid);
+        custom_titles.write().await.remove(&sid);
         let sid2 = sid.clone();
         let sess = sessions.clone();
         let _ =
@@ -492,6 +511,45 @@ pub(super) async fn schedule_topic_deletion(
         .write()
         .await
         .insert(session_id.to_string(), handle);
+}
+
+/// ADR-013 MINOR-5: Clean up stale sub-agent temp files older than 24 hours.
+/// These are written by handle_agent_response for the Details button callback.
+async fn cleanup_subagent_temp_files() {
+    let Ok(entries) = std::fs::read_dir("/tmp") else {
+        return;
+    };
+
+    let cutoff = std::time::SystemTime::now()
+        - std::time::Duration::from_secs(24 * 60 * 60);
+
+    let mut cleaned = 0u32;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n,
+            None => continue,
+        };
+
+        if !name.starts_with("ctm-subagent-") || !name.ends_with(".md") {
+            continue;
+        }
+
+        let modified = match entry.metadata().and_then(|m| m.modified()) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+
+        if modified < cutoff {
+            if std::fs::remove_file(&path).is_ok() {
+                cleaned += 1;
+            }
+        }
+    }
+
+    if cleaned > 0 {
+        tracing::info!(cleaned, "ADR-013 MINOR-5: Cleaned stale sub-agent temp files");
+    }
 }
 
 /// BUG-012: Cancel pending topic deletion when session resumes.

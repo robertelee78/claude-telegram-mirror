@@ -386,6 +386,20 @@ async fn handle_subagent_details_callback(
     agent_id: &str,
     cb: &CallbackQuery,
 ) {
+    // ADR-013 GAP-1: Validate agent_id to prevent path traversal.
+    // agent_id comes from user-controlled callback_data and is used in file paths.
+    if !crate::types::is_valid_agent_id(agent_id) {
+        tracing::warn!(
+            agent_id,
+            "ADR-013 GAP-1: Rejected invalid agent_id in subagent details callback (path traversal prevention)"
+        );
+        let _ = ctx
+            .bot
+            .answer_callback_query(&cb.id, Some("Invalid agent ID"), true)
+            .await;
+        return;
+    }
+
     // Defense-in-depth: verify chat ownership (ADR-006 M4.5)
     if cb.message.as_ref().map(|m| m.chat.id) != Some(ctx.config.chat_id) {
         tracing::warn!("IDOR: callback from wrong chat in subagent_details");

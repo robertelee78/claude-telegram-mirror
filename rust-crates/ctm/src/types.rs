@@ -488,6 +488,37 @@ pub fn is_valid_session_id(id: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
 }
 
+/// ADR-013 GAP-1: Validate an agent ID from user-controlled callback_data.
+///
+/// Rejects strings containing path-traversal characters (`/`, `\`, `..`) and
+/// only allows ASCII alphanumerics, hyphens, underscores, and dots. This
+/// prevents path traversal when the agent_id is used to construct file paths
+/// such as `/tmp/ctm-subagent-{agent_id}.md`.
+///
+/// # Examples
+///
+/// ```
+/// use ctm::types::is_valid_agent_id;
+///
+/// assert!(is_valid_agent_id("agent-42"));
+/// assert!(is_valid_agent_id("my_agent.1"));
+///
+/// // Path traversal attempts are rejected.
+/// assert!(!is_valid_agent_id("../../etc/passwd"));
+/// assert!(!is_valid_agent_id("foo/bar"));
+/// assert!(!is_valid_agent_id("foo\\bar"));
+///
+/// // Empty IDs are rejected.
+/// assert!(!is_valid_agent_id(""));
+/// ```
+pub fn is_valid_agent_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= MAX_SESSION_ID_LEN
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+}
+
 /// Slash command character whitelist validation.
 ///
 /// Only ASCII alphanumerics, underscores, hyphens, spaces, and forward
