@@ -60,6 +60,10 @@ pub struct SubagentStopEvent {
     #[serde(default)]
     #[allow(dead_code)] // Deserialized from JSON
     pub result: Option<String>,
+    /// ADR-013 GAP-2: Agent type for the sub-agent (e.g. "Explore", "researcher").
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub agent_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -488,6 +492,18 @@ pub fn is_valid_session_id(id: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
 }
 
+/// Validate an agent_id is path-safe (no directory traversal).
+/// Agent IDs from transcript paths contain only alphanumerics, hyphens, underscores, and dots.
+#[allow(dead_code)] // Library API — used by callback_handlers (ADR-013 GAP-2)
+pub fn is_valid_agent_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && !id.contains('/')
+        && !id.contains('\\')
+        && !id.contains("..")
+        && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+}
+
 /// Slash command character whitelist validation.
 ///
 /// Only ASCII alphanumerics, underscores, hyphens, spaces, and forward
@@ -557,6 +573,18 @@ pub fn extract_agent_id(transcript_path: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_valid_agent_ids() {
+        assert!(is_valid_agent_id("agent-abc123"));
+        assert!(is_valid_agent_id("agent_abc_123"));
+        assert!(is_valid_agent_id("agent.abc"));
+        assert!(!is_valid_agent_id(""));
+        assert!(!is_valid_agent_id("../etc/passwd"));
+        assert!(!is_valid_agent_id("abc/../../etc"));
+        assert!(!is_valid_agent_id("abc\\def"));
+        assert!(!is_valid_agent_id("abc..def"));
+    }
 
     #[test]
     fn test_valid_session_ids() {

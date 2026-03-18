@@ -80,7 +80,7 @@ pub(super) async fn handle_session_start(ctx: &HandlerContext, msg: &BridgeMessa
         let psid = parent_sid.clone();
         let aid = agent_id.clone();
         ctx.db_op(move |sess| {
-            let _ = sess.set_parent_info(&sid, &psid, aid.as_deref());
+            let _ = sess.set_parent_info(&sid, &psid, aid.as_deref(), None);
         })
         .await;
         tracing::info!(

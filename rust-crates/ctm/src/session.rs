@@ -38,6 +38,9 @@ pub struct Session {
     /// ADR-013: Agent ID for sub-agent sessions (e.g. "agent-abc123").
     #[allow(dead_code)] // Deserialized from DB; Library API — used by daemon routing (ADR-013)
     pub agent_id: Option<String>,
+    /// ADR-013: Agent type for sub-agent sessions (e.g. "Explore", "researcher").
+    #[allow(dead_code)]
+    pub agent_type: Option<String>,
 }
 
 /// A pending tool-approval request.
@@ -149,7 +152,8 @@ impl SessionManager {
                 project_dir       TEXT,
                 metadata          TEXT,
                 parent_session_id TEXT,
-                agent_id          TEXT
+                agent_id          TEXT,
+                agent_type        TEXT
             );
 
             CREATE TABLE IF NOT EXISTS pending_approvals (
@@ -241,6 +245,16 @@ impl SessionManager {
                 Err(e) if e.to_string().contains("duplicate column name") => {
                     // Another connection already added this column concurrently — safe to ignore.
                 }
+                Err(e) => return Err(AppError::Database(e.to_string())),
+            }
+        }
+        if !columns.iter().any(|c| c == "agent_type") {
+            match self
+                .conn
+                .execute_batch("ALTER TABLE sessions ADD COLUMN agent_type TEXT")
+            {
+                Ok(()) => {}
+                Err(e) if e.to_string().contains("duplicate column name") => {}
                 Err(e) => return Err(AppError::Database(e.to_string())),
             }
         }
@@ -625,49 +639,20 @@ impl SessionManager {
         }
     }
 
-    /// ADR-013 F8: Return all active sessions that have a non-NULL tmux_target.
-    /// Used by the daemon on startup to warm the in-memory session_tmux_targets cache.
-    ///
-    /// Returns `Vec<(session_id, tmux_target, tmux_socket)>`.
-    #[allow(dead_code)] // Library API — used by daemon startup (ADR-013 F8)
-    pub fn get_active_sessions_with_tmux(&self) -> Result<Vec<(String, String, Option<String>)>> {
-        let mut stmt = self
-            .conn
-            .prepare(
-                "SELECT id, tmux_target, tmux_socket FROM sessions
-                 WHERE status = 'active' AND tmux_target IS NOT NULL",
-            )
-            .map_err(|e| AppError::Database(e.to_string()))?;
-
-        let rows = stmt
-            .query_map([], |row| {
-                let id: String = row.get(0)?;
-                let target: String = row.get(1)?;
-                let socket: Option<String> = row.get(2)?;
-                Ok((id, target, socket))
-            })
-            .map_err(|e| AppError::Database(e.to_string()))?;
-
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r.map_err(|e| AppError::Database(e.to_string()))?);
-        }
-        Ok(out)
-    }
-
-    /// ADR-013: Store parent_session_id and agent_id for a child (sub-agent) session.
+    /// ADR-013: Store parent_session_id, agent_id, and agent_type for a child (sub-agent) session.
     #[allow(dead_code)] // Library API — used by daemon routing (ADR-013)
     pub fn set_parent_info(
         &self,
         session_id: &str,
         parent_session_id: &str,
         agent_id: Option<&str>,
+        agent_type: Option<&str>,
     ) -> Result<()> {
         let rows_changed = self
             .conn
             .execute(
-                "UPDATE sessions SET parent_session_id = ?1, agent_id = ?2 WHERE id = ?3",
-                params![parent_session_id, agent_id, session_id],
+                "UPDATE sessions SET parent_session_id = ?1, agent_id = ?2, agent_type = ?3 WHERE id = ?4",
+                params![parent_session_id, agent_id, agent_type, session_id],
             )
             .map_err(|e| AppError::Database(e.to_string()))?;
 
@@ -679,6 +664,28 @@ impl SessionManager {
             );
         }
         Ok(())
+    }
+
+    /// ADR-013 GAP-5: Get all active child sessions for a parent session.
+    /// Used by handle_session_end to cascade session end to children.
+    #[allow(dead_code)]
+    pub fn get_child_sessions(&self, parent_session_id: &str) -> Result<Vec<Session>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT * FROM sessions WHERE parent_session_id = ?1 AND status = 'active'",
+            )
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        let rows = stmt
+            .query_map(params![parent_session_id], row_to_session)
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(|e| AppError::Database(e.to_string()))?);
+        }
+        Ok(out)
     }
 
     // ------------------------------------------------------------ approvals
@@ -949,6 +956,7 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
         // ADR-013: Parent-child session fields (migrated columns, always present after init_schema)
         parent_session_id: row.get("parent_session_id")?,
         agent_id: row.get("agent_id")?,
+        agent_type: row.get::<_, Option<String>>("agent_type").unwrap_or(None),
     })
 }
 
