@@ -82,6 +82,8 @@ pub struct Config {
     pub stale_session_timeout_hours: u32,
     pub auto_delete_topics: bool,
     pub topic_delete_delay_minutes: u32,
+    /// ADR-013 E2: Inactivity threshold for topic deletion (default: 720 = 12 hours).
+    pub inactivity_delete_threshold_minutes: u32,
     pub socket_path: PathBuf,
     pub config_dir: PathBuf,
     /// Resolved path to config.json (may not exist if config was provided via env vars only)
@@ -113,6 +115,10 @@ impl fmt::Debug for Config {
             .field(
                 "topic_delete_delay_minutes",
                 &self.topic_delete_delay_minutes,
+            )
+            .field(
+                "inactivity_delete_threshold_minutes",
+                &self.inactivity_delete_threshold_minutes,
             )
             .field("socket_path", &self.socket_path)
             .field("config_dir", &self.config_dir)
@@ -156,6 +162,11 @@ struct ConfigFile {
         alias = "topic_delete_delay_minutes"
     )]
     topic_delete_delay_minutes: Option<u32>,
+    #[serde(
+        alias = "inactivityDeleteThresholdMinutes",
+        alias = "inactivity_delete_threshold_minutes"
+    )]
+    inactivity_delete_threshold_minutes: Option<u32>,
     #[serde(alias = "socketPath", alias = "socket_path")]
     socket_path: Option<String>,
 }
@@ -344,9 +355,16 @@ pub fn load_config(require_auth: bool) -> Result<Config> {
 
     let topic_delete_delay_minutes = std::env::var("TELEGRAM_TOPIC_DELETE_DELAY_MINUTES")
         .ok()
-        .map(|v| parse_u32(&v, 1440))
+        .map(|v| parse_u32(&v, 15))
         .or(file_config.topic_delete_delay_minutes)
-        .unwrap_or(1440);
+        .unwrap_or(15);
+
+    let inactivity_delete_threshold_minutes =
+        std::env::var("TELEGRAM_INACTIVITY_DELETE_THRESHOLD_MINUTES")
+            .ok()
+            .map(|v| parse_u32(&v, 720))
+            .or(file_config.inactivity_delete_threshold_minutes)
+            .unwrap_or(720);
 
     // Socket path with validation
     let socket_path = std::env::var("TELEGRAM_BRIDGE_SOCKET")
@@ -388,6 +406,7 @@ pub fn load_config(require_auth: bool) -> Result<Config> {
         stale_session_timeout_hours,
         auto_delete_topics,
         topic_delete_delay_minutes,
+        inactivity_delete_threshold_minutes,
         socket_path,
         config_dir,
         config_path,
@@ -483,6 +502,7 @@ mod tests {
         assert_eq!(config.session_timeout, 30);
         assert_eq!(config.stale_session_timeout_hours, 72);
         assert!(config.auto_delete_topics);
-        assert_eq!(config.topic_delete_delay_minutes, 1440);
+        assert_eq!(config.topic_delete_delay_minutes, 15);
+        assert_eq!(config.inactivity_delete_threshold_minutes, 720);
     }
 }

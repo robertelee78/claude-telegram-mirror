@@ -492,9 +492,13 @@ pub fn is_valid_session_id(id: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
 }
 
-/// Validate an agent_id is path-safe (no directory traversal).
-/// Agent IDs from transcript paths contain only alphanumerics, hyphens, underscores, and dots.
-#[allow(dead_code)] // Library API — used by callback_handlers (ADR-013 GAP-2)
+/// ADR-013 GAP-1: Validate an agent ID from user-controlled callback_data.
+///
+/// Rejects strings containing path-traversal characters (`/`, `\`, `..`) and
+/// only allows ASCII alphanumerics, hyphens, underscores, and dots. This
+/// prevents path traversal when the agent_id is used to construct file paths
+/// such as `/tmp/ctm-subagent-{agent_id}.md`.
+#[allow(dead_code)] // Library API — used by callback_handlers and socket_handlers (ADR-013)
 pub fn is_valid_agent_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 128
