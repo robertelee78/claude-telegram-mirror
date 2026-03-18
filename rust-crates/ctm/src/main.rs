@@ -214,8 +214,27 @@ async fn main() -> anyhow::Result<()> {
 
 // ====================================================================== commands
 
-/// Start the bridge daemon in foreground.
+/// Start the bridge daemon (via system service if installed, else foreground).
 async fn cmd_start(verbose: bool) -> anyhow::Result<()> {
+    // Check if running as OS service first — delegate if installed.
+    if service::is_service_installed() {
+        let status = service::get_service_status();
+        if !status.running {
+            println!("Starting via system service...");
+            let result = service::start_service();
+            if result.success {
+                println!("{}", result.message);
+            } else {
+                eprintln!("{}", result.message);
+                std::process::exit(1);
+            }
+            return Ok(());
+        } else {
+            println!("Daemon is already running (via system service).");
+            return Ok(());
+        }
+    }
+
     println!("Starting Claude Code Telegram Mirror...\n");
 
     let mut cfg = config::load_config(true)?;
