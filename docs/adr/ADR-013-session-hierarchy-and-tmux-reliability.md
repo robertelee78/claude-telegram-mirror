@@ -1,6 +1,6 @@
 # ADR-013: Session Hierarchy and tmux Reliability
 
-**Status:** Implemented (all gaps closed — see Audit below)
+**Status:** Implemented (all gaps closed — GAP-7 resolved via temporal correlation fallback)
 **Date:** 2026-03-18
 **Authors:** Robert, Claude
 
@@ -61,11 +61,11 @@ if let Some(session) = InputInjector::find_claude_code_session() {
 
 ### Part B: Parent-Child Session Routing
 
-#### Discovery: transcript_path contains parent session_id
+#### Discovery: transcript_path contains parent session_id (same-cwd only)
 
-Sub-agent transcripts follow the path pattern:
+Sub-agent transcripts follow the path pattern **when the sub-agent shares the parent's `cwd`**:
 ```
-~/.claude/projects/{project}/{parentSessionId}/subagents/agent-{agentId}.jsonl
+~/.claude/projects/{project-key}/{parentSessionId}/subagents/agent-{agentId}.jsonl
 ```
 
 The `transcript_path` is already transmitted to the daemon in every hook message's metadata. Extraction:
@@ -77,7 +77,27 @@ fn extract_parent_session_id(path: &str) -> Option<&str> {
 }
 ```
 
-This provides deterministic parent-child mapping with no heuristics.
+This provides deterministic parent-child mapping **only when the sub-agent's `cwd` maps to the same project key as the parent**.
+
+#### Limitation: Cross-cwd sub-agents (GAP-7)
+
+Claude Code derives the project key from `cwd` by replacing `/` with `-`. When the Agent tool spawns a sub-agent that operates in a different directory (e.g., parent at `/opt/project` → sub-agent at `/home/user`), the transcript is stored as a **flat top-level session** under the new project key:
+
+```
+# Same-cwd sub-agent (detected correctly):
+~/.claude/projects/-opt-project/{parentId}/subagents/agent-{id}.jsonl
+
+# Cross-cwd sub-agent (NOT detected — no /subagents/ segment):
+~/.claude/projects/-home-user/{sub-agent-uuid}.jsonl
+```
+
+The `extract_parent_session_id()` function finds no `/subagents/` to split on and returns `None`. The sub-agent is treated as an independent top-level session and creates its own Telegram topic.
+
+**Evidence (2026-03-18 production investigation):**
+- Database query: `SELECT COUNT(*) FROM sessions WHERE parent_session_id IS NOT NULL` → **0 rows**. Parent detection has never successfully fired in production.
+- All sub-agent sessions observed had `project_dir = '/home/robert'` while the parent was at `/opt/claude-telegram-mirror`.
+- Daemon logs showed `transcript_path canonicalization failed` warnings, but these are **unrelated** to parent detection — `validate_transcript_path()` is only called for JSONL content extraction, not for the `/subagents/` check.
+- The `/subagents/` directory convention IS real and IS used by Claude Code — but only within the same project key scope.
 
 #### Session DB Schema Changes
 
@@ -210,8 +230,8 @@ Prefer CLOSE over DELETE for the 15-minute post-session-end window (preserves hi
 ### `/rename` trick to encode parent_session_id
 Rejected. Sub-agents cannot trigger rename on the parent's topic. The `SubagentStop` handler in the hook binary is a no-op. Even if it worked, the rename would be attributed to the sub-agent's session_id.
 
-### Heuristic grouping by project_dir + time window
-Rejected as primary approach. False positives when two independent sessions use the same project. However, could serve as a fallback when transcript_path doesn't contain `/subagents/`.
+### Heuristic grouping by host + time window
+Previously rejected as primary approach due to false positive risk. Now **adopted as fallback** for GAP-7 (cross-cwd sub-agents). Implemented with safeguards: requires no-tmux on child (sub-agents are background processes), tmux on parent (real user session), same hostname, configurable time window (default 60s), excludes other sub-agents from matching. False positive risk is low in practice — you'd need two independent Claude Code sessions starting within 60s on the same machine, one with tmux and one without.
 
 ### Separate topics with naming convention
 Rejected. Causes the exact topic sprawl the user complained about. Telegram topics are flat — no nesting.
@@ -228,12 +248,27 @@ A five-agent CFA swarm audited the implementation against every requirement in t
 | Part | Grade | Verdict |
 |------|-------|---------|
 | **A** — Tmux Reliability (F1-F8) | **A** | All 8 fixes implemented. Three-tier lookup (cache → DB → live detection) is excellent. |
-| **B** — Parent-Child Routing | **A-** | ~~B-~~ → A-. `agent_type` now tracked (schema + hook + metadata). Child prefix added. Race fix via 3-attempt retry. Orphan cascade on parent end. |
+| **B** — Parent-Child Routing | **A-** | ~~D~~ → A-. GAP-7 resolved: temporal correlation fallback detects cross-cwd sub-agents (same host, no tmux, within 60s window). Path heuristic retained for same-cwd cases. 8 unit tests pass. |
 | **C** — Sub-Agent UX | **A-** | ~~B~~ → A-. Spawn notification includes agent_type when available. Details button + file transfer work. Path traversal fixed. |
 | **D** — Telegram UX (D1-D7) | **A** | ~~A-~~ → A. Resume confirmation message now sent ("🟢 tmux: reconnected"). |
 | **E** — Topic Lifecycle (E1-E5) | **A-** | ~~B~~ → A-. Default corrected to 15min. Inactivity threshold now runtime-configurable. Close fallback added. Temp file cleanup added. |
 
-### Critical Gaps (6 items — ALL RESOLVED in commit 6d18ac7)
+### Critical Gaps (7 items — ALL RESOLVED)
+
+#### GAP-7: Cross-cwd sub-agents bypass parent detection entirely
+- **Severity:** Critical (Part B — defeats the purpose of ADR-013)
+- **Location:** `types.rs:551` — `extract_parent_session_id()`, `socket_handlers.rs:67-75` — parent detection block
+- **Problem:** The `/subagents/` path heuristic only works when the sub-agent's `cwd` matches the parent's, because Claude Code organizes transcripts by project key (derived from `cwd`). When the Agent tool spawns a sub-agent with a different `cwd` — which happens frequently (e.g., worktree agents, agents that `cd` to home, general-purpose agents) — the transcript lands in a different project directory as a flat `{uuid}.jsonl` file with no `/subagents/` segment. Parent detection returns `None`, and the sub-agent creates its own topic. In production, **zero sessions** have ever had `parent_session_id` set, meaning this heuristic has a 0% success rate for the observed workload.
+- **Root cause:** ADR-013 assumed all sub-agent transcripts would be nested under `{parentId}/subagents/`. This assumption is incorrect — it only holds when parent and child share the same `cwd`.
+- **Additional finding:** The `validate_transcript_path()` canonicalization failure (logged as WARN) is a **red herring** — it only affects JSONL content extraction, not parent detection. Parent detection reads the raw unvalidated `transcript_path` string.
+- **Fix implemented:** Option 2 — daemon-side temporal correlation fallback (commit 5384a44).
+  - New method `SessionManager::find_likely_parent()` queries for the most recent active session on the same hostname with tmux + thread_id + no parent_session_id, within a configurable time window.
+  - In `handle_session_start()`, when the `/subagents/` path heuristic returns `None` AND the session has no tmux target, the fallback fires and links the sub-agent to the detected parent.
+  - New config: `TELEGRAM_SUBAGENT_DETECTION_WINDOW_SECS` (default: 60).
+  - Safety guards: excludes self, excludes other sub-agents, requires tmux on parent, requires thread_id on parent, time-windowed.
+  - 8 unit tests cover all edge cases (basic detection, self-exclusion, tmux/thread_id/hostname requirements, sub-agent exclusion, most-recent tiebreaking, time window enforcement).
+  - Files changed: `session.rs`, `socket_handlers.rs`, `config.rs`, + 4 test config fixes.
+- **Status:** RESOLVED (2026-03-18, commit 5384a44)
 
 #### GAP-1: SECURITY — Path traversal in Details callback
 - **Severity:** Security
@@ -325,10 +360,11 @@ A five-agent CFA swarm audited the implementation against every requirement in t
 | F7: No stale global default | `daemon/mod.rs` | 299-320 | Implemented |
 | F8: Startup cache warm | `daemon/mod.rs` | 322-345 | Implemented |
 | B: Parent-child schema | `session.rs` | 151-153, 211-248 | Implemented |
-| B: extract_parent_session_id | `types.rs` | 526-533 | Implemented |
-| B: Parent thread_id reuse | `daemon/socket_handlers.rs` | 57-75, 127-144 | Implemented |
-| B: Child message prefix | — | — | **MISSING (GAP-3)** |
-| B: agent_type tracking | — | — | **MISSING (GAP-2)** |
+| B: extract_parent_session_id | `types.rs` | 526-533 | Implemented (same-cwd path heuristic) |
+| B: find_likely_parent (GAP-7) | `session.rs` | 682-735 | Implemented (cross-cwd temporal correlation fallback) |
+| B: Parent thread_id reuse | `daemon/socket_handlers.rs` | 67-125 | Implemented (3-branch: path heuristic → temporal fallback → none) |
+| B: Child message prefix | `daemon/socket_handlers.rs` | via get_child_prefix() | Implemented |
+| B: agent_type tracking | `session.rs`, `types.rs`, `hook.rs` | schema + hook metadata | Implemented |
 | C: Spawn notification | `daemon/socket_handlers.rs` | 94-113 | Partial (no type) |
 | C: Completion + Details button | `daemon/socket_handlers.rs` | 317-353 | Implemented |
 | C: Details summary + file | `daemon/callback_handlers.rs` | 384-502 | Implemented |
@@ -345,9 +381,11 @@ A five-agent CFA swarm audited the implementation against every requirement in t
 | E4: Title renames | `daemon/socket_handlers.rs` | 700-795 | Partial (no agent count) |
 | E5: Close then delete | `daemon/cleanup.rs` | 438-495 | Implemented |
 
-### Remediation Plan — COMPLETED (2026-03-18, commit 6d18ac7)
+### Remediation Plan — COMPLETE (ALL GAPS RESOLVED)
 
-5-agent CFA swarm executed Phases 5-6 in parallel. All gaps closed. 13 files changed, 361 insertions. All 225 tests pass.
+5-agent CFA swarm executed Phases 5-6 in parallel (commit 6d18ac7). GAPs 1-6 closed. 13 files changed, 361 insertions.
+
+**GAP-7 resolved** (commit 5384a44). Discovered via 4-agent research swarm that traced the 0% parent detection rate to cross-cwd transcript path divergence. Fixed with daemon-side temporal correlation fallback. 2-agent CFA swarm implemented the fix: 7 files changed, 602 insertions, 8 new unit tests. All tests pass.
 
 **Phase 5: Security + Critical Gaps** (all done)
 
@@ -383,7 +421,17 @@ A five-agent CFA swarm audited the implementation against every requirement in t
 | Integration: orphan behavior | End parent, verify child cascade |
 | Security: path traversal rejection | Callback with `../` in agent_id, verify rejection |
 
-Completing Phases 5-6 would bring the grade to **A-**. Completing all three phases would bring it to **A / Excellent**.
+**Phase 8: Cross-cwd Parent Detection (GAP-7)** — COMPLETED (2026-03-18, commit 5384a44)
+
+| Step | Description | Files | Lines | Status |
+|------|-------------|-------|-------|--------|
+| 8a | Research + design (4-agent research swarm) | ADR-013 | — | Done |
+| 8b | Temporal correlation fallback in `handle_session_start()` | `socket_handlers.rs` | 124 changed | Done |
+| 8c | `find_likely_parent()` query | `session.rs` | 51 added | Done |
+| 8d | Config: `subagent_detection_window_secs` | `config.rs` | 28 added | Done |
+| 8e | Unit tests (8 cases) | `session.rs` | 461 added | Done |
+
+Part B restored from **D** to **A-**.
 
 ## References
 
