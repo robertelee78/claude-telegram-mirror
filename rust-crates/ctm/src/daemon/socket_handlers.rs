@@ -64,9 +64,23 @@ pub(super) async fn handle_session_start(ctx: &HandlerContext, msg: &BridgeMessa
     // BUG-012: Cancel pending topic deletion if session resumes
     cleanup::cancel_pending_topic_deletion(ctx, &msg.session_id).await;
 
+    // GAP-9: Suppress topic creation for headless daemon tasks.
+    // Headless sessions with no agent_id are standalone background tasks
+    // (e.g., claude-flow daemon), not sub-agents of a user session.
+    if meta.headless() && meta.agent_id().is_none() {
+        tracing::debug!(
+            session_id = %msg.session_id,
+            "GAP-9: Headless session without agent_id, suppressing topic creation"
+        );
+        return;
+    }
+
     // ADR-013 Part B: Parent-child session routing.
-    // Check if this session is a child of an existing session by examining
-    // the transcript_path for a /subagents/ pattern.
+    // GAP-8: Sub-agents share the parent's session_id and send agent_id in
+    // the base event. When agent_id is present, this is a sub-agent message
+    // on the parent's session — no new topic is needed.
+    //
+    // Also check transcript_path for /subagents/ pattern as a secondary signal.
     let transcript_path = meta.transcript_path();
     let path_parent_info: Option<(String, Option<String>)> = transcript_path.and_then(|tp| {
         let parent_id = crate::types::extract_parent_session_id(tp)?;
@@ -74,11 +88,16 @@ pub(super) async fn handle_session_start(ctx: &HandlerContext, msg: &BridgeMessa
         Some((parent_id.to_string(), agent_id.map(|s| s.to_string())))
     });
 
+    // GAP-8: If agent_id is present in metadata, this is a sub-agent on the
+    // parent's session. The session already exists (it's the parent's session_id),
+    // so the topic is already cached. Store the agent info for labeling.
+    let meta_agent_id = meta.agent_id().map(|s| s.to_string());
+    let meta_agent_type = meta.agent_type().map(|s| s.to_string());
+
     // Resolve parent_info and parent_thread_id together.
     // Strategy:
     //   1. If transcript_path heuristic found a parent, use GAP-4 retry logic for thread_id.
-    //   2. Else if no tmux (likely a sub-agent), try GAP-7 temporal correlation.
-    //   3. Otherwise, no parent.
+    //   2. Otherwise, no parent (GAP-7 temporal correlation removed — superseded by GAP-8).
     let (parent_info, parent_thread_id): (Option<(String, Option<String>)>, Option<i64>) =
         if let Some((ref parent_sid, ref agent_id)) = path_parent_info {
             // Path heuristic succeeded — use GAP-4 retry logic for parent thread_id.
@@ -126,34 +145,6 @@ pub(super) async fn handle_session_start(ctx: &HandlerContext, msg: &BridgeMessa
                 Some((parent_sid.clone(), agent_id.clone())),
                 result,
             )
-        } else if tmux_target.is_none() {
-            // ADR-013 GAP-7: Temporal correlation fallback for cross-cwd sub-agents.
-            // No /subagents/ in path AND no tmux → likely a cross-cwd sub-agent.
-            // Look for a plausible parent: same host, has tmux, active, recent.
-            if let Some(host) = hostname {
-                let h = host.to_string();
-                let sid = msg.session_id.clone();
-                let window = ctx.config.subagent_detection_window_secs;
-                let maybe_parent = ctx
-                    .db_op(move |sess| sess.find_likely_parent(&h, &sid, window).ok().flatten())
-                    .await;
-
-                if let Some(parent) = maybe_parent {
-                    let psid = parent.id.clone();
-                    let ptid = parent.thread_id;
-                    tracing::info!(
-                        session_id = %msg.session_id,
-                        parent_session_id = %psid,
-                        parent_thread_id = ?ptid,
-                        "ADR-013 GAP-7: Cross-cwd sub-agent detected via temporal correlation"
-                    );
-                    (Some((psid, None)), ptid)
-                } else {
-                    (None, None)
-                }
-            } else {
-                (None, None)
-            }
         } else {
             (None, None)
         };
@@ -162,9 +153,11 @@ pub(super) async fn handle_session_start(ctx: &HandlerContext, msg: &BridgeMessa
     if let Some((ref parent_sid, ref agent_id)) = parent_info {
         let sid = msg.session_id.clone();
         let psid = parent_sid.clone();
-        let aid = agent_id.clone();
+        // GAP-8: Prefer agent_id from metadata (base event) over transcript_path extraction
+        let aid = meta_agent_id.clone().or_else(|| agent_id.clone());
+        let at = meta_agent_type.clone();
         ctx.db_op(move |sess| {
-            let _ = sess.set_parent_info(&sid, &psid, aid.as_deref(), None);
+            let _ = sess.set_parent_info(&sid, &psid, aid.as_deref(), at.as_deref());
         })
         .await;
         tracing::info!(

@@ -29,6 +29,14 @@ pub struct HookEventBase {
     #[serde(default)]
     #[allow(dead_code)] // Deserialized from JSON
     pub timestamp: Option<String>,
+    /// GAP-8: Agent ID sent by Claude Code for sub-agent hooks.
+    /// Present only when the hook fires from within a sub-agent context.
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    /// GAP-8: Agent type sent by Claude Code for sub-agent hooks (e.g. "researcher").
+    /// Present only when the hook fires from within a sub-agent context.
+    #[serde(default)]
+    pub agent_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -296,6 +304,14 @@ impl<'a> MessageMetadata<'a> {
     #[allow(dead_code)] // Public API — used in tests and available for callers
     pub fn approval_id(&self) -> Option<&'a str> {
         self.str_field("approvalId")
+    }
+
+    /// GAP-9: Whether this session is running in headless mode (CLAUDE_CODE_HEADLESS).
+    pub fn headless(&self) -> bool {
+        self.0
+            .and_then(|m| m.get("headless"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
     }
 }
 

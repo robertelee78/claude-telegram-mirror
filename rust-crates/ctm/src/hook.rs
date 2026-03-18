@@ -131,12 +131,44 @@ fn get_cwd(event: &HookEvent) -> Option<&str> {
     base.cwd.as_deref()
 }
 
-/// Build metadata object with tmux info, hostname, and project dir
+/// GAP-8: Extract agent_id from any hook event's base fields.
+fn get_agent_id(event: &HookEvent) -> Option<&str> {
+    let base = match event {
+        HookEvent::Stop(e) => &e.base,
+        HookEvent::SubagentStop(e) => &e.base,
+        HookEvent::PreToolUse(e) => &e.base,
+        HookEvent::PostToolUse(e) => &e.base,
+        HookEvent::Notification(e) => &e.base,
+        HookEvent::UserPromptSubmit(e) => &e.base,
+        HookEvent::PreCompact(e) => &e.base,
+        HookEvent::SessionEnd(e) => &e.base,
+    };
+    base.agent_id.as_deref()
+}
+
+/// GAP-8: Extract agent_type from any hook event's base fields.
+fn get_agent_type(event: &HookEvent) -> Option<&str> {
+    let base = match event {
+        HookEvent::Stop(e) => &e.base,
+        HookEvent::SubagentStop(e) => &e.base,
+        HookEvent::PreToolUse(e) => &e.base,
+        HookEvent::PostToolUse(e) => &e.base,
+        HookEvent::Notification(e) => &e.base,
+        HookEvent::UserPromptSubmit(e) => &e.base,
+        HookEvent::PreCompact(e) => &e.base,
+        HookEvent::SessionEnd(e) => &e.base,
+    };
+    base.agent_type.as_deref()
+}
+
+/// Build metadata object with tmux info, hostname, project dir, agent info, and headless flag
 fn build_metadata(
     tmux_info: &Option<injector::TmuxInfo>,
     hostname: &str,
     transcript_path: Option<&str>,
     project_dir: Option<&str>,
+    agent_id: Option<&str>,
+    agent_type: Option<&str>,
 ) -> serde_json::Map<String, serde_json::Value> {
     let mut meta = serde_json::Map::new();
     if let Some(info) = tmux_info {
@@ -168,6 +200,26 @@ fn build_metadata(
             "projectDir".into(),
             serde_json::Value::String(dir.to_string()),
         );
+    }
+    // GAP-8: Include agent_id and agent_type from the hook event base if present
+    if let Some(aid) = agent_id {
+        meta.insert(
+            "agentId".into(),
+            serde_json::Value::String(aid.to_string()),
+        );
+    }
+    if let Some(at) = agent_type {
+        meta.insert(
+            "agentType".into(),
+            serde_json::Value::String(at.to_string()),
+        );
+    }
+    // GAP-9: Include headless flag if CLAUDE_CODE_HEADLESS is set
+    if std::env::var("CLAUDE_CODE_HEADLESS")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false)
+    {
+        meta.insert("headless".into(), serde_json::Value::Bool(true));
     }
     meta
 }
@@ -210,7 +262,9 @@ async fn build_messages(
 ) -> Vec<BridgeMessage> {
     let transcript_path = get_transcript_path(event);
     let project_dir = get_cwd(event);
-    let meta = build_metadata(tmux_info, hostname, transcript_path, project_dir);
+    let agent_id = get_agent_id(event);
+    let agent_type = get_agent_type(event);
+    let meta = build_metadata(tmux_info, hostname, transcript_path, project_dir, agent_id, agent_type);
     let mut messages = Vec::new();
 
     // C3.1: Always send session_start as the first message in every batch.
@@ -471,6 +525,8 @@ async fn get_hook_output(
         &hostname,
         get_transcript_path(event),
         get_cwd(event),
+        get_agent_id(event),
+        get_agent_type(event),
     );
 
     let mut approval_meta = meta;
