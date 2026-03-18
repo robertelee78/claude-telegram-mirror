@@ -217,7 +217,15 @@ async fn main() -> anyhow::Result<()> {
 /// Start the bridge daemon (via system service if installed, else foreground).
 async fn cmd_start(verbose: bool) -> anyhow::Result<()> {
     // Check if running as OS service first — delegate if installed.
-    if service::is_service_installed() {
+    // Skip delegation when we ARE the service (systemd sets INVOCATION_ID,
+    // launchd sets XPC_SERVICE_NAME). Without this check, the service unit
+    // calling `ctm start` would detect itself and exit immediately.
+    let launched_by_service = std::env::var_os("INVOCATION_ID").is_some()
+        || std::env::var_os("XPC_SERVICE_NAME")
+            .map(|v| v.to_string_lossy().contains("claude"))
+            .unwrap_or(false);
+
+    if !launched_by_service && service::is_service_installed() {
         let status = service::get_service_status();
         if !status.running {
             println!("Starting via system service...");

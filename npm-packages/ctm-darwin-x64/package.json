@@ -1,6 +1,6 @@
 {
   "name": "@agidreams/ctm-darwin-x64",
-  "version": "0.2.11",
+  "version": "0.2.12",
   "description": "Claude Telegram Mirror native binary for macOS Intel x86_64",
   "license": "MIT",
   "author": "Robert E. Lee <robert@agidreams.us>",
