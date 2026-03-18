@@ -49,10 +49,10 @@
     "access": "public"
   },
   "optionalDependencies": {
-    "@agidreams/ctm-linux-x64": "0.2.5",
-    "@agidreams/ctm-linux-arm64": "0.2.5",
-    "@agidreams/ctm-darwin-arm64": "0.2.5",
-    "@agidreams/ctm-darwin-x64": "0.2.5"
+    "@agidreams/ctm-linux-x64": "0.2.6",
+    "@agidreams/ctm-linux-arm64": "0.2.6",
+    "@agidreams/ctm-darwin-arm64": "0.2.6",
+    "@agidreams/ctm-darwin-x64": "0.2.6"
   },
   "engines": {
     "node": ">=18.0.0"
