@@ -363,6 +363,10 @@ async fn handle_tool_details_callback(ctx: &HandlerContext, tool_use_id: &str, c
 /// ADR-012: Taps are now tentative — the selection is stored in
 /// `pending.tentative` and the keyboard is re-rendered with a ✓ prefix on
 /// the chosen option. Nothing is injected into tmux until "Submit All".
+///
+/// Per-key Mutex: The per-entry `Mutex<PendingQuestion>` is held across
+/// state mutation AND API calls to prevent concurrent callbacks for the
+/// same question set from racing on message edits.
 async fn handle_answer_callback(ctx: &HandlerContext, data: &str, cb: &CallbackQuery) {
     // Defense-in-depth: verify chat ownership (ADR-006 M4.5)
     if cb.message.as_ref().map(|m| m.chat.id) != Some(ctx.config.chat_id) {
@@ -385,22 +389,27 @@ async fn handle_answer_callback(ctx: &HandlerContext, data: &str, cb: &CallbackQ
         Err(_) => return,
     };
 
-    let mut pq = ctx.pending_q.write().await;
-    // H6.1: Resolve short callback key to full session_id key.
-    let full_key = match resolve_pending_key(&pq, short_key) {
-        Some(k) => k.clone(),
-        None => {
-            let _ = ctx.bot.answer_callback_query(&cb.id, None, false).await;
-            return;
+    // Phase 1: Brief read lock to get the Arc<Mutex<PendingQuestion>>.
+    let (full_key, entry) = {
+        let pq = ctx.pending_q.read().await;
+        let fk = match resolve_pending_key(&pq, short_key) {
+            Some(k) => k,
+            None => {
+                let _ = ctx.bot.answer_callback_query(&cb.id, None, false).await;
+                return;
+            }
+        };
+        match pq.get(&fk) {
+            Some(arc) => (fk, Arc::clone(arc)),
+            None => {
+                let _ = ctx.bot.answer_callback_query(&cb.id, None, false).await;
+                return;
+            }
         }
-    };
-    let pending = match pq.get_mut(&full_key) {
-        Some(p) => p,
-        None => {
-            let _ = ctx.bot.answer_callback_query(&cb.id, None, false).await;
-            return;
-        }
-    };
+    }; // RwLock released.
+
+    // Phase 2: Per-key mutex held across state mutation AND API calls.
+    let mut pending = entry.lock().await;
 
     // If already finalized, reject the tap.
     if pending.finalized.get(q_idx) == Some(&true) {
@@ -473,13 +482,10 @@ async fn handle_answer_callback(ctx: &HandlerContext, data: &str, cb: &CallbackQ
         .unwrap_or(0);
     let thread_id = cb.message.as_ref().and_then(|m| m.message_thread_id);
     let chat_id = ctx.config.chat_id;
-
-    // Drop write lock before async I/O.
     let all_answered = pending.tentative.len() == pending.questions.len();
-    let full_key_clone = full_key.clone();
-    drop(pq);
 
-    // Toast feedback.
+    // Toast feedback (within per-key lock — no other callback for this
+    // question set can interleave).
     let _ = ctx
         .bot
         .answer_callback_query(
@@ -503,7 +509,7 @@ async fn handle_answer_callback(ctx: &HandlerContext, data: &str, cb: &CallbackQ
             .await
         {
             tracing::warn!(
-                session_id = %full_key_clone,
+                session_id = %full_key,
                 q_idx,
                 error = %e,
                 "Failed to edit question message after tentative selection"
@@ -513,8 +519,11 @@ async fn handle_answer_callback(ctx: &HandlerContext, data: &str, cb: &CallbackQ
 
     // If all questions now have a tentative answer, send/update summary.
     if all_answered {
-        let _ = send_or_update_summary(ctx, &full_key_clone, thread_id).await;
+        // send_or_update_summary needs its own lock access, so release ours first.
+        drop(pending);
+        let _ = send_or_update_summary(ctx, &full_key, thread_id).await;
     }
+    // Otherwise per-key Mutex drops here.
 }
 
 /// Handle multi-select toggle callback.
@@ -543,16 +552,21 @@ async fn handle_toggle_callback(ctx: &HandlerContext, data: &str, cb: &CallbackQ
         Err(_) => return,
     };
 
-    let mut pq = ctx.pending_q.write().await;
-    // H6.1: Resolve short callback key to full session_id key.
-    let full_key = match resolve_pending_key(&pq, short_key) {
-        Some(k) => k.clone(),
-        None => return,
+    // Phase 1: Brief read lock to get the Arc<Mutex<PendingQuestion>>.
+    let entry = {
+        let pq = ctx.pending_q.read().await;
+        let fk = match resolve_pending_key(&pq, short_key) {
+            Some(k) => k,
+            None => return,
+        };
+        match pq.get(&fk) {
+            Some(arc) => Arc::clone(arc),
+            None => return,
+        }
     };
-    let pending = match pq.get_mut(&full_key) {
-        Some(p) => p,
-        None => return,
-    };
+
+    // Phase 2: Per-key mutex held across state mutation AND API calls.
+    let mut pending = entry.lock().await;
 
     if pending.finalized.get(q_idx) == Some(&true) {
         return;
@@ -585,7 +599,7 @@ async fn handle_toggle_callback(ctx: &HandlerContext, data: &str, cb: &CallbackQ
         }
     };
 
-    // M2: Re-render keyboard with checkmarks
+    // M2: Re-render keyboard with checkmarks (within per-key lock).
     if let Some(question) = pending.questions.get(q_idx) {
         let mut buttons: Vec<InlineButton> = question
             .options
@@ -642,22 +656,27 @@ async fn handle_submit_callback(ctx: &HandlerContext, data: &str, cb: &CallbackQ
         }
     };
 
-    let mut pq = ctx.pending_q.write().await;
-    // H6.1: Resolve short callback key to full session_id key.
-    let full_key = match resolve_pending_key(&pq, short_key) {
-        Some(k) => k.clone(),
-        None => {
-            let _ = ctx.bot.answer_callback_query(&cb.id, None, false).await;
-            return;
+    // Phase 1: Brief read lock to get the Arc<Mutex<PendingQuestion>>.
+    let (full_key, entry) = {
+        let pq = ctx.pending_q.read().await;
+        let fk = match resolve_pending_key(&pq, short_key) {
+            Some(k) => k,
+            None => {
+                let _ = ctx.bot.answer_callback_query(&cb.id, None, false).await;
+                return;
+            }
+        };
+        match pq.get(&fk) {
+            Some(arc) => (fk, Arc::clone(arc)),
+            None => {
+                let _ = ctx.bot.answer_callback_query(&cb.id, None, false).await;
+                return;
+            }
         }
     };
-    let pending = match pq.get_mut(&full_key) {
-        Some(p) => p,
-        None => {
-            let _ = ctx.bot.answer_callback_query(&cb.id, None, false).await;
-            return;
-        }
-    };
+
+    // Phase 2: Per-key mutex held across state mutation AND API calls.
+    let mut pending = entry.lock().await;
 
     if pending.finalized.get(q_idx) == Some(&true) {
         let _ = ctx
@@ -705,8 +724,6 @@ async fn handle_submit_callback(ctx: &HandlerContext, data: &str, cb: &CallbackQ
 
     let all_answered = pending.tentative.len() == pending.questions.len();
     let thread_id = cb.message.as_ref().and_then(|m| m.message_thread_id);
-    let full_key_clone = full_key.clone();
-    drop(pq);
 
     let _ = ctx
         .bot
@@ -714,7 +731,8 @@ async fn handle_submit_callback(ctx: &HandlerContext, data: &str, cb: &CallbackQ
         .await;
 
     if all_answered {
-        let _ = send_or_update_summary(ctx, &full_key_clone, thread_id).await;
+        drop(pending);
+        let _ = send_or_update_summary(ctx, &full_key, thread_id).await;
     }
 }
 
@@ -724,137 +742,74 @@ async fn handle_submit_callback(ctx: &HandlerContext, data: &str, cb: &CallbackQ
 /// Sends a summary showing all selections with "Submit All" and "Change QN"
 /// buttons. If a summary was already sent, edits it in place.
 ///
+/// Per-key Mutex: This function acquires its own per-key Mutex from the map.
+/// Callers MUST drop their per-key Mutex guard before calling this to avoid
+/// deadlock (the per-key Mutex is not re-entrant).
+///
 /// Returns the message_id of the summary, or `None` on failure.
 pub(super) async fn send_or_update_summary(
     ctx: &HandlerContext,
     full_key: &str,
     thread_id: Option<i64>,
 ) -> Option<i64> {
-    // Read the data we need under a write lock, then release before I/O.
-    let (summary_text, reply_markup, summary_message_id, short_key) = {
+    // Look up the per-key mutex.
+    let entry = {
         let pq = ctx.pending_q.read().await;
-        let pending = pq.get(full_key)?;
-
-        // Build the short key for callback_data (first 20 chars of session_id).
-        let short = &pending.session_id[..std::cmp::min(20, pending.session_id.len())];
-
-        // Build summary text.
-        let mut text = "\u{1F4CB} *Review your answers:*\n".to_string();
-        for (q_idx, q) in pending.questions.iter().enumerate() {
-            let answer_label = match pending.tentative.get(&q_idx) {
-                Some(TentativeAnswer::Option(o_idx)) => pending
-                    .questions
-                    .get(q_idx)
-                    .and_then(|qq| qq.options.get(*o_idx))
-                    .map(|o| o.label.clone())
-                    .unwrap_or_else(|| format!("{}", o_idx + 1)),
-                Some(TentativeAnswer::MultiOption(set)) => {
-                    let mut sorted: Vec<usize> = set.iter().copied().collect();
-                    sorted.sort();
-                    let labels: Vec<String> = sorted
-                        .iter()
-                        .filter_map(|&idx| {
-                            pending
-                                .questions
-                                .get(q_idx)
-                                .and_then(|qq| qq.options.get(idx))
-                                .map(|o| o.label.clone())
-                        })
-                        .collect();
-                    if labels.is_empty() {
-                        "_(none)_".to_string()
-                    } else {
-                        labels.join(", ")
-                    }
-                }
-                Some(TentativeAnswer::FreeText(s)) => s.clone(),
-                None => "_(unanswered)_".to_string(),
-            };
-            text.push_str(&format!(
-                "\n{}. *{}:* {}",
-                q_idx + 1,
-                escape_markdown_v1(&q.header),
-                escape_markdown_v1(&answer_label)
-            ));
-        }
-
-        // Build inline keyboard: Submit All on row 1, Change buttons 2-per-row.
-        let mut rows: Vec<serde_json::Value> = Vec::new();
-        rows.push(serde_json::json!([{
-            "text": "\u{2705} Submit All",
-            "callback_data": format!("submitall:{short}"),
-        }]));
-        let n = pending.questions.len();
-        let mut change_row: Vec<serde_json::Value> = Vec::new();
-        for q_idx in 0..n {
-            change_row.push(serde_json::json!({
-                "text": format!("Change Q{}", q_idx + 1),
-                "callback_data": format!("change:{short}:{q_idx}"),
-            }));
-            if change_row.len() == 2 {
-                rows.push(serde_json::Value::Array(change_row));
-                change_row = Vec::new();
-            }
-        }
-        if !change_row.is_empty() {
-            rows.push(serde_json::Value::Array(change_row));
-        }
-        let reply_markup = serde_json::json!({"inline_keyboard": rows});
-
-        (
-            text,
-            reply_markup,
-            pending.summary_message_id,
-            short.to_string(),
-        )
+        pq.get(full_key).map(Arc::clone)?
     };
 
-    let _ = short_key; // used in closure above, suppress warning
+    let mut pending = entry.lock().await;
 
-    let chat_id = ctx.config.chat_id;
+    // Build the short key for callback_data (first 20 chars of session_id).
+    let short = &pending.session_id[..std::cmp::min(20, pending.session_id.len())];
 
-    // Either edit the existing summary or send a new one.
-    if let Some(mid) = summary_message_id {
-        match ctx
-            .bot
-            .edit_message_text_with_raw_markup(
-                chat_id,
-                mid,
-                &summary_text,
-                Some("Markdown"),
-                reply_markup,
-            )
-            .await
-        {
-            Ok(()) => {
-                return Some(mid);
-            }
-            Err(e) => {
-                tracing::warn!(
-                    session_id = full_key,
-                    error = %e,
-                    "Failed to edit summary message; will send new one"
-                );
-                // Fall through to send a new summary message.
-                let mut pq = ctx.pending_q.write().await;
-                if let Some(p) = pq.get_mut(full_key) {
-                    p.summary_message_id = None;
+    // Build summary text.
+    let mut summary_text = "\u{1F4CB} *Review your answers:*\n".to_string();
+    for (q_idx, q) in pending.questions.iter().enumerate() {
+        let answer_label = match pending.tentative.get(&q_idx) {
+            Some(TentativeAnswer::Option(o_idx)) => pending
+                .questions
+                .get(q_idx)
+                .and_then(|qq| qq.options.get(*o_idx))
+                .map(|o| o.label.clone())
+                .unwrap_or_else(|| format!("{}", o_idx + 1)),
+            Some(TentativeAnswer::MultiOption(set)) => {
+                let mut sorted: Vec<usize> = set.iter().copied().collect();
+                sorted.sort();
+                let labels: Vec<String> = sorted
+                    .iter()
+                    .filter_map(|&idx| {
+                        pending
+                            .questions
+                            .get(q_idx)
+                            .and_then(|qq| qq.options.get(idx))
+                            .map(|o| o.label.clone())
+                    })
+                    .collect();
+                if labels.is_empty() {
+                    "_(none)_".to_string()
+                } else {
+                    labels.join(", ")
                 }
             }
-        }
+            Some(TentativeAnswer::FreeText(s)) => s.clone(),
+            None => "_(unanswered)_".to_string(),
+        };
+        summary_text.push_str(&format!(
+            "\n{}. *{}:* {}",
+            q_idx + 1,
+            escape_markdown_v1(&q.header),
+            escape_markdown_v1(&answer_label)
+        ));
     }
 
-    // Re-read for sending (after possible write above).
-    let reply_markup2 = {
-        let pq = ctx.pending_q.read().await;
-        let pending = pq.get(full_key)?;
-        let short = &pending.session_id[..std::cmp::min(20, pending.session_id.len())];
+    // Helper: build reply_markup keyboard.
+    let build_keyboard = |short: &str, n: usize| -> serde_json::Value {
         let mut rows: Vec<serde_json::Value> = Vec::new();
         rows.push(serde_json::json!([{
             "text": "\u{2705} Submit All",
             "callback_data": format!("submitall:{short}"),
         }]));
-        let n = pending.questions.len();
         let mut change_row: Vec<serde_json::Value> = Vec::new();
         for q_idx in 0..n {
             change_row.push(serde_json::json!({
@@ -872,22 +827,49 @@ pub(super) async fn send_or_update_summary(
         serde_json::json!({"inline_keyboard": rows})
     };
 
-    // Send via the bot client to get back the message_id.
+    let reply_markup = build_keyboard(short, pending.questions.len());
+    let chat_id = ctx.config.chat_id;
+
+    // Either edit the existing summary or send a new one.
+    if let Some(mid) = pending.summary_message_id {
+        match ctx
+            .bot
+            .edit_message_text_with_raw_markup(
+                chat_id,
+                mid,
+                &summary_text,
+                Some("Markdown"),
+                reply_markup.clone(),
+            )
+            .await
+        {
+            Ok(()) => {
+                return Some(mid);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    session_id = full_key,
+                    error = %e,
+                    "Failed to edit summary message; will send new one"
+                );
+                pending.summary_message_id = None;
+            }
+        }
+    }
+
+    // Send new summary message.
     match ctx
         .bot
         .send_message_with_raw_markup_returning(
             &summary_text,
             Some("Markdown"),
-            reply_markup2,
+            reply_markup,
             thread_id,
         )
         .await
     {
         Ok(new_mid) => {
-            let mut pq = ctx.pending_q.write().await;
-            if let Some(pending) = pq.get_mut(full_key) {
-                pending.summary_message_id = Some(new_mid);
-            }
+            pending.summary_message_id = Some(new_mid);
             Some(new_mid)
         }
         Err(e) => {
@@ -916,84 +898,96 @@ async fn handle_submitall_callback(ctx: &HandlerContext, data: &str, cb: &Callba
     }
     let short_key = parts[1];
 
-    let mut pq = ctx.pending_q.write().await;
-    let full_key = match resolve_pending_key(&pq, short_key) {
-        Some(k) => k.clone(),
-        None => {
-            let _ = ctx.bot.answer_callback_query(&cb.id, Some("No pending question"), false).await;
-            return;
-        }
-    };
-    let pending = match pq.get_mut(&full_key) {
-        Some(p) => p,
-        None => {
-            let _ = ctx.bot.answer_callback_query(&cb.id, None, false).await;
-            return;
-        }
-    };
-
-    // Guard: if already all finalized, reject double-tap.
-    if pending.finalized.iter().all(|f| *f) {
-        let _ = ctx
-            .bot
-            .answer_callback_query(&cb.id, Some("Already submitted"), false)
-            .await;
-        return;
-    }
-
-    // Collect all answers in question order.
-    let mut answers: Vec<(usize, String)> = Vec::new(); // (q_idx, answer_text)
-    for (q_idx, _q) in pending.questions.iter().enumerate() {
-        let text = match pending.tentative.get(&q_idx) {
-            Some(TentativeAnswer::Option(o_idx)) => pending
-                .questions
-                .get(q_idx)
-                .and_then(|q| q.options.get(*o_idx))
-                .map(|o| o.label.clone())
-                .unwrap_or_else(|| format!("{}", o_idx + 1)),
-            Some(TentativeAnswer::MultiOption(set)) => {
-                let mut sorted: Vec<usize> = set.iter().copied().collect();
-                sorted.sort();
-                let labels: Vec<String> = sorted
-                    .iter()
-                    .filter_map(|&idx| {
-                        pending
-                            .questions
-                            .get(q_idx)
-                            .and_then(|q| q.options.get(idx))
-                            .map(|o| o.label.clone())
-                    })
-                    .collect();
-                if labels.is_empty() {
-                    String::new()
-                } else {
-                    labels.join(", ")
-                }
-            }
-            Some(TentativeAnswer::FreeText(s)) => s.clone(),
+    // Phase 1: Brief read lock to get the Arc and full key.
+    let (full_key, entry) = {
+        let pq = ctx.pending_q.read().await;
+        let fk = match resolve_pending_key(&pq, short_key) {
+            Some(k) => k,
             None => {
-                // Skip unanswered (shouldn't happen when summary is shown, but be safe).
-                continue;
+                let _ = ctx.bot.answer_callback_query(&cb.id, Some("No pending question"), false).await;
+                return;
             }
         };
-        answers.push((q_idx, text));
-    }
-
-    // Mark all as finalized.
-    for &(q_idx, _) in &answers {
-        if let Some(f) = pending.finalized.get_mut(q_idx) {
-            *f = true;
+        match pq.get(&fk) {
+            Some(arc) => (fk, Arc::clone(arc)),
+            None => {
+                let _ = ctx.bot.answer_callback_query(&cb.id, None, false).await;
+                return;
+            }
         }
+    };
+
+    // Phase 2: Per-key mutex for state extraction.
+    let (answers, session_id, question_message_ids, summary_message_id, thread_id) = {
+        let mut pending = entry.lock().await;
+
+        // Guard: if already all finalized, reject double-tap.
+        if pending.finalized.iter().all(|f| *f) {
+            let _ = ctx
+                .bot
+                .answer_callback_query(&cb.id, Some("Already submitted"), false)
+                .await;
+            return;
+        }
+
+        // Collect all answers in question order.
+        let mut answers: Vec<(usize, String)> = Vec::new();
+        for (q_idx, _q) in pending.questions.iter().enumerate() {
+            let text = match pending.tentative.get(&q_idx) {
+                Some(TentativeAnswer::Option(o_idx)) => pending
+                    .questions
+                    .get(q_idx)
+                    .and_then(|q| q.options.get(*o_idx))
+                    .map(|o| o.label.clone())
+                    .unwrap_or_else(|| format!("{}", o_idx + 1)),
+                Some(TentativeAnswer::MultiOption(set)) => {
+                    let mut sorted: Vec<usize> = set.iter().copied().collect();
+                    sorted.sort();
+                    let labels: Vec<String> = sorted
+                        .iter()
+                        .filter_map(|&idx| {
+                            pending
+                                .questions
+                                .get(q_idx)
+                                .and_then(|q| q.options.get(idx))
+                                .map(|o| o.label.clone())
+                        })
+                        .collect();
+                    if labels.is_empty() {
+                        String::new()
+                    } else {
+                        labels.join(", ")
+                    }
+                }
+                Some(TentativeAnswer::FreeText(s)) => s.clone(),
+                None => continue,
+            };
+            answers.push((q_idx, text));
+        }
+
+        // Mark all as finalized.
+        for &(q_idx, _) in &answers {
+            if let Some(f) = pending.finalized.get_mut(q_idx) {
+                *f = true;
+            }
+        }
+
+        let data = (
+            answers,
+            pending.session_id.clone(),
+            pending.question_message_ids.clone(),
+            pending.summary_message_id,
+            cb.message.as_ref().and_then(|m| m.message_thread_id),
+        );
+        data
+        // per-key Mutex drops here
+    };
+
+    // Remove entry from the map. No new handler can acquire it after this.
+    {
+        let mut pq = ctx.pending_q.write().await;
+        pq.remove(&full_key);
     }
-
-    let session_id = pending.session_id.clone();
-    let question_message_ids = pending.question_message_ids.clone();
-    let summary_message_id = pending.summary_message_id;
-    let thread_id = cb.message.as_ref().and_then(|m| m.message_thread_id);
-
-    // Remove from pending map before releasing the lock.
-    pq.remove(&full_key);
-    drop(pq);
 
     let _ = ctx
         .bot
@@ -1071,21 +1065,27 @@ async fn handle_change_callback(ctx: &HandlerContext, data: &str, cb: &CallbackQ
         }
     };
 
-    let mut pq = ctx.pending_q.write().await;
-    let full_key = match resolve_pending_key(&pq, short_key) {
-        Some(k) => k.clone(),
-        None => {
-            let _ = ctx.bot.answer_callback_query(&cb.id, Some("Question not found"), false).await;
-            return;
+    // Phase 1: Brief read lock to get the Arc and full key.
+    let (full_key, entry) = {
+        let pq = ctx.pending_q.read().await;
+        let fk = match resolve_pending_key(&pq, short_key) {
+            Some(k) => k,
+            None => {
+                let _ = ctx.bot.answer_callback_query(&cb.id, Some("Question not found"), false).await;
+                return;
+            }
+        };
+        match pq.get(&fk) {
+            Some(arc) => (fk, Arc::clone(arc)),
+            None => {
+                let _ = ctx.bot.answer_callback_query(&cb.id, None, false).await;
+                return;
+            }
         }
     };
-    let pending = match pq.get_mut(&full_key) {
-        Some(p) => p,
-        None => {
-            let _ = ctx.bot.answer_callback_query(&cb.id, None, false).await;
-            return;
-        }
-    };
+
+    // Phase 2: Per-key mutex held across state mutation AND API calls.
+    let mut pending = entry.lock().await;
 
     if pending.finalized.get(q_idx) == Some(&true) {
         let _ = ctx
@@ -1098,7 +1098,6 @@ async fn handle_change_callback(ctx: &HandlerContext, data: &str, cb: &CallbackQ
     // Clear the tentative answer for this question.
     pending.tentative.remove(&q_idx);
 
-    // Capture what we need to re-render the question.
     let q = match pending.questions.get(q_idx) {
         Some(q) => q.clone(),
         None => {
@@ -1112,10 +1111,9 @@ async fn handle_change_callback(ctx: &HandlerContext, data: &str, cb: &CallbackQ
         .copied()
         .unwrap_or(0);
     let summary_message_id = pending.summary_message_id.take();
-    let thread_id = cb.message.as_ref().and_then(|m| m.message_thread_id);
     let short = pending.session_id[..std::cmp::min(20, pending.session_id.len())].to_string();
-    drop(pq);
 
+    // API calls within per-key lock — no concurrent handler can race.
     let _ = ctx
         .bot
         .answer_callback_query(&cb.id, Some("Tap to re-select"), false)
@@ -1195,9 +1193,7 @@ async fn handle_change_callback(ctx: &HandlerContext, data: &str, cb: &CallbackQ
             );
         }
     }
-
-    // Clear thread_id to avoid unused variable lint.
-    let _ = thread_id;
+    // Per-key Mutex drops here.
 }
 
 /// After all AskUserQuestion answers are collected, Claude Code shows a

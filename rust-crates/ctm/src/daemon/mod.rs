@@ -139,7 +139,7 @@ pub(super) struct DaemonState {
     pub(super) compacting_sessions: Arc<RwLock<HashSet<String>>>,
     pub(super) pending_deletions: Arc<RwLock<HashMap<String, tokio::task::JoinHandle<()>>>>,
     pub(super) session_custom_titles: Arc<RwLock<HashMap<String, String>>>,
-    pub(super) pending_questions: Arc<RwLock<HashMap<String, PendingQuestion>>>,
+    pub(super) pending_questions: Arc<RwLock<HashMap<String, Arc<Mutex<PendingQuestion>>>>>,
 
     // BUG-002: Topic creation locks
     pub(super) topic_creation_locks: Arc<RwLock<HashMap<String, Arc<TopicCreationState>>>>,
@@ -406,7 +406,7 @@ struct HandlerContext {
     compacting: Arc<RwLock<HashSet<String>>>,
     pending_del: Arc<RwLock<HashMap<String, tokio::task::JoinHandle<()>>>>,
     custom_titles: Arc<RwLock<HashMap<String, String>>>,
-    pending_q: Arc<RwLock<HashMap<String, PendingQuestion>>>,
+    pending_q: Arc<RwLock<HashMap<String, Arc<Mutex<PendingQuestion>>>>>,
     topic_locks: Arc<RwLock<HashMap<String, Arc<TopicCreationState>>>>,
     /// Per-thread bot session state (keyed by thread_id).
     bot_sessions: Arc<RwLock<HashMap<i64, BotSessionState>>>,
@@ -907,11 +907,11 @@ fn escape_markdown_v1(text: &str) -> String {
 
 /// H6.1: Resolve a short session_id prefix (from callback_data) to the full
 /// session_id key in the pending_questions map. Returns `None` if no match.
-fn resolve_pending_key<'a>(
-    pq: &'a HashMap<String, PendingQuestion>,
+fn resolve_pending_key<V>(
+    pq: &HashMap<String, V>,
     short_key: &str,
-) -> Option<&'a String> {
-    pq.keys().find(|k| k.starts_with(short_key))
+) -> Option<String> {
+    pq.keys().find(|k| k.starts_with(short_key)).cloned()
 }
 
 /// BUG-004: Check if text is an interrupt command.

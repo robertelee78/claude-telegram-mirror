@@ -205,6 +205,56 @@ impl TelegramBot {
             .await
             .map_err(|e| AppError::Telegram(self.scrub_token(&e.to_string())))?;
 
+        if !tg.ok {
+            let desc = tg.description.as_deref().unwrap_or("Unknown error");
+            let code = tg.error_code.unwrap_or(0);
+
+            // 429: Rate limited. Adjust AIMD and retry once after retry_after.
+            if code == 429 {
+                let retry_after = tg
+                    .parameters
+                    .as_ref()
+                    .and_then(|p| p.retry_after)
+                    .unwrap_or(1);
+                self.aimd.lock().await.on_rate_limit(retry_after);
+                tracing::warn!(method, retry_after, "Telegram 429, retrying after backoff");
+                tokio::time::sleep(tokio::time::Duration::from_secs(retry_after)).await;
+                // Single retry after backoff.
+                self.rate_limiter.until_ready().await;
+                let resp2 = self
+                    .client
+                    .post(self.api_url(method))
+                    .json(body)
+                    .send()
+                    .await
+                    .map_err(|e| AppError::Telegram(self.scrub_token(&e.to_string())))?;
+                let tg2: TgResponse<T> = resp2
+                    .json()
+                    .await
+                    .map_err(|e| AppError::Telegram(self.scrub_token(&e.to_string())))?;
+                if !tg2.ok {
+                    return Err(AppError::Telegram(format!(
+                        "{method}: {} (after retry)",
+                        tg2.description.as_deref().unwrap_or("Unknown error")
+                    )));
+                }
+                self.aimd.lock().await.on_success();
+                return Ok(tg2);
+            }
+
+            // 400 "message is not modified": harmless no-op (expected during
+            // concurrent edits or user double-taps). Return the response as-is;
+            // callers using `let _: TgResponse<T>` already discard the result.
+            if code == 400 && desc.contains("message is not modified") {
+                tracing::debug!(method, "Message not modified (harmless)");
+                return Ok(tg);
+            }
+
+            // All other API errors: propagate.
+            return Err(AppError::Telegram(format!("{method}: {desc}")));
+        }
+
+        self.aimd.lock().await.on_success();
         Ok(tg)
     }
 

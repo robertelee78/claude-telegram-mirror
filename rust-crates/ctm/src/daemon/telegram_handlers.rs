@@ -870,115 +870,102 @@ async fn handle_bot_command(ctx: &HandlerContext, msg: &TgMessage, text: &str) {
 /// `TentativeAnswer::FreeText` and can be replaced by typing again.
 /// The question message is edited to show the current free-text selection.
 /// Nothing is injected into tmux until the user taps "Submit All".
+///
+/// Per-key Mutex: Uses the same per-entry lock as callback handlers to
+/// prevent races between free-text input and button taps.
 pub(super) async fn handle_free_text_answer(
     ctx: &HandlerContext,
     session_id: &str,
     text: &str,
 ) -> bool {
+    // Phase 1: Find the pending entry for this session under a brief read lock.
+    let (pending_key, entry) = {
+        let pq = ctx.pending_q.read().await;
+        let found = pq.iter().find(|(_, v)| {
+            // We need to check session_id, but the value is behind a Mutex.
+            // Use try_lock to avoid blocking; if contended, another handler is
+            // active on this entry and we should skip (the user is tapping buttons).
+            if let Ok(p) = v.try_lock() {
+                p.session_id == session_id
+            } else {
+                false
+            }
+        });
+        match found {
+            Some((k, v)) => (k.clone(), Arc::clone(v)),
+            None => return false,
+        }
+    };
+
+    // Phase 2: Per-key mutex held across state mutation AND API calls.
+    let mut pending = entry.lock().await;
+
     // ADR-012 D4 targeting rules:
     //   a. First question with no tentative answer, OR
     //   b. First question that already has a FreeText tentative answer (allow replacement).
     //   Questions with Option/MultiOption tentative answers are skipped.
-    let (pending_key, q_idx, msg_id, thread_id_hint) = {
-        let pq = ctx.pending_q.read().await;
-        let entry = match pq.iter().find(|(_, v)| v.session_id == session_id) {
-            Some(e) => e,
-            None => return false,
-        };
-        let (key, pending) = entry;
-
-        // Find target question index.
-        let target = (0..pending.questions.len()).find(|&i| {
-            match pending.tentative.get(&i) {
-                None => !pending.finalized.get(i).copied().unwrap_or(false),
-                Some(TentativeAnswer::FreeText(_)) => true,
-                Some(TentativeAnswer::Option(_)) | Some(TentativeAnswer::MultiOption(_)) => false,
-            }
-        });
-
-        let q_idx = match target {
-            Some(i) => i,
-            None => return false,
-        };
-        let msg_id = pending
-            .question_message_ids
-            .get(q_idx)
-            .copied()
-            .unwrap_or(0);
-        (key.clone(), q_idx, msg_id, None::<i64>)
+    let q_idx = match (0..pending.questions.len()).find(|&i| {
+        match pending.tentative.get(&i) {
+            None => !pending.finalized.get(i).copied().unwrap_or(false),
+            Some(TentativeAnswer::FreeText(_)) => true,
+            Some(TentativeAnswer::Option(_)) | Some(TentativeAnswer::MultiOption(_)) => false,
+        }
+    }) {
+        Some(i) => i,
+        None => return false,
     };
 
-    // Now acquire a write lock to store the tentative answer.
-    let all_answered = {
-        let mut pq = ctx.pending_q.write().await;
-        let pending = match pq.get_mut(&pending_key) {
-            Some(p) => p,
-            None => return false,
-        };
+    let msg_id = pending
+        .question_message_ids
+        .get(q_idx)
+        .copied()
+        .unwrap_or(0);
 
-        pending
-            .tentative
-            .insert(q_idx, TentativeAnswer::FreeText(text.to_string()));
+    pending
+        .tentative
+        .insert(q_idx, TentativeAnswer::FreeText(text.to_string()));
 
-        pending.tentative.len() == pending.questions.len()
-    };
-
+    let all_answered = pending.tentative.len() == pending.questions.len();
     let chat_id = ctx.config.chat_id;
 
     // Edit question message to show the free-text answer (keep keyboard).
     if msg_id != 0 {
-        // Rebuild the question text with the free-text shown.
-        let (updated_text, buttons) = {
-            let pq = ctx.pending_q.read().await;
-            if let Some(pending) = pq.get(&pending_key) {
-                if let Some(q) = pending.questions.get(q_idx) {
-                    let mut t = format!(
-                        "\u{2753} *{}*\n\n{}\n",
-                        escape_markdown_v1(&q.header),
-                        escape_markdown_v1(&q.question)
-                    );
-                    for opt in &q.options {
-                        t.push_str(&format!(
-                            "\n\u{2022} *{}* \u{2014} {}",
-                            escape_markdown_v1(&opt.label),
-                            escape_markdown_v1(&opt.description)
-                        ));
-                    }
-                    t.push_str("\n\n_Or type your answer in this topic_");
-                    t.push_str(&format!(
-                        "\n\n\u{1F4DD} *Your answer:* {}",
-                        escape_markdown_v1(text)
-                    ));
-                    let btns: Vec<InlineButton> = if q.options.is_empty() {
-                        Vec::new()
-                    } else {
-                        let short = &pending.session_id
-                            [..std::cmp::min(20, pending.session_id.len())];
-                        q.options
-                            .iter()
-                            .enumerate()
-                            .map(|(o_idx, opt)| InlineButton {
-                                text: opt.label.clone(),
-                                callback_data: format!("answer:{short}:{q_idx}:{o_idx}"),
-                            })
-                            .collect()
-                    };
-                    (t, btns)
-                } else {
-                    (String::new(), Vec::new())
-                }
-            } else {
-                (String::new(), Vec::new())
+        if let Some(q) = pending.questions.get(q_idx) {
+            let mut updated_text = format!(
+                "\u{2753} *{}*\n\n{}\n",
+                escape_markdown_v1(&q.header),
+                escape_markdown_v1(&q.question)
+            );
+            for opt in &q.options {
+                updated_text.push_str(&format!(
+                    "\n\u{2022} *{}* \u{2014} {}",
+                    escape_markdown_v1(&opt.label),
+                    escape_markdown_v1(&opt.description)
+                ));
             }
-        };
+            updated_text.push_str("\n\n_Or type your answer in this topic_");
+            updated_text.push_str(&format!(
+                "\n\n\u{1F4DD} *Your answer:* {}",
+                escape_markdown_v1(text)
+            ));
 
-        if !updated_text.is_empty() {
-            if buttons.is_empty() {
+            if q.options.is_empty() {
                 let _ = ctx
                     .bot
-                    .edit_message_text_no_markup(msg_id, &updated_text, thread_id_hint)
+                    .edit_message_text_no_markup(msg_id, &updated_text, None)
                     .await;
             } else {
+                let short =
+                    &pending.session_id[..std::cmp::min(20, pending.session_id.len())];
+                let buttons: Vec<InlineButton> = q
+                    .options
+                    .iter()
+                    .enumerate()
+                    .map(|(o_idx, opt)| InlineButton {
+                        text: opt.label.clone(),
+                        callback_data: format!("answer:{short}:{q_idx}:{o_idx}"),
+                    })
+                    .collect();
                 let _ = ctx
                     .bot
                     .edit_message_text_with_markup(
@@ -994,7 +981,9 @@ pub(super) async fn handle_free_text_answer(
     }
 
     if all_answered {
-        let _ = callback_handlers::send_or_update_summary(ctx, &pending_key, thread_id_hint).await;
+        drop(pending);
+        let _ =
+            callback_handlers::send_or_update_summary(ctx, &pending_key, None).await;
     }
 
     true

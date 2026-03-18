@@ -734,14 +734,14 @@ pub(super) async fn handle_ask_user_question(ctx: &HandlerContext, msg: &BridgeM
         let mut pq = ctx.pending_q.write().await;
         pq.insert(
             pending_key.clone(),
-            PendingQuestion {
+            Arc::new(Mutex::new(PendingQuestion {
                 session_id: msg.session_id.clone(),
                 questions: questions.clone(),
                 tentative: HashMap::new(),
                 finalized: vec![false; questions.len()],
                 question_message_ids: Vec::new(),
                 summary_message_id: None,
-            },
+            })),
         );
     }
 
@@ -807,8 +807,9 @@ pub(super) async fn handle_ask_user_question(ctx: &HandlerContext, msg: &BridgeM
 
     // Store captured message_ids back into the pending question.
     {
-        let mut pq = ctx.pending_q.write().await;
-        if let Some(pending) = pq.get_mut(&pending_key) {
+        let pq = ctx.pending_q.read().await;
+        if let Some(entry) = pq.get(&pending_key) {
+            let mut pending = entry.lock().await;
             pending.question_message_ids = question_message_ids;
         }
     }
@@ -816,14 +817,23 @@ pub(super) async fn handle_ask_user_question(ctx: &HandlerContext, msg: &BridgeM
 
 /// Clean up pending questions for a session.
 pub(super) async fn cleanup_pending_questions(ctx: &HandlerContext, session_id: &str) {
-    let mut pq = ctx.pending_q.write().await;
-    let keys_to_remove: Vec<String> = pq
-        .iter()
-        .filter(|(_, v)| v.session_id == session_id)
-        .map(|(k, _)| k.clone())
-        .collect();
-    for k in keys_to_remove {
-        pq.remove(&k);
+    // Collect keys whose PendingQuestion belongs to this session.
+    let keys_to_remove: Vec<String> = {
+        let pq = ctx.pending_q.read().await;
+        let mut keys = Vec::new();
+        for (k, v) in pq.iter() {
+            let entry = v.lock().await;
+            if entry.session_id == session_id {
+                keys.push(k.clone());
+            }
+        }
+        keys
+    };
+    if !keys_to_remove.is_empty() {
+        let mut pq = ctx.pending_q.write().await;
+        for k in keys_to_remove {
+            pq.remove(&k);
+        }
     }
 }
 
