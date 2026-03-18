@@ -1,6 +1,6 @@
 # ADR-013: Session Hierarchy and tmux Reliability
 
-**Status:** Implemented (all gaps closed — GAP-7 resolved via temporal correlation fallback)
+**Status:** Phase 9 in progress — GAP-8/9/10 identified via deep investigation (2026-03-18)
 **Date:** 2026-03-18
 **Authors:** Robert, Claude
 
@@ -432,6 +432,136 @@ A five-agent CFA swarm audited the implementation against every requirement in t
 | 8e | Unit tests (8 cases) | `session.rs` | 461 added | Done |
 
 Part B restored from **D** to **A-**.
+
+## Phase 9: Deterministic Parent Detection + Message Delivery (GAP-8/9/10)
+
+### Investigation Summary (2026-03-18)
+
+A 10-agent research swarm across 3 rounds of investigation uncovered that Phase 8's temporal correlation approach was fundamentally flawed. Deep testing with live hook event capture, filesystem analysis, database queries, and process inspection revealed the true architecture of Claude Code's sub-agent hook system.
+
+### GAP-8: Sub-agent hooks share the parent's session_id — our code doesn't use agent_id
+
+#### Why (Problem Statement)
+
+Claude Code's hook events carry `agent_id` and `agent_type` in the base event for ALL hooks fired from within a sub-agent. The `session_id` field is the **parent's session_id**, not a new unique ID. Our `HookEventBase` struct does not deserialize `agent_id` or `agent_type`, so we silently drop these fields. Without `agent_id`, the daemon cannot distinguish "sub-agent message for session X" from "parent's own message for session X."
+
+**Evidence:**
+- Live hook event capture confirmed: sub-agent PreToolUse event has `session_id: "88f1d883..."` (parent's), `agent_id: "ac3dc83c0f0ac43df"`, `agent_type: "researcher"`.
+- Parent's own events have NO `agent_id` field.
+- Verified against Claude Code's `cli.js` source: `HH = S.object({ ..., agent_id: S.string().optional().describe("Subagent identifier. Present only when the hook fires from within a subagent...") })`.
+
+**Impact:** The entire GAP-7 temporal correlation mechanism was unnecessary. Sub-agents already identify themselves via `agent_id` on the parent's session — no second session is created, no parent matching needed. The daemon just needs to read `agent_id` to know "this is a sub-agent message, prefix it with a label."
+
+#### What (Proposed Solution)
+
+Add `agent_id: Option<String>` and `agent_type: Option<String>` to `HookEventBase`. When `agent_id` is present in a hook event:
+- The hook binary includes it in the BridgeMessage metadata.
+- The daemon recognizes the message as a sub-agent contribution to the parent session.
+- Messages are prefixed with the sub-agent label (🤖 [agent_type]).
+- No new session is created. No new topic is created. Messages go to the parent's existing topic.
+
+#### How (Implementation Details)
+
+| File | Change | Lines |
+|------|--------|-------|
+| `types.rs:19-32` | Add `agent_id: Option<String>` and `agent_type: Option<String>` to `HookEventBase` with `#[serde(default)]` | ~4 lines |
+| `hook.rs:134-165` | In `build_metadata()`, include `agent_id` and `agent_type` from the hook event base if present | ~8 lines |
+| `daemon/socket_handlers.rs` | When processing messages where `meta.agent_id()` is Some, use the sub-agent label prefix. Skip session creation for sub-agent messages (they belong to the parent session). | ~20 lines |
+
+#### Acceptance Criteria
+
+1. Spawn a sub-agent via Agent tool → no new topic created in Telegram.
+2. Sub-agent messages appear in the parent's topic with 🤖 prefix.
+3. `agent_id` is visible in daemon logs for sub-agent messages.
+4. Parent's own messages continue to work without any prefix.
+5. Multiple concurrent sub-agents on the same parent session are distinguishable by `agent_id`.
+
+---
+
+### GAP-9: Headless daemon tasks create orphan topics
+
+#### Why (Problem Statement)
+
+The claude-flow daemon spawns headless Claude processes (`CLAUDE_CODE_HEADLESS=true`) for background tasks. These fire hooks with their own unique `session_id` (not shared with any parent). The daemon creates a topic for each one, cluttering the Telegram group with unwanted topics for background automation that the user never sees.
+
+**Evidence:**
+- Process inspection: PID 316875, `claude`, `CLAUDE_CODE_HEADLESS=true`, `ANTHROPIC_MODEL=claude-sonnet-4-5-20250929`, spawned by claude-flow daemon.
+- Database query: sessions created every ~5 minutes from `/home/robert` with no tmux, no `agent_id` — these are daemon tasks, not user-initiated sub-agents.
+
+**Impact:** Topic sprawl from automated background processes. Users see 5-10 unwanted topics accumulate per hour.
+
+#### What (Proposed Solution)
+
+Read the `CLAUDE_CODE_HEADLESS` environment variable in the hook binary and include it in BridgeMessage metadata as `headless: true/false`. In the daemon, when a `session_start` arrives with `headless = true` AND no `agent_id` (not a sub-agent of a known parent), suppress topic creation entirely. Messages from headless sessions are silently dropped or routed to a single "Background" topic (configurable).
+
+#### How (Implementation Details)
+
+| File | Change | Lines |
+|------|--------|-------|
+| `hook.rs:134-165` | In `build_metadata()`, read `std::env::var("CLAUDE_CODE_HEADLESS")` and include `"headless": true` in metadata if set | ~4 lines |
+| `types.rs` | Add `fn headless(&self) -> bool` to `MessageMetadata` | ~4 lines |
+| `daemon/socket_handlers.rs` | In `handle_session_start()`, when `headless = true` AND `agent_id` is None, skip topic creation. Optionally skip the session DB row entirely. | ~10 lines |
+| `daemon/mod.rs` | In `ensure_session_exists()`, same headless check to avoid creating topics for late-arriving messages | ~10 lines |
+
+#### Acceptance Criteria
+
+1. Claude-flow daemon tasks → no new Telegram topic created.
+2. User-initiated sessions (with tmux) → topics created normally.
+3. Agent tool sub-agents (headless but with `agent_id`) → route to parent topic (GAP-8), NOT suppressed.
+4. No messages silently lost — headless session messages are intentionally suppressed, not accidentally dropped.
+5. Works on any system — no hardcoded paths or project assumptions.
+
+---
+
+### GAP-10: Markdown parse entities fallback is dead code
+
+#### Why (Problem Statement)
+
+The `"can't parse entities"` fallback handler at `queue.rs:314-337` never executes. When Telegram returns HTTP 400 with "can't parse entities", `api_call()` at `client.rs:254` converts it to `Err(AppError::Telegram("sendMessage: can't parse entities..."))`. The `?` operator on `send_item` line 231 propagates this error immediately, skipping the response-based error handlers at lines 262-337. The fallback handler inspects `resp.ok`, `resp.error_code`, and `resp.description`, but `resp` is never populated because `api_call` already returned an `Err`.
+
+**Evidence:**
+- Daemon logs show `"can't parse entities"` going through the standard 3-retry path (retries=1/2/3, then "Failed to send message after 3 retries"), NOT the "Markdown parsing failed, retrying as plain text" log from the fallback handler.
+- Code trace: `api_call()` line 254 returns `Err` for all non-ok, non-429, non-"not modified" responses. `send_item()` line 231 uses `?` which short-circuits past lines 237-337.
+- The TOPIC_CLOSED, TOPIC_ID_INVALID, "message thread not found", and "can't parse entities" handlers at lines 262-337 are ALL dead code for the same reason.
+
+**Impact:** Claude's text responses with any malformed Markdown (unmatched `*`, `_`, `` ` ``) are permanently dropped after 3 futile retries. Users see tool calls but not the assistant's actual response text.
+
+#### What (Proposed Solution)
+
+Move the error classification from `send_item` into `api_call`, OR change `api_call` to return the response for 400 errors instead of converting to `Err`. The error handlers in `send_item` must be reachable.
+
+The cleanest fix: have `api_call` return `Ok(tg)` for 400 errors (just like it does for "message is not modified" at line 248). Let `send_item` inspect the response and decide what to do. This makes ALL the existing handlers at lines 262-337 functional, not just the parse entities one.
+
+#### How (Implementation Details)
+
+| File | Change | Lines |
+|------|--------|-------|
+| `bot/client.rs:252-254` | Instead of `return Err(...)` for all non-ok responses, return `Ok(tg)` for HTTP 400 errors. Keep `Err` for 5xx and network errors. | ~5 lines |
+| `bot/queue.rs:231` | Remove the `?` — instead `match` on the result. If `Err` (network/5xx), handle as retry. If `Ok` with `!resp.ok`, fall through to the existing error handlers. | ~15 lines |
+| `bot/queue.rs:337` | After the "can't parse entities" handler, also propagate the correct error for the plain-text fallback failure path (currently uses the stale original `desc`). | ~3 lines |
+
+#### Acceptance Criteria
+
+1. Send a message with malformed Markdown → "Markdown parsing failed, retrying as plain text" appears in logs.
+2. The message arrives in Telegram as plain text (no formatting but content preserved).
+3. TOPIC_CLOSED handler fires and reopens topics (was also dead code).
+4. TOPIC_ID_INVALID and "message thread not found" handlers fire and drop immediately (no futile retries).
+5. Network errors and 5xx errors still go through the retry loop.
+6. No change to 429 handling (already works via separate path in `api_call`).
+
+---
+
+### Phase 9 Execution Plan
+
+| Step | Gap | Dependencies | Files | Risk |
+|------|-----|-------------|-------|------|
+| 9a | GAP-10: Fix dead code in send_item/api_call | None (independent) | `client.rs`, `queue.rs` | Medium — changes error flow for all messages |
+| 9b | GAP-8: Add agent_id to HookEventBase + metadata | None (independent) | `types.rs`, `hook.rs`, `socket_handlers.rs` | Low — additive fields |
+| 9c | GAP-9: Add headless detection + topic suppression | Depends on 9b (agent_id needed to distinguish sub-agents from daemon tasks) | `hook.rs`, `types.rs`, `socket_handlers.rs`, `mod.rs` | Low — additive check |
+| 9d | Remove GAP-7 temporal correlation (superseded) | Depends on 9b (agent_id makes it unnecessary) | `socket_handlers.rs`, `session.rs`, `config.rs` | Low — removes code |
+| 9e | Tests | Depends on 9a-9d | `tests/` | Low |
+
+Steps 9a and 9b can run in parallel. Step 9c depends on 9b. Step 9d depends on 9b.
 
 ## References
 
