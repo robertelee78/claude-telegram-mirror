@@ -1142,14 +1142,13 @@ async fn handle_submitall_callback(ctx: &HandlerContext, data: &str, cb: &Callba
             }
         }
 
-        let data = (
+        // per-key Mutex drops here
+        (
             answers,
             pending.session_id.clone(),
             pending.question_message_ids.clone(),
             pending.summary_message_id,
-        );
-        data
-        // per-key Mutex drops here
+        )
     };
 
     // Remove entry from the map. No new handler can acquire it after this.

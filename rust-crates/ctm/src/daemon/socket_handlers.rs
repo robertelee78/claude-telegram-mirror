@@ -1019,7 +1019,7 @@ pub(super) async fn handle_ask_user_question(ctx: &HandlerContext, msg: &BridgeM
     // edit its question messages to "Superseded" and delete its summary.
     let old_entry = {
         let mut pq = ctx.pending_q.write().await;
-        let old = pq.insert(
+        pq.insert(
             pending_key.clone(),
             Arc::new(Mutex::new(PendingQuestion {
                 session_id: msg.session_id.clone(),
@@ -1029,8 +1029,7 @@ pub(super) async fn handle_ask_user_question(ctx: &HandlerContext, msg: &BridgeM
                 question_message_ids: Vec::new(),
                 summary_message_id: None,
             })),
-        );
-        old
+        )
     };
     if let Some(old_arc) = old_entry {
         let old_pq = old_arc.lock().await;

@@ -540,10 +540,8 @@ async fn cleanup_subagent_temp_files() {
             Err(_) => continue,
         };
 
-        if modified < cutoff {
-            if std::fs::remove_file(&path).is_ok() {
-                cleaned += 1;
-            }
+        if modified < cutoff && std::fs::remove_file(&path).is_ok() {
+            cleaned += 1;
         }
     }
 

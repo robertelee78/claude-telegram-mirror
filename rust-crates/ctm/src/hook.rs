@@ -434,7 +434,7 @@ async fn build_messages(
 
             // Extract agent_id and agent_type from the transcript_path if available
             let transcript_agent_id = transcript_path
-                .and_then(|tp| crate::types::extract_agent_id(tp));
+                .and_then(crate::types::extract_agent_id);
             let display_agent_id = transcript_agent_id
                 .as_deref()
                 .unwrap_or(agent_id);
