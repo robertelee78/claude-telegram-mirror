@@ -216,7 +216,9 @@ pub(super) async fn handle_session_start(ctx: &HandlerContext, msg: &BridgeMessa
         // Reuse parent's thread — store it for this child session too
         let sid = msg.session_id.clone();
         ctx.db_op(move |sess| {
-            let _ = sess.set_session_thread(&sid, ptid);
+            if let Err(e) = sess.set_session_thread(&sid, ptid) {
+                tracing::error!(session_id = %sid, thread_id = ptid, error = %e, "Failed to save thread_id to DB");
+            }
         })
         .await;
         ctx.session_threads
@@ -270,7 +272,9 @@ pub(super) async fn handle_session_start(ctx: &HandlerContext, msg: &BridgeMessa
                     Ok(Some(tid)) => {
                         let sid = msg.session_id.clone();
                         ctx.db_op(move |sess| {
-                            let _ = sess.set_session_thread(&sid, tid);
+                            if let Err(e) = sess.set_session_thread(&sid, tid) {
+                                tracing::error!(session_id = %sid, thread_id = tid, error = %e, "Failed to save thread_id to DB");
+                            }
                         })
                         .await;
                         ctx.session_threads
@@ -436,7 +440,7 @@ pub(super) async fn handle_session_end(ctx: &HandlerContext, msg: &BridgeMessage
 pub(super) async fn handle_agent_response(ctx: &HandlerContext, msg: &BridgeMessage) {
     let thread_id = ctx.wait_for_topic(&msg.session_id).await;
     if thread_id.is_none() && ctx.config.use_threads {
-        tracing::error!(session_id = %msg.session_id, "Topic creation timeout - dropping agent_response");
+        tracing::warn!(session_id = %msg.session_id, "No topic — dropping agent_response");
         return;
     }
 
@@ -537,6 +541,7 @@ pub(super) async fn handle_tool_start(ctx: &HandlerContext, msg: &BridgeMessage)
 
     let thread_id = ctx.wait_for_topic(&msg.session_id).await;
     if thread_id.is_none() && ctx.config.use_threads {
+        tracing::warn!(session_id = %msg.session_id, "No topic — dropping tool_start");
         return;
     }
 
@@ -636,6 +641,7 @@ pub(super) async fn handle_tool_result(ctx: &HandlerContext, msg: &BridgeMessage
 
     let thread_id = ctx.wait_for_topic(&msg.session_id).await;
     if thread_id.is_none() && ctx.config.use_threads {
+        tracing::warn!(session_id = %msg.session_id, "No topic — dropping tool_result");
         return;
     }
 
@@ -689,6 +695,7 @@ pub(super) async fn handle_user_input(ctx: &HandlerContext, msg: &BridgeMessage)
 
     let thread_id = ctx.wait_for_topic(&msg.session_id).await;
     if thread_id.is_none() && ctx.config.use_threads {
+        tracing::warn!(session_id = %msg.session_id, "No topic — dropping user_input");
         return;
     }
 
@@ -727,6 +734,7 @@ pub(super) async fn handle_approval_request(ctx: &HandlerContext, msg: &BridgeMe
 
     let thread_id = ctx.wait_for_topic(&msg.session_id).await;
     if thread_id.is_none() && ctx.config.use_threads {
+        tracing::warn!(session_id = %msg.session_id, "No topic — dropping approval_request");
         return;
     }
 
@@ -753,6 +761,7 @@ pub(super) async fn handle_approval_request(ctx: &HandlerContext, msg: &BridgeMe
 pub(super) async fn handle_error(ctx: &HandlerContext, msg: &BridgeMessage) {
     let thread_id = ctx.wait_for_topic(&msg.session_id).await;
     if thread_id.is_none() && ctx.config.use_threads {
+        tracing::warn!(session_id = %msg.session_id, "No topic — dropping error");
         return;
     }
     ctx.bot
@@ -807,6 +816,7 @@ pub(super) async fn handle_pre_compact(ctx: &HandlerContext, msg: &BridgeMessage
 
     let thread_id = ctx.wait_for_topic(&msg.session_id).await;
     if thread_id.is_none() && ctx.config.use_threads {
+        tracing::warn!(session_id = %msg.session_id, "No topic — dropping pre_compact");
         return;
     }
 
@@ -951,6 +961,7 @@ pub(super) async fn handle_session_rename(
 pub(super) async fn handle_ask_user_question(ctx: &HandlerContext, msg: &BridgeMessage) {
     let thread_id = ctx.wait_for_topic(&msg.session_id).await;
     if thread_id.is_none() && ctx.config.use_threads {
+        tracing::warn!(session_id = %msg.session_id, "No topic — dropping ask_user_question");
         return;
     }
 

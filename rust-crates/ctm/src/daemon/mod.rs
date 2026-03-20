@@ -512,6 +512,10 @@ impl HandlerContext {
     }
 
     /// Wait for topic creation to complete (BUG-002 fix).
+    ///
+    /// Waits up to 45 seconds for a pending topic creation to finish.
+    /// The generous timeout accounts for Telegram 429 rate-limit retries
+    /// (observed backoffs of 30-40s in production logs).
     async fn wait_for_topic(&self, session_id: &str) -> Option<i64> {
         // Fast path
         if let Some(tid) = self.get_thread_id(session_id).await {
@@ -525,9 +529,8 @@ impl HandlerContext {
         };
 
         if let Some(state) = lock {
-            // Wait up to 5 seconds
             let _ =
-                tokio::time::timeout(tokio::time::Duration::from_secs(5), state.notify.notified())
+                tokio::time::timeout(tokio::time::Duration::from_secs(45), state.notify.notified())
                     .await;
             // Check again after notification
             return self.get_thread_id(session_id).await;
@@ -659,28 +662,34 @@ async fn handle_socket_message(ctx: HandlerContext, msg: BridgeMessage) {
         }
         MessageType::SessionEnd => socket_handlers::handle_session_end(&ctx, &msg).await,
         MessageType::AgentResponse => {
-            ensure_session_exists(&ctx, &msg).await;
-            socket_handlers::handle_agent_response(&ctx, &msg).await;
+            if ensure_session_exists(&ctx, &msg).await {
+                socket_handlers::handle_agent_response(&ctx, &msg).await;
+            }
         }
         MessageType::ToolStart => {
-            ensure_session_exists(&ctx, &msg).await;
-            socket_handlers::handle_tool_start(&ctx, &msg).await;
+            if ensure_session_exists(&ctx, &msg).await {
+                socket_handlers::handle_tool_start(&ctx, &msg).await;
+            }
         }
         MessageType::ToolResult => {
-            ensure_session_exists(&ctx, &msg).await;
-            socket_handlers::handle_tool_result(&ctx, &msg).await;
+            if ensure_session_exists(&ctx, &msg).await {
+                socket_handlers::handle_tool_result(&ctx, &msg).await;
+            }
         }
         MessageType::UserInput => {
-            ensure_session_exists(&ctx, &msg).await;
-            socket_handlers::handle_user_input(&ctx, &msg).await;
+            if ensure_session_exists(&ctx, &msg).await {
+                socket_handlers::handle_user_input(&ctx, &msg).await;
+            }
         }
         MessageType::ApprovalRequest => {
-            ensure_session_exists(&ctx, &msg).await;
-            socket_handlers::handle_approval_request(&ctx, &msg).await;
+            if ensure_session_exists(&ctx, &msg).await {
+                socket_handlers::handle_approval_request(&ctx, &msg).await;
+            }
         }
         MessageType::Error => {
-            ensure_session_exists(&ctx, &msg).await;
-            socket_handlers::handle_error(&ctx, &msg).await;
+            if ensure_session_exists(&ctx, &msg).await {
+                socket_handlers::handle_error(&ctx, &msg).await;
+            }
         }
         MessageType::TurnComplete => {
             tracing::debug!(session_id = %msg.session_id, "Turn complete");
@@ -689,8 +698,9 @@ async fn handle_socket_message(ctx: HandlerContext, msg: BridgeMessage) {
             }
         }
         MessageType::PreCompact => {
-            ensure_session_exists(&ctx, &msg).await;
-            socket_handlers::handle_pre_compact(&ctx, &msg).await;
+            if ensure_session_exists(&ctx, &msg).await {
+                socket_handlers::handle_pre_compact(&ctx, &msg).await;
+            }
         }
         MessageType::SessionRename => {
             socket_handlers::handle_session_rename(&ctx, &msg.session_id, &msg.content).await;
@@ -699,8 +709,9 @@ async fn handle_socket_message(ctx: HandlerContext, msg: BridgeMessage) {
             socket_handlers::handle_command(&ctx, &msg).await;
         }
         MessageType::SendImage => {
-            ensure_session_exists(&ctx, &msg).await;
-            socket_handlers::handle_send_image(&ctx, &msg).await;
+            if ensure_session_exists(&ctx, &msg).await {
+                socket_handlers::handle_send_image(&ctx, &msg).await;
+            }
         }
         _ => {
             tracing::debug!(msg_type = %msg.msg_type, "Unknown message type");
@@ -771,7 +782,8 @@ async fn check_and_update_tmux_target(ctx: &HandlerContext, msg: &BridgeMessage)
 /// transparently — including forum topic creation when threads are enabled.
 /// This differs from the TS design where `handleSessionStart` and
 /// `handleSessionEnd` were standalone entry points.
-async fn ensure_session_exists(ctx: &HandlerContext, msg: &BridgeMessage) {
+/// Returns `false` if the session is non-interactive and should be ignored.
+async fn ensure_session_exists(ctx: &HandlerContext, msg: &BridgeMessage) -> bool {
     // Suppress topic creation for non-interactive sessions (claude -p, SDK, CI).
     // These are programmatic pipeline calls, not user-driven sessions.
     let meta = msg.meta();
@@ -779,9 +791,9 @@ async fn ensure_session_exists(ctx: &HandlerContext, msg: &BridgeMessage) {
         tracing::debug!(
             session_id = %msg.session_id,
             entrypoint = ?meta.entrypoint(),
-            "Non-interactive session in ensure_session_exists, skipping topic creation"
+            "Non-interactive session, suppressing"
         );
-        return;
+        return false;
     }
     let sid = msg.session_id.clone();
     let existing = ctx
@@ -820,7 +832,7 @@ async fn ensure_session_exists(ctx: &HandlerContext, msg: &BridgeMessage) {
                         notify.notified(),
                     )
                     .await;
-                    return;
+                    return true;
                 }
                 let state = Arc::new(TopicCreationState {
                     notify: Arc::new(tokio::sync::Notify::new()),
@@ -842,7 +854,9 @@ async fn ensure_session_exists(ctx: &HandlerContext, msg: &BridgeMessage) {
             if let Ok(Some(tid)) = ctx.bot.create_forum_topic(&topic_name, color_index).await {
                 let sid = msg.session_id.clone();
                 ctx.db_op(move |sess| {
-                    let _ = sess.set_session_thread(&sid, tid);
+                    if let Err(e) = sess.set_session_thread(&sid, tid) {
+                        tracing::error!(session_id = %sid, thread_id = tid, error = %e, "Failed to save thread_id to DB");
+                    }
                 })
                 .await;
                 ctx.session_threads
@@ -906,7 +920,7 @@ async fn ensure_session_exists(ctx: &HandlerContext, msg: &BridgeMessage) {
             lock.notify.notify_waiters();
             ctx.topic_locks.write().await.remove(&msg.session_id);
         }
-        return;
+        return true;
     }
 
     // BUG-002/BUG-010: Atomically check-and-insert the topic creation lock.
@@ -919,7 +933,7 @@ async fn ensure_session_exists(ctx: &HandlerContext, msg: &BridgeMessage) {
             drop(locks);
             let _ =
                 tokio::time::timeout(tokio::time::Duration::from_secs(5), notify.notified()).await;
-            return;
+            return true;
         }
         // Insert lock before releasing — concurrent callers will wait above.
         if ctx.config.use_threads {
@@ -933,6 +947,7 @@ async fn ensure_session_exists(ctx: &HandlerContext, msg: &BridgeMessage) {
     // Create session on-the-fly
     tracing::info!(session_id = %msg.session_id, "Creating session on-the-fly");
     socket_handlers::handle_session_start(ctx, msg).await;
+    true
 }
 
 /// Broadcast a `BridgeMessage` to all currently-connected socket clients.
