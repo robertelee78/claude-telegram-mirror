@@ -11,6 +11,14 @@ use tokio::time::{timeout, Duration};
 /// Process a hook event from stdin.
 /// This is the entry point for `ctm hook`.
 pub async fn process_hook() -> anyhow::Result<()> {
+    // Suppress mirroring for non-interactive sessions (claude -p, SDK, CI).
+    // Claude Code sets CLAUDE_CODE_ENTRYPOINT="cli" for interactive sessions
+    // and "sdk-cli" for -p/pipe mode. Hooks inherit this env var.
+    let entrypoint = std::env::var("CLAUDE_CODE_ENTRYPOINT").unwrap_or_default();
+    if !entrypoint.is_empty() && entrypoint != "cli" {
+        return Ok(());
+    }
+
     let cfg = config::load_config(false)?;
 
     // Read stdin with size limit
@@ -214,13 +222,13 @@ fn build_metadata(
             serde_json::Value::String(at.to_string()),
         );
     }
-    // GAP-9: Include headless flag if CLAUDE_CODE_HEADLESS is set
-    if std::env::var("CLAUDE_CODE_HEADLESS")
-        .map(|v| v == "true" || v == "1")
-        .unwrap_or(false)
-    {
-        meta.insert("headless".into(), serde_json::Value::Bool(true));
-    }
+    // Include entrypoint so the daemon can distinguish session types.
+    meta.insert(
+        "entrypoint".into(),
+        serde_json::Value::String(
+            std::env::var("CLAUDE_CODE_ENTRYPOINT").unwrap_or_else(|_| "cli".into()),
+        ),
+    );
     meta
 }
 

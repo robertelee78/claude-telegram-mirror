@@ -64,13 +64,12 @@ pub(super) async fn handle_session_start(ctx: &HandlerContext, msg: &BridgeMessa
     // BUG-012: Cancel pending topic deletion if session resumes
     cleanup::cancel_pending_topic_deletion(ctx, &msg.session_id).await;
 
-    // GAP-9: Suppress topic creation for headless daemon tasks.
-    // Headless sessions with no agent_id are standalone background tasks
-    // (e.g., claude-flow daemon), not sub-agents of a user session.
-    if meta.headless() && meta.agent_id().is_none() {
+    // Suppress topic creation for non-interactive sessions (claude -p, SDK, CI).
+    if meta.is_non_interactive() {
         tracing::debug!(
             session_id = %msg.session_id,
-            "GAP-9: Headless session without agent_id, suppressing topic creation"
+            entrypoint = ?meta.entrypoint(),
+            "Non-interactive session, suppressing topic creation"
         );
         return;
     }

@@ -306,11 +306,16 @@ impl<'a> MessageMetadata<'a> {
         self.str_field("approvalId")
     }
 
-    /// GAP-9: Whether this session is running in headless mode (CLAUDE_CODE_HEADLESS).
-    pub fn headless(&self) -> bool {
-        self.0
-            .and_then(|m| m.get("headless"))
-            .and_then(|v| v.as_bool())
+    /// CLAUDE_CODE_ENTRYPOINT value (e.g. "cli", "sdk-cli", "sdk-ts").
+    /// Non-"cli" values indicate non-interactive sessions (pipe mode, SDK, CI).
+    pub fn entrypoint(&self) -> Option<&'a str> {
+        self.str_field("entrypoint")
+    }
+
+    /// Whether this session is non-interactive (claude -p, SDK, CI).
+    pub fn is_non_interactive(&self) -> bool {
+        self.entrypoint()
+            .map(|ep| ep != "cli")
             .unwrap_or(false)
     }
 }
