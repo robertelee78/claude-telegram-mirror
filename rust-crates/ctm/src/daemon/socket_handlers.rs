@@ -237,40 +237,67 @@ pub(super) async fn handle_session_start(ctx: &HandlerContext, msg: &BridgeMessa
         tracing::info!(session_id = %msg.session_id, thread_id = tid, "Reusing existing thread");
         Some(tid)
     } else if ctx.config.use_threads {
-        let topic_name = HandlerContext::format_topic_name(&msg.session_id, hostname, project_dir);
-        // Hash session_id to pick a color (6 valid Telegram topic colors)
-        let color_index = msg
-            .session_id
-            .bytes()
-            .fold(0u32, |acc, b| acc.wrapping_add(b as u32)) as usize
-            % 6;
-        match ctx.bot.create_forum_topic(&topic_name, color_index).await {
-            Ok(Some(tid)) => {
-                let sid = msg.session_id.clone();
-                ctx.db_op(move |sess| {
-                    let _ = sess.set_session_thread(&sid, tid);
-                })
+        // BUG-002: Acquire topic creation lock to prevent duplicate topics
+        // from concurrent messages (e.g. ensure_session_exists racing us).
+        let lock = {
+            let mut locks = ctx.topic_locks.write().await;
+            if let Some(state) = locks.get(&msg.session_id) {
+                // Another task is already creating the topic -- wait for it.
+                let notify = std::sync::Arc::clone(&state.notify);
+                drop(locks);
+                let _ = tokio::time::timeout(
+                    tokio::time::Duration::from_secs(5),
+                    notify.notified(),
+                )
                 .await;
-                ctx.session_threads
-                    .write()
-                    .await
-                    .insert(msg.session_id.clone(), tid);
-                Some(tid)
+                // Topic should now exist — read it back.
+                ctx.get_thread_id(&msg.session_id).await
+            } else {
+                let state = std::sync::Arc::new(super::TopicCreationState {
+                    notify: std::sync::Arc::new(tokio::sync::Notify::new()),
+                });
+                locks.insert(msg.session_id.clone(), state.clone());
+                drop(locks);
+
+                let topic_name =
+                    HandlerContext::format_topic_name(&msg.session_id, hostname, project_dir);
+                let color_index = msg
+                    .session_id
+                    .bytes()
+                    .fold(0u32, |acc, b| acc.wrapping_add(b as u32)) as usize
+                    % 6;
+                let created = match ctx.bot.create_forum_topic(&topic_name, color_index).await {
+                    Ok(Some(tid)) => {
+                        let sid = msg.session_id.clone();
+                        ctx.db_op(move |sess| {
+                            let _ = sess.set_session_thread(&sid, tid);
+                        })
+                        .await;
+                        ctx.session_threads
+                            .write()
+                            .await
+                            .insert(msg.session_id.clone(), tid);
+                        Some(tid)
+                    }
+                    _ => None,
+                };
+
+                // Resolve lock so waiters can proceed.
+                {
+                    let locks = ctx.topic_locks.read().await;
+                    if let Some(state) = locks.get(&msg.session_id) {
+                        state.notify.notify_waiters();
+                    }
+                }
+                ctx.topic_locks.write().await.remove(&msg.session_id);
+
+                created
             }
-            _ => None,
-        }
+        };
+        lock
     } else {
         None
     };
-
-    // BUG-002: Resolve topic creation lock
-    {
-        let locks = ctx.topic_locks.read().await;
-        if let Some(state) = locks.get(&msg.session_id) {
-            state.notify.notify_waiters();
-        }
-    }
-    ctx.topic_locks.write().await.remove(&msg.session_id);
 
     // ADR-013 D3: Build session info with tmux status indicator.
     let mut session_info = format_session_start(&msg.session_id, project_dir, hostname);
