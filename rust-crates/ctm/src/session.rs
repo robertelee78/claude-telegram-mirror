@@ -974,21 +974,3 @@ fn row_to_approval(row: &rusqlite::Row<'_>) -> rusqlite::Result<PendingApproval>
     })
 }
 
-// ------------------------------------------------------------------- tests
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::tempdir;
-
-    /// Create a `SessionManager` backed by a temporary on-disk SQLite database.
-    ///
-    /// The returned `TempDir` must be kept alive for the duration of the test;
-    /// dropping it deletes the directory and its database file.
-    fn make_mgr() -> (SessionManager, tempfile::TempDir) {
-        let tmp = tempdir().expect("tempdir");
-        let mgr = SessionManager::new(tmp.path(), 5).expect("SessionManager::new");
-        (mgr, tmp)
-    }
-
-}

@@ -923,24 +923,21 @@ async fn ensure_session_exists(ctx: &HandlerContext, msg: &BridgeMessage) -> boo
         return true;
     }
 
-    // BUG-002/BUG-010: Atomically check-and-insert the topic creation lock.
-    // Using a write lock for the entire check+insert prevents two callers from
-    // both seeing "no lock" and racing to create duplicate topics.
+    // BUG-002/BUG-010: If another task is already creating this session's
+    // topic, wait for it rather than racing to create a duplicate.
+    // NOTE: We intentionally do NOT insert a lock here. handle_session_start
+    // manages its own TopicCreationState lock internally. Inserting one here
+    // caused a self-deadlock: handle_session_start would see our lock, assume
+    // another task was creating the topic, wait 5s, and give up — leaving a
+    // stale lock that blocked all subsequent messages for the session (BUG-014).
     {
-        let mut locks = ctx.topic_locks.write().await;
+        let locks = ctx.topic_locks.read().await;
         if let Some(state) = locks.get(&msg.session_id) {
             let notify = Arc::clone(&state.notify);
             drop(locks);
             let _ =
                 tokio::time::timeout(tokio::time::Duration::from_secs(5), notify.notified()).await;
             return true;
-        }
-        // Insert lock before releasing — concurrent callers will wait above.
-        if ctx.config.use_threads {
-            let state = Arc::new(TopicCreationState {
-                notify: Arc::new(tokio::sync::Notify::new()),
-            });
-            locks.insert(msg.session_id.clone(), state);
         }
     }
 
