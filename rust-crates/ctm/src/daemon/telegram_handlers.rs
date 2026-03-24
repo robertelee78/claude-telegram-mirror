@@ -939,12 +939,10 @@ pub(super) async fn handle_free_text_answer(
     //   a. First question with no tentative answer, OR
     //   b. First question that already has a FreeText tentative answer (allow replacement).
     //   Questions with Option/MultiOption tentative answers are skipped.
-    let q_idx = match (0..pending.questions.len()).find(|&i| {
-        match pending.tentative.get(&i) {
-            None => !pending.finalized.get(i).copied().unwrap_or(false),
-            Some(TentativeAnswer::FreeText(_)) => true,
-            Some(TentativeAnswer::Option(_)) | Some(TentativeAnswer::MultiOption(_)) => false,
-        }
+    let q_idx = match (0..pending.questions.len()).find(|&i| match pending.tentative.get(&i) {
+        None => !pending.finalized.get(i).copied().unwrap_or(false),
+        Some(TentativeAnswer::FreeText(_)) => true,
+        Some(TentativeAnswer::Option(_)) | Some(TentativeAnswer::MultiOption(_)) => false,
     }) {
         Some(i) => i,
         None => return false,
@@ -990,8 +988,7 @@ pub(super) async fn handle_free_text_answer(
                     .edit_message_text_no_markup(msg_id, &updated_text)
                     .await;
             } else {
-                let short =
-                    &pending.session_id[..std::cmp::min(20, pending.session_id.len())];
+                let short = &pending.session_id[..std::cmp::min(20, pending.session_id.len())];
                 let buttons: Vec<InlineButton> = q
                     .options
                     .iter()
@@ -1019,8 +1016,7 @@ pub(super) async fn handle_free_text_answer(
         let session_id_for_thread = pending.session_id.clone();
         drop(pending);
         let thread_id = ctx.get_thread_id(&session_id_for_thread).await;
-        let _ =
-            callback_handlers::send_or_update_summary(ctx, &pending_key, thread_id).await;
+        let _ = callback_handlers::send_or_update_summary(ctx, &pending_key, thread_id).await;
     }
 
     true

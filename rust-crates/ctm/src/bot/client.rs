@@ -727,11 +727,7 @@ impl TelegramBot {
     ///
     /// Note: Telegram's `editMessageText` does not accept `message_thread_id` —
     /// the message is identified by `chat_id` + `message_id` alone.
-    pub async fn edit_message_text_no_markup(
-        &self,
-        message_id: i64,
-        text: &str,
-    ) -> Result<()> {
+    pub async fn edit_message_text_no_markup(&self, message_id: i64, text: &str) -> Result<()> {
         let body = serde_json::json!({
             "chat_id": self.chat_id,
             "message_id": message_id,

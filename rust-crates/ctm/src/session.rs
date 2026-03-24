@@ -317,10 +317,7 @@ impl SessionManager {
                 }
 
                 if !updates.is_empty() {
-                    let sql = format!(
-                        "UPDATE sessions SET {} WHERE id = ?",
-                        updates.join(", ")
-                    );
+                    let sql = format!("UPDATE sessions SET {} WHERE id = ?", updates.join(", "));
                     param_values.push(Box::new(session_id.to_string()));
                     let params: Vec<&dyn rusqlite::types::ToSql> =
                         param_values.iter().map(|p| p.as_ref()).collect();
@@ -581,30 +578,27 @@ impl SessionManager {
         tmux_socket: Option<&str>,
     ) -> Result<()> {
         let rows_changed = match (tmux_target, tmux_socket) {
-            (Some(t), Some(s)) => {
-                self.conn
-                    .execute(
-                        "UPDATE sessions SET tmux_target = ?1, tmux_socket = ?2 WHERE id = ?3",
-                        params![t, s, session_id],
-                    )
-                    .map_err(|e| AppError::Database(e.to_string()))?
-            }
-            (Some(t), None) => {
-                self.conn
-                    .execute(
-                        "UPDATE sessions SET tmux_target = ?1 WHERE id = ?2",
-                        params![t, session_id],
-                    )
-                    .map_err(|e| AppError::Database(e.to_string()))?
-            }
-            (None, Some(s)) => {
-                self.conn
-                    .execute(
-                        "UPDATE sessions SET tmux_socket = ?1 WHERE id = ?2",
-                        params![s, session_id],
-                    )
-                    .map_err(|e| AppError::Database(e.to_string()))?
-            }
+            (Some(t), Some(s)) => self
+                .conn
+                .execute(
+                    "UPDATE sessions SET tmux_target = ?1, tmux_socket = ?2 WHERE id = ?3",
+                    params![t, s, session_id],
+                )
+                .map_err(|e| AppError::Database(e.to_string()))?,
+            (Some(t), None) => self
+                .conn
+                .execute(
+                    "UPDATE sessions SET tmux_target = ?1 WHERE id = ?2",
+                    params![t, session_id],
+                )
+                .map_err(|e| AppError::Database(e.to_string()))?,
+            (None, Some(s)) => self
+                .conn
+                .execute(
+                    "UPDATE sessions SET tmux_socket = ?1 WHERE id = ?2",
+                    params![s, session_id],
+                )
+                .map_err(|e| AppError::Database(e.to_string()))?,
             (None, None) => return Ok(()),
         };
 
@@ -672,9 +666,7 @@ impl SessionManager {
     pub fn get_child_sessions(&self, parent_session_id: &str) -> Result<Vec<Session>> {
         let mut stmt = self
             .conn
-            .prepare(
-                "SELECT * FROM sessions WHERE parent_session_id = ?1 AND status = 'active'",
-            )
+            .prepare("SELECT * FROM sessions WHERE parent_session_id = ?1 AND status = 'active'")
             .map_err(|e| AppError::Database(e.to_string()))?;
 
         let rows = stmt
@@ -973,4 +965,3 @@ fn row_to_approval(row: &rusqlite::Row<'_>) -> rusqlite::Result<PendingApproval>
         message_id: row.get("message_id")?,
     })
 }
-

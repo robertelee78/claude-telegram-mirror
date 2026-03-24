@@ -529,9 +529,11 @@ impl HandlerContext {
         };
 
         if let Some(state) = lock {
-            let _ =
-                tokio::time::timeout(tokio::time::Duration::from_secs(45), state.notify.notified())
-                    .await;
+            let _ = tokio::time::timeout(
+                tokio::time::Duration::from_secs(45),
+                state.notify.notified(),
+            )
+            .await;
             // Check again after notification
             return self.get_thread_id(session_id).await;
         }
@@ -1042,10 +1044,7 @@ fn escape_markdown_v1(text: &str) -> String {
 
 /// H6.1: Resolve a short session_id prefix (from callback_data) to the full
 /// session_id key in the pending_questions map. Returns `None` if no match.
-fn resolve_pending_key<V>(
-    pq: &HashMap<String, V>,
-    short_key: &str,
-) -> Option<String> {
+fn resolve_pending_key<V>(pq: &HashMap<String, V>, short_key: &str) -> Option<String> {
     pq.keys().find(|k| k.starts_with(short_key)).cloned()
 }
 

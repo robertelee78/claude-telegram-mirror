@@ -211,10 +211,7 @@ fn build_metadata(
     }
     // GAP-8: Include agent_id and agent_type from the hook event base if present
     if let Some(aid) = agent_id {
-        meta.insert(
-            "agentId".into(),
-            serde_json::Value::String(aid.to_string()),
-        );
+        meta.insert("agentId".into(), serde_json::Value::String(aid.to_string()));
     }
     if let Some(at) = agent_type {
         meta.insert(
@@ -272,7 +269,14 @@ async fn build_messages(
     let project_dir = get_cwd(event);
     let agent_id = get_agent_id(event);
     let agent_type = get_agent_type(event);
-    let meta = build_metadata(tmux_info, hostname, transcript_path, project_dir, agent_id, agent_type);
+    let meta = build_metadata(
+        tmux_info,
+        hostname,
+        transcript_path,
+        project_dir,
+        agent_id,
+        agent_type,
+    );
     let mut messages = Vec::new();
 
     // C3.1: Always send session_start as the first message in every batch.
@@ -433,11 +437,8 @@ async fn build_messages(
             let result_text = e.result.as_deref().unwrap_or("(no result summary)");
 
             // Extract agent_id and agent_type from the transcript_path if available
-            let transcript_agent_id = transcript_path
-                .and_then(crate::types::extract_agent_id);
-            let display_agent_id = transcript_agent_id
-                .as_deref()
-                .unwrap_or(agent_id);
+            let transcript_agent_id = transcript_path.and_then(crate::types::extract_agent_id);
+            let display_agent_id = transcript_agent_id.as_deref().unwrap_or(agent_id);
 
             let agent_type_str = e.agent_type.as_deref().unwrap_or("");
             let content = if agent_type_str.is_empty() {

@@ -7,18 +7,15 @@ use super::*;
 async fn get_child_prefix(ctx: &HandlerContext, session_id: &str) -> Option<String> {
     let sid = session_id.to_string();
     ctx.db_op(move |sess| {
-        sess.get_session(&sid)
-            .ok()
-            .flatten()
-            .and_then(|s| {
-                s.parent_session_id.as_ref()?; // Only for child sessions
-                let agent_label = s
-                    .agent_type
-                    .as_deref()
-                    .or(s.agent_id.as_deref())
-                    .unwrap_or("sub-agent");
-                Some(format!("\u{1F916} [{}] ", agent_label))
-            })
+        sess.get_session(&sid).ok().flatten().and_then(|s| {
+            s.parent_session_id.as_ref()?; // Only for child sessions
+            let agent_label = s
+                .agent_type
+                .as_deref()
+                .or(s.agent_id.as_deref())
+                .unwrap_or("sub-agent");
+            Some(format!("\u{1F916} [{}] ", agent_label))
+        })
     })
     .await
 }
@@ -140,10 +137,7 @@ pub(super) async fn handle_session_start(ctx: &HandlerContext, msg: &BridgeMessa
                     "ADR-013 GAP-4: Parent thread_id not found after 3 attempts — child gets own topic"
                 );
             }
-            (
-                Some((parent_sid.clone(), agent_id.clone())),
-                result,
-            )
+            (Some((parent_sid.clone(), agent_id.clone())), result)
         } else {
             (None, None)
         };
@@ -247,11 +241,9 @@ pub(super) async fn handle_session_start(ctx: &HandlerContext, msg: &BridgeMessa
                 // Another task is already creating the topic -- wait for it.
                 let notify = std::sync::Arc::clone(&state.notify);
                 drop(locks);
-                let _ = tokio::time::timeout(
-                    tokio::time::Duration::from_secs(5),
-                    notify.notified(),
-                )
-                .await;
+                let _ =
+                    tokio::time::timeout(tokio::time::Duration::from_secs(5), notify.notified())
+                        .await;
                 // Topic should now exist — read it back.
                 ctx.get_thread_id(&msg.session_id).await
             } else {
@@ -266,7 +258,8 @@ pub(super) async fn handle_session_start(ctx: &HandlerContext, msg: &BridgeMessa
                 let color_index = msg
                     .session_id
                     .bytes()
-                    .fold(0u32, |acc, b| acc.wrapping_add(b as u32)) as usize
+                    .fold(0u32, |acc, b| acc.wrapping_add(b as u32))
+                    as usize
                     % 6;
                 let created = match ctx.bot.create_forum_topic(&topic_name, color_index).await {
                     Ok(Some(tid)) => {
@@ -1052,7 +1045,10 @@ pub(super) async fn handle_ask_user_question(ctx: &HandlerContext, msg: &BridgeM
         // Dismiss old question messages.
         for &mid in &old_pq.question_message_ids {
             if mid != 0 {
-                let _ = ctx.bot.edit_message_text_no_markup(mid, "\u{2B55} Superseded").await;
+                let _ = ctx
+                    .bot
+                    .edit_message_text_no_markup(mid, "\u{2B55} Superseded")
+                    .await;
             }
         }
         // Delete old summary if present.

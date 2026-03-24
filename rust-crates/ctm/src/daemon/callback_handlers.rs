@@ -416,11 +416,7 @@ async fn handle_subagent_details_callback(
         Ok(_) => {
             let _ = ctx
                 .bot
-                .answer_callback_query(
-                    &cb.id,
-                    Some("Sub-agent output is empty"),
-                    true,
-                )
+                .answer_callback_query(&cb.id, Some("Sub-agent output is empty"), true)
                 .await;
             return;
         }
@@ -646,11 +642,7 @@ async fn handle_answer_callback(ctx: &HandlerContext, data: &str, cb: &CallbackQ
     // question set can interleave).
     let _ = ctx
         .bot
-        .answer_callback_query(
-            &cb.id,
-            Some(&format!("Selected: {option_label}")),
-            false,
-        )
+        .answer_callback_query(&cb.id, Some(&format!("Selected: {option_label}")), false)
         .await;
 
     // Edit the question message in place (keep keyboard).
@@ -731,9 +723,11 @@ async fn handle_toggle_callback(ctx: &HandlerContext, data: &str, cb: &CallbackQ
     }
 
     // Toggle the option in the MultiOption set.
-    let selected = match pending.tentative.entry(q_idx).or_insert_with(|| {
-        TentativeAnswer::MultiOption(HashSet::new())
-    }) {
+    let selected = match pending
+        .tentative
+        .entry(q_idx)
+        .or_insert_with(|| TentativeAnswer::MultiOption(HashSet::new()))
+    {
         TentativeAnswer::MultiOption(set) => {
             if set.contains(&o_idx) {
                 set.remove(&o_idx);
@@ -1062,7 +1056,10 @@ async fn handle_submitall_callback(ctx: &HandlerContext, data: &str, cb: &Callba
         let fk = match resolve_pending_key(&pq, short_key) {
             Some(k) => k,
             None => {
-                let _ = ctx.bot.answer_callback_query(&cb.id, Some("No pending question"), false).await;
+                let _ = ctx
+                    .bot
+                    .answer_callback_query(&cb.id, Some("No pending question"), false)
+                    .await;
                 return;
             }
         };
@@ -1093,11 +1090,7 @@ async fn handle_submitall_callback(ctx: &HandlerContext, data: &str, cb: &Callba
         if pending.tentative.len() != pending.questions.len() {
             let _ = ctx
                 .bot
-                .answer_callback_query(
-                    &cb.id,
-                    Some("Please answer all questions first"),
-                    true,
-                )
+                .answer_callback_query(&cb.id, Some("Please answer all questions first"), true)
                 .await;
             return;
         }
@@ -1294,7 +1287,10 @@ async fn handle_change_callback(ctx: &HandlerContext, data: &str, cb: &CallbackQ
         let fk = match resolve_pending_key(&pq, short_key) {
             Some(k) => k,
             None => {
-                let _ = ctx.bot.answer_callback_query(&cb.id, Some("Question not found"), false).await;
+                let _ = ctx
+                    .bot
+                    .answer_callback_query(&cb.id, Some("Question not found"), false)
+                    .await;
                 return;
             }
         };

@@ -177,7 +177,9 @@ async fn cleanup_stale_sessions(ctx: &HandlerContext) {
         }
 
         // Check if pane is still alive
-        let Some(target) = tmux_target.as_deref() else { continue; };
+        let Some(target) = tmux_target.as_deref() else {
+            continue;
+        };
         let pane_alive = InputInjector::is_pane_alive(target, session.tmux_socket.as_deref());
         let t = target.to_string();
         let sid = session.id.clone();
@@ -355,8 +357,7 @@ async fn cleanup_inactive_topics(ctx: &HandlerContext) {
     let now = chrono::Utc::now();
     let threshold_minutes = ctx.config.inactivity_delete_threshold_minutes as i64;
     let delete_cutoff = now
-        - chrono::TimeDelta::try_minutes(threshold_minutes)
-            .unwrap_or(chrono::TimeDelta::hours(12));
+        - chrono::TimeDelta::try_minutes(threshold_minutes).unwrap_or(chrono::TimeDelta::hours(12));
 
     let mut cleaned = 0u32;
     for session in &active_sessions {
@@ -438,10 +439,7 @@ async fn cleanup_inactive_topics(ctx: &HandlerContext) {
     }
 
     if cleaned > 0 {
-        tracing::info!(
-            cleaned,
-            "ADR-013 E2: Completed inactivity cleanup sweep"
-        );
+        tracing::info!(cleaned, "ADR-013 E2: Completed inactivity cleanup sweep");
     }
 }
 
@@ -469,8 +467,7 @@ pub(super) async fn schedule_topic_deletion(
     // ADR-013 E5: Two-stage lifecycle.
     // Stage 1: CLOSE the topic after delay_ms (preserves history, hides from list).
     // Stage 2: DELETE the topic after inactivity_delete_threshold_minutes total.
-    let inactivity_threshold_ms =
-        ctx.config.inactivity_delete_threshold_minutes as u64 * 60 * 1000;
+    let inactivity_threshold_ms = ctx.config.inactivity_delete_threshold_minutes as u64 * 60 * 1000;
     let stage2_delay_ms = inactivity_threshold_ms;
 
     let handle = tokio::spawn(async move {
@@ -503,8 +500,7 @@ pub(super) async fn schedule_topic_deletion(
         let sid2 = sid.clone();
         let sess = sessions.clone();
         let _ =
-            tokio::task::spawn_blocking(move || sess.blocking_lock().clear_thread_id(&sid2))
-                .await;
+            tokio::task::spawn_blocking(move || sess.blocking_lock().clear_thread_id(&sid2)).await;
     });
 
     ctx.pending_del
@@ -520,8 +516,7 @@ async fn cleanup_subagent_temp_files() {
         return;
     };
 
-    let cutoff = std::time::SystemTime::now()
-        - std::time::Duration::from_secs(24 * 60 * 60);
+    let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(24 * 60 * 60);
 
     let mut cleaned = 0u32;
     for entry in entries.flatten() {
@@ -546,7 +541,10 @@ async fn cleanup_subagent_temp_files() {
     }
 
     if cleaned > 0 {
-        tracing::info!(cleaned, "ADR-013 MINOR-5: Cleaned stale sub-agent temp files");
+        tracing::info!(
+            cleaned,
+            "ADR-013 MINOR-5: Cleaned stale sub-agent temp files"
+        );
     }
 }
 

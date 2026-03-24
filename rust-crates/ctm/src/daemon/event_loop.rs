@@ -175,10 +175,7 @@ async fn handle_topic_invalidated(ctx: HandlerContext, thread_id: i64) {
                 "Cleared stale thread_id from DB (topic permanently deleted)"
             );
         } else {
-            tracing::debug!(
-                thread_id,
-                "No session found for invalidated thread_id"
-            );
+            tracing::debug!(thread_id, "No session found for invalidated thread_id");
         }
         return;
     };

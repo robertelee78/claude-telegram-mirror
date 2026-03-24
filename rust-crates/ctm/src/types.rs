@@ -314,9 +314,7 @@ impl<'a> MessageMetadata<'a> {
 
     /// Whether this session is non-interactive (claude -p, SDK, CI).
     pub fn is_non_interactive(&self) -> bool {
-        self.entrypoint()
-            .map(|ep| ep != "cli")
-            .unwrap_or(false)
+        self.entrypoint().map(|ep| ep != "cli").unwrap_or(false)
     }
 }
 
@@ -533,7 +531,9 @@ pub fn is_valid_agent_id(id: &str) -> bool {
         && !id.contains('/')
         && !id.contains('\\')
         && !id.contains("..")
-        && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
 }
 
 /// Slash command character whitelist validation.
@@ -816,19 +816,13 @@ mod tests {
     #[test]
     fn test_extract_agent_id_typical() {
         let path = "/home/user/.claude/projects/myproj/sess-abc123/subagents/agent-def456.jsonl";
-        assert_eq!(
-            extract_agent_id(path),
-            Some("agent-def456".to_string())
-        );
+        assert_eq!(extract_agent_id(path), Some("agent-def456".to_string()));
     }
 
     #[test]
     fn test_extract_agent_id_no_extension() {
         let path = "/some/path/sess/subagents/agent-xyz";
-        assert_eq!(
-            extract_agent_id(path),
-            Some("agent-xyz".to_string())
-        );
+        assert_eq!(extract_agent_id(path), Some("agent-xyz".to_string()));
     }
 
     #[test]
