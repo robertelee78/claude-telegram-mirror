@@ -13,6 +13,10 @@ config.json
 *.db
 *.db-journal
 
+# Ruflo / RuVector runtime artifacts (agent memory state — not source)
+*.rvf
+*.rvf.lock
+
 # Debug logs
 *.log
 
