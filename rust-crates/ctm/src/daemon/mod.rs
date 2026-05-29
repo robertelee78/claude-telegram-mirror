@@ -612,9 +612,18 @@ async fn handle_socket_message(ctx: HandlerContext, msg: BridgeMessage) {
 
     // Epic 1: Toggle gating — skip outbound messages when mirroring is disabled.
     // Safety-critical paths (approvals, commands) always proceed.
+    //
+    // ADR-014 E1: AskUserQuestion is a BLOCKING path just like approvals — the hook
+    // waits up to 300s for a QuestionResponse. If mirroring is off and we drop the
+    // QuestionRequest here, the hook hangs for the full timeout. So the question
+    // request/response pair must also be always-active.
     let is_always_active = matches!(
         msg.msg_type,
-        MessageType::ApprovalRequest | MessageType::ApprovalResponse | MessageType::Command
+        MessageType::ApprovalRequest
+            | MessageType::ApprovalResponse
+            | MessageType::Command
+            | MessageType::QuestionRequest
+            | MessageType::QuestionResponse
     );
     if !is_always_active
         && !ctx

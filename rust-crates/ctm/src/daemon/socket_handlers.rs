@@ -368,6 +368,15 @@ pub(super) async fn handle_session_end(ctx: &HandlerContext, msg: &BridgeMessage
             session_id = %msg.session_id,
             "ADR-014 A3: SessionEnd reason=resume — suspending, not tearing down"
         );
+        // Review fix (MED-3): a suspending session's blocked-question client is no
+        // longer reachable (its hook process is going away), so drop the mapping now
+        // rather than leaking it until the next cleanup sweep. Keyed by session_id so
+        // this is cheap. (Approval entries are keyed by approval_id and are reaped by
+        // the cleanup sweep.)
+        ctx.pending_question_clients
+            .write()
+            .await
+            .remove(&msg.session_id);
         return;
     }
 
@@ -411,10 +420,24 @@ pub(super) async fn handle_session_end(ctx: &HandlerContext, msg: &BridgeMessage
                 // still exist from the inactivity sweep (cleanup.rs).
                 cleanup::cancel_pending_topic_deletion(ctx, &msg.session_id).await;
 
+                // Review fix (HIGH-3): clear thread_id from BOTH the cache and the DB
+                // BEFORE deleting the Telegram topic. These two steps cannot be made
+                // atomic across an API call + DB write, so order them for a benign
+                // failure mode: if the daemon crashes between them, the worst case is a
+                // leaked empty topic (cosmetic) rather than a stale thread_id pointing
+                // at a deleted topic (which would break sends until the self-heal
+                // fires). Clearing first also closes the window where a concurrent
+                // resume reads a thread_id for a topic that is about to vanish.
+                ctx.session_threads.write().await.remove(&msg.session_id);
+                let sid_clear = msg.session_id.clone();
+                ctx.db_op(move |sess| {
+                    let _ = sess.clear_thread_id(&sid_clear);
+                })
+                .await;
+
                 // Tolerate "topic already deleted": delete_forum_topic returns
-                // Ok(false)/Err for an already-gone topic; either way we proceed to
-                // clear the mapping. The goal state (no topic, no thread_id) is reached
-                // regardless.
+                // Ok(false)/Err for an already-gone topic. The mapping is already
+                // cleared, so the goal state (no topic, no thread_id) holds regardless.
                 match ctx.bot.delete_forum_topic(tid).await {
                     Ok(true) => tracing::info!(
                         session_id = %msg.session_id,
@@ -424,16 +447,9 @@ pub(super) async fn handle_session_end(ctx: &HandlerContext, msg: &BridgeMessage
                     Ok(false) | Err(_) => tracing::info!(
                         session_id = %msg.session_id,
                         thread_id = tid,
-                        "ADR-014 A4: Topic already gone or delete failed; clearing mapping anyway"
+                        "ADR-014 A4: Topic already gone or delete failed (mapping already cleared)"
                     ),
                 }
-
-                ctx.session_threads.write().await.remove(&msg.session_id);
-                let sid_clear = msg.session_id.clone();
-                ctx.db_op(move |sess| {
-                    let _ = sess.clear_thread_id(&sid_clear);
-                })
-                .await;
             } else {
                 let _ = ctx.bot.close_forum_topic(tid).await;
                 ctx.session_threads.write().await.remove(&msg.session_id);
@@ -450,27 +466,30 @@ pub(super) async fn handle_session_end(ctx: &HandlerContext, msg: &BridgeMessage
             .remove(&msg.session_id);
         cleanup_pending_questions(ctx, &msg.session_id).await;
 
-        // ADR-014 B4: evict this session's approval->client entries so the map can't
-        // grow unbounded (it was only ever removed on a button tap). Fetch the
-        // session's pending approval IDs before they are expired by end_session.
-        {
-            let sid = msg.session_id.clone();
-            let approval_ids = ctx
-                .db_op(move |sess| sess.get_pending_approvals(&sid).unwrap_or_default())
-                .await;
-            if !approval_ids.is_empty() {
-                let mut clients = ctx.pending_approval_clients.write().await;
-                for ap in &approval_ids {
-                    clients.remove(&ap.id);
-                }
-            }
-        }
+        // ADR-014 B4: capture this session's pending approval IDs BEFORE end_session
+        // expires them, so we can evict their client-map entries afterward.
+        let sid_pa = msg.session_id.clone();
+        let approval_ids = ctx
+            .db_op(move |sess| sess.get_pending_approvals(&sid_pa).unwrap_or_default())
+            .await;
 
         let sid = msg.session_id.clone();
         ctx.db_op(move |sess| {
             let _ = sess.end_session(&sid, crate::types::SessionStatus::Ended);
         })
         .await;
+
+        // ADR-014 B4 (review fix HIGH-2): evict the approval->client entries AFTER
+        // end_session has expired the approvals. Now a button tap racing with teardown
+        // hits resolve_approval on an already-expired row (returns false → no response
+        // sent, B2), so removing the client entry here cannot strand a transition. This
+        // closes the unbounded-growth leak without a mis-route window.
+        if !approval_ids.is_empty() {
+            let mut clients = ctx.pending_approval_clients.write().await;
+            for ap in &approval_ids {
+                clients.remove(&ap.id);
+            }
+        }
 
         // ADR-013 GAP-5: Cascade session end to child sub-agent sessions.
         // When a parent session ends, end all its active children to prevent orphans.

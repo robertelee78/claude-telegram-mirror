@@ -26,6 +26,29 @@ enum CollectedAnswer {
     FreeText(String),
 }
 
+/// ADR-014 E1/E3: which delivery path a "Submit All" tap takes. Pure decision so it
+/// is unit-testable (the review flagged the edge cases this encodes).
+#[derive(Debug, PartialEq, Eq)]
+enum SubmitPath {
+    /// All answers are option-based AND a blocked hook client is registered:
+    /// deliver structurally via updatedInput, no keystrokes.
+    Structured,
+    /// At least one free-text answer AND a blocked hook client: release the hook to
+    /// its TUI and inject via the isolated keystroke path.
+    FreeTextRelease,
+    /// No blocked hook client recorded (its `_client_id` was missing or already
+    /// consumed): cannot route or safely inject — surface to the user instead.
+    NoClient,
+}
+
+fn classify_submit(has_free_text: bool, has_client: bool) -> SubmitPath {
+    match (has_free_text, has_client) {
+        (_, false) => SubmitPath::NoClient,
+        (false, true) => SubmitPath::Structured,
+        (true, true) => SubmitPath::FreeTextRelease,
+    }
+}
+
 /// Handle callback queries (button presses).
 ///
 /// H4.2: Each sub-handler answers the callback individually with appropriate
@@ -1109,12 +1132,16 @@ fn build_answers_map_content(answers: &[(usize, String, CollectedAnswer)]) -> St
 /// response routing (S-2) — never broadcast, so one session's answer cannot be
 /// delivered to another session's hook. `content` is the JSON answers map or the
 /// free-text fallback sentinel.
+/// Returns `true` only if the response was written to a still-connected client.
+/// `false` means the client is gone (e.g. the hook already timed out and closed its
+/// socket) or the write failed — the caller must then surface the answer rather than
+/// silently dropping it (ADR-014 review: late-submit-after-timeout loss).
 async fn send_question_response(
     ctx: &HandlerContext,
     session_id: &str,
     content: &str,
     client_id: &str,
-) {
+) -> bool {
     let response = BridgeMessage {
         msg_type: MessageType::QuestionResponse,
         session_id: session_id.to_string(),
@@ -1126,27 +1153,39 @@ async fn send_question_response(
         Ok(j) => j,
         Err(e) => {
             tracing::error!(error = %e, "Failed to serialise question_response");
-            return;
+            return false;
         }
     };
     let line = format!("{json}\n");
-    let guard = ctx.socket_clients.lock().await;
-    if let Some(writer) = guard.get(client_id) {
-        let mut w = writer.lock().await;
-        if let Err(e) = w.write_all(line.as_bytes()).await {
-            tracing::warn!(session_id, error = %e, "Failed to write question_response to client");
-        } else {
+
+    // Clone the per-client writer Arc and DROP the socket_clients map lock before
+    // the async write, so a slow write cannot hold the shared map lock and block
+    // every other handler's outbound writes (ADR-014 review MED-1).
+    let writer = {
+        let guard = ctx.socket_clients.lock().await;
+        guard.get(client_id).cloned()
+    };
+    let Some(writer) = writer else {
+        tracing::warn!(
+            session_id,
+            client_id,
+            "ADR-014 E1: originating client gone — hook already timed out / disconnected"
+        );
+        return false;
+    };
+    let mut w = writer.lock().await;
+    match w.write_all(line.as_bytes()).await {
+        Ok(()) => {
             tracing::info!(
                 session_id,
                 "ADR-014 E1: question_response sent to originating client"
             );
+            true
         }
-    } else {
-        tracing::warn!(
-            session_id,
-            client_id,
-            "ADR-014 E1: originating client gone — hook will time out and show its TUI"
-        );
+        Err(e) => {
+            tracing::warn!(session_id, error = %e, "Failed to write question_response to client");
+            false
+        }
     }
 }
 
@@ -1288,125 +1327,178 @@ async fn handle_submitall_callback(ctx: &HandlerContext, data: &str, cb: &Callba
         .await
         .remove(&session_id);
 
-    // Structured delivery only when there is no free-text AND a hook is blocked.
-    let structured_client = if has_free_text {
-        None
-    } else {
-        originating_client.clone()
-    };
-
-    if let Some(client) = structured_client {
-        // ---- Structured path (E1/E2): NO keystrokes, NO TUI. ----
-        // Build the answers map: question text -> selected label (single) or
-        // comma-joined labels (multi-select), per the spike-confirmed contract.
-        let content = build_answers_map_content(&answers);
-        send_question_response(ctx, &session_id, &content, &client).await;
-        let _ = ctx
-            .bot
-            .answer_callback_query(&cb.id, Some("Submitted \u{2705}"), false)
-            .await;
-        tracing::info!(
-            session_id = %session_id,
-            "ADR-014 E1: AskUserQuestion answered structurally via updatedInput (no keystrokes)"
-        );
-    } else {
-        // ---- Isolated keystroke fallback (E3): free-text, or no blocking hook. ----
-        // This is the SOLE remaining keystroke-injection path in the project.
-        let _ = ctx
-            .bot
-            .answer_callback_query(&cb.id, Some("Submitting..."), false)
-            .await;
-
-        // If a hook is blocked, release it with a bare `allow` (no updatedInput) so
-        // Claude renders its interactive TUI for us to drive. Then wait briefly for
-        // the TUI to appear. This render wait is inherently racy and is accepted for
-        // the free-text case ONLY (ADR-014 E3).
-        if let Some(client_id) = &originating_client {
-            send_question_response(
-                ctx,
-                &session_id,
-                crate::types::FREETEXT_FALLBACK_SENTINEL,
-                client_id,
-            )
-            .await;
-            tracing::info!(
-                session_id = %session_id,
-                "ADR-014 E3: free-text answer — falling back to isolated keystroke path"
-            );
-            tokio::time::sleep(tokio::time::Duration::from_millis(
-                QUESTION_TUI_RENDER_WAIT_MS,
-            ))
-            .await;
-        }
-
-        // ADR-013 D1/D2: Warn when tmux is unavailable.
-        let tmux_target = ctx.session_tmux.read().await.get(&session_id).cloned();
-        if let Some(target) = tmux_target {
-            let sid = session_id.clone();
-            let socket = ctx
-                .db_op(move |sess| {
-                    sess.get_session(&sid)
-                        .ok()
-                        .flatten()
-                        .and_then(|s| s.tmux_socket)
-                })
-                .await;
-
-            let mut inj = ctx.injector.lock().await;
-            inj.set_target(&target, socket.as_deref());
-            for (_, _, answer) in &answers {
-                match answer {
-                    // Single-option label or free-text: inject as literal text.
-                    CollectedAnswer::Option(text) | CollectedAnswer::FreeText(text) => {
-                        let _ = inj.inject(text);
-                    }
-                    CollectedAnswer::MultiSelect {
-                        selected_indices,
-                        total_options,
-                        ..
-                    } => {
-                        // Claude Code's multi-select is a custom Ink (React CLI)
-                        // checkbox TUI. Key bindings (from cli.js source):
-                        //   Number keys (1-9) = toggle option by 1-based index
-                        //   Down/Tab = move cursor; past last option focuses Submit
-                        //   Enter on Submit button = submit selections
-                        let key_delay = tokio::time::Duration::from_millis(300);
-
-                        // Step 1: Toggle desired options by 1-based index.
-                        for &idx in selected_indices {
-                            let digit = format!("{}", idx + 1);
-                            let _ = inj.send_key(&digit);
-                            tokio::time::sleep(key_delay).await;
-                        }
-
-                        // Step 2: Navigate past options + "Other" to focus Submit.
-                        let downs_needed = total_options + 2; // options + Other + 1
-                        for _ in 0..downs_needed {
-                            let _ = inj.send_key("Down");
-                            tokio::time::sleep(key_delay).await;
-                        }
-
-                        // Step 3: Press Enter on the focused Submit button.
-                        let _ = inj.send_key("Enter");
-                    }
-                }
-            }
-            drop(inj);
-
-            // Auto-submit the Claude Code review screen (fallback path only).
-            auto_submit_answers(ctx, &session_id).await;
-        } else {
-            tracing::warn!(
-                session_id = %session_id,
-                "ADR-013 D1: tmux not detected during submitall, answers cannot be injected"
-            );
-            ctx.bot
+    match classify_submit(has_free_text, originating_client.is_some()) {
+        SubmitPath::Structured => {
+            // ---- Structured path (E1/E2): NO keystrokes, NO TUI. ----
+            let client = originating_client
+                .clone()
+                .expect("classify_submit Structured implies a client is present");
+            // Build the answers map: question text -> selected label (single) or
+            // comma-joined labels (multi-select), per the spike-confirmed contract.
+            let content = build_answers_map_content(&answers);
+            let delivered = send_question_response(ctx, &session_id, &content, &client).await;
+            if delivered {
+                let _ = ctx
+                    .bot
+                    .answer_callback_query(&cb.id, Some("Submitted \u{2705}"), false)
+                    .await;
+                tracing::info!(
+                    session_id = %session_id,
+                    "ADR-014 E1: AskUserQuestion answered structurally via updatedInput (no keystrokes)"
+                );
+            } else {
+                // Review fix (late-submit-after-timeout): the hook already timed out and
+                // closed its socket, so the structured answer cannot be delivered. Do NOT
+                // silently drop the user's answer — alert and tell them to answer at the
+                // terminal (Claude has fallen back to its own TUI).
+                let _ = ctx
+                    .bot
+                    .answer_callback_query(&cb.id, Some("This question already timed out."), true)
+                    .await;
+                ctx.bot
                 .send_message(
-                    "\u{26A0}\u{FE0F} Answers could not be submitted \u{2014} tmux not detected. Please answer at the terminal.",
+                    "\u{26A0}\u{FE0F} This question timed out before your answer was submitted. If Claude is still waiting, please answer at the terminal.",
                     None,
                     thread_id,
                 )
                 .await;
+                tracing::warn!(
+                    session_id = %session_id,
+                    "ADR-014: structured answer not delivered (hook gone) — user notified"
+                );
+            }
+        }
+        SubmitPath::FreeTextRelease => {
+            // ---- Free-text fallback (E3): the SOLE remaining keystroke path. ----
+            let client_id = originating_client
+                .clone()
+                .expect("classify_submit FreeTextRelease implies a client is present");
+            // Release the blocked hook with a bare `allow` (no updatedInput) so Claude
+            // renders its interactive TUI for us to drive. Inject ONLY if the release
+            // actually reached the (still-connected) hook; otherwise it timed out and
+            // injecting blind would type into the wrong screen.
+            let released = send_question_response(
+                ctx,
+                &session_id,
+                crate::types::FREETEXT_FALLBACK_SENTINEL,
+                &client_id,
+            )
+            .await;
+            if !released {
+                let _ = ctx
+                    .bot
+                    .answer_callback_query(&cb.id, Some("This question already timed out."), true)
+                    .await;
+                ctx.bot
+                .send_message(
+                    "\u{26A0}\u{FE0F} This question timed out before your answer was submitted. Please answer at the terminal.",
+                    None,
+                    thread_id,
+                )
+                .await;
+                tracing::warn!(session_id = %session_id, "ADR-014 E3: free-text release found hook gone — user notified");
+            } else {
+                let _ = ctx
+                    .bot
+                    .answer_callback_query(&cb.id, Some("Submitting..."), false)
+                    .await;
+                tracing::info!(
+                    session_id = %session_id,
+                    "ADR-014 E3: free-text answer — releasing hook and injecting via keystrokes"
+                );
+                // Claude needs a moment to render the TUI after the hook returns. This
+                // wait is inherently racy and accepted for the free-text case only (E3).
+                tokio::time::sleep(tokio::time::Duration::from_millis(
+                    QUESTION_TUI_RENDER_WAIT_MS,
+                ))
+                .await;
+
+                let tmux_target = ctx.session_tmux.read().await.get(&session_id).cloned();
+                if let Some(target) = tmux_target {
+                    let sid = session_id.clone();
+                    let socket = ctx
+                        .db_op(move |sess| {
+                            sess.get_session(&sid)
+                                .ok()
+                                .flatten()
+                                .and_then(|s| s.tmux_socket)
+                        })
+                        .await;
+
+                    let mut inj = ctx.injector.lock().await;
+                    inj.set_target(&target, socket.as_deref());
+                    for (_, _, answer) in &answers {
+                        match answer {
+                            // Single-option label or free-text: inject as literal text.
+                            CollectedAnswer::Option(text) | CollectedAnswer::FreeText(text) => {
+                                let _ = inj.inject(text);
+                            }
+                            CollectedAnswer::MultiSelect {
+                                selected_indices,
+                                total_options,
+                                ..
+                            } => {
+                                // Claude Code's multi-select is a custom Ink (React CLI)
+                                // checkbox TUI. Key bindings (from cli.js source):
+                                //   Number keys (1-9) = toggle option by 1-based index
+                                //   Down/Tab = move cursor; past last option focuses Submit
+                                //   Enter on Submit button = submit selections
+                                let key_delay = tokio::time::Duration::from_millis(300);
+
+                                for &idx in selected_indices {
+                                    let digit = format!("{}", idx + 1);
+                                    let _ = inj.send_key(&digit);
+                                    tokio::time::sleep(key_delay).await;
+                                }
+                                let downs_needed = total_options + 2; // options + Other + 1
+                                for _ in 0..downs_needed {
+                                    let _ = inj.send_key("Down");
+                                    tokio::time::sleep(key_delay).await;
+                                }
+                                let _ = inj.send_key("Enter");
+                            }
+                        }
+                    }
+                    drop(inj);
+
+                    // Auto-submit the Claude Code review screen (fallback path only).
+                    auto_submit_answers(ctx, &session_id).await;
+                } else {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        "ADR-013 D1: tmux not detected during submitall, answers cannot be injected"
+                    );
+                    ctx.bot
+                    .send_message(
+                        "\u{26A0}\u{FE0F} Answers could not be submitted \u{2014} tmux not detected. Please answer at the terminal.",
+                        None,
+                        thread_id,
+                    )
+                    .await;
+                }
+            }
+        }
+        SubmitPath::NoClient => {
+            // ---- Degenerate: no blocked hook client recorded for this session. ----
+            // Review fix (MED-2): the QuestionRequest never registered a client (its
+            // _client_id was missing) or it was already consumed. There is no hook to
+            // release and the terminal screen state is unknown, so we must NOT blindly
+            // inject keystrokes. Surface it instead of silently doing the wrong thing.
+            let _ = ctx
+                .bot
+                .answer_callback_query(&cb.id, Some("Couldn't submit — no active question."), true)
+                .await;
+            ctx.bot
+            .send_message(
+                "\u{26A0}\u{FE0F} Couldn't route your answer (no active question session). Please answer at the terminal.",
+                None,
+                thread_id,
+            )
+            .await;
+            tracing::warn!(
+                session_id = %session_id,
+                "ADR-014: submitall with no originating client — answer not routed"
+            );
         }
     }
 
@@ -1683,6 +1775,18 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert_eq!(v["Q1"], "A");
         assert!(v.get("Q2").is_none());
+    }
+
+    /// ADR-014 review: the submit-path decision must be exactly: no client → NoClient
+    /// (never blind-inject); options-only + client → Structured; any free-text +
+    /// client → FreeTextRelease. Guards the edge cases both reviewers flagged.
+    #[test]
+    fn classify_submit_decision_table() {
+        assert_eq!(classify_submit(false, true), SubmitPath::Structured);
+        assert_eq!(classify_submit(true, true), SubmitPath::FreeTextRelease);
+        // No client → NoClient regardless of free-text (cannot route or safely inject).
+        assert_eq!(classify_submit(false, false), SubmitPath::NoClient);
+        assert_eq!(classify_submit(true, false), SubmitPath::NoClient);
     }
 
     /// ADR-014 PR-E benchmark: the structured answer-delivery compute path

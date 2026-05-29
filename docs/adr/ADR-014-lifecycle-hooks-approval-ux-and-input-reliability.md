@@ -219,6 +219,20 @@ The whole point of PR-E is replacing a multi-second, racy keystroke sequence wit
 
 That is a ~6-order-of-magnitude reduction in answer-delivery compute and removal of the dominant fragility. The keystroke path now runs only on the free-text fallback (E3). This *is* the optimization — there was no faster way to deliver option answers, so the work was eliminating the slow path, not tuning it.
 
+### Adversarial review (/cfa dual-mode: Claude reviewer + Codex 0.128) — 2026-05-28
+
+Both reviewers ran read-only over the branch diff. Real bugs found and fixed (tests added):
+
+- **Codex HIGH — mirroring toggle dropped blocking questions** (`mod.rs` `is_always_active`): `QuestionRequest`/`QuestionResponse` were not in the always-active set, so toggling mirroring off would drop the blocking question and hang the hook for 300s. Fixed — they join approvals/commands as always-active (a blocking path must never be gated). 
+- **Codex HIGH — late Submit-All after timeout silently lost the answer**: a tap after the hook's 300s timeout took the structured path and wrote to the dead client with no feedback. Fixed — `send_question_response` now returns delivery success; on failure the user is alerted ("timed out … answer at the terminal"), never silent loss.
+- **Claude HIGH — approval-client eviction ordered before `end_session`** (`socket_handlers.rs`): reordered to evict *after* `end_session` expires the approvals, so a racing tap resolves to a no-op (B2) instead of mis-routing.
+- **Claude HIGH — teardown atomicity**: `clear_thread_id` (DB+cache) now runs *before* `delete_forum_topic`, so a crash between leaves a benign leaked topic instead of a stale mapping (the `topic_invalidated` self-heal already covered the residual case).
+- **Claude MED — guard held across await** in `send_question_response`: now clones the writer Arc and drops the `socket_clients` map lock before the write.
+- **Claude MED — blind keystroke injection with no hook client**: submit logic refactored to a unit-tested `classify_submit` (`Structured` / `FreeTextRelease` / `NoClient`); the no-client case now notifies instead of injecting into an unknown screen.
+- **Claude MED — resume leaked the question-client entry**: the `resume` early-return now drops it immediately.
+
+Verified non-issues (documented, no change): `QuestionRequest`-before-`SessionStart` is handled by `ensure_session_exists` on-the-fly creation (same as the proven approval path); the `custom_title` column always exists by the time `row_to_session` runs (migration in `new()`); `SessionStart`-after-`get_hook_output` ordering is pre-existing approval-flow behavior, not introduced here. New tests: `classify_submit_decision_table` (+ the prior PR-E/PR-B coverage). Final: 416 tests passing, clippy clean, release build verified.
+
 ## Links
 
 - ADR-003 — Dual hook handlers (hook architecture this builds on)
