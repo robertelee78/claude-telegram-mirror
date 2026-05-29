@@ -339,12 +339,10 @@ fn cleanup_old_downloads() {
 
 /// ADR-013 E2: Sweep active sessions for inactivity-based topic cleanup.
 ///
-/// Two stages:
-/// - Stage 2 (>720 min inactivity): DELETE the topic (full cleanup).
-///
-/// Stage 1 (close after session end) is handled by `schedule_topic_deletion`.
-/// This sweep catches sessions that are technically still "active" in the DB
-/// but have been idle for a long time (e.g. user walked away without ending).
+/// ADR-014 A4: True SessionEnd now deletes the topic immediately (see
+/// `socket_handlers::handle_session_end`), so this sweep is purely a safety net
+/// for sessions that are still "active" in the DB but have been idle for a long
+/// time (e.g. the process was killed without a SessionEnd hook firing).
 async fn cleanup_inactive_topics(ctx: &HandlerContext) {
     let active_sessions = ctx
         .db_op(|sess| sess.get_active_sessions().unwrap_or_default())
@@ -443,71 +441,12 @@ async fn cleanup_inactive_topics(ctx: &HandlerContext) {
     }
 }
 
-/// ADR-013 E2/E5: Schedule topic lifecycle with two stages.
-///
-/// - **Stage 1** (after `delay_ms`): CLOSE the topic (hides from list, preserves history).
-/// - **Stage 2** (after 12 hours total): DELETE the topic (full cleanup).
-///
-/// This replaces the previous behavior that deleted immediately after the delay.
-/// Schedule topic deletion with delay (allows for session resume).
-pub(super) async fn schedule_topic_deletion(
-    ctx: &HandlerContext,
-    session_id: &str,
-    thread_id: i64,
-    delay_ms: u64,
-) {
-    let bot = Arc::clone(&ctx.bot);
-    let sessions = Arc::clone(&ctx.sessions);
-    let session_threads = Arc::clone(&ctx.session_threads);
-    // ADR-013 MINOR-7: Capture additional caches for full cleanup on stage-2 deletion.
-    let session_tmux = Arc::clone(&ctx.session_tmux);
-    let custom_titles = Arc::clone(&ctx.custom_titles);
-    let sid = session_id.to_string();
-
-    // ADR-013 E5: Two-stage lifecycle.
-    // Stage 1: CLOSE the topic after delay_ms (preserves history, hides from list).
-    // Stage 2: DELETE the topic after inactivity_delete_threshold_minutes total.
-    let inactivity_threshold_ms = ctx.config.inactivity_delete_threshold_minutes as u64 * 60 * 1000;
-    let stage2_delay_ms = inactivity_threshold_ms;
-
-    let handle = tokio::spawn(async move {
-        // Stage 1: Wait for the configured delay, then CLOSE the topic.
-        tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
-        tracing::info!(session_id = %sid, thread_id, "ADR-013 E5 Stage 1: Closing forum topic");
-        let _ = bot.close_forum_topic(thread_id).await;
-
-        // Stage 2: Wait for the remaining time until the full deletion threshold,
-        // then DELETE the topic. The remaining time is (stage2 - stage1).
-        let remaining_ms = stage2_delay_ms.saturating_sub(delay_ms);
-        if remaining_ms > 0 {
-            tokio::time::sleep(tokio::time::Duration::from_millis(remaining_ms)).await;
-        }
-
-        tracing::info!(session_id = %sid, thread_id, "ADR-013 E5 Stage 2: Deleting forum topic");
-        let deleted = bot.delete_forum_topic(thread_id).await.unwrap_or(false);
-        if deleted {
-            tracing::info!(session_id = %sid, thread_id, "Auto-deleted forum topic (stage 2)");
-        } else {
-            tracing::warn!(session_id = %sid, thread_id, "Failed to delete topic in stage 2");
-        }
-        // Clear thread_id and cache regardless of delete success,
-        // to prevent orphaned cleanup retrying endlessly.
-        session_threads.write().await.remove(&sid);
-        // ADR-013 MINOR-7: Also clear tmux and custom_titles caches on stage-2 deletion.
-        // Previously only session_threads was cleared, leaving stale entries.
-        session_tmux.write().await.remove(&sid);
-        custom_titles.write().await.remove(&sid);
-        let sid2 = sid.clone();
-        let sess = sessions.clone();
-        let _ =
-            tokio::task::spawn_blocking(move || sess.blocking_lock().clear_thread_id(&sid2)).await;
-    });
-
-    ctx.pending_del
-        .write()
-        .await
-        .insert(session_id.to_string(), handle);
-}
+// ADR-014 A4: `schedule_topic_deletion` (the two-stage close→delete schedule) was
+// removed. True SessionEnd now deletes the topic immediately and synchronously
+// clears the thread_id (see `socket_handlers::handle_session_end`). The
+// `pending_del` map is therefore normally empty; `cancel_pending_topic_deletion`
+// is retained as a safe no-op guard, and the inactivity sweep above is the
+// remaining safety net for sessions that die without a SessionEnd hook.
 
 /// ADR-013 MINOR-5: Clean up stale sub-agent temp files older than 24 hours.
 /// These are written by handle_agent_response for the Details button callback.

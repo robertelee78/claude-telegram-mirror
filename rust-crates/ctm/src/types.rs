@@ -138,8 +138,12 @@ pub struct SessionEndEvent {
     #[serde(flatten)]
     pub base: HookEventBase,
     /// Why the session ended: "clear", "logout", "prompt_input_exit",
-    /// "bypass_permissions_disabled", or "other".
-    #[serde(default)]
+    /// "bypass_permissions_disabled", "resume", or "other".
+    ///
+    /// ADR-014 A2: Claude Code emits this field as `session_exit_reason` (verified
+    /// against the official hooks docs). Without the alias the field always
+    /// deserialized to `None`, so the `resume` special-case (A3) could never fire.
+    #[serde(default, alias = "session_exit_reason")]
     pub reason: Option<String>,
 }
 
@@ -605,6 +609,58 @@ pub fn extract_agent_id(transcript_path: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ADR-014 A2: Claude Code emits the SessionEnd reason as `session_exit_reason`.
+    /// The `#[serde(alias = "session_exit_reason")]` on `reason` must populate it.
+    /// Hypothesis: without the alias `reason` is `None`; with it, the value is read.
+    #[test]
+    fn session_end_deserializes_session_exit_reason() {
+        let json = r#"{
+            "hook_event_name": "SessionEnd",
+            "session_id": "sess-a2",
+            "session_exit_reason": "clear"
+        }"#;
+        let ev: HookEvent = serde_json::from_str(json).expect("deserialize SessionEnd");
+        match ev {
+            HookEvent::SessionEnd(e) => {
+                assert_eq!(e.base.session_id, "sess-a2");
+                assert_eq!(e.reason.as_deref(), Some("clear"));
+            }
+            other => panic!("expected SessionEnd, got {other:?}"),
+        }
+    }
+
+    /// ADR-014 A2/A3: the `resume` reason must round-trip so the daemon can
+    /// special-case it (A3) and avoid tearing down a resuming session.
+    #[test]
+    fn session_end_deserializes_resume_reason() {
+        let json = r#"{
+            "hook_event_name": "SessionEnd",
+            "session_id": "sess-resume",
+            "session_exit_reason": "resume"
+        }"#;
+        let ev: HookEvent = serde_json::from_str(json).expect("deserialize SessionEnd");
+        match ev {
+            HookEvent::SessionEnd(e) => assert_eq!(e.reason.as_deref(), Some("resume")),
+            other => panic!("expected SessionEnd, got {other:?}"),
+        }
+    }
+
+    /// ADR-014 A2: a SessionEnd payload that omits the reason entirely still
+    /// deserializes (reason defaults to None) — true terminations from older
+    /// Claude Code builds must not break.
+    #[test]
+    fn session_end_without_reason_defaults_none() {
+        let json = r#"{
+            "hook_event_name": "SessionEnd",
+            "session_id": "sess-none"
+        }"#;
+        let ev: HookEvent = serde_json::from_str(json).expect("deserialize SessionEnd");
+        match ev {
+            HookEvent::SessionEnd(e) => assert_eq!(e.reason, None),
+            other => panic!("expected SessionEnd, got {other:?}"),
+        }
+    }
 
     #[test]
     fn test_valid_agent_ids() {

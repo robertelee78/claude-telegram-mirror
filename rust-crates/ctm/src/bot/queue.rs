@@ -143,10 +143,7 @@ impl TelegramBot {
                     // Additive increase: successful send, rate can grow.
                     self.aimd.lock().await.on_success();
                 }
-                Err(AppError::RateLimited {
-                    retry_after_secs,
-                    adaptive_retry_ms,
-                }) => {
+                Err(AppError::RateLimited { retry_after_secs }) => {
                     // Telegram 429 — the entire bot token is globally blocked.
                     // No API calls of any type succeed during the retry_after window.
                     // The entire queue must pause; continuing to send other messages
@@ -155,9 +152,12 @@ impl TelegramBot {
                     // Multiplicative decrease: halve the effective send rate.
                     self.aimd.lock().await.on_rate_limit(retry_after_secs);
 
-                    // Compute wait duration: prefer ms-precision adaptive_retry when
-                    // available (Bot API 8.0+), fall back to retry_after in seconds.
-                    let wait_ms = adaptive_retry_ms.unwrap_or(retry_after_secs * 1000);
+                    // grammY-style philosophy (ADR-014 A7): honor the server-provided
+                    // `retry_after` and pause this token's sends for that window. There
+                    // is no millisecond-precision field in the real Bot API — the former
+                    // `adaptive_retry` path was dead code built on a fabricated field and
+                    // was removed.
+                    let wait_ms = retry_after_secs * 1000;
                     // Add ~10% jitter to prevent thundering herd if multiple bots recover
                     // simultaneously. Jitter is deterministic (no rand crate).
                     let jitter_ms = (wait_ms as f64 * 0.1 * simple_jitter_fraction()) as u64;
@@ -166,7 +166,6 @@ impl TelegramBot {
                     let q_depth = self.queue.lock().await.total_len();
                     tracing::warn!(
                         retry_after_secs,
-                        adaptive_retry_ms = ?adaptive_retry_ms,
                         total_wait_ms = total_wait.as_millis(),
                         queue_depth = q_depth,
                         "429 rate limited — pausing entire queue (bot token globally blocked)"
@@ -248,18 +247,13 @@ impl TelegramBot {
                 .as_ref()
                 .and_then(|p| p.retry_after)
                 .unwrap_or(30); // Conservative fallback per ADR-011.
-            let adaptive_retry_ms = resp.parameters.as_ref().and_then(|p| p.adaptive_retry);
 
             tracing::warn!(
                 retry_after_secs,
-                adaptive_retry_ms = ?adaptive_retry_ms,
                 "Telegram rate limited (429), honoring retry_after"
             );
 
-            return Err(AppError::RateLimited {
-                retry_after_secs,
-                adaptive_retry_ms,
-            });
+            return Err(AppError::RateLimited { retry_after_secs });
         }
 
         // TOPIC_CLOSED: reopen topic, retry send

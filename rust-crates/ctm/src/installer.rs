@@ -18,6 +18,10 @@ const HOOK_TYPES: &[&str] = &[
     "Stop",
     "UserPromptSubmit",
     "PreCompact",
+    // ADR-014 A1: SessionEnd activates the already-built event-driven teardown
+    // handler (types.rs / hook.rs / socket_handlers.rs). Uses the standard
+    // create_hook_entry() with no custom timeout (unlike PreToolUse).
+    "SessionEnd",
 ];
 
 fn home_dir() -> PathBuf {
@@ -644,6 +648,37 @@ mod tests {
         for c in &changes2 {
             assert_eq!(c.status, HookChangeStatus::Unchanged);
         }
+    }
+
+    /// ADR-014 A1: SessionEnd must be registered, and via the standard
+    /// create_hook_entry() with NO custom timeout (unlike PreToolUse which gets
+    /// 310). Hypothesis: after install, settings.hooks.SessionEnd exists, is a CTM
+    /// hook, and its inner hook object has no `timeout` key.
+    #[test]
+    fn session_end_hook_registered_without_timeout() {
+        assert!(
+            HOOK_TYPES.contains(&"SessionEnd"),
+            "SessionEnd must be in HOOK_TYPES"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let settings_path = dir.path().join("settings.json");
+        install_hooks_to_path(&settings_path, dir.path()).unwrap();
+        let settings = read_settings(&settings_path);
+
+        let arr = settings["hooks"]["SessionEnd"]
+            .as_array()
+            .expect("SessionEnd registered");
+        assert!(item_is_ctm(&arr[0]), "SessionEnd is a CTM hook");
+        let inner = &arr[0]["hooks"][0];
+        assert!(
+            inner.get("timeout").is_none(),
+            "SessionEnd must have no custom timeout, got {inner:?}"
+        );
+
+        // PreToolUse, by contrast, must carry the 310s approval timeout.
+        let pre = &settings["hooks"]["PreToolUse"].as_array().unwrap()[0]["hooks"][0];
+        assert_eq!(pre.get("timeout").and_then(|t| t.as_u64()), Some(310));
     }
 
     #[test]

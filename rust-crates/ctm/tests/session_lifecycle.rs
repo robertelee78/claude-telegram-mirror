@@ -358,3 +358,93 @@ fn cleanup_old_sessions_removes_ancient() {
     assert_eq!(removed, 1);
     assert!(mgr.get_session("ancient").unwrap().is_none());
 }
+
+// ======================================================================
+// ADR-014 PR-A: lifecycle correctness
+// ======================================================================
+
+/// ADR-014 A5: the custom title (set via /rename) is persisted to the DB and
+/// survives reload, so a resume after a daemon restart recovers the name.
+/// Hypothesis: set_custom_title writes a value get_session can read back, and it
+/// outlives end_session (the row is not deleted on end).
+#[test]
+fn custom_title_persists_and_survives_end() {
+    let (mgr, _tmp) = make_mgr();
+    mgr.create_session("title-sess", 1, None, None, None, None, None)
+        .unwrap();
+
+    // No title initially.
+    assert_eq!(
+        mgr.get_session("title-sess").unwrap().unwrap().custom_title,
+        None
+    );
+
+    mgr.set_custom_title("title-sess", "My Feature Work")
+        .unwrap();
+    assert_eq!(
+        mgr.get_session("title-sess")
+            .unwrap()
+            .unwrap()
+            .custom_title
+            .as_deref(),
+        Some("My Feature Work")
+    );
+
+    // The title must survive a true session end (the row persists; resume reads it).
+    mgr.end_session("title-sess", SessionStatus::Ended).unwrap();
+    assert_eq!(
+        mgr.get_session("title-sess")
+            .unwrap()
+            .unwrap()
+            .custom_title
+            .as_deref(),
+        Some("My Feature Work")
+    );
+}
+
+/// ADR-014 A5: a custom title set on one SessionManager is visible to a freshly
+/// opened SessionManager over the same DB file — proving DB persistence (not just
+/// the in-memory cache), which is the daemon-restart scenario.
+#[test]
+fn custom_title_visible_across_reopen() {
+    let tmp = tempdir().unwrap();
+    {
+        let mgr = SessionManager::new(tmp.path(), 5).unwrap();
+        mgr.create_session("reopen-sess", 7, None, None, None, None, None)
+            .unwrap();
+        mgr.set_custom_title("reopen-sess", "Persisted Title")
+            .unwrap();
+    }
+    // Reopen — mimics a daemon restart with an empty in-memory cache.
+    let mgr2 = SessionManager::new(tmp.path(), 5).unwrap();
+    assert_eq!(
+        mgr2.get_session("reopen-sess")
+            .unwrap()
+            .unwrap()
+            .custom_title
+            .as_deref(),
+        Some("Persisted Title")
+    );
+}
+
+/// ADR-014 A4: the DB invariant behind immediate teardown — once a topic is
+/// deleted, clearing the thread_id makes get_session report no thread_id, so a
+/// later resume cannot target a stale (deleted) topic.
+#[test]
+fn clear_thread_id_drops_stale_topic_mapping() {
+    let (mgr, _tmp) = make_mgr();
+    mgr.create_session("teardown-sess", 1, None, None, None, None, None)
+        .unwrap();
+    mgr.set_session_thread("teardown-sess", 54321).unwrap();
+    assert_eq!(
+        mgr.get_session("teardown-sess").unwrap().unwrap().thread_id,
+        Some(54321)
+    );
+
+    // Simulate A4's synchronous clear after delete_forum_topic.
+    mgr.clear_thread_id("teardown-sess").unwrap();
+    assert_eq!(
+        mgr.get_session("teardown-sess").unwrap().unwrap().thread_id,
+        None
+    );
+}

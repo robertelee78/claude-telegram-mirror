@@ -357,6 +357,20 @@ pub(super) async fn handle_session_start(ctx: &HandlerContext, msg: &BridgeMessa
 /// the Rust equivalent of the TypeScript `handleSessionEnd()`.  See also
 /// `ensure_session_exists` which handles the start (creation) side.
 pub(super) async fn handle_session_end(ctx: &HandlerContext, msg: &BridgeMessage) {
+    // ADR-014 A3: `session_exit_reason == "resume"` means the session is being
+    // suspended and WILL come back. Tearing down here would wrongly destroy a
+    // resuming session's topic, so skip teardown entirely. The reason is carried
+    // in the message content (see hook.rs SessionEnd arm). Only true terminations
+    // (clear, logout, prompt_input_exit, bypass_permissions_disabled, other,
+    // unknown) fall through to teardown.
+    if msg.content.trim() == "resume" {
+        tracing::info!(
+            session_id = %msg.session_id,
+            "ADR-014 A3: SessionEnd reason=resume — suspending, not tearing down"
+        );
+        return;
+    }
+
     let sid = msg.session_id.clone();
     let session_opt = ctx
         .db_op(move |sess| sess.get_session(&sid).ok().flatten())
@@ -384,8 +398,42 @@ pub(super) async fn handle_session_end(ctx: &HandlerContext, msg: &BridgeMessage
 
         if let Some(tid) = thread_id {
             if ctx.config.auto_delete_topics {
-                let delay_ms = ctx.config.topic_delete_delay_minutes as u64 * 60 * 1000;
-                cleanup::schedule_topic_deletion(ctx, &msg.session_id, tid, delay_ms).await;
+                // ADR-014 A4: Delete the topic IMMEDIATELY on a true SessionEnd
+                // (replaces the two-stage close→delete schedule). Phone-side history
+                // is not valued; the computer retains transcript history. Then
+                // SYNCHRONOUSLY clear thread_id from BOTH the DB and the
+                // session_threads cache — no fire-and-forget — before returning, so a
+                // late/concurrent resume cannot read a stale thread_id for an
+                // already-deleted topic (A5 atomic-clear).
+                //
+                // Defensive: cancel any pending two-stage deletion task. After this
+                // change handle_session_end no longer schedules one, but a task could
+                // still exist from the inactivity sweep (cleanup.rs).
+                cleanup::cancel_pending_topic_deletion(ctx, &msg.session_id).await;
+
+                // Tolerate "topic already deleted": delete_forum_topic returns
+                // Ok(false)/Err for an already-gone topic; either way we proceed to
+                // clear the mapping. The goal state (no topic, no thread_id) is reached
+                // regardless.
+                match ctx.bot.delete_forum_topic(tid).await {
+                    Ok(true) => tracing::info!(
+                        session_id = %msg.session_id,
+                        thread_id = tid,
+                        "ADR-014 A4: Deleted forum topic immediately on SessionEnd"
+                    ),
+                    Ok(false) | Err(_) => tracing::info!(
+                        session_id = %msg.session_id,
+                        thread_id = tid,
+                        "ADR-014 A4: Topic already gone or delete failed; clearing mapping anyway"
+                    ),
+                }
+
+                ctx.session_threads.write().await.remove(&msg.session_id);
+                let sid_clear = msg.session_id.clone();
+                ctx.db_op(move |sess| {
+                    let _ = sess.clear_thread_id(&sid_clear);
+                })
+                .await;
             } else {
                 let _ = ctx.bot.close_forum_topic(tid).await;
                 ctx.session_threads.write().await.remove(&msg.session_id);
@@ -910,6 +958,20 @@ pub(super) async fn handle_session_rename(
         .write()
         .await
         .insert(session_id.to_string(), custom_title.to_string());
+
+    // ADR-014 A5: Also persist to the DB so a resume after a daemon restart (which
+    // empties the in-memory cache) still recovers the title for the new topic name
+    // and the "Session resumed: {title}" message.
+    {
+        let sid = session_id.to_string();
+        let title = custom_title.to_string();
+        ctx.db_op(move |sess| {
+            if let Err(e) = sess.set_custom_title(&sid, &title) {
+                tracing::warn!(session_id = %sid, error = %e, "ADR-014 A5: Failed to persist custom title to DB");
+            }
+        })
+        .await;
+    }
 
     let thread_id = match ctx.get_thread_id(session_id).await {
         Some(tid) => tid,

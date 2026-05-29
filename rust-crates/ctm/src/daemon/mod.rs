@@ -40,7 +40,10 @@ use tokio::sync::{Mutex, RwLock};
 
 // ---------------------------------------------------------------- constants
 
-const CLEANUP_INTERVAL_SECS: u64 = 5 * 60; // 5 minutes
+// ADR-014 A6: SessionEnd (A1) now drives teardown event-driven and immediately,
+// so the periodic sweep is only a safety net for sessions that die without a
+// SessionEnd hook (crash/kill). Run it far less often (20 min vs the old 5 min).
+const CLEANUP_INTERVAL_SECS: u64 = 20 * 60; // 20 minutes
 const ECHO_TTL_SECS: u64 = 10;
 const TOOL_CACHE_TTL_SECS: u64 = 5 * 60; // 5 minutes
 const DOWNLOAD_MAX_AGE_SECS: u64 = 24 * 60 * 60; // 24 hours
@@ -843,6 +846,29 @@ async fn ensure_session_exists(ctx: &HandlerContext, msg: &BridgeMessage) -> boo
                 state
             };
 
+            // ADR-014 A5: Child-orphan edge case. A resumed sub-agent session whose
+            // parent has already ended has no surviving parent topic. We do NOT
+            // silently drop it — we create its own topic (as below) and log the
+            // orphaning so it is visible rather than mysterious.
+            if let Some(parent_id) = &session.parent_session_id {
+                let pid = parent_id.clone();
+                let parent_active = ctx
+                    .db_op(move |sess| {
+                        matches!(
+                            sess.get_session(&pid).ok().flatten().map(|s| s.status),
+                            Some(crate::types::SessionStatus::Active)
+                        )
+                    })
+                    .await;
+                if !parent_active {
+                    tracing::info!(
+                        session_id = %msg.session_id,
+                        parent_session_id = %parent_id,
+                        "ADR-014 A5: Resumed child session whose parent has ended — creating its own topic (orphan, not dropped)"
+                    );
+                }
+            }
+
             let hostname = session.hostname.as_deref();
             let project_dir = session.project_dir.as_deref();
             let topic_name =
@@ -868,7 +894,24 @@ async fn ensure_session_exists(ctx: &HandlerContext, msg: &BridgeMessage) -> boo
                 // ADR-013 E3: Enhanced session resume context message.
                 // Include custom title and inactivity duration if available.
                 let resume_msg = {
-                    let custom_title = ctx.custom_titles.read().await.get(&msg.session_id).cloned();
+                    // ADR-014 A5: Prefer the in-memory cache, but fall back to the
+                    // DB-persisted title (set via /rename) so a resume after a daemon
+                    // restart — which empties the cache — still recovers the name.
+                    // Warm the cache on a DB hit so subsequent renames dedup correctly.
+                    let custom_title =
+                        match ctx.custom_titles.read().await.get(&msg.session_id).cloned() {
+                            Some(t) => Some(t),
+                            None => match &session.custom_title {
+                                Some(t) => {
+                                    ctx.custom_titles
+                                        .write()
+                                        .await
+                                        .insert(msg.session_id.clone(), t.clone());
+                                    Some(t.clone())
+                                }
+                                None => None,
+                            },
+                        };
                     let inactivity_str = {
                         let la = chrono::DateTime::parse_from_rfc3339(&session.last_activity).ok();
                         la.map(|t| {
