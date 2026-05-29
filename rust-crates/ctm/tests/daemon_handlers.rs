@@ -205,6 +205,9 @@ fn message_type_serialization_all_variants() {
         (MessageType::PreCompact, "pre_compact"),
         (MessageType::SessionRename, "session_rename"),
         (MessageType::SendImage, "send_image"),
+        // ADR-014 E1
+        (MessageType::QuestionRequest, "question_request"),
+        (MessageType::QuestionResponse, "question_response"),
     ];
 
     for (variant, expected_str) in &cases {

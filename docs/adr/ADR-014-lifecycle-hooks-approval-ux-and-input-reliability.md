@@ -177,7 +177,20 @@ Changes shipped:
 - **A6** `CLEANUP_INTERVAL_SECS` 5 min → 20 min (sweep is now a safety net).
 - **A7** `adaptive_retry` dead code deleted from `error.rs`, `bot/types.rs`, `bot/queue.rs`; `retry_after`-only backoff retained with a grammY-philosophy comment.
 
-PR-E, PR-B, PR-D: pending.
+### PR-E — landed 2026-05-28 (structured AskUserQuestion; all tests green, +10 new)
+
+Reused the approval correlation backbone (`send_and_wait` + targeted client write-back) for questions, so the most fragile path in the project now uses the same proven mechanism.
+
+- **New message types** `QuestionRequest` / `QuestionResponse` (`types.rs`); `send_and_wait` generalized to match any expected response type (the approval caller now passes `ApprovalResponse`).
+- **E1** Hook side: `get_question_hook_output` blocks on a `QuestionRequest` and, on reply, emits `permissionDecision: allow` + `updatedInput { questions, answers }` (answers keyed by question text). The contract-critical builder is the pure, unit-tested `question_hook_output_from_response`. The AskUserQuestion `ToolStart` is suppressed in `build_messages` (it would be a duplicate, late render under the blocking model).
+- Daemon side: `handle_question_request` registers the originating client (`pending_question_clients`, keyed by session_id) and renders via the existing tentative-selection UI (the ADR-012 "Submit All" review is **retained**). `handle_submitall_callback` now builds the answers map (`build_answers_map_content`, unit-tested) and writes a targeted `QuestionResponse` — **no keystrokes**.
+- **E2** The 300ms toggle/Down/Enter dance + the 2s `auto_submit` sleep no longer run on the option path; they survive **only** inside the free-text fallback branch.
+- **E3** Free-text has no structured contract, so a `QuestionResponse` carrying the `__freetext_fallback__` sentinel makes the hook return a bare `allow`; the daemon then drives the answer via the isolated keystroke path (the sole remaining injection path).
+- **E4** `msg_id == 0` render failures are now surfaced in the topic ("N of M question(s) failed to send"), not silently swallowed.
+
+**Design decision flagged for review (deviation from E2's literal wording):** a single AskUserQuestion call can mix option-questions and a free-text answer. Since free-text has no structured path, the whole set falls back to keystrokes when *any* answer is free-text — so the multi-select dance is *relocated into* the isolated fallback branch rather than deleted outright. When no free-text is present (the dominant case), zero keystrokes run. The free-text fallback also reintroduces a TUI-render wait (`QUESTION_TUI_RENDER_WAIT_MS = 1500ms`) that is inherently racy — accepted for free-text only, per E3.
+
+PR-B, PR-D: pending.
 
 ## Links
 

@@ -162,6 +162,10 @@ pub(super) struct DaemonState {
     // the specific socket client that submitted the approval_request, not
     // broadcast to all connected clients.
     pub(super) pending_approval_clients: Arc<RwLock<HashMap<String, String>>>,
+
+    // ADR-014 E1: Map session_id -> client_id of the hook blocked on an
+    // AskUserQuestion, so its QuestionResponse routes back to that exact client.
+    pub(super) pending_question_clients: Arc<RwLock<HashMap<String, String>>>,
 }
 
 /// Bridge Daemon — orchestrates all components.
@@ -208,6 +212,7 @@ impl Daemon {
             config: Arc::new(config),
             running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pending_approval_clients: Arc::new(RwLock::new(HashMap::new())),
+            pending_question_clients: Arc::new(RwLock::new(HashMap::new())),
         });
 
         Ok(Self {
@@ -459,6 +464,9 @@ struct HandlerContext {
     socket_clients: SocketClients,
     /// S-2: Maps approval_id -> client_id for targeted approval response routing.
     pending_approval_clients: Arc<RwLock<HashMap<String, String>>>,
+    /// ADR-014 E1: Maps session_id -> client_id of the hook blocked on an
+    /// AskUserQuestion, so the QuestionResponse routes back to that exact client.
+    pending_question_clients: Arc<RwLock<HashMap<String, String>>>,
 }
 
 impl HandlerContext {
@@ -716,6 +724,14 @@ async fn handle_socket_message(ctx: HandlerContext, msg: BridgeMessage) {
         MessageType::SendImage => {
             if ensure_session_exists(&ctx, &msg).await {
                 socket_handlers::handle_send_image(&ctx, &msg).await;
+            }
+        }
+        // ADR-014 E1: A blocking AskUserQuestion request from the hook. Register the
+        // originating socket client (so the answer routes back to it) and render the
+        // question UI. The hook stays blocked until "Submit All" sends QuestionResponse.
+        MessageType::QuestionRequest => {
+            if ensure_session_exists(&ctx, &msg).await {
+                socket_handlers::handle_question_request(&ctx, &msg).await;
             }
         }
         _ => {

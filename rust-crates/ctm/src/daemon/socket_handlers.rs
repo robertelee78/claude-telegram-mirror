@@ -443,6 +443,11 @@ pub(super) async fn handle_session_end(ctx: &HandlerContext, msg: &BridgeMessage
         // Clean up caches
         ctx.session_tmux.write().await.remove(&msg.session_id);
         ctx.custom_titles.write().await.remove(&msg.session_id);
+        // ADR-014 E1: drop any blocked-question client mapping for this session.
+        ctx.pending_question_clients
+            .write()
+            .await
+            .remove(&msg.session_id);
         cleanup_pending_questions(ctx, &msg.session_id).await;
 
         let sid = msg.session_id.clone();
@@ -567,9 +572,11 @@ pub(super) async fn handle_tool_start(ctx: &HandlerContext, msg: &BridgeMessage)
     let meta = msg.meta();
     let tool_name = meta.tool().unwrap_or("Unknown");
 
-    // Intercept AskUserQuestion tool
+    // ADR-014 E1: AskUserQuestion is no longer rendered from ToolStart — it is
+    // rendered from the blocking QuestionRequest (handle_question_request). The hook
+    // also suppresses the AskUserQuestion ToolStart, so this is a defensive guard:
+    // never render a question from the (late, non-blocking) ToolStart path.
     if tool_name == "AskUserQuestion" {
-        handle_ask_user_question(ctx, msg).await;
         return;
     }
 
@@ -1013,6 +1020,29 @@ pub(super) async fn handle_session_rename(
 
 // ====================================================================== AskUserQuestion (Epic 3)
 
+/// ADR-014 E1: Handle a blocking AskUserQuestion request from the hook.
+///
+/// Records the originating socket client (so `handle_submitall_callback` can route
+/// the answer back to the exact hook that is blocked), then renders the question UI
+/// via the existing `handle_ask_user_question` path. The hook stays blocked on
+/// `send_and_wait` until "Submit All" replies with a `QuestionResponse`.
+pub(super) async fn handle_question_request(ctx: &HandlerContext, msg: &BridgeMessage) {
+    if let Some(client_id) = msg.meta().client_id() {
+        ctx.pending_question_clients
+            .write()
+            .await
+            .insert(msg.session_id.clone(), client_id.to_string());
+    } else {
+        // No client to answer back to — without it the structured reply cannot be
+        // routed. Log loudly; the hook will time out and fall back to its own TUI.
+        tracing::warn!(
+            session_id = %msg.session_id,
+            "ADR-014 E1: QuestionRequest missing _client_id — answer cannot be routed back"
+        );
+    }
+    handle_ask_user_question(ctx, msg).await;
+}
+
 pub(super) async fn handle_ask_user_question(ctx: &HandlerContext, msg: &BridgeMessage) {
     let thread_id = ctx.wait_for_topic(&msg.session_id).await;
     if thread_id.is_none() && ctx.config.use_threads {
@@ -1177,6 +1207,30 @@ pub(super) async fn handle_ask_user_question(ctx: &HandlerContext, msg: &BridgeM
                 question_message_ids.push(0);
             }
         }
+    }
+
+    // ADR-014 E4: Surface render failures instead of silently swallowing them.
+    // A `0` sentinel means a question message failed to send — the user would
+    // otherwise see a partial/empty prompt and Claude would block with no visible
+    // way to answer. Notify in the topic so the failure is visible.
+    let failed_renders = question_message_ids.iter().filter(|&&m| m == 0).count();
+    if failed_renders > 0 {
+        tracing::warn!(
+            session_id = %msg.session_id,
+            failed_renders,
+            total = question_message_ids.len(),
+            "ADR-014 E4: {failed_renders} AskUserQuestion message(s) failed to render"
+        );
+        ctx.bot
+            .send_message(
+                &format!(
+                    "\u{26A0}\u{FE0F} {failed_renders} of {} question(s) failed to send. Please answer at the terminal.",
+                    question_message_ids.len()
+                ),
+                None,
+                thread_id,
+            )
+            .await;
     }
 
     // Store captured message_ids back into the pending question.

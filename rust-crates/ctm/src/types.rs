@@ -147,6 +147,12 @@ pub struct SessionEndEvent {
     pub reason: Option<String>,
 }
 
+/// ADR-014 E3: Sentinel `QuestionResponse` content meaning "a free-text answer was
+/// given; there is no structured `updatedInput` path for it." The hook responds
+/// with a bare `allow` and the daemon drives the answer via the isolated keystroke
+/// path. Shared between the hook and the daemon so both agree on the contract.
+pub const FREETEXT_FALLBACK_SENTINEL: &str = "__freetext_fallback__";
+
 /// Message types sent to the bridge daemon via Unix socket (NDJSON)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -165,6 +171,16 @@ pub enum MessageType {
     PreCompact,
     SessionRename,
     SendImage,
+    /// ADR-014 E1: A blocking AskUserQuestion request sent by the hook. Carries the
+    /// `questions` payload; the daemon renders the Telegram question UI and replies
+    /// with a `QuestionResponse` once the user taps "Submit All" — mirroring the
+    /// ApprovalRequest/ApprovalResponse correlation, no keystroke injection.
+    QuestionRequest,
+    /// ADR-014 E1: The daemon's reply to a `QuestionRequest`. Its `content` is a
+    /// JSON answers map (question text → label, multi-select labels comma-joined),
+    /// or the sentinel `__freetext_fallback__` when a free-text answer forces the
+    /// isolated keystroke path (E3).
+    QuestionResponse,
     /// Forward-compatible catch-all for unknown message types.
     #[serde(other)]
     Unknown,
@@ -187,6 +203,8 @@ impl std::fmt::Display for MessageType {
             Self::PreCompact => write!(f, "pre_compact"),
             Self::SessionRename => write!(f, "session_rename"),
             Self::SendImage => write!(f, "send_image"),
+            Self::QuestionRequest => write!(f, "question_request"),
+            Self::QuestionResponse => write!(f, "question_response"),
             Self::Unknown => write!(f, "unknown"),
         }
     }

@@ -2,16 +2,28 @@
 
 use super::*;
 
+/// ADR-014 E3: How long to wait after releasing a blocked AskUserQuestion hook
+/// (bare `allow`) before injecting free-text keystrokes, to let Claude render its
+/// interactive TUI. Inherently racy; used only on the free-text fallback path.
+const QUESTION_TUI_RENDER_WAIT_MS: u64 = 1500;
+
 /// Collected answer for tmux injection, preserving type information
 /// so multi-select can be injected as key sequences instead of text.
 enum CollectedAnswer {
-    /// Single-select or free-text: inject as literal text + Enter.
-    Text(String),
-    /// Multi-select: inject as Space/Down key sequences for the checkbox TUI.
+    /// Single-select: the chosen option's label. Structured delivery (ADR-014 E1)
+    /// uses the label directly; the keystroke fallback injects it as literal text.
+    Option(String),
+    /// Multi-select: the chosen option labels (for the structured answers map,
+    /// comma-joined) plus the indices/total needed by the keystroke fallback.
     MultiSelect {
+        labels: Vec<String>,
         selected_indices: Vec<usize>,
         total_options: usize,
     },
+    /// Free-text typed by the user. ADR-014 E3: there is no structured path for
+    /// free-text, so its presence forces the whole answer set onto the isolated
+    /// keystroke path.
+    FreeText(String),
 }
 
 /// Handle callback queries (button presses).
@@ -1036,6 +1048,69 @@ pub(super) async fn send_or_update_summary(
 /// ADR-012 Phase 6: Locks all tentative answers, injects them into tmux in
 /// question order, edits each question message and the summary to show
 /// "Submitted", then auto-submits the Claude Code review screen.
+/// ADR-014 E1: Build the JSON answers-map content for a structured QuestionResponse.
+/// Keyed by question text; single-select uses the chosen label, multi-select uses
+/// comma-joined labels (the spike-confirmed contract). Free-text entries are skipped
+/// (they force the keystroke fallback, so this is only ever called with none present).
+fn build_answers_map_content(answers: &[(usize, String, CollectedAnswer)]) -> String {
+    let mut map = serde_json::Map::new();
+    for (_, qtext, ans) in answers {
+        let val = match ans {
+            CollectedAnswer::Option(label) => label.clone(),
+            CollectedAnswer::MultiSelect { labels, .. } => labels.join(", "),
+            CollectedAnswer::FreeText(_) => continue,
+        };
+        map.insert(qtext.clone(), serde_json::Value::String(val));
+    }
+    serde_json::Value::Object(map).to_string()
+}
+
+/// ADR-014 E1: Write a `QuestionResponse` back to the specific socket client whose
+/// hook is blocked on this session's AskUserQuestion. Mirrors the targeted approval
+/// response routing (S-2) — never broadcast, so one session's answer cannot be
+/// delivered to another session's hook. `content` is the JSON answers map or the
+/// free-text fallback sentinel.
+async fn send_question_response(
+    ctx: &HandlerContext,
+    session_id: &str,
+    content: &str,
+    client_id: &str,
+) {
+    let response = BridgeMessage {
+        msg_type: MessageType::QuestionResponse,
+        session_id: session_id.to_string(),
+        timestamp: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        content: content.to_string(),
+        metadata: None,
+    };
+    let json = match serde_json::to_string(&response) {
+        Ok(j) => j,
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to serialise question_response");
+            return;
+        }
+    };
+    let line = format!("{json}\n");
+    let guard = ctx.socket_clients.lock().await;
+    if let Some(writer) = guard.get(client_id) {
+        let mut w = writer.lock().await;
+        if let Err(e) = w.write_all(line.as_bytes()).await {
+            tracing::warn!(session_id, error = %e, "Failed to write question_response to client");
+        } else {
+            tracing::info!(
+                session_id,
+                "ADR-014 E1: question_response sent to originating client"
+            );
+        }
+    } else {
+        tracing::warn!(
+            session_id,
+            client_id,
+            "ADR-014 E1: originating client gone — hook will time out and show its TUI"
+        );
+    }
+}
+
 async fn handle_submitall_callback(ctx: &HandlerContext, data: &str, cb: &CallbackQuery) {
     // Defense-in-depth: verify chat ownership (ADR-006 M4.5)
     if cb.message.as_ref().map(|m| m.chat.id) != Some(ctx.config.chat_id) {
@@ -1095,41 +1170,48 @@ async fn handle_submitall_callback(ctx: &HandlerContext, data: &str, cb: &Callba
             return;
         }
 
-        // Collect all answers in question order, preserving type info
-        // so multi-select can be injected as key sequences.
-        let mut answers: Vec<(usize, CollectedAnswer)> = Vec::new();
-        for (q_idx, _q) in pending.questions.iter().enumerate() {
+        // Collect all answers in question order, preserving type info so the
+        // structured path (ADR-014 E1) can build the answers map by question text
+        // and the keystroke fallback can still inject key sequences.
+        let mut answers: Vec<(usize, String, CollectedAnswer)> = Vec::new();
+        for (q_idx, q) in pending.questions.iter().enumerate() {
+            let question_text = q.question.clone();
             let answer = match pending.tentative.get(&q_idx) {
                 Some(TentativeAnswer::Option(o_idx)) => {
-                    let label = pending
-                        .questions
-                        .get(q_idx)
-                        .and_then(|q| q.options.get(*o_idx))
+                    let label = q
+                        .options
+                        .get(*o_idx)
                         .map(|o| o.label.clone())
                         .unwrap_or_else(|| format!("{}", o_idx + 1));
-                    CollectedAnswer::Text(label)
+                    CollectedAnswer::Option(label)
                 }
                 Some(TentativeAnswer::MultiOption(set)) => {
-                    let total_options = pending
-                        .questions
-                        .get(q_idx)
-                        .map(|q| q.options.len())
-                        .unwrap_or(0);
+                    let total_options = q.options.len();
                     let mut sorted: Vec<usize> = set.iter().copied().collect();
                     sorted.sort();
+                    let labels: Vec<String> = sorted
+                        .iter()
+                        .map(|&i| {
+                            q.options
+                                .get(i)
+                                .map(|o| o.label.clone())
+                                .unwrap_or_else(|| format!("{}", i + 1))
+                        })
+                        .collect();
                     CollectedAnswer::MultiSelect {
+                        labels,
                         selected_indices: sorted,
                         total_options,
                     }
                 }
-                Some(TentativeAnswer::FreeText(s)) => CollectedAnswer::Text(s.clone()),
+                Some(TentativeAnswer::FreeText(s)) => CollectedAnswer::FreeText(s.clone()),
                 None => continue,
             };
-            answers.push((q_idx, answer));
+            answers.push((q_idx, question_text, answer));
         }
 
         // Mark all as finalized.
-        for &(q_idx, _) in &answers {
+        for &(q_idx, _, _) in &answers {
             if let Some(f) = pending.finalized.get_mut(q_idx) {
                 *f = true;
             }
@@ -1150,90 +1232,147 @@ async fn handle_submitall_callback(ctx: &HandlerContext, data: &str, cb: &Callba
         pq.remove(&full_key);
     }
 
-    let _ = ctx
-        .bot
-        .answer_callback_query(&cb.id, Some("Submitting..."), false)
-        .await;
-
     let chat_id = ctx.config.chat_id;
-
-    // Inject each answer into tmux.
-    // ADR-013 D1/D2: Warn when tmux is unavailable. Every failed attempt gets a warning.
-    let tmux_target = ctx.session_tmux.read().await.get(&session_id).cloned();
     let thread_id = cb.message.as_ref().and_then(|m| m.message_thread_id);
-    if let Some(target) = tmux_target {
-        let sid = session_id.clone();
-        let socket = ctx
-            .db_op(move |sess| {
-                sess.get_session(&sid)
-                    .ok()
-                    .flatten()
-                    .and_then(|s| s.tmux_socket)
-            })
+
+    // ADR-014 E1/E2/E3: Decide structured delivery vs the isolated keystroke
+    // fallback. A blocked hook is identified by an entry in pending_question_clients
+    // (keyed by session_id). Structured delivery applies only when EVERY answer is
+    // option-based — free-text has no structured contract (E3), so its presence
+    // forces the whole set onto keystrokes.
+    let has_free_text = answers
+        .iter()
+        .any(|(_, _, a)| matches!(a, CollectedAnswer::FreeText(_)));
+    let originating_client = ctx
+        .pending_question_clients
+        .write()
+        .await
+        .remove(&session_id);
+
+    // Structured delivery only when there is no free-text AND a hook is blocked.
+    let structured_client = if has_free_text {
+        None
+    } else {
+        originating_client.clone()
+    };
+
+    if let Some(client) = structured_client {
+        // ---- Structured path (E1/E2): NO keystrokes, NO TUI. ----
+        // Build the answers map: question text -> selected label (single) or
+        // comma-joined labels (multi-select), per the spike-confirmed contract.
+        let content = build_answers_map_content(&answers);
+        send_question_response(ctx, &session_id, &content, &client).await;
+        let _ = ctx
+            .bot
+            .answer_callback_query(&cb.id, Some("Submitted \u{2705}"), false)
+            .await;
+        tracing::info!(
+            session_id = %session_id,
+            "ADR-014 E1: AskUserQuestion answered structurally via updatedInput (no keystrokes)"
+        );
+    } else {
+        // ---- Isolated keystroke fallback (E3): free-text, or no blocking hook. ----
+        // This is the SOLE remaining keystroke-injection path in the project.
+        let _ = ctx
+            .bot
+            .answer_callback_query(&cb.id, Some("Submitting..."), false)
             .await;
 
-        let mut inj = ctx.injector.lock().await;
-        inj.set_target(&target, socket.as_deref());
-        for (_, answer) in &answers {
-            match answer {
-                CollectedAnswer::Text(text) => {
-                    let _ = inj.inject(text);
-                }
-                CollectedAnswer::MultiSelect {
-                    selected_indices,
-                    total_options,
-                } => {
-                    // Claude Code's multi-select is a custom Ink (React CLI)
-                    // checkbox TUI. Key bindings (from cli.js source):
-                    //   Number keys (1-9) = toggle option by 1-based index
-                    //   Down/Tab = move cursor; past last option focuses Submit
-                    //   Enter/Space on option = toggle (NOT submit)
-                    //   Enter on Submit button = submit selections
-                    //
-                    // Strategy: use number keys to toggle desired options (no
-                    // cursor movement needed), then Down past all options +
-                    // "Other" to focus the Submit button, then Enter.
-                    let key_delay = tokio::time::Duration::from_millis(300);
-
-                    // Step 1: Toggle desired options by 1-based index.
-                    for &idx in selected_indices {
-                        let digit = format!("{}", idx + 1);
-                        let _ = inj.send_key(&digit);
-                        tokio::time::sleep(key_delay).await;
-                    }
-
-                    // Step 2: Navigate to Submit button. The TUI has
-                    // total_options items + "Other" (type-in) = total_options+1
-                    // items. Down from any position past the last item focuses
-                    // Submit. Send enough Downs to guarantee we reach it.
-                    let downs_needed = total_options + 2; // options + Other + 1
-                    for _ in 0..downs_needed {
-                        let _ = inj.send_key("Down");
-                        tokio::time::sleep(key_delay).await;
-                    }
-
-                    // Step 3: Press Enter on the focused Submit button.
-                    let _ = inj.send_key("Enter");
-                }
-            }
-        }
-    } else {
-        // ADR-013 D1/D2: tmux not available — warn the user in the topic.
-        tracing::warn!(
-            session_id = %session_id,
-            "ADR-013 D1: tmux not detected during submitall, answers cannot be injected"
-        );
-        ctx.bot
-            .send_message(
-                "\u{26A0}\u{FE0F} Answers could not be submitted \u{2014} tmux not detected. Please answer at the terminal.",
-                None,
-                thread_id,
+        // If a hook is blocked, release it with a bare `allow` (no updatedInput) so
+        // Claude renders its interactive TUI for us to drive. Then wait briefly for
+        // the TUI to appear. This render wait is inherently racy and is accepted for
+        // the free-text case ONLY (ADR-014 E3).
+        if let Some(client_id) = &originating_client {
+            send_question_response(
+                ctx,
+                &session_id,
+                crate::types::FREETEXT_FALLBACK_SENTINEL,
+                client_id,
             )
             .await;
+            tracing::info!(
+                session_id = %session_id,
+                "ADR-014 E3: free-text answer — falling back to isolated keystroke path"
+            );
+            tokio::time::sleep(tokio::time::Duration::from_millis(
+                QUESTION_TUI_RENDER_WAIT_MS,
+            ))
+            .await;
+        }
+
+        // ADR-013 D1/D2: Warn when tmux is unavailable.
+        let tmux_target = ctx.session_tmux.read().await.get(&session_id).cloned();
+        if let Some(target) = tmux_target {
+            let sid = session_id.clone();
+            let socket = ctx
+                .db_op(move |sess| {
+                    sess.get_session(&sid)
+                        .ok()
+                        .flatten()
+                        .and_then(|s| s.tmux_socket)
+                })
+                .await;
+
+            let mut inj = ctx.injector.lock().await;
+            inj.set_target(&target, socket.as_deref());
+            for (_, _, answer) in &answers {
+                match answer {
+                    // Single-option label or free-text: inject as literal text.
+                    CollectedAnswer::Option(text) | CollectedAnswer::FreeText(text) => {
+                        let _ = inj.inject(text);
+                    }
+                    CollectedAnswer::MultiSelect {
+                        selected_indices,
+                        total_options,
+                        ..
+                    } => {
+                        // Claude Code's multi-select is a custom Ink (React CLI)
+                        // checkbox TUI. Key bindings (from cli.js source):
+                        //   Number keys (1-9) = toggle option by 1-based index
+                        //   Down/Tab = move cursor; past last option focuses Submit
+                        //   Enter on Submit button = submit selections
+                        let key_delay = tokio::time::Duration::from_millis(300);
+
+                        // Step 1: Toggle desired options by 1-based index.
+                        for &idx in selected_indices {
+                            let digit = format!("{}", idx + 1);
+                            let _ = inj.send_key(&digit);
+                            tokio::time::sleep(key_delay).await;
+                        }
+
+                        // Step 2: Navigate past options + "Other" to focus Submit.
+                        let downs_needed = total_options + 2; // options + Other + 1
+                        for _ in 0..downs_needed {
+                            let _ = inj.send_key("Down");
+                            tokio::time::sleep(key_delay).await;
+                        }
+
+                        // Step 3: Press Enter on the focused Submit button.
+                        let _ = inj.send_key("Enter");
+                    }
+                }
+            }
+            drop(inj);
+
+            // Auto-submit the Claude Code review screen (fallback path only).
+            auto_submit_answers(ctx, &session_id).await;
+        } else {
+            tracing::warn!(
+                session_id = %session_id,
+                "ADR-013 D1: tmux not detected during submitall, answers cannot be injected"
+            );
+            ctx.bot
+                .send_message(
+                    "\u{26A0}\u{FE0F} Answers could not be submitted \u{2014} tmux not detected. Please answer at the terminal.",
+                    None,
+                    thread_id,
+                )
+                .await;
+        }
     }
 
-    // Edit each question message to show "Submitted" and strip keyboard.
-    for (q_idx, _) in &answers {
+    // Edit each question message to show "Submitted" and strip keyboard (both paths).
+    for (q_idx, _, _) in &answers {
         let mid = question_message_ids.get(*q_idx).copied().unwrap_or(0);
         if mid != 0 {
             let _ = ctx
@@ -1250,9 +1389,6 @@ async fn handle_submitall_callback(ctx: &HandlerContext, data: &str, cb: &Callba
             .edit_message(chat_id, mid, "\u{2705} All answers submitted", None)
             .await;
     }
-
-    // Auto-submit Claude Code review screen.
-    auto_submit_answers(ctx, &session_id).await;
 }
 
 /// Handle "Change QN" callback.
@@ -1449,5 +1585,64 @@ pub(super) async fn auto_submit_answers(ctx: &HandlerContext, session_id: &str) 
         // in the input buffer after the review screen dismisses.
         let _ = inj.send_key("Enter");
         tracing::info!(session_id, "Auto-submitted AskUserQuestion review screen");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ADR-014 E1: single-select answers map to their chosen label, keyed by
+    /// question text, as exact JSON.
+    #[test]
+    fn answers_map_single_select() {
+        let answers = vec![(
+            0usize,
+            "Pick a color".to_string(),
+            CollectedAnswer::Option("Red".to_string()),
+        )];
+        let content = build_answers_map_content(&answers);
+        let v: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(v["Pick a color"], "Red");
+        assert_eq!(v.as_object().unwrap().len(), 1);
+    }
+
+    /// ADR-014 E1: multi-select labels are comma-joined into one string value.
+    #[test]
+    fn answers_map_multi_select_comma_joined() {
+        let answers = vec![(
+            0usize,
+            "Pick langs".to_string(),
+            CollectedAnswer::MultiSelect {
+                labels: vec!["Rust".to_string(), "Go".to_string()],
+                selected_indices: vec![0, 1],
+                total_options: 3,
+            },
+        )];
+        let content = build_answers_map_content(&answers);
+        let v: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(v["Pick langs"], "Rust, Go");
+    }
+
+    /// ADR-014 E3: free-text entries are excluded from the structured map (their
+    /// presence forces the keystroke fallback, so they are never delivered here).
+    #[test]
+    fn answers_map_skips_free_text() {
+        let answers = vec![
+            (
+                0usize,
+                "Q1".to_string(),
+                CollectedAnswer::Option("A".to_string()),
+            ),
+            (
+                1usize,
+                "Q2".to_string(),
+                CollectedAnswer::FreeText("typed".to_string()),
+            ),
+        ];
+        let content = build_answers_map_content(&answers);
+        let v: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(v["Q1"], "A");
+        assert!(v.get("Q2").is_none());
     }
 }
