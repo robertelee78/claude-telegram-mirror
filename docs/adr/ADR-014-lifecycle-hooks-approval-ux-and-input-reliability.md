@@ -1,6 +1,6 @@
 # ADR-014: Lifecycle Hooks, Approval UX, and Human-Input Reliability
 
-**Status:** accepted, in progress — scope finalized via deep-research, a verification spike, and a per-work-item product interview (2026-05-28). **PR-A landed 2026-05-28** (see Implementation log).
+**Status:** accepted — scope finalized via deep-research, a verification spike, and a per-work-item product interview (2026-05-28). **All PRs (A, E, B, D) landed 2026-05-28** on `feat/adr-014-lifecycle-approvals` (see Implementation log). PR-C was removed per the interview.
 **Date:** 2026-05-28
 **Authors:** Robert, Claude
 **Tags:** hooks, session-lifecycle, approvals, askuserquestion, telegram-ux, onboarding, channels
@@ -198,7 +198,15 @@ Reused the approval correlation backbone (`send_and_wait` + targeted client writ
 - **B4** `pending_approval_clients` is now evicted: precisely at session end (the session's pending approval IDs are removed from the map) and via a **cleanup-cycle sweep** that retains only still-pending IDs (`SessionManager::pending_approval_ids`). The sweep also reaps disconnect-orphaned entries, so the deliberately approval-agnostic socket layer stays unchanged. Test: `pending_approval_ids_tracks_status`.
 - **B5** A callback for an unknown/expired approval ID no longer silently returns: it answers with a `show_alert` ("This request expired or was already handled.") and edits the message to mark it stale — never crashes, blocks, or mis-routes. Test: `get_approval_unknown_id_is_none`.
 
-PR-D: pending.
+### PR-D — landed 2026-05-28 (trust acknowledgment; all tests green, +1 new)
+
+- **D1** The setup wizard (`setup.rs`) now requires an active `y/N` trust acknowledgment **before any config is written**, and aborts (writing nothing) on `N`. Scope is **new setups only**: `is_new_setup` is false when an existing token or chat ID is found, so configured users are not re-prompted on upgrade/reconfigure, and `ctm doctor` is untouched. Acceptance is recorded as `trustAcknowledged: true` in `config.json`. The notice is a single shared `TRUST_NOTICE` const (the exact ADR wording), mirrored in the README's new "Trust Model" section. Terminology: future trusted-user lists are a **whitelist** / **blacklist**. Test: `trust_notice_states_the_model` guards the load-bearing wording.
+
+(D1 is otherwise an interactive `dialoguer` flow; the prompt/abort path is verified manually, the wording and new-setup gating are the unit-tested invariants.)
+
+### Summary
+
+All four PRs landed on `feat/adr-014-lifecycle-approvals`. Test count 392 → 413 (+21 across PRs). `cargo fmt` clean; `cargo clippy` clean except two pre-existing warnings unrelated to this work (`queue.rs:526` manual-range in a test, `service/env.rs:125` empty `writeln!`). Next: validation/benchmark/optimize pass and the /cfa + codex adversarial review.
 
 ## Links
 

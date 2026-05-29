@@ -12,6 +12,17 @@ use dialoguer::{Confirm, Input, Select};
 use crate::colors::{bold, cyan, gray, green, red, yellow};
 use crate::config;
 
+/// ADR-014 D1: The trust-model notice shown (and recorded as accepted) during a
+/// new setup. The chat-level model is intentional — anyone with channel access can
+/// drive the shell and approve tool calls, so the channel must be treated like a
+/// shared shell. Mirrored in the README. Per project terminology, any future
+/// trusted-user list is a whitelist (and its inverse a blacklist).
+pub const TRUST_NOTICE: &str =
+    "Anyone you add to this Telegram channel can drive your shell and approve \
+tool calls. Treat the channel like a shared shell: only add people you would \
+already trust with git-commit access. Semi-trusted or public channels are not \
+supported.";
+
 fn separator() {
     println!("{}", gray(&"-".repeat(60)));
 }
@@ -267,6 +278,11 @@ pub async fn run_setup() -> anyhow::Result<()> {
     if existing_token.is_some() || existing_chat_id.is_some() {
         println!();
     }
+
+    // ADR-014 D1: a fresh setup is one with no existing token AND no existing chat
+    // ID. The trust acknowledgment is required for new setups only — existing users
+    // are not re-prompted on upgrade/reconfigure.
+    let is_new_setup = existing_token.is_none() && existing_chat_id.is_none();
 
     let client = reqwest::Client::new();
 
@@ -631,6 +647,37 @@ pub async fn run_setup() -> anyhow::Result<()> {
     separator();
     println!();
 
+    // ADR-014 D1: Require an explicit, recorded trust acknowledgment BEFORE any
+    // config is written — and only for new setups (do not re-prompt configured
+    // users on upgrade). The chat-level trust model is intentional (see ADR-014
+    // "Neutral consequences"): anyone with channel access already has, in effect,
+    // git-commit access. We make that an active operator decision, not a buried note.
+    let trust_acknowledged = if is_new_setup {
+        println!();
+        println!("{}", yellow("TRUST MODEL — PLEASE READ"));
+        separator();
+        println!();
+        print_box(TRUST_NOTICE);
+        println!();
+        let accepted = Confirm::new()
+            .with_prompt("Do you understand and accept this?")
+            .default(false)
+            .interact()?;
+        if !accepted {
+            println!();
+            println!(
+                "{} Setup aborted — trust model not accepted. No configuration was written.",
+                yellow("!")
+            );
+            return Ok(());
+        }
+        true
+    } else {
+        // Existing setup: the operator already accepted (or predates the prompt).
+        // Do not re-prompt; preserve acceptance.
+        true
+    };
+
     let cdir = config_dir();
     config::ensure_config_dir(&cdir)?;
     println!("{} Created/verified config directory", green("OK"));
@@ -644,6 +691,8 @@ pub async fn run_setup() -> anyhow::Result<()> {
         "useThreads": use_threads,
         "verbose": true,
         "approvals": true,
+        // ADR-014 D1: record the recorded trust acknowledgment.
+        "trustAcknowledged": trust_acknowledged,
     });
 
     let config_path = config_file();
@@ -898,6 +947,22 @@ pub async fn run_setup() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ADR-014 D1: the recorded trust notice must keep its load-bearing wording —
+    /// the git-commit-access framing and the "not supported" stance for
+    /// semi-trusted/public channels. Guards against accidental softening.
+    #[test]
+    fn trust_notice_states_the_model() {
+        assert!(
+            TRUST_NOTICE.contains("git-commit access"),
+            "trust notice must frame access as git-commit-equivalent"
+        );
+        assert!(
+            TRUST_NOTICE.to_lowercase().contains("not supported"),
+            "trust notice must state semi-trusted/public channels are not supported"
+        );
+        assert!(TRUST_NOTICE.contains("drive your shell"));
+    }
 
     #[test]
     fn test_load_existing_config_empty() {
