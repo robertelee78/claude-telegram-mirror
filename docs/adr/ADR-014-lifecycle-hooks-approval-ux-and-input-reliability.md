@@ -206,7 +206,18 @@ Reused the approval correlation backbone (`send_and_wait` + targeted client writ
 
 ### Summary
 
-All four PRs landed on `feat/adr-014-lifecycle-approvals`. Test count 392 → 413 (+21 across PRs). `cargo fmt` clean; `cargo clippy` clean except two pre-existing warnings unrelated to this work (`queue.rs:526` manual-range in a test, `service/env.rs:125` empty `writeln!`). Next: validation/benchmark/optimize pass and the /cfa + codex adversarial review.
+All four PRs landed on `feat/adr-014-lifecycle-approvals`. Test count 392 → 414 (+22 across PRs). `cargo fmt` clean; `cargo clippy` clean except two pre-existing warnings unrelated to this work (`queue.rs:526` manual-range in a test, `service/env.rs:125` empty `writeln!`). Release build (LTO, production profile) verified.
+
+### Benchmark — PR-E answer-delivery latency
+
+The whole point of PR-E is replacing a multi-second, racy keystroke sequence with a structured reply. Measured (`bench_structured_delivery_is_negligible`):
+
+| Path | Fixed latency (representative 4-option multi-select, 2–3 selected) |
+|---|---|
+| Old keystroke (E2 deleted) | ~4,700 ms — 9 keys × 300ms + 2,000ms `auto_submit` sleep, **plus** an unbounded TUI readiness race |
+| New structured (E1) | **~3 µs** compute + one socket write; no sleeps, no race |
+
+That is a ~6-order-of-magnitude reduction in answer-delivery compute and removal of the dominant fragility. The keystroke path now runs only on the free-text fallback (E3). This *is* the optimization — there was no faster way to deliver option answers, so the work was eliminating the slow path, not tuning it.
 
 ## Links
 

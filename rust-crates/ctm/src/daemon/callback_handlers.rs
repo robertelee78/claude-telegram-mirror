@@ -1684,4 +1684,62 @@ mod tests {
         assert_eq!(v["Q1"], "A");
         assert!(v.get("Q2").is_none());
     }
+
+    /// ADR-014 PR-E benchmark: the structured answer-delivery compute path
+    /// (`build_answers_map_content`) must be a negligible latency source compared
+    /// to the keystroke path it replaces. The keystroke path's fixed cost for a
+    /// representative 4-option multi-select selecting 2 options is, from the code
+    /// constants (300ms/key + 2000ms auto_submit):
+    ///   2 digit keys + (4 options + 2) Down keys + 1 Enter = 9 keys × 300ms
+    ///   = 2700ms, plus the 2000ms auto_submit sleep = ~4700ms.
+    /// The structured path below builds the entire answers map in microseconds and
+    /// then performs a single socket write — eliminating that multi-second fixed
+    /// latency AND the TUI readiness race. This test measures the compute cost and
+    /// asserts it is comfortably sub-millisecond per call.
+    #[test]
+    fn bench_structured_delivery_is_negligible() {
+        let answers = vec![
+            (
+                0usize,
+                "Which language?".to_string(),
+                CollectedAnswer::Option("Rust".to_string()),
+            ),
+            (
+                1usize,
+                "Which features?".to_string(),
+                CollectedAnswer::MultiSelect {
+                    labels: vec!["a".to_string(), "b".to_string(), "c".to_string()],
+                    selected_indices: vec![0, 1, 2],
+                    total_options: 5,
+                },
+            ),
+        ];
+
+        let iters = 10_000u32;
+        let start = std::time::Instant::now();
+        let mut sink = 0usize;
+        for _ in 0..iters {
+            let c = build_answers_map_content(&answers);
+            sink = sink.wrapping_add(c.len());
+        }
+        let elapsed = start.elapsed();
+        let per_call_ns = elapsed.as_nanos() / iters as u128;
+        assert!(sink > 0);
+
+        // Keystroke path fixed cost for the comparable multi-select (see doc above).
+        let keystroke_ms = 9 * 300 + 2000; // 4700ms
+        eprintln!(
+            "ADR-014 PR-E bench: structured build = {per_call_ns} ns/call ({} calls in {:?}); \
+             keystroke path it replaces ~= {keystroke_ms} ms fixed latency",
+            iters, elapsed
+        );
+
+        // Generous bound to stay non-flaky across machines/CI: the structured
+        // compute must be < 1ms/call (it is typically a few µs). The point is that
+        // it is orders of magnitude below the multi-second keystroke path.
+        assert!(
+            per_call_ns < 1_000_000,
+            "structured delivery compute regressed to {per_call_ns} ns/call (> 1ms)"
+        );
+    }
 }
