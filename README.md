@@ -53,6 +53,17 @@ tmux new -s claude
 claude
 ```
 
+## Trust Model (read before adding anyone)
+
+**Anyone you add to this Telegram channel can drive your shell and approve tool
+calls.** Treat the channel like a shared shell: only add people you would already
+trust with git-commit access. Semi-trusted or public channels are **not
+supported** — authorization is intentionally chat-level, not per-user. The setup
+wizard requires you to acknowledge this before writing any configuration.
+
+If a trusted-user list is ever added, it will be a **whitelist** (and its inverse
+a **blacklist**).
+
 ## CLI Commands
 
 ```bash

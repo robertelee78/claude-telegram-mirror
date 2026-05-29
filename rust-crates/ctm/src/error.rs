@@ -43,9 +43,6 @@ pub enum AppError {
     RateLimited {
         /// Seconds to wait before any API call, as reported by Telegram.
         retry_after_secs: u64,
-        /// Millisecond-precision adaptive retry signal (Bot API 8.0+, Nov 2025).
-        /// Use this when available — it is more granular than `retry_after_secs`.
-        adaptive_retry_ms: Option<u64>,
     },
 }
 

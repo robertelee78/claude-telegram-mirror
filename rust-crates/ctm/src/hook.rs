@@ -2,7 +2,10 @@ use crate::config;
 use crate::error::{AppError, Result};
 use crate::formatting;
 use crate::injector::{self, InputInjector};
-use crate::types::{self, BridgeMessage, HookEvent, MessageType, MAX_LINE_BYTES, SAFE_COMMANDS};
+use crate::types::{
+    self, BridgeMessage, HookEvent, MessageType, FREETEXT_FALLBACK_SENTINEL, MAX_LINE_BYTES,
+    SAFE_COMMANDS,
+};
 use std::io::Read;
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -297,22 +300,29 @@ async fn build_messages(
 
     match event {
         HookEvent::PreToolUse(e) => {
-            // Send tool_start (fire-and-forget preview)
-            let mut tool_meta = meta.clone();
-            tool_meta.insert(
-                "tool".into(),
-                serde_json::Value::String(e.tool_name.clone()),
-            );
-            tool_meta.insert("input".into(), e.tool_input.clone());
-            if let Some(id) = &e.tool_use_id {
-                tool_meta.insert("toolUseId".into(), serde_json::Value::String(id.clone()));
+            // ADR-014 E1: AskUserQuestion is rendered from the blocking QuestionRequest
+            // (sent in get_hook_output), not from this ToolStart. Crucially, ToolStart
+            // is sent AFTER get_hook_output returns (process_hook ordering), i.e. after
+            // the question is already answered — so a ToolStart-driven render would be
+            // both duplicate and too late. Suppress it.
+            if e.tool_name != "AskUserQuestion" {
+                // Send tool_start (fire-and-forget preview)
+                let mut tool_meta = meta.clone();
+                tool_meta.insert(
+                    "tool".into(),
+                    serde_json::Value::String(e.tool_name.clone()),
+                );
+                tool_meta.insert("input".into(), e.tool_input.clone());
+                if let Some(id) = &e.tool_use_id {
+                    tool_meta.insert("toolUseId".into(), serde_json::Value::String(id.clone()));
+                }
+                messages.push(make_message(
+                    MessageType::ToolStart,
+                    session_id,
+                    &e.tool_name,
+                    tool_meta,
+                ));
             }
-            messages.push(make_message(
-                MessageType::ToolStart,
-                session_id,
-                &e.tool_name,
-                tool_meta,
-            ));
         }
         HookEvent::PostToolUse(e) => {
             // H2: fall back to tool_error when tool_output is absent
@@ -517,6 +527,12 @@ async fn get_hook_output(
         return None;
     }
 
+    // ADR-014 E1: AskUserQuestion is delivered structurally (no keystrokes) via a
+    // blocking QuestionRequest + updatedInput, NOT through the approval path.
+    if pre_tool.tool_name == "AskUserQuestion" {
+        return get_question_hook_output(pre_tool, session_id, cfg).await;
+    }
+
     // Check if tool requires approval
     if !tool_requires_approval(&pre_tool.tool_name, &pre_tool.tool_input) {
         return None;
@@ -563,7 +579,14 @@ async fn get_hook_output(
     // If the socket file exists but connect fails immediately we treat it the
     // same way — the daemon is not available so we return None and let Claude
     // continue normally rather than blocking on a phantom approval request.
-    match send_and_wait(&cfg.socket_path, &msg, Duration::from_secs(300)).await {
+    match send_and_wait(
+        &cfg.socket_path,
+        &msg,
+        Duration::from_secs(300),
+        MessageType::ApprovalResponse,
+    )
+    .await
+    {
         Ok(response) => {
             let action = response.content.as_str();
             let (decision, reason) = match action {
@@ -603,6 +626,124 @@ async fn get_hook_output(
             )
         }
     }
+}
+
+/// ADR-014 E1/E2/E3: Structured AskUserQuestion answer delivery.
+///
+/// Blocks on the daemon (the same `send_and_wait` correlation the approval flow
+/// uses) by sending a `QuestionRequest` carrying the original `questions`. The
+/// daemon renders the tentative-selection Telegram UI and, when the user taps
+/// "Submit All", replies with a `QuestionResponse` whose `content` is either:
+///   - a JSON answers map (question text → label; multi-select comma-joined) →
+///     we return `permissionDecision: allow` + `updatedInput { questions, answers }`
+///     so Claude proceeds with NO TUI and NO keystrokes (E1/E2), or
+///   - the sentinel `__freetext_fallback__` → there is no structured path for a
+///     free-text answer (E3), so we return a bare `allow`; Claude shows its TUI
+///     and the daemon injects the answers via the isolated keystroke path.
+///
+/// On timeout / daemon-not-running we return `None` (Claude shows its own TUI),
+/// mirroring the approval flow's daemon-down behavior.
+async fn get_question_hook_output(
+    pre_tool: &crate::types::PreToolUseEvent,
+    session_id: &str,
+    cfg: &config::Config,
+) -> Option<String> {
+    if !cfg.socket_path.exists() {
+        return None;
+    }
+
+    let tmux_info = InputInjector::detect_tmux_session();
+    let hostname = injector::get_hostname();
+    let mut question_meta = build_metadata(
+        &tmux_info,
+        &hostname,
+        pre_tool.base.transcript_path.as_deref(),
+        pre_tool.base.cwd.as_deref(),
+        pre_tool.base.agent_id.as_deref(),
+        pre_tool.base.agent_type.as_deref(),
+    );
+    // The daemon's render path reads the questions from metadata.input.
+    question_meta.insert(
+        "tool".into(),
+        serde_json::Value::String("AskUserQuestion".into()),
+    );
+    question_meta.insert("input".into(), pre_tool.tool_input.clone());
+    if let Some(hook_id) = &pre_tool.base.hook_id {
+        question_meta.insert("hookId".into(), serde_json::Value::String(hook_id.clone()));
+    }
+
+    let msg = make_message(
+        MessageType::QuestionRequest,
+        session_id,
+        "AskUserQuestion",
+        question_meta,
+    );
+
+    match send_and_wait(
+        &cfg.socket_path,
+        &msg,
+        Duration::from_secs(300),
+        MessageType::QuestionResponse,
+    )
+    .await
+    {
+        Ok(response) => {
+            let questions = pre_tool
+                .tool_input
+                .get("questions")
+                .cloned()
+                .unwrap_or(serde_json::Value::Array(vec![]));
+            question_hook_output_from_response(&response.content, &questions)
+        }
+        Err(AppError::Socket(ref m)) if m.contains("Failed to connect") => {
+            tracing::debug!(
+                "Question socket connect failed (daemon not running), letting Claude continue"
+            );
+            None
+        }
+        Err(_) => {
+            // Timeout — let Claude fall back to its own TUI rather than blocking.
+            tracing::debug!("AskUserQuestion daemon wait timed out, letting Claude show its TUI");
+            None
+        }
+    }
+}
+
+/// ADR-014 E1: Pure, testable core of the AskUserQuestion hook output.
+///
+/// Given the daemon's `QuestionResponse` content and the original `questions`,
+/// produce the stdout the hook must emit:
+///   - sentinel `__freetext_fallback__` → bare `permissionDecision: allow` (no
+///     updatedInput); Claude shows its TUI and the daemon injects keystrokes (E3).
+///   - a JSON answers map → `permissionDecision: allow` + `updatedInput`
+///     `{ questions, answers }` so Claude proceeds with no TUI (E1).
+///   - invalid JSON → `None` (let Claude show its own TUI rather than emit garbage).
+fn question_hook_output_from_response(
+    content: &str,
+    questions: &serde_json::Value,
+) -> Option<String> {
+    if content.trim() == FREETEXT_FALLBACK_SENTINEL {
+        return Some(
+            "{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"allow\"}}"
+                .to_string(),
+        );
+    }
+
+    let answers: serde_json::Value = match serde_json::from_str(content) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "QuestionResponse answers not valid JSON; letting Claude show its TUI");
+            return None;
+        }
+    };
+    let out = serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "allow",
+            "updatedInput": { "questions": questions, "answers": answers }
+        }
+    });
+    Some(out.to_string())
 }
 
 /// H5: Format a rich approval prompt matching TypeScript's formatToolDescription()
@@ -856,6 +997,7 @@ async fn send_and_wait(
     socket_path: &std::path::Path,
     message: &BridgeMessage,
     wait_timeout: Duration,
+    expected: MessageType,
 ) -> Result<BridgeMessage> {
     let stream = UnixStream::connect(socket_path)
         .await
@@ -895,7 +1037,7 @@ async fn send_and_wait(
             }
 
             if let Ok(msg) = serde_json::from_str::<BridgeMessage>(line.trim()) {
-                if msg.session_id == *session_id && msg.msg_type == MessageType::ApprovalResponse {
+                if msg.session_id == *session_id && msg.msg_type == expected {
                     return Ok(msg);
                 }
             }
@@ -912,6 +1054,63 @@ async fn send_and_wait(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ADR-014 E1: a JSON answers map yields permissionDecision:allow + updatedInput
+    /// carrying the original questions and the answers, keyed by question text.
+    #[test]
+    fn question_output_structured_builds_updated_input() {
+        let questions = serde_json::json!([
+            {"question": "Pick a color", "header": "Color",
+             "options": [{"label": "Red", "description": ""}]}
+        ]);
+        let answers = r#"{"Pick a color":"Red"}"#;
+        let out = question_hook_output_from_response(answers, &questions).expect("Some output");
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let hso = &v["hookSpecificOutput"];
+        assert_eq!(hso["hookEventName"], "PreToolUse");
+        assert_eq!(hso["permissionDecision"], "allow");
+        assert_eq!(hso["updatedInput"]["answers"]["Pick a color"], "Red");
+        // Original questions are echoed back in updatedInput.
+        assert_eq!(hso["updatedInput"]["questions"][0]["header"], "Color");
+    }
+
+    /// ADR-014 E1: multi-select labels arrive comma-joined in the answers map and
+    /// are passed through verbatim.
+    #[test]
+    fn question_output_passes_through_multiselect_join() {
+        let questions =
+            serde_json::json!([{"question": "Pick langs", "header": "L", "options": []}]);
+        let answers = r#"{"Pick langs":"Rust,Go"}"#;
+        let out = question_hook_output_from_response(answers, &questions).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            v["hookSpecificOutput"]["updatedInput"]["answers"]["Pick langs"],
+            "Rust,Go"
+        );
+    }
+
+    /// ADR-014 E3: the free-text fallback sentinel yields a bare `allow` with NO
+    /// updatedInput, so Claude shows its TUI for the keystroke path.
+    #[test]
+    fn question_output_freetext_fallback_is_bare_allow() {
+        let questions = serde_json::json!([]);
+        let out =
+            question_hook_output_from_response(FREETEXT_FALLBACK_SENTINEL, &questions).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "allow");
+        assert!(
+            v["hookSpecificOutput"].get("updatedInput").is_none(),
+            "free-text fallback must NOT carry updatedInput"
+        );
+    }
+
+    /// Invalid answers JSON → None, so the hook stays silent and Claude shows its
+    /// own TUI rather than emitting malformed output.
+    #[test]
+    fn question_output_invalid_json_returns_none() {
+        let questions = serde_json::json!([]);
+        assert!(question_hook_output_from_response("not json{", &questions).is_none());
+    }
 
     #[test]
     fn test_tool_requires_approval() {

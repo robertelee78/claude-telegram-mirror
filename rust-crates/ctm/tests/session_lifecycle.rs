@@ -358,3 +358,157 @@ fn cleanup_old_sessions_removes_ancient() {
     assert_eq!(removed, 1);
     assert!(mgr.get_session("ancient").unwrap().is_none());
 }
+
+// ======================================================================
+// ADR-014 PR-A: lifecycle correctness
+// ======================================================================
+
+/// ADR-014 A5: the custom title (set via /rename) is persisted to the DB and
+/// survives reload, so a resume after a daemon restart recovers the name.
+/// Hypothesis: set_custom_title writes a value get_session can read back, and it
+/// outlives end_session (the row is not deleted on end).
+#[test]
+fn custom_title_persists_and_survives_end() {
+    let (mgr, _tmp) = make_mgr();
+    mgr.create_session("title-sess", 1, None, None, None, None, None)
+        .unwrap();
+
+    // No title initially.
+    assert_eq!(
+        mgr.get_session("title-sess").unwrap().unwrap().custom_title,
+        None
+    );
+
+    mgr.set_custom_title("title-sess", "My Feature Work")
+        .unwrap();
+    assert_eq!(
+        mgr.get_session("title-sess")
+            .unwrap()
+            .unwrap()
+            .custom_title
+            .as_deref(),
+        Some("My Feature Work")
+    );
+
+    // The title must survive a true session end (the row persists; resume reads it).
+    mgr.end_session("title-sess", SessionStatus::Ended).unwrap();
+    assert_eq!(
+        mgr.get_session("title-sess")
+            .unwrap()
+            .unwrap()
+            .custom_title
+            .as_deref(),
+        Some("My Feature Work")
+    );
+}
+
+/// ADR-014 A5: a custom title set on one SessionManager is visible to a freshly
+/// opened SessionManager over the same DB file — proving DB persistence (not just
+/// the in-memory cache), which is the daemon-restart scenario.
+#[test]
+fn custom_title_visible_across_reopen() {
+    let tmp = tempdir().unwrap();
+    {
+        let mgr = SessionManager::new(tmp.path(), 5).unwrap();
+        mgr.create_session("reopen-sess", 7, None, None, None, None, None)
+            .unwrap();
+        mgr.set_custom_title("reopen-sess", "Persisted Title")
+            .unwrap();
+    }
+    // Reopen — mimics a daemon restart with an empty in-memory cache.
+    let mgr2 = SessionManager::new(tmp.path(), 5).unwrap();
+    assert_eq!(
+        mgr2.get_session("reopen-sess")
+            .unwrap()
+            .unwrap()
+            .custom_title
+            .as_deref(),
+        Some("Persisted Title")
+    );
+}
+
+/// ADR-014 A4: the DB invariant behind immediate teardown — once a topic is
+/// deleted, clearing the thread_id makes get_session report no thread_id, so a
+/// later resume cannot target a stale (deleted) topic.
+#[test]
+fn clear_thread_id_drops_stale_topic_mapping() {
+    let (mgr, _tmp) = make_mgr();
+    mgr.create_session("teardown-sess", 1, None, None, None, None, None)
+        .unwrap();
+    mgr.set_session_thread("teardown-sess", 54321).unwrap();
+    assert_eq!(
+        mgr.get_session("teardown-sess").unwrap().unwrap().thread_id,
+        Some(54321)
+    );
+
+    // Simulate A4's synchronous clear after delete_forum_topic.
+    mgr.clear_thread_id("teardown-sess").unwrap();
+    assert_eq!(
+        mgr.get_session("teardown-sess").unwrap().unwrap().thread_id,
+        None
+    );
+}
+
+// ======================================================================
+// ADR-014 PR-B: approval reliability (DB invariants)
+// ======================================================================
+
+/// ADR-014 B2: resolve_approval is idempotent — the first call transitions the
+/// pending row and returns true; a second call (a double-tap) returns false, so
+/// the handler knows not to emit a second ApprovalResponse to the hook.
+#[test]
+fn resolve_approval_is_idempotent() {
+    let (mgr, _tmp) = make_mgr();
+    mgr.create_session("appr-sess", 1, None, None, None, None, None)
+        .unwrap();
+    let aid = mgr
+        .create_approval("appr-sess", "run rm -rf", None)
+        .unwrap();
+
+    // First tap transitions the row.
+    assert!(mgr
+        .resolve_approval(&aid, ApprovalStatus::Approved)
+        .unwrap());
+    // Second tap (double-tap / restart race) does NOT transition again.
+    assert!(!mgr
+        .resolve_approval(&aid, ApprovalStatus::Approved)
+        .unwrap());
+    // A different decision also cannot re-transition an already-resolved row.
+    assert!(!mgr
+        .resolve_approval(&aid, ApprovalStatus::Rejected)
+        .unwrap());
+}
+
+/// ADR-014 B4: pending_approval_ids reflects only still-pending approvals, so the
+/// cleanup sweep can evict orphaned in-memory client entries.
+#[test]
+fn pending_approval_ids_tracks_status() {
+    let (mgr, _tmp) = make_mgr();
+    mgr.create_session("sweep-sess", 1, None, None, None, None, None)
+        .unwrap();
+    let a1 = mgr.create_approval("sweep-sess", "cmd1", None).unwrap();
+    let a2 = mgr.create_approval("sweep-sess", "cmd2", None).unwrap();
+
+    let mut ids = mgr.pending_approval_ids().unwrap();
+    ids.sort();
+    let mut expected = vec![a1.clone(), a2.clone()];
+    expected.sort();
+    assert_eq!(ids, expected);
+
+    // Resolving one drops it from the pending set.
+    mgr.resolve_approval(&a1, ApprovalStatus::Approved).unwrap();
+    let ids = mgr.pending_approval_ids().unwrap();
+    assert_eq!(ids, vec![a2]);
+}
+
+/// ADR-014 B5: get_approval returns None for an unknown id (daemon restarted /
+/// expired), which the callback handler treats as a stale request rather than
+/// crashing.
+#[test]
+fn get_approval_unknown_id_is_none() {
+    let (mgr, _tmp) = make_mgr();
+    assert!(mgr
+        .get_approval("approval-does-not-exist")
+        .unwrap()
+        .is_none());
+}

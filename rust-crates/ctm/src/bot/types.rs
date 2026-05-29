@@ -61,16 +61,12 @@ pub(super) struct QueuedMessage {
 
 /// Telegram API response parameters — present in certain error responses.
 ///
-/// Included in 429 (rate-limited) responses since Bot API 8.0.
+/// Included in 429 (rate-limited) responses.
 #[derive(Debug, Deserialize, Default)]
 pub(super) struct ResponseParameters {
     /// Seconds to wait before retrying. Present on 429 responses.
     #[serde(default)]
     pub(super) retry_after: Option<u64>,
-    /// Millisecond-precision adaptive retry (Bot API 8.0+, November 2025).
-    /// More granular than `retry_after`. Use this when available.
-    #[serde(default)]
-    pub(super) adaptive_retry: Option<u64>,
     /// Chat migration target. Present when a group was upgraded to a supergroup.
     #[serde(default)]
     #[allow(dead_code)] // Present in Telegram API responses for future use

@@ -138,10 +138,20 @@ pub struct SessionEndEvent {
     #[serde(flatten)]
     pub base: HookEventBase,
     /// Why the session ended: "clear", "logout", "prompt_input_exit",
-    /// "bypass_permissions_disabled", or "other".
-    #[serde(default)]
+    /// "bypass_permissions_disabled", "resume", or "other".
+    ///
+    /// ADR-014 A2: Claude Code emits this field as `session_exit_reason` (verified
+    /// against the official hooks docs). Without the alias the field always
+    /// deserialized to `None`, so the `resume` special-case (A3) could never fire.
+    #[serde(default, alias = "session_exit_reason")]
     pub reason: Option<String>,
 }
+
+/// ADR-014 E3: Sentinel `QuestionResponse` content meaning "a free-text answer was
+/// given; there is no structured `updatedInput` path for it." The hook responds
+/// with a bare `allow` and the daemon drives the answer via the isolated keystroke
+/// path. Shared between the hook and the daemon so both agree on the contract.
+pub const FREETEXT_FALLBACK_SENTINEL: &str = "__freetext_fallback__";
 
 /// Message types sent to the bridge daemon via Unix socket (NDJSON)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -161,6 +171,16 @@ pub enum MessageType {
     PreCompact,
     SessionRename,
     SendImage,
+    /// ADR-014 E1: A blocking AskUserQuestion request sent by the hook. Carries the
+    /// `questions` payload; the daemon renders the Telegram question UI and replies
+    /// with a `QuestionResponse` once the user taps "Submit All" — mirroring the
+    /// ApprovalRequest/ApprovalResponse correlation, no keystroke injection.
+    QuestionRequest,
+    /// ADR-014 E1: The daemon's reply to a `QuestionRequest`. Its `content` is a
+    /// JSON answers map (question text → label, multi-select labels comma-joined),
+    /// or the sentinel `__freetext_fallback__` when a free-text answer forces the
+    /// isolated keystroke path (E3).
+    QuestionResponse,
     /// Forward-compatible catch-all for unknown message types.
     #[serde(other)]
     Unknown,
@@ -183,6 +203,8 @@ impl std::fmt::Display for MessageType {
             Self::PreCompact => write!(f, "pre_compact"),
             Self::SessionRename => write!(f, "session_rename"),
             Self::SendImage => write!(f, "send_image"),
+            Self::QuestionRequest => write!(f, "question_request"),
+            Self::QuestionResponse => write!(f, "question_response"),
             Self::Unknown => write!(f, "unknown"),
         }
     }
@@ -605,6 +627,58 @@ pub fn extract_agent_id(transcript_path: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ADR-014 A2: Claude Code emits the SessionEnd reason as `session_exit_reason`.
+    /// The `#[serde(alias = "session_exit_reason")]` on `reason` must populate it.
+    /// Hypothesis: without the alias `reason` is `None`; with it, the value is read.
+    #[test]
+    fn session_end_deserializes_session_exit_reason() {
+        let json = r#"{
+            "hook_event_name": "SessionEnd",
+            "session_id": "sess-a2",
+            "session_exit_reason": "clear"
+        }"#;
+        let ev: HookEvent = serde_json::from_str(json).expect("deserialize SessionEnd");
+        match ev {
+            HookEvent::SessionEnd(e) => {
+                assert_eq!(e.base.session_id, "sess-a2");
+                assert_eq!(e.reason.as_deref(), Some("clear"));
+            }
+            other => panic!("expected SessionEnd, got {other:?}"),
+        }
+    }
+
+    /// ADR-014 A2/A3: the `resume` reason must round-trip so the daemon can
+    /// special-case it (A3) and avoid tearing down a resuming session.
+    #[test]
+    fn session_end_deserializes_resume_reason() {
+        let json = r#"{
+            "hook_event_name": "SessionEnd",
+            "session_id": "sess-resume",
+            "session_exit_reason": "resume"
+        }"#;
+        let ev: HookEvent = serde_json::from_str(json).expect("deserialize SessionEnd");
+        match ev {
+            HookEvent::SessionEnd(e) => assert_eq!(e.reason.as_deref(), Some("resume")),
+            other => panic!("expected SessionEnd, got {other:?}"),
+        }
+    }
+
+    /// ADR-014 A2: a SessionEnd payload that omits the reason entirely still
+    /// deserializes (reason defaults to None) — true terminations from older
+    /// Claude Code builds must not break.
+    #[test]
+    fn session_end_without_reason_defaults_none() {
+        let json = r#"{
+            "hook_event_name": "SessionEnd",
+            "session_id": "sess-none"
+        }"#;
+        let ev: HookEvent = serde_json::from_str(json).expect("deserialize SessionEnd");
+        match ev {
+            HookEvent::SessionEnd(e) => assert_eq!(e.reason, None),
+            other => panic!("expected SessionEnd, got {other:?}"),
+        }
+    }
 
     #[test]
     fn test_valid_agent_ids() {

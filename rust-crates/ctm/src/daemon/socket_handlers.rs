@@ -357,6 +357,29 @@ pub(super) async fn handle_session_start(ctx: &HandlerContext, msg: &BridgeMessa
 /// the Rust equivalent of the TypeScript `handleSessionEnd()`.  See also
 /// `ensure_session_exists` which handles the start (creation) side.
 pub(super) async fn handle_session_end(ctx: &HandlerContext, msg: &BridgeMessage) {
+    // ADR-014 A3: `session_exit_reason == "resume"` means the session is being
+    // suspended and WILL come back. Tearing down here would wrongly destroy a
+    // resuming session's topic, so skip teardown entirely. The reason is carried
+    // in the message content (see hook.rs SessionEnd arm). Only true terminations
+    // (clear, logout, prompt_input_exit, bypass_permissions_disabled, other,
+    // unknown) fall through to teardown.
+    if msg.content.trim() == "resume" {
+        tracing::info!(
+            session_id = %msg.session_id,
+            "ADR-014 A3: SessionEnd reason=resume — suspending, not tearing down"
+        );
+        // Review fix (MED-3): a suspending session's blocked-question client is no
+        // longer reachable (its hook process is going away), so drop the mapping now
+        // rather than leaking it until the next cleanup sweep. Keyed by session_id so
+        // this is cheap. (Approval entries are keyed by approval_id and are reaped by
+        // the cleanup sweep.)
+        ctx.pending_question_clients
+            .write()
+            .await
+            .remove(&msg.session_id);
+        return;
+    }
+
     let sid = msg.session_id.clone();
     let session_opt = ctx
         .db_op(move |sess| sess.get_session(&sid).ok().flatten())
@@ -384,8 +407,49 @@ pub(super) async fn handle_session_end(ctx: &HandlerContext, msg: &BridgeMessage
 
         if let Some(tid) = thread_id {
             if ctx.config.auto_delete_topics {
-                let delay_ms = ctx.config.topic_delete_delay_minutes as u64 * 60 * 1000;
-                cleanup::schedule_topic_deletion(ctx, &msg.session_id, tid, delay_ms).await;
+                // ADR-014 A4: Delete the topic IMMEDIATELY on a true SessionEnd
+                // (replaces the two-stage close→delete schedule). Phone-side history
+                // is not valued; the computer retains transcript history. Then
+                // SYNCHRONOUSLY clear thread_id from BOTH the DB and the
+                // session_threads cache — no fire-and-forget — before returning, so a
+                // late/concurrent resume cannot read a stale thread_id for an
+                // already-deleted topic (A5 atomic-clear).
+                //
+                // Defensive: cancel any pending two-stage deletion task. After this
+                // change handle_session_end no longer schedules one, but a task could
+                // still exist from the inactivity sweep (cleanup.rs).
+                cleanup::cancel_pending_topic_deletion(ctx, &msg.session_id).await;
+
+                // Review fix (HIGH-3): clear thread_id from BOTH the cache and the DB
+                // BEFORE deleting the Telegram topic. These two steps cannot be made
+                // atomic across an API call + DB write, so order them for a benign
+                // failure mode: if the daemon crashes between them, the worst case is a
+                // leaked empty topic (cosmetic) rather than a stale thread_id pointing
+                // at a deleted topic (which would break sends until the self-heal
+                // fires). Clearing first also closes the window where a concurrent
+                // resume reads a thread_id for a topic that is about to vanish.
+                ctx.session_threads.write().await.remove(&msg.session_id);
+                let sid_clear = msg.session_id.clone();
+                ctx.db_op(move |sess| {
+                    let _ = sess.clear_thread_id(&sid_clear);
+                })
+                .await;
+
+                // Tolerate "topic already deleted": delete_forum_topic returns
+                // Ok(false)/Err for an already-gone topic. The mapping is already
+                // cleared, so the goal state (no topic, no thread_id) holds regardless.
+                match ctx.bot.delete_forum_topic(tid).await {
+                    Ok(true) => tracing::info!(
+                        session_id = %msg.session_id,
+                        thread_id = tid,
+                        "ADR-014 A4: Deleted forum topic immediately on SessionEnd"
+                    ),
+                    Ok(false) | Err(_) => tracing::info!(
+                        session_id = %msg.session_id,
+                        thread_id = tid,
+                        "ADR-014 A4: Topic already gone or delete failed (mapping already cleared)"
+                    ),
+                }
             } else {
                 let _ = ctx.bot.close_forum_topic(tid).await;
                 ctx.session_threads.write().await.remove(&msg.session_id);
@@ -395,13 +459,37 @@ pub(super) async fn handle_session_end(ctx: &HandlerContext, msg: &BridgeMessage
         // Clean up caches
         ctx.session_tmux.write().await.remove(&msg.session_id);
         ctx.custom_titles.write().await.remove(&msg.session_id);
+        // ADR-014 E1: drop any blocked-question client mapping for this session.
+        ctx.pending_question_clients
+            .write()
+            .await
+            .remove(&msg.session_id);
         cleanup_pending_questions(ctx, &msg.session_id).await;
+
+        // ADR-014 B4: capture this session's pending approval IDs BEFORE end_session
+        // expires them, so we can evict their client-map entries afterward.
+        let sid_pa = msg.session_id.clone();
+        let approval_ids = ctx
+            .db_op(move |sess| sess.get_pending_approvals(&sid_pa).unwrap_or_default())
+            .await;
 
         let sid = msg.session_id.clone();
         ctx.db_op(move |sess| {
             let _ = sess.end_session(&sid, crate::types::SessionStatus::Ended);
         })
         .await;
+
+        // ADR-014 B4 (review fix HIGH-2): evict the approval->client entries AFTER
+        // end_session has expired the approvals. Now a button tap racing with teardown
+        // hits resolve_approval on an already-expired row (returns false → no response
+        // sent, B2), so removing the client entry here cannot strand a transition. This
+        // closes the unbounded-growth leak without a mis-route window.
+        if !approval_ids.is_empty() {
+            let mut clients = ctx.pending_approval_clients.write().await;
+            for ap in &approval_ids {
+                clients.remove(&ap.id);
+            }
+        }
 
         // ADR-013 GAP-5: Cascade session end to child sub-agent sessions.
         // When a parent session ends, end all its active children to prevent orphans.
@@ -519,9 +607,11 @@ pub(super) async fn handle_tool_start(ctx: &HandlerContext, msg: &BridgeMessage)
     let meta = msg.meta();
     let tool_name = meta.tool().unwrap_or("Unknown");
 
-    // Intercept AskUserQuestion tool
+    // ADR-014 E1: AskUserQuestion is no longer rendered from ToolStart — it is
+    // rendered from the blocking QuestionRequest (handle_question_request). The hook
+    // also suppresses the AskUserQuestion ToolStart, so this is a defensive guard:
+    // never render a question from the (late, non-blocking) ToolStart path.
     if tool_name == "AskUserQuestion" {
-        handle_ask_user_question(ctx, msg).await;
         return;
     }
 
@@ -734,11 +824,11 @@ pub(super) async fn handle_approval_request(ctx: &HandlerContext, msg: &BridgeMe
     let keyboard = crate::bot::create_approval_keyboard(&approval_id);
     let buttons: Vec<InlineButton> = keyboard.into_iter().flatten().collect();
 
-    // ADR-011 Fix #9: This send should use Critical priority once bot/client.rs
-    // exposes a priority-aware send interface. Approval requests must not be
-    // delayed behind normal or low-priority traffic.
+    // ADR-014 B1 (resolves the ADR-011 Fix #9 TODO): approval requests go at
+    // Critical priority so a queue backlog cannot delay the prompt the user is
+    // blocked on — the top-ranked glitch cause (prompt arriving late / never).
     ctx.bot
-        .send_with_buttons(
+        .send_with_buttons_critical(
             &format_approval_request(&msg.content),
             buttons,
             Some(&SendOptions {
@@ -911,6 +1001,20 @@ pub(super) async fn handle_session_rename(
         .await
         .insert(session_id.to_string(), custom_title.to_string());
 
+    // ADR-014 A5: Also persist to the DB so a resume after a daemon restart (which
+    // empties the in-memory cache) still recovers the title for the new topic name
+    // and the "Session resumed: {title}" message.
+    {
+        let sid = session_id.to_string();
+        let title = custom_title.to_string();
+        ctx.db_op(move |sess| {
+            if let Err(e) = sess.set_custom_title(&sid, &title) {
+                tracing::warn!(session_id = %sid, error = %e, "ADR-014 A5: Failed to persist custom title to DB");
+            }
+        })
+        .await;
+    }
+
     let thread_id = match ctx.get_thread_id(session_id).await {
         Some(tid) => tid,
         None => return,
@@ -950,6 +1054,29 @@ pub(super) async fn handle_session_rename(
 }
 
 // ====================================================================== AskUserQuestion (Epic 3)
+
+/// ADR-014 E1: Handle a blocking AskUserQuestion request from the hook.
+///
+/// Records the originating socket client (so `handle_submitall_callback` can route
+/// the answer back to the exact hook that is blocked), then renders the question UI
+/// via the existing `handle_ask_user_question` path. The hook stays blocked on
+/// `send_and_wait` until "Submit All" replies with a `QuestionResponse`.
+pub(super) async fn handle_question_request(ctx: &HandlerContext, msg: &BridgeMessage) {
+    if let Some(client_id) = msg.meta().client_id() {
+        ctx.pending_question_clients
+            .write()
+            .await
+            .insert(msg.session_id.clone(), client_id.to_string());
+    } else {
+        // No client to answer back to — without it the structured reply cannot be
+        // routed. Log loudly; the hook will time out and fall back to its own TUI.
+        tracing::warn!(
+            session_id = %msg.session_id,
+            "ADR-014 E1: QuestionRequest missing _client_id — answer cannot be routed back"
+        );
+    }
+    handle_ask_user_question(ctx, msg).await;
+}
 
 pub(super) async fn handle_ask_user_question(ctx: &HandlerContext, msg: &BridgeMessage) {
     let thread_id = ctx.wait_for_topic(&msg.session_id).await;
@@ -1115,6 +1242,30 @@ pub(super) async fn handle_ask_user_question(ctx: &HandlerContext, msg: &BridgeM
                 question_message_ids.push(0);
             }
         }
+    }
+
+    // ADR-014 E4: Surface render failures instead of silently swallowing them.
+    // A `0` sentinel means a question message failed to send — the user would
+    // otherwise see a partial/empty prompt and Claude would block with no visible
+    // way to answer. Notify in the topic so the failure is visible.
+    let failed_renders = question_message_ids.iter().filter(|&&m| m == 0).count();
+    if failed_renders > 0 {
+        tracing::warn!(
+            session_id = %msg.session_id,
+            failed_renders,
+            total = question_message_ids.len(),
+            "ADR-014 E4: {failed_renders} AskUserQuestion message(s) failed to render"
+        );
+        ctx.bot
+            .send_message(
+                &format!(
+                    "\u{26A0}\u{FE0F} {failed_renders} of {} question(s) failed to send. Please answer at the terminal.",
+                    question_message_ids.len()
+                ),
+                None,
+                thread_id,
+            )
+            .await;
     }
 
     // Store captured message_ids back into the pending question.

@@ -41,6 +41,10 @@ pub struct Session {
     /// ADR-013: Agent type for sub-agent sessions (e.g. "Explore", "researcher").
     #[allow(dead_code)]
     pub agent_type: Option<String>,
+    /// ADR-014 A5: Persisted custom title (from `/rename`), so a resume after a
+    /// daemon restart recovers the session name even though the in-memory
+    /// `custom_titles` cache is empty.
+    pub custom_title: Option<String>,
 }
 
 /// A pending tool-approval request.
@@ -153,7 +157,8 @@ impl SessionManager {
                 metadata          TEXT,
                 parent_session_id TEXT,
                 agent_id          TEXT,
-                agent_type        TEXT
+                agent_type        TEXT,
+                custom_title      TEXT
             );
 
             CREATE TABLE IF NOT EXISTS pending_approvals (
@@ -177,6 +182,54 @@ impl SessionManager {
 
         self.migrate_add_tmux_columns()?;
         self.migrate_add_parent_columns()?;
+        self.migrate_add_custom_title_column()?;
+        Ok(())
+    }
+
+    /// ADR-014 A5 Migration: add `custom_title` if upgrading from an older DB.
+    ///
+    /// Persisting the custom title (set via `/rename`) means a resume *after a
+    /// daemon restart* still recovers the session name for the new topic and the
+    /// "Session resumed: {title}" message — the in-memory `custom_titles` cache is
+    /// lost on restart. For new databases the column is in CREATE TABLE so this is
+    /// a no-op. The "duplicate column name" error is tolerated for concurrent
+    /// migrations racing on the same DB file (same pattern as the ADR-013 columns).
+    fn migrate_add_custom_title_column(&self) -> Result<()> {
+        let mut stmt = self
+            .conn
+            .prepare("PRAGMA table_info(sessions)")
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        let columns: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|e| AppError::Database(e.to_string()))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        if !columns.iter().any(|c| c == "custom_title") {
+            match self
+                .conn
+                .execute_batch("ALTER TABLE sessions ADD COLUMN custom_title TEXT")
+            {
+                Ok(()) => {}
+                Err(e) if e.to_string().contains("duplicate column name") => {
+                    // Another connection already added this column concurrently — safe to ignore.
+                }
+                Err(e) => return Err(AppError::Database(e.to_string())),
+            }
+        }
+        Ok(())
+    }
+
+    /// ADR-014 A5: Persist the custom title (from `/rename`) to the DB so it
+    /// survives daemon restarts. Complements the in-memory `custom_titles` cache.
+    pub fn set_custom_title(&self, session_id: &str, title: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE sessions SET custom_title = ?1 WHERE id = ?2",
+                params![title, session_id],
+            )
+            .map_err(|e| AppError::Database(e.to_string()))?;
         Ok(())
     }
 
@@ -784,6 +837,22 @@ impl SessionManager {
         Ok(changed)
     }
 
+    /// ADR-014 B4: All currently-pending approval IDs. Used by the cleanup sweep to
+    /// evict stale entries from the in-memory `pending_approval_clients` map (an entry
+    /// whose approval is no longer pending is orphaned and would otherwise leak).
+    pub fn pending_approval_ids(&self) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id FROM pending_approvals WHERE status = 'pending'")
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        let ids = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| AppError::Database(e.to_string()))?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(ids)
+    }
+
     // -------------------------------------------------------------- cleanup
 
     pub fn get_stale_session_candidates(&self, timeout_hours: u32) -> Result<Vec<Session>> {
@@ -949,6 +1018,9 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
         parent_session_id: row.get("parent_session_id")?,
         agent_id: row.get("agent_id")?,
         agent_type: row.get::<_, Option<String>>("agent_type").unwrap_or(None),
+        // ADR-014 A5: custom_title is a migrated column; tolerate a NULL/absent
+        // value defensively (older rows have no title set).
+        custom_title: row.get::<_, Option<String>>("custom_title").unwrap_or(None),
     })
 }
 

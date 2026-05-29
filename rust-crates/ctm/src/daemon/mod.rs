@@ -40,7 +40,10 @@ use tokio::sync::{Mutex, RwLock};
 
 // ---------------------------------------------------------------- constants
 
-const CLEANUP_INTERVAL_SECS: u64 = 5 * 60; // 5 minutes
+// ADR-014 A6: SessionEnd (A1) now drives teardown event-driven and immediately,
+// so the periodic sweep is only a safety net for sessions that die without a
+// SessionEnd hook (crash/kill). Run it far less often (20 min vs the old 5 min).
+const CLEANUP_INTERVAL_SECS: u64 = 20 * 60; // 20 minutes
 const ECHO_TTL_SECS: u64 = 10;
 const TOOL_CACHE_TTL_SECS: u64 = 5 * 60; // 5 minutes
 const DOWNLOAD_MAX_AGE_SECS: u64 = 24 * 60 * 60; // 24 hours
@@ -159,6 +162,10 @@ pub(super) struct DaemonState {
     // the specific socket client that submitted the approval_request, not
     // broadcast to all connected clients.
     pub(super) pending_approval_clients: Arc<RwLock<HashMap<String, String>>>,
+
+    // ADR-014 E1: Map session_id -> client_id of the hook blocked on an
+    // AskUserQuestion, so its QuestionResponse routes back to that exact client.
+    pub(super) pending_question_clients: Arc<RwLock<HashMap<String, String>>>,
 }
 
 /// Bridge Daemon — orchestrates all components.
@@ -205,6 +212,7 @@ impl Daemon {
             config: Arc::new(config),
             running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pending_approval_clients: Arc::new(RwLock::new(HashMap::new())),
+            pending_question_clients: Arc::new(RwLock::new(HashMap::new())),
         });
 
         Ok(Self {
@@ -456,6 +464,9 @@ struct HandlerContext {
     socket_clients: SocketClients,
     /// S-2: Maps approval_id -> client_id for targeted approval response routing.
     pending_approval_clients: Arc<RwLock<HashMap<String, String>>>,
+    /// ADR-014 E1: Maps session_id -> client_id of the hook blocked on an
+    /// AskUserQuestion, so the QuestionResponse routes back to that exact client.
+    pending_question_clients: Arc<RwLock<HashMap<String, String>>>,
 }
 
 impl HandlerContext {
@@ -601,9 +612,18 @@ async fn handle_socket_message(ctx: HandlerContext, msg: BridgeMessage) {
 
     // Epic 1: Toggle gating — skip outbound messages when mirroring is disabled.
     // Safety-critical paths (approvals, commands) always proceed.
+    //
+    // ADR-014 E1: AskUserQuestion is a BLOCKING path just like approvals — the hook
+    // waits up to 300s for a QuestionResponse. If mirroring is off and we drop the
+    // QuestionRequest here, the hook hangs for the full timeout. So the question
+    // request/response pair must also be always-active.
     let is_always_active = matches!(
         msg.msg_type,
-        MessageType::ApprovalRequest | MessageType::ApprovalResponse | MessageType::Command
+        MessageType::ApprovalRequest
+            | MessageType::ApprovalResponse
+            | MessageType::Command
+            | MessageType::QuestionRequest
+            | MessageType::QuestionResponse
     );
     if !is_always_active
         && !ctx
@@ -713,6 +733,14 @@ async fn handle_socket_message(ctx: HandlerContext, msg: BridgeMessage) {
         MessageType::SendImage => {
             if ensure_session_exists(&ctx, &msg).await {
                 socket_handlers::handle_send_image(&ctx, &msg).await;
+            }
+        }
+        // ADR-014 E1: A blocking AskUserQuestion request from the hook. Register the
+        // originating socket client (so the answer routes back to it) and render the
+        // question UI. The hook stays blocked until "Submit All" sends QuestionResponse.
+        MessageType::QuestionRequest => {
+            if ensure_session_exists(&ctx, &msg).await {
+                socket_handlers::handle_question_request(&ctx, &msg).await;
             }
         }
         _ => {
@@ -843,6 +871,29 @@ async fn ensure_session_exists(ctx: &HandlerContext, msg: &BridgeMessage) -> boo
                 state
             };
 
+            // ADR-014 A5: Child-orphan edge case. A resumed sub-agent session whose
+            // parent has already ended has no surviving parent topic. We do NOT
+            // silently drop it — we create its own topic (as below) and log the
+            // orphaning so it is visible rather than mysterious.
+            if let Some(parent_id) = &session.parent_session_id {
+                let pid = parent_id.clone();
+                let parent_active = ctx
+                    .db_op(move |sess| {
+                        matches!(
+                            sess.get_session(&pid).ok().flatten().map(|s| s.status),
+                            Some(crate::types::SessionStatus::Active)
+                        )
+                    })
+                    .await;
+                if !parent_active {
+                    tracing::info!(
+                        session_id = %msg.session_id,
+                        parent_session_id = %parent_id,
+                        "ADR-014 A5: Resumed child session whose parent has ended — creating its own topic (orphan, not dropped)"
+                    );
+                }
+            }
+
             let hostname = session.hostname.as_deref();
             let project_dir = session.project_dir.as_deref();
             let topic_name =
@@ -868,7 +919,24 @@ async fn ensure_session_exists(ctx: &HandlerContext, msg: &BridgeMessage) -> boo
                 // ADR-013 E3: Enhanced session resume context message.
                 // Include custom title and inactivity duration if available.
                 let resume_msg = {
-                    let custom_title = ctx.custom_titles.read().await.get(&msg.session_id).cloned();
+                    // ADR-014 A5: Prefer the in-memory cache, but fall back to the
+                    // DB-persisted title (set via /rename) so a resume after a daemon
+                    // restart — which empties the cache — still recovers the name.
+                    // Warm the cache on a DB hit so subsequent renames dedup correctly.
+                    let custom_title =
+                        match ctx.custom_titles.read().await.get(&msg.session_id).cloned() {
+                            Some(t) => Some(t),
+                            None => match &session.custom_title {
+                                Some(t) => {
+                                    ctx.custom_titles
+                                        .write()
+                                        .await
+                                        .insert(msg.session_id.clone(), t.clone());
+                                    Some(t.clone())
+                                }
+                                None => None,
+                            },
+                        };
                     let inactivity_str = {
                         let la = chrono::DateTime::parse_from_rfc3339(&session.last_activity).ok();
                         la.map(|t| {

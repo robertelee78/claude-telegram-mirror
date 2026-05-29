@@ -54,6 +54,7 @@ pub(super) async fn run_event_loop(
         config: Arc::clone(&state.config),
         socket_clients,
         pending_approval_clients: Arc::clone(&state.pending_approval_clients),
+        pending_question_clients: Arc::clone(&state.pending_question_clients),
     };
 
     loop {
