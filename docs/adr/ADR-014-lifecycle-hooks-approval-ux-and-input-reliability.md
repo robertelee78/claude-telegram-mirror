@@ -231,6 +231,14 @@ Both reviewers ran read-only over the branch diff. Real bugs found and fixed (te
 - **Claude MED — blind keystroke injection with no hook client**: submit logic refactored to a unit-tested `classify_submit` (`Structured` / `FreeTextRelease` / `NoClient`); the no-client case now notifies instead of injecting into an unknown screen.
 - **Claude MED — resume leaked the question-client entry**: the `resume` early-return now drops it immediately.
 
+### Post-merge deep-research verification (2026-05-28) — `updatedInput` contract vs ground truth
+
+A `/deep-research` pass cross-checked PR-E's `updatedInput` contract against official docs and **jsayubi/ccgram's current production `question-notify.ts`** (the source the original spike cited). Findings:
+
+- **Confirmed:** answers map is keyed by **question text**, original `questions` echoed back, `permissionDecision: "allow"` — PR-E matches.
+- **Fixed (was a real bug):** multi-select labels must be joined with a **bare comma, no space** (`labels.join(',')`, "Claude Code format" per ccgram). PR-E had `", "`; a comma+space risks a leading space on every label after the first (`" Go"` ≠ `"Go"`) if Claude splits on `,` without trimming. Corrected to `","`; tests updated.
+- **Open finding (revisits an interview decision):** ccgram's current code delivers **free-text answers via `updatedInput` too** (`answers[questionText] = textAnswer`, no keystrokes) — contradicting this ADR's spike premise that free-text "has no structured path." That premise appears **outdated**. PR-E's E3 keystroke fallback (and its racy `QUESTION_TUI_RENDER_WAIT_MS`) may therefore be **unnecessary**: free-text could likely go structural by placing the typed string in the answers map, eliminating the last injection path and the race. **Not changed yet** — ccgram only demonstrates this for option-less questions; the arbitrary-"Other"-on-an-option-question case needs an empirical spike before ripping out a deliberately-decided fallback ("never guess"). Recommended as the top follow-up to reach a fully keystroke-free design.
+
 Verified non-issues (documented, no change): `QuestionRequest`-before-`SessionStart` is handled by `ensure_session_exists` on-the-fly creation (same as the proven approval path); the `custom_title` column always exists by the time `row_to_session` runs (migration in `new()`); `SessionStart`-after-`get_hook_output` ordering is pre-existing approval-flow behavior, not introduced here. New tests: `classify_submit_decision_table` (+ the prior PR-E/PR-B coverage). Final: 416 tests passing, clippy clean, release build verified.
 
 ## Links

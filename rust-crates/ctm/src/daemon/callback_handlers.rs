@@ -1119,7 +1119,12 @@ fn build_answers_map_content(answers: &[(usize, String, CollectedAnswer)]) -> St
     for (_, qtext, ans) in answers {
         let val = match ans {
             CollectedAnswer::Option(label) => label.clone(),
-            CollectedAnswer::MultiSelect { labels, .. } => labels.join(", "),
+            // Multi-select: join labels with a bare comma and NO space. This is the
+            // "Claude Code format" — verified against jsayubi/ccgram's production
+            // question-notify.ts (`selectedLabels.join(',')`). A comma+space would
+            // risk a leading space on every label after the first (" Go" != "Go") if
+            // Claude Code splits on "," without trimming.
+            CollectedAnswer::MultiSelect { labels, .. } => labels.join(","),
             CollectedAnswer::FreeText(_) => continue,
         };
         map.insert(qtext.clone(), serde_json::Value::String(val));
@@ -1752,7 +1757,8 @@ mod tests {
         )];
         let content = build_answers_map_content(&answers);
         let v: serde_json::Value = serde_json::from_str(&content).unwrap();
-        assert_eq!(v["Pick langs"], "Rust, Go");
+        // Bare comma, NO space — matches ccgram's verified "Claude Code format".
+        assert_eq!(v["Pick langs"], "Rust,Go");
     }
 
     /// ADR-014 E3: free-text entries are excluded from the structured map (their

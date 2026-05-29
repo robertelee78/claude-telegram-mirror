@@ -1080,12 +1080,12 @@ mod tests {
     fn question_output_passes_through_multiselect_join() {
         let questions =
             serde_json::json!([{"question": "Pick langs", "header": "L", "options": []}]);
-        let answers = r#"{"Pick langs":"Rust, Go"}"#;
+        let answers = r#"{"Pick langs":"Rust,Go"}"#;
         let out = question_hook_output_from_response(answers, &questions).unwrap();
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(
             v["hookSpecificOutput"]["updatedInput"]["answers"]["Pick langs"],
-            "Rust, Go"
+            "Rust,Go"
         );
     }
 
