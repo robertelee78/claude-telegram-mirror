@@ -192,42 +192,91 @@ async fn handle_approval_callback(
         "reject" => "Rejected",
         _ => "Aborted",
     };
-    let _ = ctx
-        .bot
-        .answer_callback_query(&cb.id, Some(action_label), false)
-        .await;
     let aid = approval_id.to_string();
     let approval = ctx
         .db_op(move |sess| sess.get_approval(&aid).ok().flatten())
         .await;
 
+    // ADR-014 B5: tolerate stale/unknown approval IDs gracefully — daemon restarted
+    // (in-memory map lost), expired, or already handled. Never crash/block/mis-route:
+    // alert the user and mark the message stale instead of silently returning.
     let approval = match approval {
         Some(a) => a,
         None => {
-            tracing::warn!(approval_id, "Approval not found");
+            tracing::info!(
+                approval_id,
+                "ADR-014 B5: callback for unknown/expired approval"
+            );
+            let _ = ctx
+                .bot
+                .answer_callback_query(
+                    &cb.id,
+                    Some("This request expired or was already handled."),
+                    true,
+                )
+                .await;
+            if let Some(msg) = &cb.message {
+                let _ = ctx
+                    .bot
+                    .edit_message_text_no_markup(
+                        msg.message_id,
+                        "\u{231B} This approval expired or was already handled.",
+                    )
+                    .await;
+            }
             return;
         }
     };
 
-    {
+    // ADR-014 B2: only emit the ApprovalResponse when THIS tap actually transitioned
+    // the pending row. resolve_approval returns false if it was already resolved (a
+    // double-tap or a daemon-restart race), which prevents sending two responses to
+    // the hook. For abort, end the session only when the transition actually happened.
+    let changed = {
         let aid = approval_id.to_string();
         let asid = approval.session_id.clone();
         let act = action.to_string();
         ctx.db_op(move |sess| {
             if act == "abort" {
-                let _ = sess.end_session(&asid, crate::types::SessionStatus::Aborted);
-                let _ = sess.resolve_approval(&aid, crate::types::ApprovalStatus::Rejected);
+                let c = sess
+                    .resolve_approval(&aid, crate::types::ApprovalStatus::Rejected)
+                    .unwrap_or(false);
+                if c {
+                    let _ = sess.end_session(&asid, crate::types::SessionStatus::Aborted);
+                }
+                c
             } else {
                 let status = if act == "approve" {
                     crate::types::ApprovalStatus::Approved
                 } else {
                     crate::types::ApprovalStatus::Rejected
                 };
-                let _ = sess.resolve_approval(&aid, status);
+                sess.resolve_approval(&aid, status).unwrap_or(false)
             }
         })
-        .await;
+        .await
+    };
+
+    if !changed {
+        // ADR-014 B2/B5: a double-tap or already-handled request. Acknowledge without
+        // sending a second response or re-editing the (already resolved) message.
+        tracing::info!(
+            approval_id,
+            action,
+            "ADR-014 B2: approval already resolved, ignoring duplicate tap"
+        );
+        let _ = ctx
+            .bot
+            .answer_callback_query(&cb.id, Some("Already handled."), true)
+            .await;
+        return;
     }
+
+    // The decision took effect — acknowledge it to the tapping user.
+    let _ = ctx
+        .bot
+        .answer_callback_query(&cb.id, Some(action_label), false)
+        .await;
 
     // ADR-006 C1 / S-2: Send `approval_response` only to the specific socket
     // client that originated the approval_request, preventing approval forgery
@@ -297,34 +346,24 @@ async fn handle_approval_callback(
         );
     }
 
-    // C2.2: Edit the original approval message to append the decision and remove keyboard.
-    // Use plain text (parse_mode = None) because approval text may contain tool names
-    // with underscores that break Markdown rendering.
+    // ADR-014 B3: Edit the original approval message to a static resolved line
+    // showing the decision AND the time (e.g. "✅ Approved · 14:03"), and REMOVE the
+    // inline keyboard. This structurally prevents re-taps (no buttons remain) and
+    // turns the topic into a readable audit trail. edit_message_text_no_markup both
+    // sets the text and drops the keyboard in one call. Plain text (no Markdown):
+    // tool names with underscores would otherwise break rendering.
     if let Some(msg) = &cb.message {
         let action_text = match action {
-            "approve" => "\u{2705} Approved via Telegram",
-            "reject" => "\u{274C} Rejected via Telegram",
-            _ => "\u{1F6D1} Session Aborted via Telegram",
+            "approve" => "\u{2705} Approved",
+            "reject" => "\u{274C} Rejected",
+            _ => "\u{1F6D1} Aborted",
         };
-        let original = msg.text.as_deref().unwrap_or("");
-        let updated = format!("{original}\n\nDecision: {action_text}");
-        // Attempt edit with decision appended; fall back to decision-only text on failure.
-        if ctx
+        let time = chrono::Local::now().format("%H:%M");
+        let resolved = format!("{action_text} \u{00B7} {time}");
+        let _ = ctx
             .bot
-            .edit_message(msg.chat.id, msg.message_id, &updated, None)
-            .await
-            .is_err()
-        {
-            let _ = ctx
-                .bot
-                .edit_message(
-                    msg.chat.id,
-                    msg.message_id,
-                    &format!("Decision: {action_text}"),
-                    None,
-                )
-                .await;
-        }
+            .edit_message_text_no_markup(msg.message_id, &resolved)
+            .await;
     }
 }
 

@@ -190,7 +190,15 @@ Reused the approval correlation backbone (`send_and_wait` + targeted client writ
 
 **Design decision flagged for review (deviation from E2's literal wording):** a single AskUserQuestion call can mix option-questions and a free-text answer. Since free-text has no structured path, the whole set falls back to keystrokes when *any* answer is free-text — so the multi-select dance is *relocated into* the isolated fallback branch rather than deleted outright. When no free-text is present (the dominant case), zero keystrokes run. The free-text fallback also reintroduces a TUI-render wait (`QUESTION_TUI_RENDER_WAIT_MS = 1500ms`) that is inherently racy — accepted for free-text only, per E3.
 
-PR-B, PR-D: pending.
+### PR-B — landed 2026-05-28 (approval reliability; all tests green, +3 new)
+
+- **B1** Approval requests now send at **Critical** priority. `bot::client` gained `send_with_buttons_critical`; `MessagePriority` stays bot-private (callers choose intent, not the enum). Resolves the ADR-011 Fix #9 TODO.
+- **B2** `handle_approval_callback` now checks the `resolve_approval` boolean and only emits the `ApprovalResponse` when **this** tap actually transitioned the pending row — a double-tap returns `false` and is ignored (no second response to the hook). For abort, the session is ended only when the transition happened. Test: `resolve_approval_is_idempotent`.
+- **B3** On resolve, the message is edited to a static resolved line **decision + time** (e.g. "✅ Approved · 14:03", local time) with the **keyboard removed** (`edit_message_text_no_markup`), structurally preventing re-taps and forming a readable audit trail.
+- **B4** `pending_approval_clients` is now evicted: precisely at session end (the session's pending approval IDs are removed from the map) and via a **cleanup-cycle sweep** that retains only still-pending IDs (`SessionManager::pending_approval_ids`). The sweep also reaps disconnect-orphaned entries, so the deliberately approval-agnostic socket layer stays unchanged. Test: `pending_approval_ids_tracks_status`.
+- **B5** A callback for an unknown/expired approval ID no longer silently returns: it answers with a `show_alert` ("This request expired or was already handled.") and edits the message to mark it stale — never crashes, blocks, or mis-routes. Test: `get_approval_unknown_id_is_none`.
+
+PR-D: pending.
 
 ## Links
 

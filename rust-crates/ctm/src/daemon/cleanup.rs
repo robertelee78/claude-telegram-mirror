@@ -22,6 +22,29 @@ pub(super) async fn run_cleanup(ctx: HandlerContext) {
     })
     .await;
 
+    // ADR-014 B4: Sweep the in-memory approval->client map. After expiry above, any
+    // approval_id that is no longer pending is orphaned (the session ended, the
+    // request expired, or its client disconnected) and would otherwise leak. Retain
+    // only entries whose approval is still pending. This also reaps entries left by
+    // socket-client disconnects, which the (deliberately approval-agnostic) socket
+    // layer does not evict directly.
+    {
+        let pending_ids = ctx
+            .db_op(|sess| sess.pending_approval_ids().unwrap_or_default())
+            .await;
+        let pending: std::collections::HashSet<String> = pending_ids.into_iter().collect();
+        let mut clients = ctx.pending_approval_clients.write().await;
+        let before = clients.len();
+        clients.retain(|approval_id, _| pending.contains(approval_id));
+        let removed = before - clients.len();
+        if removed > 0 {
+            tracing::info!(
+                removed,
+                "ADR-014 B4: swept orphaned pending_approval_clients entries"
+            );
+        }
+    }
+
     // Clean stale sessions (differentiated timeouts)
     cleanup_stale_sessions(&ctx).await;
 

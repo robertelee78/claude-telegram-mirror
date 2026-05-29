@@ -450,6 +450,22 @@ pub(super) async fn handle_session_end(ctx: &HandlerContext, msg: &BridgeMessage
             .remove(&msg.session_id);
         cleanup_pending_questions(ctx, &msg.session_id).await;
 
+        // ADR-014 B4: evict this session's approval->client entries so the map can't
+        // grow unbounded (it was only ever removed on a button tap). Fetch the
+        // session's pending approval IDs before they are expired by end_session.
+        {
+            let sid = msg.session_id.clone();
+            let approval_ids = ctx
+                .db_op(move |sess| sess.get_pending_approvals(&sid).unwrap_or_default())
+                .await;
+            if !approval_ids.is_empty() {
+                let mut clients = ctx.pending_approval_clients.write().await;
+                for ap in &approval_ids {
+                    clients.remove(&ap.id);
+                }
+            }
+        }
+
         let sid = msg.session_id.clone();
         ctx.db_op(move |sess| {
             let _ = sess.end_session(&sid, crate::types::SessionStatus::Ended);
@@ -789,11 +805,11 @@ pub(super) async fn handle_approval_request(ctx: &HandlerContext, msg: &BridgeMe
     let keyboard = crate::bot::create_approval_keyboard(&approval_id);
     let buttons: Vec<InlineButton> = keyboard.into_iter().flatten().collect();
 
-    // ADR-011 Fix #9: This send should use Critical priority once bot/client.rs
-    // exposes a priority-aware send interface. Approval requests must not be
-    // delayed behind normal or low-priority traffic.
+    // ADR-014 B1 (resolves the ADR-011 Fix #9 TODO): approval requests go at
+    // Critical priority so a queue backlog cannot delay the prompt the user is
+    // blocked on — the top-ranked glitch cause (prompt arriving late / never).
     ctx.bot
-        .send_with_buttons(
+        .send_with_buttons_critical(
             &format_approval_request(&msg.content),
             buttons,
             Some(&SendOptions {

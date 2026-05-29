@@ -837,6 +837,22 @@ impl SessionManager {
         Ok(changed)
     }
 
+    /// ADR-014 B4: All currently-pending approval IDs. Used by the cleanup sweep to
+    /// evict stale entries from the in-memory `pending_approval_clients` map (an entry
+    /// whose approval is no longer pending is orphaned and would otherwise leak).
+    pub fn pending_approval_ids(&self) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id FROM pending_approvals WHERE status = 'pending'")
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        let ids = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| AppError::Database(e.to_string()))?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(ids)
+    }
+
     // -------------------------------------------------------------- cleanup
 
     pub fn get_stale_session_candidates(&self, timeout_hours: u32) -> Result<Vec<Session>> {

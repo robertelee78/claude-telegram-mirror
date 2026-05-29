@@ -340,6 +340,34 @@ impl TelegramBot {
         options: Option<&SendOptions>,
         thread_id: Option<i64>,
     ) {
+        self.send_with_buttons_inner(text, buttons, options, thread_id, MessagePriority::Normal)
+            .await;
+    }
+
+    /// ADR-014 B1: Send a buttoned message at Critical queue priority.
+    ///
+    /// Approval requests use this so a backlog of normal/low traffic cannot delay
+    /// the prompt the user is blocked on. `MessagePriority` is intentionally kept
+    /// private to the bot module — callers pick intent (critical) not the enum.
+    pub async fn send_with_buttons_critical(
+        &self,
+        text: &str,
+        buttons: Vec<InlineButton>,
+        options: Option<&SendOptions>,
+        thread_id: Option<i64>,
+    ) {
+        self.send_with_buttons_inner(text, buttons, options, thread_id, MessagePriority::Critical)
+            .await;
+    }
+
+    async fn send_with_buttons_inner(
+        &self,
+        text: &str,
+        buttons: Vec<InlineButton>,
+        options: Option<&SendOptions>,
+        thread_id: Option<i64>,
+        priority: MessagePriority,
+    ) {
         let parse_mode = options
             .and_then(|o| o.parse_mode.clone())
             .or_else(|| Some("Markdown".into()));
@@ -356,7 +384,7 @@ impl TelegramBot {
             reply_to_message_id,
             retries: 0,
             created_at: epoch_millis(),
-            priority: MessagePriority::Normal,
+            priority,
         })
         .await;
     }

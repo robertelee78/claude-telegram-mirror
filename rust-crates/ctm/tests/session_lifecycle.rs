@@ -448,3 +448,67 @@ fn clear_thread_id_drops_stale_topic_mapping() {
         None
     );
 }
+
+// ======================================================================
+// ADR-014 PR-B: approval reliability (DB invariants)
+// ======================================================================
+
+/// ADR-014 B2: resolve_approval is idempotent — the first call transitions the
+/// pending row and returns true; a second call (a double-tap) returns false, so
+/// the handler knows not to emit a second ApprovalResponse to the hook.
+#[test]
+fn resolve_approval_is_idempotent() {
+    let (mgr, _tmp) = make_mgr();
+    mgr.create_session("appr-sess", 1, None, None, None, None, None)
+        .unwrap();
+    let aid = mgr
+        .create_approval("appr-sess", "run rm -rf", None)
+        .unwrap();
+
+    // First tap transitions the row.
+    assert!(mgr
+        .resolve_approval(&aid, ApprovalStatus::Approved)
+        .unwrap());
+    // Second tap (double-tap / restart race) does NOT transition again.
+    assert!(!mgr
+        .resolve_approval(&aid, ApprovalStatus::Approved)
+        .unwrap());
+    // A different decision also cannot re-transition an already-resolved row.
+    assert!(!mgr
+        .resolve_approval(&aid, ApprovalStatus::Rejected)
+        .unwrap());
+}
+
+/// ADR-014 B4: pending_approval_ids reflects only still-pending approvals, so the
+/// cleanup sweep can evict orphaned in-memory client entries.
+#[test]
+fn pending_approval_ids_tracks_status() {
+    let (mgr, _tmp) = make_mgr();
+    mgr.create_session("sweep-sess", 1, None, None, None, None, None)
+        .unwrap();
+    let a1 = mgr.create_approval("sweep-sess", "cmd1", None).unwrap();
+    let a2 = mgr.create_approval("sweep-sess", "cmd2", None).unwrap();
+
+    let mut ids = mgr.pending_approval_ids().unwrap();
+    ids.sort();
+    let mut expected = vec![a1.clone(), a2.clone()];
+    expected.sort();
+    assert_eq!(ids, expected);
+
+    // Resolving one drops it from the pending set.
+    mgr.resolve_approval(&a1, ApprovalStatus::Approved).unwrap();
+    let ids = mgr.pending_approval_ids().unwrap();
+    assert_eq!(ids, vec![a2]);
+}
+
+/// ADR-014 B5: get_approval returns None for an unknown id (daemon restarted /
+/// expired), which the callback handler treats as a stale request rather than
+/// crashing.
+#[test]
+fn get_approval_unknown_id_is_none() {
+    let (mgr, _tmp) = make_mgr();
+    assert!(mgr
+        .get_approval("approval-does-not-exist")
+        .unwrap()
+        .is_none());
+}
