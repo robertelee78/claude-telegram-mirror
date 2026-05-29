@@ -22,7 +22,7 @@ This installs a native Rust binary (`ctm`) via platform-specific optional packag
 - **CLI to Telegram**: Mirror Claude's responses, tool usage, and notifications
 - **Telegram to CLI**: Send prompts from Telegram directly to Claude Code
 - **Tool Summarizer**: Human-readable summaries for 30+ command patterns ("Running tests" instead of "Running: Bash")
-- **AskUserQuestion Rendering**: Inline buttons for Claude's interactive questions
+- **AskUserQuestion (no keystrokes)**: Inline buttons for Claude's interactive questions; option answers are returned to Claude structurally via the hook's `updatedInput` instead of fragile keystroke injection
 - **Photo & Document Upload**: Send images/files from Telegram, path injected into Claude
 - **Stop/Interrupt**: Type `stop` to send Escape, `kill` to send Ctrl-C
 - **Session Threading**: Each Claude session gets its own Forum Topic
@@ -153,10 +153,10 @@ Approval buttons only appear in normal mode, not with `--dangerously-skip-permis
 
 **Flow:**
 1. Claude Code hooks invoke `ctm hook`, which reads the event from stdin
-2. PreToolUse: sends approval request via socket, waits for Telegram response
+2. PreToolUse: sends an approval request (or, for AskUserQuestion, a question request) via socket and blocks for the Telegram response
 3. Other hooks: sends JSON to daemon via socket and exits immediately
 4. Daemon forwards messages to Telegram Forum Topic with summarized tool actions
-5. Telegram replies are injected into CLI via `tmux send-keys`
+5. Telegram text replies are injected into the CLI via `tmux send-keys`. **AskUserQuestion option/multi-select answers are returned structurally via the hook's `updatedInput` — no keystrokes** (only free-text answers fall back to injection)
 6. Stop/kill commands send Escape or Ctrl-C to interrupt Claude
 
 ## Multi-System Architecture
@@ -284,7 +284,7 @@ ctm install-hooks --project
 | CLI -> Telegram | Claude responds | Claude: ... |
 | CLI -> Telegram | Session starts | New Forum Topic created |
 | CLI -> Telegram | Context compacting | Notification sent |
-| CLI -> Telegram | AskUserQuestion | Inline buttons rendered |
+| CLI <-> Telegram | AskUserQuestion | Inline buttons; answers returned structurally (no keystrokes) |
 | Telegram -> CLI | User sends message | Injected via tmux |
 | Telegram -> CLI | User sends photo | Downloaded, path injected |
 | Telegram -> CLI | User types "stop" | Sends Escape interrupt |
