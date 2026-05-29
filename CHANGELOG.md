@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.18] - 2026-05-28
+
+### Added (ADR-014)
+- **Structured AskUserQuestion answers** — option/multi-select answers are now delivered to Claude Code via a blocking `PreToolUse` hook returning `updatedInput` (the same correlation the approval flow uses), replacing fragile 300ms-per-key tmux keystroke injection. ~6 orders of magnitude lower answer-delivery latency and no TUI readiness race. Free-text retains an isolated keystroke fallback.
+- **Event-driven session teardown** — the `SessionEnd` hook is now registered (`session_exit_reason` parsed, `resume` special-cased so a suspending session is not torn down). True termination deletes the forum topic immediately and clears `thread_id` synchronously; custom titles persist across daemon restarts.
+- **Approval reliability** — approval requests sent at Critical priority; double-taps are idempotent (no duplicate hook responses); the message is edited to a decision+time audit line with the keyboard removed; the approval→client map no longer leaks.
+- **Setup trust acknowledgment** — the wizard now requires an explicit, recorded `y/N` acknowledgment of the chat-level trust model before writing config (new setups only); mirrored in the README.
+
+### Fixed
+- Removed fabricated `adaptive_retry` dead code (a Bot API field that does not exist); rate-limit backoff honors `retry_after` only.
+- Multi-select answer labels are joined with a bare comma (Claude Code format), verified against the reference implementation.
+
+See `docs/adr/ADR-014-lifecycle-hooks-approval-ux-and-input-reliability.md` for the full design, benchmark, and review log.
+
 ## [0.2.1] - 2026-03-17
 
 ### Changed
