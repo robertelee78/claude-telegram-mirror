@@ -96,7 +96,7 @@ pub(super) struct PendingQuestion {
 }
 
 #[derive(Clone)]
-struct QuestionDef {
+pub(super) struct QuestionDef {
     question: String,
     header: String,
     options: Vec<OptionDef>,
@@ -104,9 +104,30 @@ struct QuestionDef {
 }
 
 #[derive(Clone)]
-struct OptionDef {
+pub(super) struct OptionDef {
     label: String,
     description: String,
+}
+
+/// ADR-014 (review follow-up): render an AskUserQuestion as PLAIN TEXT.
+///
+/// Every question-widget message (initial render, per-tap re-render, free-text edit)
+/// must be plain text — never Telegram Markdown. The text interpolates arbitrary
+/// model-generated content (headers, questions, option labels/descriptions full of
+/// `*`, `_`, `[`, code, ADR refs) and legacy Markdown v1 has no reliable escaping, so
+/// any stray marker produced an unbalanced-entity HTTP 400 and the message (often the
+/// one carrying the "Submit All" button) silently failed to render. Plain text cannot
+/// 400. Centralised here so all render sites stay consistent.
+pub(super) fn render_question_text(q: &QuestionDef) -> String {
+    let mut text = format!("\u{2753} {}\n\n{}\n", q.header, q.question);
+    for opt in &q.options {
+        text.push_str(&format!(
+            "\n\u{2022} {} \u{2014} {}",
+            opt.label, opt.description
+        ));
+    }
+    text.push_str("\n\nOr type your answer in this topic");
+    text
 }
 
 /// Topic creation lock for BUG-002 prevention.

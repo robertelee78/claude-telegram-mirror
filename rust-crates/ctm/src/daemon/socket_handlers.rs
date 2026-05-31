@@ -1063,10 +1063,30 @@ pub(super) async fn handle_session_rename(
 /// `send_and_wait` until "Submit All" replies with a `QuestionResponse`.
 pub(super) async fn handle_question_request(ctx: &HandlerContext, msg: &BridgeMessage) {
     if let Some(client_id) = msg.meta().client_id() {
-        ctx.pending_question_clients
+        let prev = ctx
+            .pending_question_clients
             .write()
             .await
             .insert(msg.session_id.clone(), client_id.to_string());
+        // ADR-014 (review follow-up): if a different hook was already blocked on this
+        // session (two overlapping AskUserQuestion calls), the old client mapping was
+        // just overwritten. Release that previous hook to its TUI now, otherwise it
+        // would hang for the full 300s timeout with no way to answer.
+        if let Some(prev_client) = prev {
+            if prev_client != client_id {
+                let _ = super::callback_handlers::send_question_response(
+                    ctx,
+                    &msg.session_id,
+                    crate::types::FREETEXT_FALLBACK_SENTINEL,
+                    &prev_client,
+                )
+                .await;
+                tracing::warn!(
+                    session_id = %msg.session_id,
+                    "ADR-014: superseding AskUserQuestion — released previous blocked hook"
+                );
+            }
+        }
     } else {
         // No client to answer back to — without it the structured reply cannot be
         // routed. Log loudly; the hook will time out and fall back to its own TUI.
@@ -1082,17 +1102,28 @@ pub(super) async fn handle_ask_user_question(ctx: &HandlerContext, msg: &BridgeM
     let thread_id = ctx.wait_for_topic(&msg.session_id).await;
     if thread_id.is_none() && ctx.config.use_threads {
         tracing::warn!(session_id = %msg.session_id, "No topic — dropping ask_user_question");
+        // ADR-014 (review follow-up): release the blocked hook instead of leaving it
+        // to hang for the full 300s timeout with the user seeing nothing.
+        super::callback_handlers::release_question_hook(ctx, &msg.session_id).await;
         return;
     }
 
     let tool_input = match msg.meta().input() {
         Some(v) => v,
-        None => return,
+        None => {
+            tracing::warn!(session_id = %msg.session_id, "QuestionRequest missing metadata.input — releasing hook");
+            super::callback_handlers::release_question_hook(ctx, &msg.session_id).await;
+            return;
+        }
     };
 
     let questions_val = match tool_input.get("questions").and_then(|v| v.as_array()) {
         Some(q) if !q.is_empty() => q,
-        _ => return,
+        _ => {
+            tracing::warn!(session_id = %msg.session_id, "QuestionRequest missing/empty questions — releasing hook");
+            super::callback_handlers::release_question_hook(ctx, &msg.session_id).await;
+            return;
+        }
     };
 
     let mut questions = Vec::new();
@@ -1188,19 +1219,9 @@ pub(super) async fn handle_ask_user_question(ctx: &HandlerContext, msg: &BridgeM
     // so we can edit them in place when the user changes their selection.
     let mut question_message_ids: Vec<i64> = Vec::new();
     for (q_idx, q) in questions.iter().enumerate() {
-        let mut text = format!(
-            "\u{2753} *{}*\n\n{}\n",
-            escape_markdown_v1(&q.header),
-            escape_markdown_v1(&q.question)
-        );
-        for opt in &q.options {
-            text.push_str(&format!(
-                "\n\u{2022} *{}* \u{2014} {}",
-                escape_markdown_v1(&opt.label),
-                escape_markdown_v1(&opt.description)
-            ));
-        }
-        text.push_str("\n\n_Or type your answer in this topic_");
+        // ADR-014 (review follow-up): PLAIN TEXT render (no parse_mode on the send
+        // below). See render_question_text for why Markdown is unsafe here.
+        let text = super::render_question_text(q);
 
         let mut buttons = Vec::new();
         if q.multi_select {
@@ -1224,21 +1245,26 @@ pub(super) async fn handle_ask_user_question(ctx: &HandlerContext, msg: &BridgeM
         }
 
         // ADR-012 Phase 10: Use send_with_buttons_returning to capture message_id.
+        // parse_mode = None: see plain-text rationale above (D2).
         match ctx
             .bot
-            .send_with_buttons_returning(&text, buttons, Some("Markdown"), thread_id)
+            .send_with_buttons_returning(&text, buttons, None, thread_id)
             .await
         {
             Ok(mid) => question_message_ids.push(mid),
             Err(e) => {
+                // ADR-014 (review follow-up): this is NOT retried — the previous
+                // "retrying via queue" comment was false (it only pushed the 0
+                // sentinel). A queued retry would lose the message_id this flow needs
+                // for in-place edits. The failure is surfaced to the user below (E4)
+                // and the blocked hook is released so it falls back to its TUI.
                 tracing::warn!(
                     session_id = %msg.session_id,
                     q_idx,
                     error = %e,
-                    "Failed to send question message — retrying via queue"
+                    "Failed to render question message (no retry; surfaced to user + hook released)"
                 );
-                // Fall back to fire-and-forget; use 0 as sentinel so indices
-                // stay aligned (edit will silently fail but won't crash).
+                // 0 sentinel keeps indices aligned with `questions` (edits skip 0).
                 question_message_ids.push(0);
             }
         }
@@ -1266,6 +1292,11 @@ pub(super) async fn handle_ask_user_question(ctx: &HandlerContext, msg: &BridgeM
                 thread_id,
             )
             .await;
+        // ADR-014 (review follow-up): a partial/total render failure means the widget
+        // can never be completed ("Submit All" requires every question answered), so the
+        // blocked hook would hang for the full 300s timeout. Release it to its TUI now —
+        // the E4 notice above already directs the user to the terminal.
+        super::callback_handlers::release_question_hook(ctx, &msg.session_id).await;
     }
 
     // Store captured message_ids back into the pending question.

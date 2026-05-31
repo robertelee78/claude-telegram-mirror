@@ -660,26 +660,12 @@ async fn handle_answer_callback(ctx: &HandlerContext, data: &str, cb: &CallbackQ
         .tentative
         .insert(q_idx, TentativeAnswer::Option(o_idx));
 
-    // Rebuild the question message text with current selection shown.
+    // Rebuild the question message text (PLAIN TEXT — see render_question_text) with
+    // the current selection shown.
     let updated_text = {
         let q = &pending.questions[q_idx];
-        let mut t = format!(
-            "\u{2753} *{}*\n\n{}\n",
-            escape_markdown_v1(&q.header),
-            escape_markdown_v1(&q.question)
-        );
-        for opt in &q.options {
-            t.push_str(&format!(
-                "\n\u{2022} *{}* \u{2014} {}",
-                escape_markdown_v1(&opt.label),
-                escape_markdown_v1(&opt.description)
-            ));
-        }
-        t.push_str("\n\n_Or type your answer in this topic_");
-        t.push_str(&format!(
-            "\n\n\u{2713} *Selected: {}*",
-            escape_markdown_v1(&option_label)
-        ));
+        let mut t = super::render_question_text(q);
+        t.push_str(&format!("\n\n\u{2713} Selected: {option_label}"));
         t
     };
 
@@ -723,13 +709,7 @@ async fn handle_answer_callback(ctx: &HandlerContext, data: &str, cb: &CallbackQ
     if msg_id != 0 {
         if let Err(e) = ctx
             .bot
-            .edit_message_text_with_markup(
-                chat_id,
-                msg_id,
-                &updated_text,
-                Some("Markdown"),
-                &[new_buttons],
-            )
+            .edit_message_text_with_markup(chat_id, msg_id, &updated_text, None, &[new_buttons])
             .await
         {
             tracing::warn!(
@@ -990,7 +970,10 @@ pub(super) async fn send_or_update_summary(
     let short = &pending.session_id[..std::cmp::min(20, pending.session_id.len())];
 
     // Build summary text.
-    let mut summary_text = "\u{1F4CB} *Review your answers:*\n".to_string();
+    // PLAIN TEXT (sent with parse_mode None below) — answer labels are arbitrary
+    // model content; Markdown here risked an HTTP 400 that would drop the Submit All
+    // button and strand the blocked hook. See render_question_text.
+    let mut summary_text = "\u{1F4CB} Review your answers:\n".to_string();
     for (q_idx, q) in pending.questions.iter().enumerate() {
         let answer_label = match pending.tentative.get(&q_idx) {
             Some(TentativeAnswer::Option(o_idx)) => pending
@@ -1013,20 +996,15 @@ pub(super) async fn send_or_update_summary(
                     })
                     .collect();
                 if labels.is_empty() {
-                    "_(none)_".to_string()
+                    "(none)".to_string()
                 } else {
                     labels.join(", ")
                 }
             }
             Some(TentativeAnswer::FreeText(s)) => s.clone(),
-            None => "_(unanswered)_".to_string(),
+            None => "(unanswered)".to_string(),
         };
-        summary_text.push_str(&format!(
-            "\n{}. *{}:* {}",
-            q_idx + 1,
-            escape_markdown_v1(&q.header),
-            escape_markdown_v1(&answer_label)
-        ));
+        summary_text.push_str(&format!("\n{}. {}: {}", q_idx + 1, q.header, answer_label));
     }
 
     // Helper: build reply_markup keyboard.
@@ -1064,7 +1042,7 @@ pub(super) async fn send_or_update_summary(
                 chat_id,
                 mid,
                 &summary_text,
-                Some("Markdown"),
+                None,
                 reply_markup.clone(),
             )
             .await
@@ -1086,12 +1064,7 @@ pub(super) async fn send_or_update_summary(
     // Send new summary message.
     match ctx
         .bot
-        .send_message_with_raw_markup_returning(
-            &summary_text,
-            Some("Markdown"),
-            reply_markup,
-            thread_id,
-        )
+        .send_message_with_raw_markup_returning(&summary_text, None, reply_markup, thread_id)
         .await
     {
         Ok(new_mid) => {
@@ -1141,7 +1114,7 @@ fn build_answers_map_content(answers: &[(usize, String, CollectedAnswer)]) -> St
 /// `false` means the client is gone (e.g. the hook already timed out and closed its
 /// socket) or the write failed — the caller must then surface the answer rather than
 /// silently dropping it (ADR-014 review: late-submit-after-timeout loss).
-async fn send_question_response(
+pub(super) async fn send_question_response(
     ctx: &HandlerContext,
     session_id: &str,
     content: &str,
@@ -1191,6 +1164,38 @@ async fn send_question_response(
             tracing::warn!(session_id, error = %e, "Failed to write question_response to client");
             false
         }
+    }
+}
+
+/// ADR-014 (review follow-up): Release a blocked AskUserQuestion hook back to its
+/// own terminal TUI when the daemon cannot render (or finish rendering) the widget.
+///
+/// After `handle_question_request` registers the originating socket client, EVERY
+/// early-return / drop / error path in the render flow must call this — otherwise the
+/// hook stays blocked on `send_and_wait` for the full 300s timeout while the user sees
+/// nothing (silent ~5-minute freeze). Sending the free-text fallback sentinel makes the
+/// hook emit a bare `allow` and fall back to its native TUI immediately. Removes the
+/// pending-client mapping so a later "Submit All" can't try to route to a dead hook.
+///
+/// No-op (returns without effect) if no client was registered for this session.
+pub(super) async fn release_question_hook(ctx: &HandlerContext, session_id: &str) {
+    let client = ctx
+        .pending_question_clients
+        .write()
+        .await
+        .remove(session_id);
+    if let Some(client_id) = client {
+        let _ = send_question_response(
+            ctx,
+            session_id,
+            crate::types::FREETEXT_FALLBACK_SENTINEL,
+            &client_id,
+        )
+        .await;
+        tracing::warn!(
+            session_id,
+            "ADR-014: released blocked AskUserQuestion hook to its TUI (widget unavailable)"
+        );
     }
 }
 
@@ -1624,20 +1629,9 @@ async fn handle_change_callback(ctx: &HandlerContext, data: &str, cb: &CallbackQ
     }
 
     // Re-render the question message with original text and no checkmarks.
+    // PLAIN TEXT (parse_mode None below) — see render_question_text.
     if msg_id != 0 {
-        let mut original_text = format!(
-            "\u{2753} *{}*\n\n{}\n",
-            escape_markdown_v1(&q.header),
-            escape_markdown_v1(&q.question)
-        );
-        for opt in &q.options {
-            original_text.push_str(&format!(
-                "\n\u{2022} *{}* \u{2014} {}",
-                escape_markdown_v1(&opt.label),
-                escape_markdown_v1(&opt.description)
-            ));
-        }
-        original_text.push_str("\n\n_Or type your answer in this topic_");
+        let original_text = super::render_question_text(&q);
 
         let buttons: Vec<InlineButton> = if q.multi_select {
             let mut btns: Vec<InlineButton> = q
@@ -1667,13 +1661,7 @@ async fn handle_change_callback(ctx: &HandlerContext, data: &str, cb: &CallbackQ
 
         if let Err(e) = ctx
             .bot
-            .edit_message_text_with_markup(
-                chat_id,
-                msg_id,
-                &original_text,
-                Some("Markdown"),
-                &[buttons],
-            )
+            .edit_message_text_with_markup(chat_id, msg_id, &original_text, None, &[buttons])
             .await
         {
             tracing::warn!(

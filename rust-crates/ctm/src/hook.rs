@@ -511,6 +511,39 @@ async fn build_messages(
     messages
 }
 
+/// How a `PreToolUse` event is routed by `get_hook_output`.
+#[derive(Debug, PartialEq, Eq)]
+enum HookRoute {
+    /// `AskUserQuestion` — deliver structurally via a blocking QuestionRequest +
+    /// `updatedInput` (no keystrokes). Takes precedence over `BypassAllow`.
+    Question,
+    /// `bypassPermissions` is active and the tool is not a question — there is no
+    /// approval to perform, so the hook returns `None` and Claude proceeds.
+    BypassAllow,
+    /// Normal tool — fall through to the approval-required check.
+    ApprovalCheck,
+}
+
+/// Pure routing decision for `get_hook_output` (ADR-014 E1).
+///
+/// The `AskUserQuestion` check MUST come before the `bypassPermissions` check.
+/// AskUserQuestion is a genuine user *question*, not a tool-execution permission
+/// gate, so bypassing permissions (`--dangerously-skip-permissions`) must still
+/// surface it to Telegram. The original code ordered the bypass short-circuit first,
+/// which silently swallowed every question in bypass mode — the hook returned `None`
+/// before sending the QuestionRequest, the daemon never rendered the widget, and
+/// Claude fell back to its terminal TUI. This function exists to make that ordering
+/// explicit and unit-testable without any socket/daemon I/O.
+fn classify_hook_route(tool_name: &str, permission_mode: Option<&str>) -> HookRoute {
+    if tool_name == "AskUserQuestion" {
+        return HookRoute::Question;
+    }
+    if permission_mode == Some("bypassPermissions") {
+        return HookRoute::BypassAllow;
+    }
+    HookRoute::ApprovalCheck
+}
+
 /// Get hook output for PreToolUse (approval workflow)
 async fn get_hook_output(
     event: &HookEvent,
@@ -522,15 +555,17 @@ async fn get_hook_output(
         _ => return None,
     };
 
-    // Check bypass mode
-    if pre_tool.base.permission_mode.as_deref() == Some("bypassPermissions") {
-        return None;
-    }
-
-    // ADR-014 E1: AskUserQuestion is delivered structurally (no keystrokes) via a
-    // blocking QuestionRequest + updatedInput, NOT through the approval path.
-    if pre_tool.tool_name == "AskUserQuestion" {
-        return get_question_hook_output(pre_tool, session_id, cfg).await;
+    // Route the event. The ordering here is load-bearing (see HookRoute docs):
+    // AskUserQuestion MUST win over the bypassPermissions short-circuit.
+    match classify_hook_route(
+        &pre_tool.tool_name,
+        pre_tool.base.permission_mode.as_deref(),
+    ) {
+        HookRoute::Question => {
+            return get_question_hook_output(pre_tool, session_id, cfg).await;
+        }
+        HookRoute::BypassAllow => return None,
+        HookRoute::ApprovalCheck => {}
     }
 
     // Check if tool requires approval
@@ -1054,6 +1089,42 @@ async fn send_and_wait(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ADR-014 (regression): AskUserQuestion must route to the structured Question
+    /// path EVEN in bypassPermissions mode (`--dangerously-skip-permissions`). The
+    /// original bug ordered the bypass short-circuit first, so questions were silently
+    /// swallowed and never rendered to Telegram. This locks the ordering.
+    #[test]
+    fn askuserquestion_routes_to_question_even_in_bypass() {
+        assert_eq!(
+            classify_hook_route("AskUserQuestion", Some("bypassPermissions")),
+            HookRoute::Question,
+            "AskUserQuestion must reach the Question path in bypass mode (the original bug)"
+        );
+        assert_eq!(
+            classify_hook_route("AskUserQuestion", None),
+            HookRoute::Question
+        );
+        assert_eq!(
+            classify_hook_route("AskUserQuestion", Some("default")),
+            HookRoute::Question
+        );
+    }
+
+    /// Non-question tools keep the original semantics: bypass short-circuits to allow,
+    /// everything else falls through to the approval-required check.
+    #[test]
+    fn non_question_tools_route_normally() {
+        assert_eq!(
+            classify_hook_route("Bash", Some("bypassPermissions")),
+            HookRoute::BypassAllow
+        );
+        assert_eq!(
+            classify_hook_route("Bash", Some("default")),
+            HookRoute::ApprovalCheck
+        );
+        assert_eq!(classify_hook_route("Write", None), HookRoute::ApprovalCheck);
+    }
 
     /// ADR-014 E1: a JSON answers map yields permissionDecision:allow + updatedInput
     /// carrying the original questions and the answers, keyed by question text.
