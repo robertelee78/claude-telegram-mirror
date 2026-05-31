@@ -85,7 +85,7 @@ fn ctm_hook_command() -> String {
 ///
 /// This avoids false positives from tools like `xctm-linter` where "ctm" is embedded
 /// inside a longer identifier word.
-fn is_ctm_command(cmd: &str) -> bool {
+pub(crate) fn is_ctm_command(cmd: &str) -> bool {
     if cmd.contains("telegram-hook") || cmd.contains("hooks/handler") {
         return true;
     }
@@ -116,7 +116,7 @@ fn is_ctm_command(cmd: &str) -> bool {
 }
 
 /// Check if a hook item (in the new format) contains a CTM command.
-fn item_is_ctm(item: &Value) -> bool {
+pub(crate) fn item_is_ctm(item: &Value) -> bool {
     // New format: { "matcher": "", "hooks": [{ "type": "command", "command": "..." }] }
     if let Some(hooks_arr) = item.get("hooks").and_then(|v| v.as_array()) {
         return hooks_arr.iter().any(|h| {

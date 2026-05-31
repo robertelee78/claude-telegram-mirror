@@ -251,6 +251,41 @@ fn check_env_vars() -> CheckResult {
     }
 }
 
+/// ADR-014 / Claude Code #15897 (D7): detect a NON-ctm `PreToolUse` hook.
+///
+/// Claude Code ignores the `updatedInput` returned by a PreToolUse hook when more
+/// than one PreToolUse hook is registered (anthropics/claude-code#15897, closed
+/// "not planned"). That silently breaks ctm's structured AskUserQuestion answer
+/// delivery: the Telegram question buttons still render, but tapping them no longer
+/// answers Claude. Returns the first foreign command found, if any.
+fn foreign_pretooluse_command(hooks: Option<&serde_json::Value>) -> Option<String> {
+    // Use the canonical, token-based classifier from the installer so a tool like
+    // `xctm-linter` or `/opt/ctm-guard/...` (where "ctm" is embedded) is correctly
+    // treated as FOREIGN rather than mistaken for ctm's own hook.
+    use crate::installer::is_ctm_command;
+    let arr = hooks
+        .and_then(|h| h.get("PreToolUse"))
+        .and_then(|v| v.as_array())?;
+    for item in arr {
+        // New format: { matcher, hooks: [{ type, command }] }
+        if let Some(inner) = item.get("hooks").and_then(|h| h.as_array()) {
+            for h in inner {
+                if let Some(cmd) = h.get("command").and_then(|c| c.as_str()) {
+                    if !is_ctm_command(cmd) {
+                        return Some(cmd.to_string());
+                    }
+                }
+            }
+        } else if let Some(cmd) = item.get("command").and_then(|c| c.as_str()) {
+            // Old format: { matcher, command }
+            if !is_ctm_command(cmd) {
+                return Some(cmd.to_string());
+            }
+        }
+    }
+    None
+}
+
 fn check_hooks(fix: bool) -> CheckResult {
     let path = claude_settings_path();
     if !path.exists() {
@@ -279,80 +314,40 @@ fn check_hooks(fix: bool) -> CheckResult {
                 "UserPromptSubmit",
                 "PreCompact",
             ];
+            // Use the canonical, token-based classifier (shared with the installer) so
+            // tools like `xctm-linter` aren't miscounted as ctm hooks.
+            let ctm_hook_installed = |ht: &str| -> bool {
+                hooks
+                    .and_then(|h| h.get(ht))
+                    .and_then(|v| v.as_array())
+                    .map(|arr| arr.iter().any(crate::installer::item_is_ctm))
+                    .unwrap_or(false)
+            };
             let installed = check_types
                 .iter()
-                .filter(|&&ht| {
-                    hooks
-                        .and_then(|h| h.get(ht))
-                        .and_then(|v| v.as_array())
-                        .map(|arr| {
-                            arr.iter().any(|item| {
-                                // New format
-                                item.get("hooks")
-                                    .and_then(|h| h.as_array())
-                                    .map(|hooks| {
-                                        hooks.iter().any(|h| {
-                                            h.get("command")
-                                                .and_then(|c| c.as_str())
-                                                .map(|c| {
-                                                    c.contains("telegram-hook")
-                                                        || c.contains("ctm")
-                                                })
-                                                .unwrap_or(false)
-                                        })
-                                    })
-                                    .unwrap_or(false)
-                                    // Old format
-                                    || item
-                                        .get("command")
-                                        .and_then(|c| c.as_str())
-                                        .map(|c| {
-                                            c.contains("telegram-hook") || c.contains("ctm")
-                                        })
-                                        .unwrap_or(false)
-                            })
-                        })
-                        .unwrap_or(false)
-                })
+                .filter(|&&ht| ctm_hook_installed(ht))
                 .count();
 
             if installed == check_types.len() {
-                CheckResult::pass("Claude Code Hooks", "All hooks installed")
+                // D7: even with all ctm hooks installed, a coexisting non-ctm
+                // PreToolUse hook breaks structured AskUserQuestion answers (#15897).
+                if let Some(foreign) = foreign_pretooluse_command(hooks) {
+                    let foreign_short: String = foreign.chars().take(60).collect();
+                    CheckResult::warn(
+                        "Claude Code Hooks",
+                        "Another PreToolUse hook is registered — AskUserQuestion answers may be ignored",
+                    )
+                    .with_details(&format!(
+                        "Claude Code ignores hook updatedInput when multiple PreToolUse hooks run (anthropics/claude-code#15897). Telegram question buttons will render but tapping them may not answer Claude. Foreign PreToolUse hook: {foreign_short}"
+                    ))
+                } else {
+                    CheckResult::pass("Claude Code Hooks", "All hooks installed")
+                }
             } else if installed > 0 {
                 // Detect legacy 3-hook installs (PreToolUse + PostToolUse + Notification only)
                 let legacy_hooks = ["PreToolUse", "PostToolUse", "Notification"];
-                let is_legacy = installed == 3
-                    && legacy_hooks.iter().all(|&ht| {
-                        hooks
-                            .and_then(|h| h.get(ht))
-                            .and_then(|v| v.as_array())
-                            .map(|arr| {
-                                arr.iter().any(|item| {
-                                    item.get("hooks")
-                                        .and_then(|h| h.as_array())
-                                        .map(|hooks| {
-                                            hooks.iter().any(|h| {
-                                                h.get("command")
-                                                    .and_then(|c| c.as_str())
-                                                    .map(|c| {
-                                                        c.contains("telegram-hook")
-                                                            || c.contains("ctm")
-                                                    })
-                                                    .unwrap_or(false)
-                                            })
-                                        })
-                                        .unwrap_or(false)
-                                        || item
-                                            .get("command")
-                                            .and_then(|c| c.as_str())
-                                            .map(|c| {
-                                                c.contains("telegram-hook") || c.contains("ctm")
-                                            })
-                                            .unwrap_or(false)
-                                })
-                            })
-                            .unwrap_or(false)
-                    });
+                let is_legacy =
+                    installed == 3 && legacy_hooks.iter().all(|&ht| ctm_hook_installed(ht));
 
                 let msg = if is_legacy {
                     format!(
@@ -896,5 +891,42 @@ mod tests {
         assert!(r.fixed);
         assert_eq!(r.fix_message.as_deref(), Some("fixed it"));
         assert_eq!(r.details.as_deref(), Some("details"));
+    }
+
+    /// D7 (Claude Code #15897): a non-ctm PreToolUse hook must be flagged; a
+    /// ctm-only PreToolUse set must not.
+    #[test]
+    fn test_foreign_pretooluse_detection() {
+        // Only ctm's hook present -> no foreign hook.
+        let ctm_only = serde_json::json!({
+            "PreToolUse": [
+                {"matcher": "", "hooks": [{"type": "command", "command": "/path/to/ctm hook"}]}
+            ]
+        });
+        assert_eq!(foreign_pretooluse_command(Some(&ctm_only)), None);
+
+        // A second, non-ctm PreToolUse hook -> flagged.
+        let with_foreign = serde_json::json!({
+            "PreToolUse": [
+                {"matcher": "", "hooks": [{"type": "command", "command": "/path/to/ctm hook"}]},
+                {"matcher": "Bash", "hooks": [{"type": "command", "command": "/opt/guard/block-rm.sh"}]}
+            ]
+        });
+        assert_eq!(
+            foreign_pretooluse_command(Some(&with_foreign)).as_deref(),
+            Some("/opt/guard/block-rm.sh")
+        );
+
+        // Old (flat) format is also inspected.
+        let old_format = serde_json::json!({
+            "PreToolUse": [ {"matcher": "", "command": "/usr/bin/other-hook"} ]
+        });
+        assert_eq!(
+            foreign_pretooluse_command(Some(&old_format)).as_deref(),
+            Some("/usr/bin/other-hook")
+        );
+
+        // No hooks block at all -> None.
+        assert_eq!(foreign_pretooluse_command(None), None);
     }
 }
