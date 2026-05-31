@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed (ADR-014 post-release field defects)
+- **AskUserQuestion now reaches Telegram under `--dangerously-skip-permissions`** (D1, root cause) — the `PreToolUse` hook short-circuited on `bypassPermissions` *before* the AskUserQuestion branch, so in the operator's normal mode the question was never sent and Claude fell back to its terminal TUI. AskUserQuestion is now routed ahead of the bypass check (it's input collection, not a permission gate).
+- **Question widgets render as plain text** (D2) — header/question/option/answer text is arbitrary model content; sending it under Telegram Markdown v1 (with backtick-only escaping) caused HTTP 400 "can't parse entities" that silently dropped the widget (including the "Submit All" message). All question-lifecycle messages now render as plain text via a shared renderer.
+- **No more silent ~5-minute hangs** (D3/D4) — every render drop/error path (no topic, missing input, empty questions, render failure, supersede) now releases the blocked hook to the terminal instead of leaving it to time out; the misleading "retrying via queue" log (which never retried) is corrected.
+- **Mirror-storm resilience** (D6) — `ToolStart` previews moved to a new Low queue priority so a tool-spam storm can no longer starve or evict substantive `ToolResult`s or approvals/questions; the per-drop log spam is replaced by a throttled 5-second aggregate.
+- **`ctm doctor` warns about competing PreToolUse hooks** (D7) — Claude Code ignores hook `updatedInput` when multiple `PreToolUse` hooks are registered (anthropics/claude-code#15897), which would silently break structured AskUserQuestion answers.
+- **Configurable AskUserQuestion wait** (D8) — `question_wait_secs` (env `TELEGRAM_QUESTION_WAIT_SECS` / config `questionWaitSecs`, default 300) replaces hardcoded timeouts; a pre-emptive "answer at the terminal" notice posts near expiry.
+- **Resilient rate-limit handling** (D5) — Telegram 429s are now retried up to 3× (honoring `retry_after`) instead of once, so a rate-limit burst can't strand the direct question/summary sends.
+- **Collision-safe answer routing** — an ambiguous 20-char session-id prefix in callback data is now refused (logged) rather than risking misdelivery to the wrong session.
+
 ## [0.2.18] - 2026-05-28
 
 ### Added (ADR-014)
