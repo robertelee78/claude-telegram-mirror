@@ -314,6 +314,35 @@ impl TelegramBot {
         options: Option<&SendOptions>,
         thread_id: Option<i64>,
     ) {
+        self.send_message_inner(text, options, thread_id, MessagePriority::Normal)
+            .await;
+    }
+
+    /// ADR-014 D6: Send a message at Low queue priority.
+    ///
+    /// Used for ephemeral tool-execution *previews* (ToolStart). Low-priority
+    /// messages drain only after Critical and Normal are empty, so during a
+    /// tool-spam storm previews are naturally deferred (and shed oldest-first when
+    /// the Low tier overflows) while substantive ToolResults in the Normal tier are
+    /// preserved and delivered first. `MessagePriority` stays private — callers pick
+    /// intent (low), mirroring `send_with_buttons_critical`.
+    pub async fn send_message_low(
+        &self,
+        text: &str,
+        options: Option<&SendOptions>,
+        thread_id: Option<i64>,
+    ) {
+        self.send_message_inner(text, options, thread_id, MessagePriority::Low)
+            .await;
+    }
+
+    async fn send_message_inner(
+        &self,
+        text: &str,
+        options: Option<&SendOptions>,
+        thread_id: Option<i64>,
+        priority: MessagePriority,
+    ) {
         let chunks = chunk_message(text, self.chunk_size);
         let parse_mode = options
             .and_then(|o| o.parse_mode.clone())
@@ -334,7 +363,7 @@ impl TelegramBot {
                 reply_to_message_id: reply_id,
                 retries: 0,
                 created_at: epoch_millis(),
-                priority: MessagePriority::Normal,
+                priority,
             })
             .await;
         }
@@ -365,6 +394,19 @@ impl TelegramBot {
         thread_id: Option<i64>,
     ) {
         self.send_with_buttons_inner(text, buttons, options, thread_id, MessagePriority::Critical)
+            .await;
+    }
+
+    /// ADR-014 D6: Send a buttoned message at Low queue priority (ToolStart preview
+    /// with a "Details" button). See `send_message_low` for the rationale.
+    pub async fn send_with_buttons_low(
+        &self,
+        text: &str,
+        buttons: Vec<InlineButton>,
+        options: Option<&SendOptions>,
+        thread_id: Option<i64>,
+    ) {
+        self.send_with_buttons_inner(text, buttons, options, thread_id, MessagePriority::Low)
             .await;
     }
 

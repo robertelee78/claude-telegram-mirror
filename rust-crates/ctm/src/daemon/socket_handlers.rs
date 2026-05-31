@@ -671,11 +671,11 @@ pub(super) async fn handle_tool_start(ctx: &HandlerContext, msg: &BridgeMessage)
     let text = format!("\u{1F527} {summary}\n    Tool: `{tool_name}`{preview}");
 
     if !tool_input.is_null() && tool_input.as_object().is_some_and(|o| !o.is_empty()) {
-        // ADR-011 Fix #9: This send should use Low priority once bot/client.rs
-        // exposes a priority-aware send interface. Tool-start notifications are
-        // high-frequency diagnostic noise and should not block critical messages.
+        // ADR-011 Fix #9 / ADR-014 D6: ToolStart previews are high-frequency
+        // diagnostic noise — sent at Low priority so a tool-spam storm cannot starve
+        // or evict substantive ToolResults (Normal) or approvals/questions (Critical).
         ctx.bot
-            .send_with_buttons(
+            .send_with_buttons_low(
                 &text,
                 vec![InlineButton {
                     text: "\u{1F4CB} Details".into(),
@@ -689,10 +689,9 @@ pub(super) async fn handle_tool_start(ctx: &HandlerContext, msg: &BridgeMessage)
             )
             .await;
     } else {
-        // ADR-011 Fix #9: This send should use Low priority once bot/client.rs
-        // exposes a priority-aware send interface (same reasoning as above).
+        // ADR-011 Fix #9 / ADR-014 D6: Low priority — see above.
         ctx.bot
-            .send_message(
+            .send_message_low(
                 &text,
                 Some(&SendOptions {
                     parse_mode: Some("Markdown".into()),
@@ -741,9 +740,10 @@ pub(super) async fn handle_tool_result(ctx: &HandlerContext, msg: &BridgeMessage
         ctx.config.verbose,
     );
 
-    // ADR-011 Fix #9: This send should use Low priority once bot/client.rs
-    // exposes a priority-aware send interface. Tool-result notifications are
-    // high-frequency diagnostic noise and should not block critical messages.
+    // ADR-014 D6: ToolResult stays at Normal priority (NOT Low). Unlike the
+    // ToolStart *preview*, the result is the substantive mirror the user actually
+    // reads, so it must survive a tool-spam storm and outrank Low-tier previews.
+    // (Low is reserved for ToolStart previews; Critical for approvals/questions.)
     ctx.bot
         .send_message(
             &format!("\u{2705} {result_summary}\n{formatted}"),
