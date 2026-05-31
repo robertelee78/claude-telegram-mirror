@@ -1073,6 +1073,19 @@ pub(super) async fn send_or_update_summary(
         }
         Err(e) => {
             tracing::warn!(session_id = full_key, error = %e, "Failed to send summary message");
+            // ADR-014 (review follow-up, residual D5): the "Submit All" summary could
+            // not be sent (e.g. a transient Telegram error), so the user has no button
+            // to submit and the blocked hook would otherwise hang until timeout. Drop
+            // the entry lock, tell the user, and release the hook to its terminal TUI.
+            drop(pending);
+            ctx.bot
+                .send_message(
+                    "\u{26A0}\u{FE0F} Couldn't show the Submit button (Telegram send failed). Please answer at the terminal.",
+                    None,
+                    thread_id,
+                )
+                .await;
+            release_question_hook(ctx, full_key).await;
             None
         }
     }
