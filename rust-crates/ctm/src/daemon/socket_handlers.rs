@@ -1179,19 +1179,17 @@ pub(super) async fn handle_ask_user_question(ctx: &HandlerContext, msg: &BridgeM
     // C4: If a PendingQuestion already exists for this session (second
     // AskUserQuestion before the first was answered), supersede the old one:
     // edit its question messages to "Superseded" and delete its summary.
+    let new_entry = Arc::new(Mutex::new(PendingQuestion {
+        session_id: msg.session_id.clone(),
+        questions: questions.clone(),
+        tentative: HashMap::new(),
+        finalized: vec![false; questions.len()],
+        question_message_ids: Vec::new(),
+        summary_message_id: None,
+    }));
     let old_entry = {
         let mut pq = ctx.pending_q.write().await;
-        pq.insert(
-            pending_key.clone(),
-            Arc::new(Mutex::new(PendingQuestion {
-                session_id: msg.session_id.clone(),
-                questions: questions.clone(),
-                tentative: HashMap::new(),
-                finalized: vec![false; questions.len()],
-                question_message_ids: Vec::new(),
-                summary_message_id: None,
-            })),
-        )
+        pq.insert(pending_key.clone(), Arc::clone(&new_entry))
     };
     if let Some(old_arc) = old_entry {
         let old_pq = old_arc.lock().await;
@@ -1305,6 +1303,45 @@ pub(super) async fn handle_ask_user_question(ctx: &HandlerContext, msg: &BridgeM
         if let Some(entry) = pq.get(&pending_key) {
             let mut pending = entry.lock().await;
             pending.question_message_ids = question_message_ids;
+        }
+    }
+
+    // ADR-014 D8c: pre-emptive expiry nudge. If the widget rendered cleanly but is
+    // still unanswered at ~80% of the wait window, post one low-priority notice so the
+    // user isn't left tapping a widget whose blocked hook is about to time out (the
+    // #28508-class "silent dead widget"). Skipped when the render failed (the hook was
+    // already released to its TUI). The timer self-cancels if the question is answered
+    // (key removed) or superseded (Arc replaced — detected via ptr_eq). A benign race
+    // remains: if the question is answered in the brief gap between the live-check and
+    // the send, one extra "about to expire" notice may post — harmless.
+    if failed_renders == 0 {
+        let wait_secs = ctx.config.question_wait_secs as u64;
+        if wait_secs >= 30 {
+            let nudge_after = std::time::Duration::from_secs(wait_secs * 4 / 5);
+            let bot = Arc::clone(&ctx.bot);
+            let pending_q = Arc::clone(&ctx.pending_q);
+            let entry_ref = Arc::clone(&new_entry);
+            let key = pending_key.clone();
+            let tid = thread_id;
+            tokio::spawn(async move {
+                tokio::time::sleep(nudge_after).await;
+                let still_live = {
+                    let pq = pending_q.read().await;
+                    pq.get(&key).is_some_and(|cur| Arc::ptr_eq(cur, &entry_ref))
+                };
+                if !still_live {
+                    return;
+                }
+                if entry_ref.lock().await.finalized.iter().all(|f| *f) {
+                    return; // mid-submit; no nudge
+                }
+                bot.send_message_low(
+                    "\u{23F3} This question is about to expire \u{2014} if the buttons stop responding, answer at the terminal.",
+                    None,
+                    tid,
+                )
+                .await;
+            });
         }
     }
 }

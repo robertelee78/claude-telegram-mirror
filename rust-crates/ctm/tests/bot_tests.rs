@@ -20,6 +20,7 @@ fn test_config() -> Config {
         chunk_size: 4000,
         rate_limit: 20,
         session_timeout: 30,
+        question_wait_secs: 300,
         stale_session_timeout_hours: 72,
         auto_delete_topics: true,
         topic_delete_delay_minutes: 15,

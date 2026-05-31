@@ -717,7 +717,7 @@ async fn get_question_hook_output(
     match send_and_wait(
         &cfg.socket_path,
         &msg,
-        Duration::from_secs(300),
+        Duration::from_secs(cfg.question_wait_secs as u64),
         MessageType::QuestionResponse,
     )
     .await

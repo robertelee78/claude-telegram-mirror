@@ -65,6 +65,12 @@ pub fn write_mirror_status(config_dir: &std::path::Path, enabled: bool, pid: Opt
     }
 }
 
+/// ADR-014 D8: default AskUserQuestion hook wait (seconds). Was a hardcoded 300.
+pub const DEFAULT_QUESTION_WAIT_SECS: u32 = 300;
+/// ADR-014 D8: buffer added to `question_wait_secs` for the registered PreToolUse hook
+/// timeout, so Claude Code does not cancel the hook before its own wait completes.
+pub const QUESTION_HOOK_TIMEOUT_BUFFER_SECS: u32 = 10;
+
 /// CTM configuration loaded from env vars > config file > defaults
 #[derive(Clone)]
 pub struct Config {
@@ -78,6 +84,13 @@ pub struct Config {
     pub chunk_size: usize,
     pub rate_limit: u32,
     pub session_timeout: u32,
+    /// ADR-014 D8: how long the AskUserQuestion hook blocks waiting for a Telegram
+    /// answer before falling back to Claude's terminal TUI (default
+    /// `DEFAULT_QUESTION_WAIT_SECS` = 300). The installer registers the PreToolUse hook
+    /// timeout at `DEFAULT_QUESTION_WAIT_SECS + QUESTION_HOOK_TIMEOUT_BUFFER_SECS` (310).
+    /// Lowering this is always safe; raising it ABOVE 310 also requires bumping the
+    /// PreToolUse `timeout` in settings.json, or Claude Code cancels the hook first.
+    pub question_wait_secs: u32,
     #[allow(dead_code)] // Library API
     pub stale_session_timeout_hours: u32,
     pub auto_delete_topics: bool,
@@ -107,6 +120,7 @@ impl fmt::Debug for Config {
             .field("chunk_size", &self.chunk_size)
             .field("rate_limit", &self.rate_limit)
             .field("session_timeout", &self.session_timeout)
+            .field("question_wait_secs", &self.question_wait_secs)
             .field(
                 "stale_session_timeout_hours",
                 &self.stale_session_timeout_hours,
@@ -150,6 +164,8 @@ struct ConfigFile {
     rate_limit: Option<u32>,
     #[serde(alias = "sessionTimeout", alias = "session_timeout")]
     session_timeout: Option<u32>,
+    #[serde(alias = "questionWaitSecs", alias = "question_wait_secs")]
+    question_wait_secs: Option<u32>,
     #[serde(
         alias = "staleSessionTimeoutHours",
         alias = "stale_session_timeout_hours"
@@ -341,6 +357,14 @@ pub fn load_config(require_auth: bool) -> Result<Config> {
         .or(file_config.session_timeout)
         .unwrap_or(30);
 
+    // ADR-014 D8: AskUserQuestion hook wait, configurable so it can be tuned against
+    // Claude Code's own AskUserQuestion behavior without editing two magic numbers.
+    let question_wait_secs = std::env::var("TELEGRAM_QUESTION_WAIT_SECS")
+        .ok()
+        .map(|v| parse_u32(&v, DEFAULT_QUESTION_WAIT_SECS))
+        .or(file_config.question_wait_secs)
+        .unwrap_or(DEFAULT_QUESTION_WAIT_SECS);
+
     let stale_session_timeout_hours = std::env::var("TELEGRAM_STALE_SESSION_TIMEOUT_HOURS")
         .ok()
         .map(|v| parse_u32(&v, 72))
@@ -407,6 +431,7 @@ pub fn load_config(require_auth: bool) -> Result<Config> {
         auto_delete_topics,
         topic_delete_delay_minutes,
         inactivity_delete_threshold_minutes,
+        question_wait_secs,
         socket_path,
         config_dir,
         config_path,

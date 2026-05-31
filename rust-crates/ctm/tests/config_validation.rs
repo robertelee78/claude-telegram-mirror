@@ -35,6 +35,26 @@ fn load_config_returns_expected_default_types() {
         !cfg.socket_path.as_os_str().is_empty(),
         "socket_path should not be empty"
     );
+    // ADR-014 D8: AskUserQuestion wait must be a sane positive value.
+    assert!(
+        cfg.question_wait_secs > 0,
+        "question_wait_secs should be positive"
+    );
+}
+
+/// ADR-014 D8: the default wait + buffer must equal the PreToolUse hook timeout the
+/// installer registers (310), so the hook is never cancelled before its wait completes.
+/// This locks the "behavior-preserving at defaults" property and guards against the two
+/// numbers drifting apart.
+#[test]
+fn question_wait_default_and_buffer_match_registered_timeout() {
+    assert_eq!(config::DEFAULT_QUESTION_WAIT_SECS, 300);
+    assert_eq!(config::QUESTION_HOOK_TIMEOUT_BUFFER_SECS, 10);
+    assert_eq!(
+        config::DEFAULT_QUESTION_WAIT_SECS + config::QUESTION_HOOK_TIMEOUT_BUFFER_SECS,
+        310,
+        "installer registers PreToolUse timeout=310; keep wait+buffer in sync"
+    );
 }
 
 /// NOTE: Tests that mutate env vars are combined into a single test function to
