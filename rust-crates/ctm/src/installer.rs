@@ -85,7 +85,7 @@ fn ctm_hook_command() -> String {
 ///
 /// This avoids false positives from tools like `xctm-linter` where "ctm" is embedded
 /// inside a longer identifier word.
-fn is_ctm_command(cmd: &str) -> bool {
+pub(crate) fn is_ctm_command(cmd: &str) -> bool {
     if cmd.contains("telegram-hook") || cmd.contains("hooks/handler") {
         return true;
     }
@@ -116,7 +116,7 @@ fn is_ctm_command(cmd: &str) -> bool {
 }
 
 /// Check if a hook item (in the new format) contains a CTM command.
-fn item_is_ctm(item: &Value) -> bool {
+pub(crate) fn item_is_ctm(item: &Value) -> bool {
     // New format: { "matcher": "", "hooks": [{ "type": "command", "command": "..." }] }
     if let Some(hooks_arr) = item.get("hooks").and_then(|v| v.as_array()) {
         return hooks_arr.iter().any(|h| {
@@ -308,10 +308,14 @@ fn install_hooks_to_path(
         settings["hooks"] = serde_json::json!({});
     }
 
+    // ADR-014 D8: PreToolUse timeout derived from the AskUserQuestion wait + buffer
+    // (single source of truth in config), so the hook is never cancelled before its
+    // own send_and_wait completes. Default 300 + 10 = 310 (unchanged).
+    let pretooluse_timeout = crate::config::DEFAULT_QUESTION_WAIT_SECS
+        + crate::config::QUESTION_HOOK_TIMEOUT_BUFFER_SECS;
     for &hook_type in HOOK_TYPES {
-        // PreToolUse needs timeout: 310 for approval workflow (5 min + 10s buffer)
         let expected = if hook_type == "PreToolUse" {
-            create_hook_entry_with_timeout(&command, 310)
+            create_hook_entry_with_timeout(&command, pretooluse_timeout)
         } else {
             create_hook_entry(&command)
         };

@@ -25,6 +25,10 @@ pub(super) struct PriorityMessageQueue {
     critical: VecDeque<QueuedMessage>,
     normal: VecDeque<QueuedMessage>,
     low: VecDeque<QueuedMessage>,
+    /// ADR-014 D6: drops accumulated since the last aggregate log line.
+    dropped_since_log: u64,
+    /// ADR-014 D6: when the last aggregate drop line was emitted.
+    last_drop_log: Option<std::time::Instant>,
 }
 
 impl PriorityMessageQueue {
@@ -34,12 +38,16 @@ impl PriorityMessageQueue {
     const MAX_NORMAL: usize = 300;
     /// Maximum low-priority messages queued.
     const MAX_LOW: usize = 150;
+    /// ADR-014 D6: minimum interval between aggregate backpressure log lines.
+    const DROP_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
     pub(super) fn new() -> Self {
         Self {
             critical: VecDeque::new(),
             normal: VecDeque::new(),
             low: VecDeque::new(),
+            dropped_since_log: 0,
+            last_drop_log: None,
         }
     }
 
@@ -52,12 +60,27 @@ impl PriorityMessageQueue {
             MessagePriority::Low => (&mut self.low, Self::MAX_LOW),
         };
         if queue.len() >= max {
-            let dropped = queue.pop_front();
-            tracing::warn!(
-                priority = ?msg.priority,
-                dropped_text = dropped.as_ref().map(|d| d.text.chars().take(50).collect::<String>()),
-                "Queue full for priority tier, dropping oldest message"
-            );
+            queue.pop_front();
+            // ADR-014 D6: a tool-spam storm overflows a tier every few ms. Logging each
+            // drop individually buried the journal in per-second spam (the symptom that
+            // motivated this fix). Aggregate instead: count drops and emit at most one
+            // summary line per DROP_LOG_INTERVAL. Higher tiers are never evicted by
+            // lower-tier overflow, so this is overwhelmingly Low-tier preview churn.
+            self.dropped_since_log += 1;
+            let now = std::time::Instant::now();
+            let should_log = self
+                .last_drop_log
+                .map(|t| now.duration_since(t) >= Self::DROP_LOG_INTERVAL)
+                .unwrap_or(true);
+            if should_log {
+                tracing::warn!(
+                    dropped = self.dropped_since_log,
+                    "Queue backpressure: evicted {} oldest queued message(s) since last report (mostly Low-priority tool previews)",
+                    self.dropped_since_log
+                );
+                self.dropped_since_log = 0;
+                self.last_drop_log = Some(now);
+            }
         }
         queue.push_back(msg);
     }
@@ -376,6 +399,7 @@ mod tests {
             chunk_size: 4000,
             rate_limit: 20,
             session_timeout: 30,
+            question_wait_secs: 300,
             stale_session_timeout_hours: 72,
             auto_delete_topics: true,
             topic_delete_delay_minutes: 15,
@@ -473,6 +497,31 @@ mod tests {
         q.enqueue(make_msg("critical-safe", MessagePriority::Critical));
         assert_eq!(q.critical.len(), 1);
         assert_eq!(q.critical.front().unwrap().text, "critical-safe");
+    }
+
+    /// ADR-014 D6: under a tool-spam storm, Low-priority ToolStart previews shed
+    /// (oldest-first) while Normal-priority ToolResults are fully preserved AND
+    /// drained first. This is the core D6 guarantee.
+    #[test]
+    fn d6_low_previews_shed_while_normal_results_survive() {
+        let mut q = PriorityMessageQueue::new();
+        // Storm: far more Low previews than the tier holds, plus some Normal results.
+        for i in 0..(PriorityMessageQueue::MAX_LOW + 100) {
+            q.enqueue(make_msg(&format!("preview-{i}"), MessagePriority::Low));
+        }
+        for i in 0..10 {
+            q.enqueue(make_msg(&format!("result-{i}"), MessagePriority::Normal));
+        }
+        // Normal results are untouched by Low overflow.
+        assert_eq!(q.normal.len(), 10);
+        // Low tier is capped; the oldest 100 previews were shed.
+        assert_eq!(q.low.len(), PriorityMessageQueue::MAX_LOW);
+        // ALL results drain before ANY preview.
+        for i in 0..10 {
+            assert_eq!(q.pop_next().unwrap().text, format!("result-{i}"));
+        }
+        // Remaining previews start at preview-100 (preview-0..99 were evicted oldest-first).
+        assert_eq!(q.pop_next().unwrap().text, "preview-100");
     }
 
     #[test]

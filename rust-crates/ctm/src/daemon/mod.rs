@@ -96,7 +96,7 @@ pub(super) struct PendingQuestion {
 }
 
 #[derive(Clone)]
-struct QuestionDef {
+pub(super) struct QuestionDef {
     question: String,
     header: String,
     options: Vec<OptionDef>,
@@ -104,9 +104,30 @@ struct QuestionDef {
 }
 
 #[derive(Clone)]
-struct OptionDef {
+pub(super) struct OptionDef {
     label: String,
     description: String,
+}
+
+/// ADR-014 (review follow-up): render an AskUserQuestion as PLAIN TEXT.
+///
+/// Every question-widget message (initial render, per-tap re-render, free-text edit)
+/// must be plain text — never Telegram Markdown. The text interpolates arbitrary
+/// model-generated content (headers, questions, option labels/descriptions full of
+/// `*`, `_`, `[`, code, ADR refs) and legacy Markdown v1 has no reliable escaping, so
+/// any stray marker produced an unbalanced-entity HTTP 400 and the message (often the
+/// one carrying the "Submit All" button) silently failed to render. Plain text cannot
+/// 400. Centralised here so all render sites stay consistent.
+pub(super) fn render_question_text(q: &QuestionDef) -> String {
+    let mut text = format!("\u{2753} {}\n\n{}\n", q.header, q.question);
+    for opt in &q.options {
+        text.push_str(&format!(
+            "\n\u{2022} {} \u{2014} {}",
+            opt.label, opt.description
+        ));
+    }
+    text.push_str("\n\nOr type your answer in this topic");
+    text
 }
 
 /// Topic creation lock for BUG-002 prevention.
@@ -1113,7 +1134,21 @@ fn escape_markdown_v1(text: &str) -> String {
 /// H6.1: Resolve a short session_id prefix (from callback_data) to the full
 /// session_id key in the pending_questions map. Returns `None` if no match.
 fn resolve_pending_key<V>(pq: &HashMap<String, V>, short_key: &str) -> Option<String> {
-    pq.keys().find(|k| k.starts_with(short_key)).cloned()
+    // ADR-014 (review follow-up): callback_data carries only the first 20 chars of the
+    // session id (Telegram's 64-byte limit). If two active sessions ever shared that
+    // prefix, a first-match lookup could misroute an answer to the wrong session. That
+    // is near-impossible for UUIDs but not provably safe, so refuse to route an
+    // ambiguous prefix rather than deliver to the wrong hook.
+    let mut matches = pq.keys().filter(|k| k.starts_with(short_key));
+    let first = matches.next()?.clone();
+    if matches.next().is_some() {
+        tracing::warn!(
+            short_key,
+            "Ambiguous pending-question key prefix (collision) — refusing to route to avoid misdelivery"
+        );
+        return None;
+    }
+    Some(first)
 }
 
 /// BUG-004: Check if text is an interrupt command.
@@ -1273,6 +1308,29 @@ async fn get_tmux_target(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ADR-014 (review follow-up): a unique session-id prefix resolves, but an
+    /// ambiguous prefix (two active sessions sharing the first 20 chars) must refuse to
+    /// route rather than misdeliver an answer to the wrong session.
+    #[test]
+    fn resolve_pending_key_rejects_ambiguous_prefix() {
+        let mut m: std::collections::HashMap<String, i32> = std::collections::HashMap::new();
+        m.insert("samesameprefix000000-aaaa".to_string(), 1);
+        // Unique match on the 20-char prefix resolves.
+        assert_eq!(
+            resolve_pending_key(&m, "samesameprefix000000").as_deref(),
+            Some("samesameprefix000000-aaaa")
+        );
+        // A second key sharing the same 20-char prefix makes it ambiguous → None.
+        m.insert("samesameprefix000000-bbbb".to_string(), 2);
+        assert_eq!(resolve_pending_key(&m, "samesameprefix000000"), None);
+        // A distinct prefix still resolves uniquely.
+        m.insert("different-prefix-here-zzzz".to_string(), 3);
+        assert_eq!(
+            resolve_pending_key(&m, "different-prefix-her").as_deref(),
+            Some("different-prefix-here-zzzz")
+        );
+    }
 
     #[test]
     fn test_is_interrupt_command() {

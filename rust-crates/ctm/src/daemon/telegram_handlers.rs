@@ -964,23 +964,9 @@ pub(super) async fn handle_free_text_answer(
     // Edit question message to show the free-text answer (keep keyboard).
     if msg_id != 0 {
         if let Some(q) = pending.questions.get(q_idx) {
-            let mut updated_text = format!(
-                "\u{2753} *{}*\n\n{}\n",
-                escape_markdown_v1(&q.header),
-                escape_markdown_v1(&q.question)
-            );
-            for opt in &q.options {
-                updated_text.push_str(&format!(
-                    "\n\u{2022} *{}* \u{2014} {}",
-                    escape_markdown_v1(&opt.label),
-                    escape_markdown_v1(&opt.description)
-                ));
-            }
-            updated_text.push_str("\n\n_Or type your answer in this topic_");
-            updated_text.push_str(&format!(
-                "\n\n\u{1F4DD} *Your answer:* {}",
-                escape_markdown_v1(text)
-            ));
+            // PLAIN TEXT (parse_mode None below) — see render_question_text.
+            let mut updated_text = super::render_question_text(q);
+            updated_text.push_str(&format!("\n\n\u{1F4DD} Your answer: {text}"));
 
             if q.options.is_empty() {
                 let _ = ctx
@@ -1000,13 +986,7 @@ pub(super) async fn handle_free_text_answer(
                     .collect();
                 let _ = ctx
                     .bot
-                    .edit_message_text_with_markup(
-                        chat_id,
-                        msg_id,
-                        &updated_text,
-                        Some("Markdown"),
-                        &[buttons],
-                    )
+                    .edit_message_text_with_markup(chat_id, msg_id, &updated_text, None, &[buttons])
                     .await;
             }
         }
