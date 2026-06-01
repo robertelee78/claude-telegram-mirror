@@ -60,3 +60,20 @@ dist/
 
 # Rust build artifacts
 rust-crates/target/
+
+# Codex local configuration
+.codex/
+
+# Claude Flow runtime data
+.claude-flow/data/
+.claude-flow/logs/
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Ruflo / Claude Flow agent-tooling runtime artifacts (session-generated, not project source)
+/.agents/
+/AGENTS.md
+/data/
