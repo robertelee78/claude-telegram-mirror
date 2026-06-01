@@ -1008,6 +1008,15 @@ async fn handle_toggle_callback(ctx: &HandlerContext, data: &str, cb: &CallbackQ
 
         if pending.lifecycle != QuestionLifecycle::Active {
             None
+        } else if pending
+            .questions
+            .get(q_idx)
+            .is_none_or(|q| o_idx >= q.options.len())
+        {
+            // ADR-015 v4: stale/out-of-range toggle (an old question's button tapped after
+            // a same-key supersede). Do NOT insert a tentative entry for a non-existent
+            // question — an extra key would poison `tentative` and block Submit All forever.
+            None
         } else {
             // Toggle the option in the MultiOption set.
             let selected = match pending
@@ -1120,6 +1129,10 @@ async fn handle_submit_callback(ctx: &HandlerContext, data: &str, cb: &CallbackQ
     // ADR-015 (Codex lifecycle-gate): only mutate while `Active`.
     enum SubmitOutcome {
         NotActive,
+        /// ADR-015 v4: "Done" for a question index that doesn't exist in the CURRENT pending
+        /// question (a stale button after a same-key supersede). No-op — never insert a
+        /// tentative entry for a non-existent question (it would poison `tentative`).
+        Stale,
         Done {
             toast_text: String,
             all_answered: bool,
@@ -1131,6 +1144,8 @@ async fn handle_submit_callback(ctx: &HandlerContext, data: &str, cb: &CallbackQ
 
         if pending.lifecycle != QuestionLifecycle::Active {
             SubmitOutcome::NotActive
+        } else if pending.questions.get(q_idx).is_none() {
+            SubmitOutcome::Stale
         } else {
             // Ensure we have a MultiOption entry (may already exist from toggles;
             // if the user tapped Done without toggling anything, insert an empty set).
@@ -1182,6 +1197,13 @@ async fn handle_submit_callback(ctx: &HandlerContext, data: &str, cb: &CallbackQ
             let _ = ctx
                 .bot
                 .answer_callback_query(&cb.id, Some("Answer already being submitted"), false)
+                .await;
+            return;
+        }
+        SubmitOutcome::Stale => {
+            let _ = ctx
+                .bot
+                .answer_callback_query(&cb.id, Some("This question is no longer available"), true)
                 .await;
             return;
         }
@@ -1448,10 +1470,12 @@ async fn handle_submitall_callback(ctx: &HandlerContext, data: &str, cb: &Callba
     enum SubmitAllOutcome {
         AlreadySubmitting,
         AlreadyResolved,
-        Unanswered,
-        /// ADR-015 v4: a collected answer failed validation (out-of-range option index, or
-        /// an empty multi-select with no free-text). Carries the user-facing reason; the
-        /// entry stays Active (no injection attempted).
+        /// ADR-015 v4: a collected answer failed validation — unanswered question,
+        /// out-of-range option index, or an empty multi-select/free-text. Carries the
+        /// user-facing reason; the entry stays Active (no injection attempted). This (via
+        /// `collect_and_validate_answers`) is the SOLE "all answered" gate: a prior
+        /// `tentative.len() == questions.len()` count check was removed because a stale
+        /// callback could leave `tentative.len() > questions.len()` and block submit forever.
         BadSelection(String),
         NoTmux,
         Proceed {
@@ -1468,9 +1492,6 @@ async fn handle_submitall_callback(ctx: &HandlerContext, data: &str, cb: &Callba
             SubmitAllOutcome::AlreadySubmitting
         } else if pending.lifecycle == QuestionLifecycle::Resolved {
             SubmitAllOutcome::AlreadyResolved
-        } else if pending.tentative.len() != pending.questions.len() {
-            // "Change QN" raced "Submit All" and left a question unanswered.
-            SubmitAllOutcome::Unanswered
         } else if tmux_target.is_none() {
             // Codex B1: leave the entry Active (do NOT finalize / set Submitting / remove).
             SubmitAllOutcome::NoTmux
@@ -1510,13 +1531,6 @@ async fn handle_submitall_callback(ctx: &HandlerContext, data: &str, cb: &Callba
             let _ = ctx
                 .bot
                 .answer_callback_query(&cb.id, Some("Already submitted"), false)
-                .await;
-            return;
-        }
-        SubmitAllOutcome::Unanswered => {
-            let _ = ctx
-                .bot
-                .answer_callback_query(&cb.id, Some("Please answer all questions first"), true)
                 .await;
             return;
         }
