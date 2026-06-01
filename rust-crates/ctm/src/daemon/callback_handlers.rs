@@ -2,77 +2,195 @@
 
 use super::*;
 
-/// Per-poll interval for the navigate-to-Submit loop (time between a `capture_pane`
-/// read + a single "Down" press while walking the cursor onto the inline Submit row).
+/// Per-poll interval between a `capture_pane` read and the next keystroke/recapture
+/// while navigating the widget or waiting for a screen transition.
 const READY_POLL_INTERVAL_MS: u64 = 200;
-/// Spacing between multi-select keystrokes (Claude's Ink checkbox TUI needs a beat
-/// to register each toggle/cursor move).
-const MULTISELECT_KEY_DELAY_MS: u64 = 300;
-/// Slack added to the option count when bounding the navigate-to-Submit loop. The
-/// real Claude Code 2.1.159 multi-select widget has, below the N numbered options:
-/// an `<N+1>. Type something` free-text row, an inline `Submit` row, and a
-/// `<N+2>. Chat about this` row — so Submit is reachable within a handful of Downs.
-/// We never need more than `total_options + NAV_TO_SUBMIT_SLACK` steps; the cap just
-/// prevents an infinite loop if `capture_pane` never reports the cursor on Submit.
-const NAV_TO_SUBMIT_SLACK: usize = 4;
-/// Max `capture_pane` polls (× `READY_POLL_INTERVAL_MS`) to wait for the multi-select
-/// "Ready to submit your answers?" confirm screen to render after the inline Submit
-/// before giving up. Generous enough for a slow Ink repaint; capture-driven so it acts
-/// the instant the screen appears. If it never appears (single-select), the caller does
-/// not invoke this at all.
-const REVIEW_CONFIRM_MAX_POLLS: usize = 15;
+/// Beat after each keystroke so Claude's Ink TUI repaints before we recapture.
+const KEY_DELAY_MS: u64 = 300;
+/// Slack added to a question's option count when bounding the down-only navigate loop.
+/// Below the M options sit `Type something`, the `Next`/`Submit` advance row, and
+/// `Chat about this`, so any focusable target is within `M + NAV_SLACK_STEPS` Downs even
+/// with viewport clipping (Ink scrolls the focused row into view as we step).
+const NAV_SLACK_STEPS: usize = 6;
+/// Max `capture_pane` polls (× `READY_POLL_INTERVAL_MS`) to wait for an expected screen
+/// transition (next question active / the confirm screen) before failing closed.
+const WAIT_STATE_MAX_POLLS: usize = 25;
+/// FR32-aligned cap on free-text injected into the widget's `Type something` row.
+const FREETEXT_MAX_CHARS: usize = 8192;
 
-/// Collected answer for tmux injection, preserving type information so multi-select
-/// can be injected as a key sequence instead of literal text. ADR-015: ALL answers
-/// are delivered by injecting keystrokes into Claude's native CLI widget — there is no
-/// structured/updatedInput path anymore (the hook does not intercept the question).
+// ADR-015: hard-coded English widget labels, isolated as constants (the parsers key off
+// these; localization/CLI-version drift would require updating them + the fixtures).
+const LABEL_TYPE_SOMETHING: &str = "Type something";
+const LABEL_NEXT: &str = "Next";
+const LABEL_SUBMIT: &str = "Submit";
+const LABEL_CHAT_ABOUT: &str = "Chat about this";
+const LABEL_SUBMIT_ANSWERS: &str = "Submit answers";
+const LABEL_CONFIRM_PROMPT: &str = "Ready to submit your answers?";
+
+/// ADR-015: A validated, collected answer ready for tmux injection into Claude's native
+/// AskUserQuestion widget. Index variants carry ONLY in-range option indices (validated
+/// against the question's option count at collection time). The per-question `multiSelect`
+/// flag is carried alongside this in the answers tuple — it (not the variant) decides the
+/// advance mechanism, because free-text can answer either a single- or multi-select Q.
 enum CollectedAnswer {
-    /// Single-select: the chosen option's 0-based index, plus the total option count.
-    /// ADR-015: the native widget selects by digit key (1-based), so single-select is
-    /// delivered as a digit press + navigate-to-Submit + Enter — NOT as the label
-    /// injected as free text. `total_options` bounds the navigate-to-Submit Down loop
-    /// (Submit sits below ALL option rows + the "Type something" row, regardless of
-    /// which option was chosen).
-    Option {
-        selected_index: usize,
-        total_options: usize,
-    },
-    /// Multi-select: the chosen option indices drive the digit toggles; `total_options`
-    /// bounds the navigate-to-Submit Down loop (Submit sits below ALL option rows + the
-    /// "Type something" row, regardless of how many were selected).
-    MultiSelect {
-        selected_indices: Vec<usize>,
-        total_options: usize,
-    },
-    /// Free-text typed by the user, injected as literal text + Enter.
+    /// Single-select: the chosen option's 0-based index (`< options.len()`).
+    Single(usize),
+    /// Multi-select: chosen 0-based indices (sorted, unique, all `< options.len()`,
+    /// non-empty — an empty multi-select is rejected before injection ever begins).
+    Multi(Vec<usize>),
+    /// Free-text typed by the user (sanitized + length-capped at injection time).
     FreeText(String),
+}
+
+/// ADR-015 (Codex v3): the typed result of an injection attempt. The distinction drives
+/// the caller's recovery: `FailedClean` means NO keystroke was acknowledged by tmux, so
+/// the live widget is untouched and the Telegram entry can safely be restored to `Active`
+/// for a retry / terminal answer. `FailedDirty` means at least one keystroke landed, so
+/// the live widget is in an indeterminate partially-advanced state — a blind retry from
+/// Q0 would corrupt it, so the caller terminalizes the entry and tells the user to finish
+/// at the terminal (the live widget is still on-screen for them).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum InjectOutcome {
+    Success,
+    FailedClean,
+    FailedDirty,
 }
 
 /// The cursor glyph Claude Code's Ink TUI prints to the left of the focused row.
 const CURSOR_MARKER: char = '\u{276F}'; // ❯
 
-/// ADR-015: Return the line in the captured pane that the cursor (`❯`) is on, if any.
-///
-/// ADR-015: Is the AskUserQuestion widget's cursor parked on the inline `Submit` row?
-///
-/// Deterministic stop condition for the navigate-to-Submit loop in `inject_answers`:
-/// once true, pressing Enter once submits the whole widget (there is NO separate
-/// "review your answers" screen — the Submit button is inline on the same widget).
-///
-/// We scan **all** `❯`-marked lines, NOT just the first. The captured pane includes
-/// Claude Code's scrollback, where prior user prompts are ALSO prefixed with `❯`
-/// (e.g. "❯ yes, both"). Keying off the *first* `❯` line (an earlier bug) always matched
-/// a scrollback prompt and never the widget, so `cursor_is_on_submit` was silently always
-/// false — the navigate-to-Submit loop never detected Submit and fell through to a blind
-/// `total_options + slack` Down count that overshot Submit (the multi-select "clarify"
-/// regression; single-select was unaffected because the digit press submits it directly).
-/// The widget's Submit row is the only `❯` line that strips to exactly "Submit", so rows
-/// like "❯ Submit answers" or "❯ 1. Submit later" never false-positive. Pure string check,
-/// unit-tested without a live tmux.
-fn cursor_is_on_submit(pane: &str) -> bool {
-    pane.lines().any(|line| {
-        line.contains(CURSOR_MARKER) && line.replace(CURSOR_MARKER, "").trim() == "Submit"
+// ───────────────────────────── widget pane parsing (ADR-015 v4) ─────────────────────────
+//
+// All parsing is scoped to the LIVE widget block — the lines from the BOTTOM-MOST tab row
+// (`←  … ✔ Submit  →`) downward. The captured pane also contains Claude Code's scrollback
+// (prior prompts/output, many prefixed with `❯`) ABOVE the widget; scoping to the last tab
+// row rejects it (an earlier bug scanned all lines and matched scrollback). Within the
+// block we classify only FOCUSABLE rows by self-describing patterns — never by the
+// model-provided question/option/header text (which is arbitrary and duplicable) — and the
+// volatile status line below the widget falls through as `Other` and is ignored.
+
+/// A focusable row inside the widget block.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RowKind {
+    /// A numbered option row `N.` (0-based index = N-1). Real options only.
+    Option(usize),
+    /// The `Type something` free-text row.
+    TypeSomething,
+    /// The unnumbered advance row (`Next` for a non-final question, `Submit` for final).
+    Advance,
+    /// The `Chat about this` row.
+    ChatAbout,
+    /// The confirm screen's `1. Submit answers` row.
+    ConfirmSubmit,
+}
+
+/// One parsed focusable row: its kind, whether the cursor (`❯`) is on it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct WidgetRow {
+    kind: RowKind,
+    has_cursor: bool,
+}
+
+/// A parsed view of the live AskUserQuestion widget.
+struct WidgetView {
+    /// Count of `☒` (answered) markers in the tab row.
+    answered_count: usize,
+    /// True if the end-of-widget confirm screen is showing.
+    is_confirm: bool,
+    /// Focusable rows, in top-to-bottom order.
+    rows: Vec<WidgetRow>,
+}
+
+impl WidgetView {
+    /// The focusable row the cursor is currently on, if any.
+    fn cursor_row(&self) -> Option<RowKind> {
+        self.rows.iter().find(|r| r.has_cursor).map(|r| r.kind)
+    }
+    /// A stable signature of the screen — the answered-tab count plus the focusable rows
+    /// (kinds + which has the cursor) — used to detect a screen transition independently of
+    /// the volatile status line / clock. Including `answered_count` adds a second change
+    /// signal (e.g. a single-select advancing flips its tab `☐`→`☒`).
+    fn signature(&self) -> String {
+        let mut s = format!("a{}|", self.answered_count);
+        for r in &self.rows {
+            s.push_str(&format!("{:?}{};", r.kind, r.has_cursor as u8));
+        }
+        s
+    }
+}
+
+/// Is this line the widget's tab row (`←  ☐/☒ …  ✔ Submit  →`)? Requires the `←`, the
+/// `✔ <LABEL_SUBMIT>` tab, and the trailing `→` so stray scrollback text can't pose as one.
+fn is_tab_row(line: &str) -> bool {
+    line.contains('\u{2190}') // ←
+        && line.contains('\u{2192}') // →
+        && line.contains(&format!("\u{2714} {LABEL_SUBMIT}")) // ✔ Submit
+}
+
+/// ADR-015: Parse the live widget block (anchored on the BOTTOM-MOST tab row). Returns
+/// `None` if no tab row is present (no live widget). Pure; unit-tested without a tmux.
+fn parse_widget(pane: &str) -> Option<WidgetView> {
+    let lines: Vec<&str> = pane.lines().collect();
+    // Bottom-most tab row wins (the live render sits below any scrollback tab text).
+    let tab_idx = lines.iter().rposition(|l| is_tab_row(l))?;
+    let tab_line = lines[tab_idx];
+    let answered_count = tab_line.matches('\u{2612}').count(); // ☒
+    let block = &lines[tab_idx + 1..];
+    let is_confirm = block.iter().any(|l| l.contains(LABEL_CONFIRM_PROMPT));
+
+    let mut rows: Vec<WidgetRow> = Vec::new();
+    for &raw in block {
+        // Stop at the footer (question screen) so the status line below never parses.
+        if raw.contains("to cancel") || raw.contains("Tab/Arrow keys to navigate") {
+            break;
+        }
+        let has_cursor = raw.contains(CURSOR_MARKER);
+        let stripped = raw.replace(CURSOR_MARKER, "");
+        let trimmed = stripped.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // Order matters: the text-labelled rows (Type something / Chat about this /
+        // Submit answers) are ALSO numbered in some screens, so match them before the
+        // generic numbered-option pattern.
+        let kind = if trimmed.contains(LABEL_SUBMIT_ANSWERS) {
+            Some(RowKind::ConfirmSubmit)
+        } else if trimmed.contains(LABEL_TYPE_SOMETHING) {
+            Some(RowKind::TypeSomething)
+        } else if trimmed.contains(LABEL_CHAT_ABOUT) {
+            Some(RowKind::ChatAbout)
+        } else if trimmed == LABEL_NEXT || trimmed == LABEL_SUBMIT {
+            Some(RowKind::Advance)
+        } else {
+            // A numbered option row, or a description/separator/status line (→ None).
+            parse_option_number(trimmed).map(|n| RowKind::Option(n - 1))
+        };
+        if let Some(kind) = kind {
+            rows.push(WidgetRow { kind, has_cursor });
+        }
+    }
+
+    Some(WidgetView {
+        answered_count,
+        is_confirm,
+        rows,
     })
+}
+
+/// Parse the leading 1-based option number from a row like `1. [ ] Foo` / `2. Bar`.
+/// Strict: digits, a dot, then whitespace and a non-space — so status-line tokens
+/// (`$181.46`, `5/5`) never match.
+fn parse_option_number(trimmed: &str) -> Option<usize> {
+    let dot = trimmed.find('.')?;
+    let (num, rest) = trimmed.split_at(dot);
+    if num.is_empty() || !num.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let rest = &rest[1..]; // skip '.'
+    if !rest.starts_with(' ') || rest.trim().is_empty() {
+        return None;
+    }
+    num.parse::<usize>().ok().filter(|&n| n >= 1)
 }
 
 /// Handle callback queries (button presses).
@@ -1311,9 +1429,13 @@ async fn handle_submitall_callback(ctx: &HandlerContext, data: &str, cb: &Callba
         AlreadySubmitting,
         AlreadyResolved,
         Unanswered,
+        /// ADR-015 v4: a collected answer failed validation (out-of-range option index, or
+        /// an empty multi-select with no free-text). Carries the user-facing reason; the
+        /// entry stays Active (no injection attempted).
+        BadSelection(String),
         NoTmux,
         Proceed {
-            answers: Vec<(usize, String, CollectedAnswer)>,
+            answers: Vec<InjItem>,
             session_id: String,
             question_message_ids: Vec<i64>,
             summary_message_id: Option<i64>,
@@ -1333,39 +1455,68 @@ async fn handle_submitall_callback(ctx: &HandlerContext, data: &str, cb: &Callba
             // Codex B1: leave the entry Active (do NOT finalize / set Submitting / remove).
             SubmitAllOutcome::NoTmux
         } else {
-            // Collect all answers in question order, preserving type info for injection.
-            let mut answers: Vec<(usize, String, CollectedAnswer)> = Vec::new();
+            // ADR-015 v4: collect + VALIDATE answers in question order BEFORE claiming
+            // ownership. Every option index is validated against the question's option
+            // count (Telegram callback data is otherwise trusted unchecked — an out-of-
+            // range index would land the cursor on the `Type something`/advance row). An
+            // empty multi-select (no toggles, no free-text) is rejected (the widget can't
+            // submit an unanswered tab). On any invalid answer we DON'T transition to
+            // Submitting — the entry stays Active and the user is told to fix it.
+            let mut answers: Vec<InjItem> = Vec::new();
+            let mut bad: Option<String> = None;
             for (q_idx, q) in pending.questions.iter().enumerate() {
-                let question_text = q.question.clone();
                 let total_options = q.options.len();
+                let multi_select = q.multi_select;
                 let answer = match pending.tentative.get(&q_idx) {
-                    Some(TentativeAnswer::Option(o_idx)) => CollectedAnswer::Option {
-                        selected_index: *o_idx,
-                        total_options,
-                    },
-                    Some(TentativeAnswer::MultiOption(set)) => {
-                        let mut sorted: Vec<usize> = set.iter().copied().collect();
-                        sorted.sort();
-                        CollectedAnswer::MultiSelect {
-                            selected_indices: sorted,
-                            total_options,
+                    Some(TentativeAnswer::Option(o_idx)) => {
+                        if *o_idx >= total_options {
+                            bad = Some(format!(
+                                "Q{} selection is out of range — please re-select.",
+                                q_idx + 1
+                            ));
+                            break;
                         }
+                        CollectedAnswer::Single(*o_idx)
+                    }
+                    Some(TentativeAnswer::MultiOption(set)) => {
+                        let mut sorted: Vec<usize> =
+                            set.iter().copied().filter(|&i| i < total_options).collect();
+                        sorted.sort_unstable();
+                        sorted.dedup();
+                        if sorted.is_empty() {
+                            bad = Some(format!(
+                                "Select at least one option (or type an answer) for Q{}.",
+                                q_idx + 1
+                            ));
+                            break;
+                        }
+                        CollectedAnswer::Multi(sorted)
                     }
                     Some(TentativeAnswer::FreeText(s)) => CollectedAnswer::FreeText(s.clone()),
                     None => continue,
                 };
-                answers.push((q_idx, question_text, answer));
+                answers.push(InjItem {
+                    q_idx,
+                    total_options,
+                    multi_select,
+                    answer,
+                });
             }
 
-            // Claim ownership: Active → Submitting. resolve_pending_question now no-ops,
-            // and the map entry is NOT yet removed (so a duplicate tap hits Submitting).
-            pending.lifecycle = QuestionLifecycle::Submitting;
+            if let Some(reason) = bad {
+                // Leave the entry Active; do not claim ownership.
+                SubmitAllOutcome::BadSelection(reason)
+            } else {
+                // Claim ownership: Active → Submitting. resolve_pending_question now no-ops,
+                // and the map entry is NOT yet removed (so a duplicate tap hits Submitting).
+                pending.lifecycle = QuestionLifecycle::Submitting;
 
-            SubmitAllOutcome::Proceed {
-                answers,
-                session_id: pending.session_id.clone(),
-                question_message_ids: pending.question_message_ids.clone(),
-                summary_message_id: pending.summary_message_id,
+                SubmitAllOutcome::Proceed {
+                    answers,
+                    session_id: pending.session_id.clone(),
+                    question_message_ids: pending.question_message_ids.clone(),
+                    summary_message_id: pending.summary_message_id,
+                }
             }
         }
         // per-entry Mutex drops here
@@ -1390,6 +1541,14 @@ async fn handle_submitall_callback(ctx: &HandlerContext, data: &str, cb: &Callba
             let _ = ctx
                 .bot
                 .answer_callback_query(&cb.id, Some("Please answer all questions first"), true)
+                .await;
+            return;
+        }
+        SubmitAllOutcome::BadSelection(reason) => {
+            // Entry stays Active; user can fix the selection and resubmit.
+            let _ = ctx
+                .bot
+                .answer_callback_query(&cb.id, Some(&reason), true)
                 .await;
             return;
         }
@@ -1440,35 +1599,94 @@ async fn handle_submitall_callback(ctx: &HandlerContext, data: &str, cb: &Callba
         })
         .await;
 
-    // ADR-015: ALL answers are injected into Claude's native CLI widget via tmux.
-    // Codex B2: only on FULL delivery do we auto-submit, mark "Submitted", and remove
-    // the entry. On partial/failed delivery we restore the entry to Active (so a retry
-    // or terminal answer can resolve it) and alert — never claiming a false success.
-    let delivered = inject_answers(ctx, &target, socket.as_deref(), &answers).await;
+    // ADR-015 v4: drive the answers into Claude's native CLI widget via tmux. The typed
+    // outcome decides recovery: only `Success` finalizes ("Submitted", remove entry);
+    // `FailedClean` (nothing landed) safely restores Active for retry; `FailedDirty`
+    // (≥1 keystroke landed → live widget partially advanced) terminalizes WITHOUT retry —
+    // a blind re-drive from Q0 would corrupt the half-advanced widget.
+    let outcome = inject_answers(ctx, &target, socket.as_deref(), &answers).await;
 
-    if !delivered {
-        tracing::warn!(
-            session_id = %session_id,
-            "ADR-015: keystroke injection failed mid-flight — restoring entry to Active"
-        );
-        // Restore ownership so the question is answerable again. Only revert if we still
-        // hold it as Submitting (a concurrent resolve cannot have run while Submitting).
-        let mut pending = entry.lock().await;
-        if pending.lifecycle == QuestionLifecycle::Submitting {
-            pending.lifecycle = QuestionLifecycle::Active;
-            for f in pending.finalized.iter_mut() {
-                *f = false;
+    match outcome {
+        InjectOutcome::FailedClean => {
+            tracing::warn!(
+                session_id = %session_id,
+                "ADR-015 v4: injection FailedClean (no keystroke acked) — restoring entry to Active"
+            );
+            // Nothing was delivered — restore ownership so the question is answerable
+            // again. Only revert if we still hold it as Submitting.
+            let mut pending = entry.lock().await;
+            if pending.lifecycle == QuestionLifecycle::Submitting {
+                pending.lifecycle = QuestionLifecycle::Active;
+                for f in pending.finalized.iter_mut() {
+                    *f = false;
+                }
             }
+            drop(pending);
+            ctx.bot
+                .send_message(
+                    "\u{26A0}\u{FE0F} Couldn't deliver the answers to the terminal (nothing was entered). Answer at the terminal, or tap Submit again to retry.",
+                    None,
+                    thread_id,
+                )
+                .await;
+            return;
         }
-        drop(pending);
-        ctx.bot
-            .send_message(
-                "\u{26A0}\u{FE0F} Couldn't deliver all answers to the terminal. Please answer at the terminal, or tap Submit again to retry.",
-                None,
-                thread_id,
-            )
-            .await;
-        return;
+        InjectOutcome::FailedDirty => {
+            tracing::warn!(
+                session_id = %session_id,
+                "ADR-015 v4: injection FailedDirty (≥1 keystroke landed) — terminalizing; user to finish at terminal"
+            );
+            // The live widget is partially advanced — retry-from-Q0 is unsafe. Terminalize:
+            // mark Resolved + remove from the map so no further Telegram action targets a
+            // half-answered widget, and leave the live widget on screen for the user.
+            {
+                let mut pending = entry.lock().await;
+                if pending.lifecycle == QuestionLifecycle::Submitting {
+                    pending.lifecycle = QuestionLifecycle::Resolved;
+                    for f in pending.finalized.iter_mut() {
+                        *f = true;
+                    }
+                }
+            }
+            {
+                let mut pq = ctx.pending_q.write().await;
+                if pq
+                    .get(&full_key)
+                    .is_some_and(|cur| Arc::ptr_eq(cur, &entry))
+                {
+                    pq.remove(&full_key);
+                }
+            }
+            for it in &answers {
+                let mid = question_message_ids.get(it.q_idx).copied().unwrap_or(0);
+                if mid != 0 {
+                    let _ = ctx
+                        .bot
+                        .edit_message_text_no_markup(mid, "\u{26A0}\u{FE0F} Finish at the terminal")
+                        .await;
+                }
+            }
+            if let Some(mid) = summary_message_id {
+                let _ = ctx
+                    .bot
+                    .edit_message(
+                        chat_id,
+                        mid,
+                        "\u{26A0}\u{FE0F} Partially submitted — please finish answering at the terminal.",
+                        None,
+                    )
+                    .await;
+            }
+            ctx.bot
+                .send_message(
+                    "\u{26A0}\u{FE0F} I may have partially answered at the terminal, so I stopped to avoid corrupting the prompt. Please finish answering in the Claude Code terminal \u{2014} the question is still on screen there.",
+                    None,
+                    thread_id,
+                )
+                .await;
+            return;
+        }
+        InjectOutcome::Success => { /* fall through to finalize */ }
     }
 
     // Full delivery: transition Submitting→Resolved and finalize UNDER the entry mutex,
@@ -1496,14 +1714,13 @@ async fn handle_submitall_callback(ctx: &HandlerContext, data: &str, cb: &Callba
         }
     }
 
-    // ADR-015: No "Review your answers" screen exists — each answer's injection already
-    // landed Enter on the inline Submit row inside the widget, so the question is
-    // submitted. Do NOT fire another Enter here (it would land on the now-empty Claude
-    // prompt as a stray keystroke).
+    // ADR-015 v4: inject_answers already drove the widget's own Submit/confirm, so the
+    // questions are submitted — do NOT fire another Enter here (it would land on the
+    // now-empty Claude prompt as a stray keystroke).
 
     // Edit each question message to show "Submitted" and strip keyboard.
-    for (q_idx, _, _) in &answers {
-        let mid = question_message_ids.get(*q_idx).copied().unwrap_or(0);
+    for it in &answers {
+        let mid = question_message_ids.get(it.q_idx).copied().unwrap_or(0);
         if mid != 0 {
             let _ = ctx
                 .bot
@@ -1699,299 +1916,482 @@ async fn handle_change_callback(ctx: &HandlerContext, data: &str, cb: &CallbackQ
     }
 }
 
-/// ADR-015: Inject the collected answers into Claude's native AskUserQuestion widget
-/// via tmux, in question order. Returns `true` only if EVERY keystroke was delivered.
+/// ADR-015 v4: one question's collected answer plus the structural facts injection needs.
+struct InjItem {
+    /// Question index (tab order); used by the caller for per-question message edits.
+    q_idx: usize,
+    /// Real option count (`q.options.len()`); bounds the down-only navigate loop.
+    total_options: usize,
+    /// The question's `multiSelect` flag — decides the ADVANCE mechanism (single-select
+    /// auto-advances on commit; multi-select must navigate to the `Next`/`Submit` row).
+    multi_select: bool,
+    answer: CollectedAnswer,
+}
+
+/// Where to park the cursor inside the current question screen.
+#[derive(Clone, Copy)]
+enum RowTarget {
+    Option(usize),
+    TypeSomething,
+    Advance,
+}
+
+fn row_is(kind: RowKind, target: RowTarget) -> bool {
+    matches!(
+        (kind, target),
+        (RowKind::Option(a), RowTarget::Option(b)) if a == b
+    ) || matches!(
+        (kind, target),
+        (RowKind::TypeSomething, RowTarget::TypeSomething) | (RowKind::Advance, RowTarget::Advance)
+    )
+}
+
+/// Map a `mutated` flag to a typed failure outcome (see [`InjectOutcome`]).
+fn fail_outcome(mutated: bool) -> InjectOutcome {
+    if mutated {
+        InjectOutcome::FailedDirty
+    } else {
+        InjectOutcome::FailedClean
+    }
+}
+
+/// Sanitize free-text before literal injection: drop control chars (incl. newlines/CR,
+/// which would prematurely submit) and cap the length (FR32-aligned).
+fn sanitize_freetext(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_control())
+        .take(FREETEXT_MAX_CHARS)
+        .collect()
+}
+
+/// Capture the live pane and parse the widget view (`None` if no widget / capture failed).
+fn capture_view(inj: &crate::injector::InputInjector) -> Option<WidgetView> {
+    let pane = inj.capture_pane()?;
+    parse_widget(&pane)
+}
+
+/// Send a whitelisted key; on tmux ack set `mutated` and pace for the Ink repaint.
+/// Returns false on any non-`Ok(true)` (fail closed). A Down/Up navigation key counts as
+/// a mutation (conservative): once any key is acknowledged, a later failure is "dirty".
+async fn press(inj: &crate::injector::InputInjector, key: &str, mutated: &mut bool) -> bool {
+    match inj.send_key(key) {
+        Ok(true) => {
+            *mutated = true;
+            tokio::time::sleep(tokio::time::Duration::from_millis(KEY_DELAY_MS)).await;
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Type literal free-text (no trailing Enter) into the focused `Type something` row.
+async fn type_text(inj: &crate::injector::InputInjector, text: &str, mutated: &mut bool) -> bool {
+    match inj.inject_literal(text) {
+        Ok(true) => {
+            *mutated = true;
+            tokio::time::sleep(tokio::time::Duration::from_millis(KEY_DELAY_MS)).await;
+            true
+        }
+        _ => false,
+    }
+}
+
+/// ADR-015 v4: walk the cursor (down-only) onto `target`, verifying via `capture_pane`
+/// after each step. Down-only is sufficient because the widget opens each question with
+/// the cursor on option 1 and we visit targets in ascending order (options sorted, then
+/// the lower `Type something`/`Advance` rows). Bounded by `total_options + NAV_SLACK_STEPS`
+/// so a clipped long list still resolves (Ink scrolls the focused row into view as we
+/// step). Returns false on any miss/timeout/`None` capture — NO best-effort key is ever
+/// fired (that was the old key-leak bug). `mutated` is set as soon as any Down is acked.
+async fn place_cursor_on(
+    inj: &crate::injector::InputInjector,
+    target: RowTarget,
+    total_options: usize,
+    mutated: &mut bool,
+) -> bool {
+    let interval = tokio::time::Duration::from_millis(READY_POLL_INTERVAL_MS);
+    let max_steps = total_options + NAV_SLACK_STEPS;
+    for step in 0..=max_steps {
+        match capture_view(inj) {
+            Some(view) => {
+                if view.cursor_row().is_some_and(|k| row_is(k, target)) {
+                    return true;
+                }
+            }
+            None => return false, // capture failed → fail closed
+        }
+        if step == max_steps {
+            break;
+        }
+        if !press(inj, "Down", mutated).await {
+            return false;
+        }
+        tokio::time::sleep(interval).await;
+    }
+    false
+}
+
+/// Wait until a question screen with at least one focusable row is rendered.
+async fn wait_for_widget(inj: &crate::injector::InputInjector) -> bool {
+    let interval = tokio::time::Duration::from_millis(READY_POLL_INTERVAL_MS);
+    for _ in 0..WAIT_STATE_MAX_POLLS {
+        if capture_view(inj).is_some_and(|v| !v.rows.is_empty()) {
+            return true;
+        }
+        tokio::time::sleep(interval).await;
+    }
+    false
+}
+
+/// Wait until the widget's focusable-row signature DIFFERS from `pre_sig` (captured right
+/// before the advancing keystroke) — i.e. the widget advanced to the next question. The
+/// signature excludes the volatile status line/clock, so only a real screen change trips
+/// it. Fail closed on timeout.
+async fn wait_for_transition(inj: &crate::injector::InputInjector, pre_sig: Option<&str>) -> bool {
+    let interval = tokio::time::Duration::from_millis(READY_POLL_INTERVAL_MS);
+    for _ in 0..WAIT_STATE_MAX_POLLS {
+        if let Some(v) = capture_view(inj) {
+            if !v.rows.is_empty() && Some(v.signature().as_str()) != pre_sig {
+                return true;
+            }
+        }
+        tokio::time::sleep(interval).await;
+    }
+    false
+}
+
+/// Wait until the end-of-widget confirm screen is showing AND the cursor is on the
+/// `Submit answers` row (its default). Returns true only when both hold, so the caller's
+/// subsequent Enter can never be a blind press / land on `Cancel`. Fail closed on timeout.
+async fn wait_for_confirm(inj: &crate::injector::InputInjector) -> bool {
+    let interval = tokio::time::Duration::from_millis(READY_POLL_INTERVAL_MS);
+    for _ in 0..WAIT_STATE_MAX_POLLS {
+        if let Some(v) = capture_view(inj) {
+            if v.is_confirm && v.cursor_row() == Some(RowKind::ConfirmSubmit) {
+                return true;
+            }
+        }
+        tokio::time::sleep(interval).await;
+    }
+    false
+}
+
+/// ADR-015 v4: inject the collected answers into Claude's native AskUserQuestion widget
+/// (ONE tabbed widget, processed in question order), entirely driven by reading the live
+/// pane. See `docs/adr/ADR-015` and the captured state machine for the model.
 ///
-/// Both branches drive the SAME native widget and submit the SAME way — by pressing
-/// the option's digit key(s) to toggle the selection, then navigating the cursor onto
-/// the inline `Submit` row (deterministically, via `capture_pane`) and pressing Enter
-/// ONCE. There is NO separate "review your answers" screen; Submit is inline on the
-/// widget. Free-text is the only literal-text path.
+/// Per question: place the cursor on each target row (verified) and press Enter — a
+/// single-select selection (or a free-text commit) AUTO-ADVANCES; a multi-select toggles
+/// each option then navigates to the `Next`/`Submit` advance row + Enter. After the final
+/// question, when a confirm screen is expected (N≥2, or N=1 multi-select), wait for it and
+/// press Enter on `Submit answers`. No keystroke is ever fired blindly.
 ///
-/// - Single-select: press the chosen option's 1-based digit, then navigate-to-Submit +
-///   Enter. (Selecting by digit avoids the old "label injected as free text" risk; the
-///   navigate-to-Submit + Enter is safe even if a digit auto-confirms — the loop simply
-///   finds the cursor already off the widget and the best-effort Enter is harmless.)
-/// - Multi-select: press a digit per selected index (toggles each checkbox), then
-///   navigate-to-Submit + Enter.
-/// - Free-text: literal text + Enter (`inject`).
-///
-/// Codex B2: `inject`/`send_key` return `Result<bool>` (`Ok(false)` = validation/tmux
-/// soft failure, `Err` = hard failure). Anything other than `Ok(true)` is a delivery
-/// failure: we STOP at the first one and return `false` so the caller does NOT mark the
-/// Telegram messages "Submitted" and restores the pending entry for a retry / terminal
-/// answer. The navigate-to-Submit loop's best-effort fallback Enter is NOT a delivery
-/// failure (it logs a warning but lets the submit proceed).
+/// Returns [`InjectOutcome`]: `Success`; `FailedClean` (nothing was acknowledged — safe to
+/// retry / restore Active); or `FailedDirty` (≥1 key landed — the live widget is partially
+/// advanced; caller must terminalize, not retry).
 async fn inject_answers(
     ctx: &HandlerContext,
     target: &str,
     socket: Option<&str>,
-    answers: &[(usize, String, CollectedAnswer)],
-) -> bool {
-    let key_delay = tokio::time::Duration::from_millis(MULTISELECT_KEY_DELAY_MS);
+    answers: &[InjItem],
+) -> InjectOutcome {
     let mut inj = ctx.injector.lock().await;
     inj.set_target(target, socket);
 
-    // Helper: treat anything but Ok(true) as a delivery failure (logged by caller).
-    fn delivered(r: crate::error::Result<bool>) -> bool {
-        matches!(r, Ok(true))
+    let n = answers.len();
+    let any_multi = answers.iter().any(|it| it.multi_select);
+    let mut mutated = false;
+
+    // Ensure the widget is on screen before the first keystroke.
+    if !wait_for_widget(&inj).await {
+        return fail_outcome(mutated);
     }
 
-    for (_, _, answer) in answers {
-        // Normalize to the digit indices to press plus the total option count
-        // (single-select = one digit; multi-select = one per toggled option; free-text
-        // = none). `total_options` — NOT how many were selected — sets how far Submit
-        // can be from the top option, so it bounds the navigate-to-Submit Down loop.
-        let (indices, total_options): (Vec<usize>, usize) = match answer {
-            CollectedAnswer::FreeText(text) => {
-                // Free-text is the only literal-text path; it submits on its own Enter.
-                if !delivered(inj.inject(text)) {
-                    return false;
+    for (i, item) in answers.iter().enumerate() {
+        let is_last = i == n - 1;
+        let max = item.total_options;
+
+        // Position the cursor for this question's answer; leave it on the row whose Enter
+        // ADVANCES the widget (the selected option / the committed Type-something row for
+        // single-select; the Next/Submit advance row for multi-select).
+        match &item.answer {
+            CollectedAnswer::Single(idx) => {
+                if !place_cursor_on(&inj, RowTarget::Option(*idx), max, &mut mutated).await {
+                    return fail_outcome(mutated);
                 }
-                continue;
             }
-            CollectedAnswer::Option {
-                selected_index,
-                total_options,
-            } => (vec![*selected_index], *total_options),
-            CollectedAnswer::MultiSelect {
-                selected_indices,
-                total_options,
-            } => (selected_indices.clone(), *total_options),
-        };
-
-        // Toggle each selected option by its 1-based digit.
-        for &idx in &indices {
-            let digit = format!("{}", idx + 1);
-            if !delivered(inj.send_key(&digit)) {
-                return false;
+            CollectedAnswer::Multi(idxs) => {
+                for &idx in idxs {
+                    if !place_cursor_on(&inj, RowTarget::Option(idx), max, &mut mutated).await {
+                        return fail_outcome(mutated);
+                    }
+                    if !press(&inj, "Enter", &mut mutated).await {
+                        return fail_outcome(mutated); // toggle
+                    }
+                }
+                if !place_cursor_on(&inj, RowTarget::Advance, max, &mut mutated).await {
+                    return fail_outcome(mutated);
+                }
             }
-            tokio::time::sleep(key_delay).await;
+            CollectedAnswer::FreeText(text) => {
+                if !place_cursor_on(&inj, RowTarget::TypeSomething, max, &mut mutated).await {
+                    return fail_outcome(mutated);
+                }
+                if !type_text(&inj, &sanitize_freetext(text), &mut mutated).await {
+                    return fail_outcome(mutated);
+                }
+                // Multi-select free-text does NOT auto-advance — navigate to the advance
+                // row. Single-select free-text commits+advances on the common Enter below.
+                if item.multi_select
+                    && !place_cursor_on(&inj, RowTarget::Advance, max, &mut mutated).await
+                {
+                    return fail_outcome(mutated);
+                }
+            }
         }
-        // Navigate the cursor onto the inline Submit row, then Enter ONCE.
-        if !navigate_to_submit_and_enter(&inj, total_options, key_delay).await {
-            return false;
+
+        // The advancing Enter (selects+advances / commits+advances / activates Next/Submit).
+        // Snapshot the signature first so we can verify the advance actually happened.
+        let pre_sig = capture_view(&inj).map(|v| v.signature());
+        if !press(&inj, "Enter", &mut mutated).await {
+            return fail_outcome(mutated);
+        }
+
+        if is_last {
+            // End of widget. A confirm screen appears for any N≥2 (incl. all-single-select)
+            // and for N=1 multi-select. N=1 single-select submits directly (no confirm).
+            if n >= 2 || any_multi {
+                if !wait_for_confirm(&inj).await {
+                    return InjectOutcome::FailedDirty; // we pressed Enter → dirty
+                }
+                if !press(&inj, "Enter", &mut mutated).await {
+                    return InjectOutcome::FailedDirty;
+                }
+            }
+        } else if !wait_for_transition(&inj, pre_sig.as_deref()).await {
+            return InjectOutcome::FailedDirty;
         }
     }
-    // ADR-015: a MULTI-select shows a second "Review your answers / Ready to submit your
-    // answers? → 1. Submit answers / 2. Cancel" confirm screen after the inline Submit;
-    // it needs one more Enter (the cursor defaults to "1. Submit answers"). Single-select
-    // submits directly and never shows it. Confirm only when a multi-select was injected,
-    // and only if/when the screen actually appears (never a blind Enter).
-    let has_multiselect = answers
-        .iter()
-        .any(|(_, _, a)| matches!(a, CollectedAnswer::MultiSelect { .. }));
-    if has_multiselect {
-        return confirm_submit_answers_screen(&inj).await;
-    }
-    true
-}
 
-/// ADR-015: Walk the cursor onto the inline `Submit` row of the live AskUserQuestion
-/// widget, then press Enter ONCE to submit. Returns `false` only on a hard keystroke
-/// delivery failure (so the caller can fail closed); a best-effort fallback Enter
-/// (loop exhausted without confirming the cursor on Submit) still returns `true`.
-///
-/// The widget rows below the N numbered options are: `Type something`, an inline
-/// `Submit`, then `Chat about this`. After toggling, the cursor position is NOT
-/// deterministic, so we read `capture_pane` and, while the cursor is not yet on
-/// Submit, press "Down" and re-check — bounded by `total_options + NAV_TO_SUBMIT_SLACK`
-/// steps. The bound MUST scale with `total_options` (the worst-case distance from the
-/// top option to Submit is all N option rows + the "Type something" row), NOT with how
-/// many options were selected — otherwise a single selection in a long list would
-/// under-shoot and the best-effort Enter could fire on the wrong row.
-///
-/// The parsing (`cursor_is_on_submit`) is unit-tested; this navigation wrapper is thin
-/// (it needs a live tmux) and intentionally untested.
-async fn navigate_to_submit_and_enter(
-    inj: &tokio::sync::MutexGuard<'_, crate::injector::InputInjector>,
-    total_options: usize,
-    key_delay: tokio::time::Duration,
-) -> bool {
-    // Bound by the TOTAL option count: Submit sits below all N option rows + the
-    // "Type something" row, so the cursor may be up to ~N+1 Downs above it regardless
-    // of how many options were selected. The slack covers that "Type something" row
-    // plus a small safety margin; `cursor_is_on_submit` is the real stop condition.
-    let max_steps = total_options + NAV_TO_SUBMIT_SLACK;
-    let interval = tokio::time::Duration::from_millis(READY_POLL_INTERVAL_MS);
-
-    let mut landed = false;
-    for step in 0..=max_steps {
-        // Re-read the pane each iteration: the cursor glyph (`❯`) marks exactly one row.
-        if inj
-            .capture_pane()
-            .as_deref()
-            .is_some_and(cursor_is_on_submit)
-        {
-            landed = true;
-            break;
-        }
-        if step == max_steps {
-            break; // exhausted — fall through to best-effort Enter
-        }
-        // Not on Submit yet: step down one row and pace before re-checking.
-        match inj.send_key("Down") {
-            Ok(true) => {}
-            // Hard failure (Err) or rejected (Ok(false)) → fail closed.
-            _ => return false,
-        }
-        tokio::time::sleep(interval).await;
-        // Small extra beat lets the Ink TUI repaint the moved cursor before recapture.
-        tokio::time::sleep(key_delay).await;
-    }
-
-    if !landed {
-        tracing::warn!(
-            max_steps,
-            "ADR-015: navigate-to-Submit exhausted without confirming cursor on Submit; \
-             firing best-effort Enter"
-        );
-    }
-
-    // Either the cursor is on Submit, or best-effort: press Enter ONCE.
-    matches!(inj.send_key("Enter"), Ok(true))
-}
-
-/// ADR-015: Does the pane show the multi-select "Ready to submit your answers?" confirm
-/// screen with the cursor on "Submit answers"? That screen renders AFTER the inline
-/// Submit Enter on a multi-select; its row is `❯ 1. Submit answers` (with `2. Cancel`
-/// below). We require BOTH the cursor marker AND the literal "Submit answers" on one line
-/// so neither scrollback nor the first-screen inline `Submit` row (which is just
-/// "Submit", never "Submit answers") false-positives. Pure check, unit-tested.
-fn pane_shows_submit_answers(pane: &str) -> bool {
-    pane.lines()
-        .any(|line| line.contains(CURSOR_MARKER) && line.contains("Submit answers"))
-}
-
-/// ADR-015: Confirm the multi-select "Ready to submit your answers?" screen.
-///
-/// After the inline Submit Enter, a multi-select advances to a confirm screen
-/// (`❯ 1. Submit answers` / `2. Cancel`); the cursor defaults to "Submit answers", so one
-/// Enter finalizes. Single-select submits directly and never shows this screen — so we
-/// poll `capture_pane` for it and press Enter ONLY if/when it appears, never a blind
-/// Enter (which could otherwise land on the prompt). Returns `false` only on a hard
-/// keystroke failure; if the screen never appears within the bound we return `true`
-/// (nothing to confirm). Caller invokes this only when a multi-select was injected.
-async fn confirm_submit_answers_screen(
-    inj: &tokio::sync::MutexGuard<'_, crate::injector::InputInjector>,
-) -> bool {
-    let interval = tokio::time::Duration::from_millis(READY_POLL_INTERVAL_MS);
-    for _ in 0..REVIEW_CONFIRM_MAX_POLLS {
-        if inj
-            .capture_pane()
-            .as_deref()
-            .is_some_and(pane_shows_submit_answers)
-        {
-            return matches!(inj.send_key("Enter"), Ok(true));
-        }
-        tokio::time::sleep(interval).await;
-    }
-    // Confirm screen never rendered — nothing to finalize (e.g. it auto-submitted).
-    tracing::debug!("ADR-015: multi-select confirm screen not seen; nothing to confirm");
-    true
+    InjectOutcome::Success
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The captured layout of the REAL Claude Code 2.1.159 AskUserQuestion multi-select
-    /// widget, with the cursor (`❯`) parked on a numbered OPTION (not Submit). Captured
-    /// live via tmux capture-pane.
-    const PANE_CURSOR_ON_OPTION: &str = "\
-←  ☒ Capture  ✔ Submit  →
-🏈 Which languages?
-❯ 1. [ ] Rust
-    A systems language
-  2. [✔] Go
-    A cloud language
-  3. [ ] Type something
-     Submit
-  ──────────
-  4. Chat about this
-Enter to select · ↑/↓ to navigate · Esc to cancel";
+    // ───────────────────────── fixtures from REAL captured frames ─────────────────────────
+    // Captured live via tmux capture-pane against Claude Code 2.1.159 (N=2/N=3, single +
+    // multi + free-text + confirm). Each includes `❯`-prefixed scrollback above the tab row
+    // and the RuFlo status line below the footer, to exercise widget-scoping.
 
-    /// Same widget, but the cursor has been walked down onto the inline `Submit` row.
-    const PANE_CURSOR_ON_SUBMIT: &str = "\
-←  ☒ Capture  ✔ Submit  →
-🏈 Which languages?
-  1. [✔] Rust
-    A systems language
-  2. [✔] Go
-    A cloud language
-  3. [ ] Type something
-❯    Submit
-  ──────────
-  4. Chat about this
-Enter to select · ↑/↓ to navigate · Esc to cancel";
+    /// Multi-select question (N=3 "Keys"), cursor on option 3. Two prior tabs answered (☒).
+    const PANE_MULTI_OPT: &str = "\
+  some earlier tool output
+❯ a prior user prompt in scrollback
+←  ☒ Quarter  ☒ Keys  ☐ Goals  ✔ Submit  →
+Keys to beating Utah? (MULTI-SELECT)
+  1. [✔] Run defense
+    Stop the ground game
+  2. [✔] Win turnovers
+    Turnover margin
+❯ 3. [ ] QB poise
+    Composed quarterback play
+  4. [ ] Special teams
+    Field position and kicks
+  5. [ ] Type something
+     Next
+  6. Chat about this
+Enter to select · Tab/Arrow keys to navigate · Esc to cancel
+  ▊ RuFlo V3.10.31 ● Robert E. Lee  │  Opus 4.8  │  ● 16% ctx  │  $181.46";
 
-    /// ADR-015: `cursor_is_on_submit` is the deterministic stop condition for the
-    /// navigate-to-Submit loop. It must be TRUE only when the cursor (`❯`) line, with
-    /// the marker + decoration stripped, is exactly "Submit".
-    #[test]
-    fn cursor_on_submit_detection() {
-        // Cursor on an option row → NOT on Submit.
-        assert!(!cursor_is_on_submit(PANE_CURSOR_ON_OPTION));
-        // Cursor walked onto the inline Submit row → on Submit.
-        assert!(cursor_is_on_submit(PANE_CURSOR_ON_SUBMIT));
+    /// Same multi-select screen, cursor walked onto the `Next` advance row.
+    const PANE_MULTI_ADVANCE: &str = "\
+←  ☒ Quarter  ☒ Keys  ☐ Goals  ✔ Submit  →
+  1. [✔] Run defense
+  2. [✔] Win turnovers
+  3. [ ] QB poise
+  4. [ ] Special teams
+  5. [ ] Type something
+❯    Next
+  6. Chat about this
+Enter to select · Tab/Arrow keys to navigate · Esc to cancel";
 
-        // Minimal positive: the exact "❯    Submit" line match used live.
-        assert!(cursor_is_on_submit("❯    Submit"));
-        assert!(cursor_is_on_submit("  ❯ Submit"));
+    /// Single-select question (N=3 "Quarter"), cursor on option 2. No checkboxes, and NO
+    /// advance row (single-select auto-advances on selection).
+    const PANE_SINGLE_OPT: &str = "\
+←  ☒ Quarter  ☐ Keys  ☐ Goals  ✔ Submit  →
+Which quarter decides the season? (SINGLE-SELECT)
+  1. 1st half
+❯ 2. 3rd quarter
+  3. 4th quarter
+  4. Type something.
+  5. Chat about this
+Enter to select · Tab/Arrow keys to navigate · Esc to cancel";
 
-        // A "Submit" row WITHOUT the cursor on it → no match.
-        assert!(!cursor_is_on_submit("     Submit"));
-        // Cursor on a Submit-LIKE row that isn't exactly "Submit" → no match.
-        assert!(!cursor_is_on_submit("❯ Submit answers"));
-        assert!(!cursor_is_on_submit("❯ 1. Submit later"));
-        // No cursor anywhere / empty → no match.
-        assert!(!cursor_is_on_submit("1. [ ] Rust\n2. [ ] Go"));
-        assert!(!cursor_is_on_submit(""));
+    /// Multi-select with the cursor on the `Type something` row BEFORE typing (free-text).
+    const PANE_FREETEXT_PRE: &str = "\
+←  ☒ FreeText  ☐ Finish  ✔ Submit  →
+  1. [ ] Option A
+  2. [ ] Option B
+  3. [ ] Option C
+❯ 4. [ ] Type something
+     Next
+  5. Chat about this
+Enter to select · Tab/Arrow keys to navigate · Esc to cancel";
 
-        // Regression (ADR-015 multi-select "clarify" bug): the captured pane includes
-        // Claude Code's scrollback, whose prior prompts are ALSO `❯`-prefixed. Detection
-        // must key off the WIDGET's Submit row by scanning ALL lines — not the FIRST `❯`
-        // line (which is a scrollback prompt). Keying off the first `❯` always read false,
-        // so the navigate-to-Submit loop blind-counted past Submit and mis-submitted.
-        let scrollback = "❯ yes, both\n❯ ask again\n❯ I'm not seeing our session\n";
-        assert!(!cursor_is_on_submit(&format!(
-            "{scrollback}{PANE_CURSOR_ON_OPTION}"
-        )));
-        assert!(cursor_is_on_submit(&format!(
-            "{scrollback}{PANE_CURSOR_ON_SUBMIT}"
-        )));
-    }
-
-    /// The REAL Claude Code 2.1.159 multi-select "Ready to submit your answers?" confirm
-    /// screen that renders AFTER the inline Submit Enter (captured live). The cursor
-    /// defaults to "1. Submit answers".
-    const PANE_REVIEW_SUBMIT: &str = "\
-←  ☒ capture 2nd  ✔ Submit  →
+    /// The end-of-widget confirm screen, cursor defaulting to `Submit answers`. Note the
+    /// status line below has NO footer (clipped) — parsing must still classify correctly.
+    const PANE_CONFIRM: &str = "\
+←  ☒ Quarter  ☒ Keys  ☒ Goals  ✔ Submit  →
 Review your answers
- ● Which storylines? → Big 12 title, Beat Utah, Playoff push
+ ● Which quarter? → 3rd quarter
+ ● Keys? → Run defense, Win turnovers
+ ● Goals? → Win Big 12, 10+ wins
 Ready to submit your answers?
 ❯ 1. Submit answers
-  2. Cancel";
+  2. Cancel
+  ▊ RuFlo V3.10.31 ● Robert E. Lee  │  Opus 4.8  │  $181.46";
 
-    /// ADR-015: `pane_shows_submit_answers` gates the second-Enter confirm. TRUE only when
-    /// the cursor is on the "Submit answers" row of the confirm screen — never on the
-    /// first-screen inline `Submit`, on scrollback, or on a cursorless "Submit answers".
     #[test]
-    fn submit_answers_screen_detection() {
-        // The confirm screen, cursor on "Submit answers" → detected.
-        assert!(pane_shows_submit_answers(PANE_REVIEW_SUBMIT));
-        // Detected even behind `❯`-prefixed scrollback prompts.
-        assert!(pane_shows_submit_answers(&format!(
-            "❯ yes\n❯ ask again\n{PANE_REVIEW_SUBMIT}"
-        )));
-        // The FIRST-screen widget (inline "Submit", never "Submit answers") → NOT detected,
-        // so the confirm step can't false-fire on the page we just submitted.
-        assert!(!pane_shows_submit_answers(PANE_CURSOR_ON_SUBMIT));
-        assert!(!pane_shows_submit_answers(PANE_CURSOR_ON_OPTION));
-        // "Submit answers" present but the cursor is NOT on it → NOT actionable yet.
-        assert!(!pane_shows_submit_answers(
-            "  1. Submit answers\n  2. Cancel"
-        ));
-        assert!(!pane_shows_submit_answers(""));
+    fn parse_none_without_tab_row() {
+        assert!(parse_widget("just some\nscrollback text\n❯ a prompt").is_none());
+        assert!(parse_widget("").is_none());
+    }
+
+    #[test]
+    fn parse_multi_option_screen() {
+        let v = parse_widget(PANE_MULTI_OPT).expect("widget present");
+        assert_eq!(v.answered_count, 2); // Quarter + Keys are ☒
+        assert!(!v.is_confirm);
+        assert_eq!(v.cursor_row(), Some(RowKind::Option(2))); // ❯ on "3. QB poise"
+                                                              // Focusable rows: 4 options + Type something + Advance + Chat about this.
+        assert!(v.rows.iter().any(|r| r.kind == RowKind::Option(0)));
+        assert!(v.rows.iter().any(|r| r.kind == RowKind::Option(3)));
+        assert!(v.rows.iter().any(|r| r.kind == RowKind::TypeSomething));
+        assert!(v.rows.iter().any(|r| r.kind == RowKind::Advance));
+        assert!(v.rows.iter().any(|r| r.kind == RowKind::ChatAbout));
+        // The status line below the footer must NOT have been parsed (no spurious option).
+        assert!(!v.rows.iter().any(|r| r.kind == RowKind::ConfirmSubmit));
+        // "Type something" (row 5) is classified as TypeSomething, NOT Option(4).
+        assert!(!v.rows.iter().any(|r| r.kind == RowKind::Option(4)));
+    }
+
+    #[test]
+    fn parse_multi_advance_cursor() {
+        let v = parse_widget(PANE_MULTI_ADVANCE).expect("widget present");
+        assert_eq!(v.cursor_row(), Some(RowKind::Advance));
+        assert!(!v.is_confirm);
+    }
+
+    #[test]
+    fn parse_single_select_screen() {
+        let v = parse_widget(PANE_SINGLE_OPT).expect("widget present");
+        assert_eq!(v.answered_count, 1);
+        assert_eq!(v.cursor_row(), Some(RowKind::Option(1))); // ❯ on "2. 3rd quarter"
+        assert!(v.rows.iter().any(|r| r.kind == RowKind::TypeSomething));
+        // Single-select has NO advance row.
+        assert!(!v.rows.iter().any(|r| r.kind == RowKind::Advance));
+    }
+
+    #[test]
+    fn parse_freetext_type_something_cursor() {
+        let v = parse_widget(PANE_FREETEXT_PRE).expect("widget present");
+        // Cursor on the (still-empty) "Type something" row → classified TypeSomething,
+        // not Option(3), so place_cursor_on(TypeSomething) lands correctly.
+        assert_eq!(v.cursor_row(), Some(RowKind::TypeSomething));
+    }
+
+    #[test]
+    fn parse_confirm_screen() {
+        let v = parse_widget(PANE_CONFIRM).expect("widget present");
+        assert!(v.is_confirm);
+        assert_eq!(v.answered_count, 3);
+        assert_eq!(v.cursor_row(), Some(RowKind::ConfirmSubmit));
+    }
+
+    #[test]
+    fn bottom_most_tab_row_wins() {
+        // A stale earlier widget's tab row sits in scrollback ABOVE the live one. Parsing
+        // must anchor on the LAST (live) tab row — answered_count and rows come from it.
+        let pane = format!(
+            "←  ☒ OldA  ☐ OldB  ✔ Submit  →\n  1. stale option\n❯ stale prompt\n{PANE_MULTI_OPT}"
+        );
+        let v = parse_widget(&pane).expect("widget present");
+        assert_eq!(v.answered_count, 2); // from the LIVE tab row, not the stale (1 ☒)
+        assert_eq!(v.cursor_row(), Some(RowKind::Option(2)));
+    }
+
+    #[test]
+    fn scrollback_above_tab_row_excluded() {
+        // `❯`-prefixed scrollback prompts above the tab row must not become focusable rows
+        // nor steal the cursor (the old all-lines-scan bug). A scrollback line that even
+        // contains the confirm phrase must not flip is_confirm for a question screen.
+        let pane = format!(
+            "❯ yes, both\n❯ Ready to submit your answers? (in my chat text)\n{PANE_MULTI_OPT}"
+        );
+        let v = parse_widget(&pane).expect("widget present");
+        assert!(!v.is_confirm);
+        assert_eq!(v.cursor_row(), Some(RowKind::Option(2)));
+    }
+
+    #[test]
+    fn parse_option_number_strictness() {
+        assert_eq!(parse_option_number("1. Foo"), Some(1));
+        assert_eq!(parse_option_number("12. Bar baz"), Some(12));
+        assert_eq!(parse_option_number("3. [ ] Toggle"), Some(3));
+        // Status-line / non-option tokens must NOT parse as options.
+        assert_eq!(parse_option_number("$181.46"), None);
+        assert_eq!(parse_option_number("5/5"), None);
+        assert_eq!(parse_option_number("● 16% ctx"), None);
+        assert_eq!(parse_option_number("1."), None); // no trailing content
+        assert_eq!(parse_option_number("1.no space"), None);
+        assert_eq!(parse_option_number("v1.2"), None);
+    }
+
+    #[test]
+    fn signature_distinguishes_screens() {
+        let a = parse_widget(PANE_MULTI_OPT).unwrap().signature();
+        let b = parse_widget(PANE_SINGLE_OPT).unwrap().signature();
+        let c = parse_widget(PANE_MULTI_ADVANCE).unwrap().signature();
+        assert_ne!(a, b);
+        assert_ne!(a, c); // same screen, different cursor row → different signature
+    }
+
+    #[test]
+    fn row_is_matching() {
+        assert!(row_is(RowKind::Option(2), RowTarget::Option(2)));
+        assert!(!row_is(RowKind::Option(2), RowTarget::Option(3)));
+        assert!(row_is(RowKind::TypeSomething, RowTarget::TypeSomething));
+        assert!(row_is(RowKind::Advance, RowTarget::Advance));
+        assert!(!row_is(RowKind::Advance, RowTarget::Option(0)));
+        assert!(!row_is(RowKind::ChatAbout, RowTarget::TypeSomething));
+    }
+
+    #[test]
+    fn is_tab_row_strictness() {
+        assert!(is_tab_row("←  ☒ Quarter  ☐ Keys  ✔ Submit  →"));
+        // Missing one of ← / ✔ Submit / → → not a tab row.
+        assert!(!is_tab_row("☒ Quarter  ✔ Submit"));
+        assert!(!is_tab_row("← just an arrow → with no submit tab"));
+        assert!(!is_tab_row("I'll Submit the answers →"));
+    }
+
+    #[test]
+    fn sanitize_freetext_strips_and_caps() {
+        // Newlines/control chars stripped (would otherwise prematurely submit).
+        assert_eq!(sanitize_freetext("hi\nthere\t!"), "hithere!");
+        assert_eq!(sanitize_freetext("a\r\nb"), "ab");
+        // Length capped.
+        let long = "x".repeat(FREETEXT_MAX_CHARS + 50);
+        assert_eq!(sanitize_freetext(&long).chars().count(), FREETEXT_MAX_CHARS);
+        // Ordinary text untouched.
+        assert_eq!(sanitize_freetext("WR1"), "WR1");
+    }
+
+    #[test]
+    fn fail_outcome_maps_mutated() {
+        assert_eq!(fail_outcome(false), InjectOutcome::FailedClean);
+        assert_eq!(fail_outcome(true), InjectOutcome::FailedDirty);
     }
 }

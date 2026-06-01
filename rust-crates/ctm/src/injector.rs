@@ -136,6 +136,53 @@ impl InputInjector {
         Ok(true)
     }
 
+    /// ADR-015: Inject LITERAL text into the tmux pane WITHOUT a trailing Enter.
+    ///
+    /// Unlike [`inject`], this sends only the characters (`send-keys -t <target> -l <text>`)
+    /// and does NOT press Enter afterward. It is used to type into the AskUserQuestion
+    /// widget's `Type something` free-text row, where the surrounding inject_answers flow
+    /// owns the subsequent commit/advance keystroke (single-select free-text commits with
+    /// one Enter; multi-select free-text advances via the `Next`/`Submit` row). Reusing
+    /// the Enter-appending [`inject`] here would double-fire and submit prematurely.
+    ///
+    /// `Command::arg()` only — no shell interpolation. Callers MUST sanitize/cap the text
+    /// (strip control chars/newlines, bound length) before calling. Returns `Ok(false)` on
+    /// a missing target or tmux soft failure, `Err` on a hard failure.
+    pub fn inject_literal(&self, text: &str) -> Result<bool> {
+        let target = match &self.tmux_target {
+            Some(t) => t,
+            None => return Ok(false),
+        };
+
+        if let Err(reason) = self.validate_target() {
+            tracing::warn!(%reason, "Target validation failed (inject_literal)");
+            return Ok(false);
+        }
+
+        let mut send_cmd = Command::new("tmux");
+        for arg in self.socket_args() {
+            send_cmd.arg(arg);
+        }
+        send_cmd
+            .arg("send-keys")
+            .arg("-t")
+            .arg(target)
+            .arg("-l")
+            .arg(text);
+
+        let output = send_cmd.output()?;
+        if !output.status.success() {
+            tracing::error!(
+                stderr = %String::from_utf8_lossy(&output.stderr),
+                "tmux send-keys -l (literal, no Enter) failed"
+            );
+            return Ok(false);
+        }
+
+        tracing::debug!(%target, text_len = text.len(), "Injected literal text (no Enter) via tmux");
+        Ok(true)
+    }
+
     /// Send a special key (from whitelist only).
     /// BUG-004 fix: includes socket flag for correct tmux server targeting.
     pub fn send_key(&self, key: &str) -> Result<bool> {

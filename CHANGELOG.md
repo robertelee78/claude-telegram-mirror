@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.22] - 2026-06-01
+
+### Fixed (ADR-015 — multi-question AskUserQuestion injection, N-generic)
+- **Answering a multi-question AskUserQuestion from Telegram now works for any number of questions (1, 2, 3, … N).** The 0.2.20/0.2.21 path treated a multi-question widget as N separately-submitted single-question widgets, so a 2-question widget left Q2+ unanswered and leaked a stray keystroke into the prompt. Empirical capture of Claude Code 2.1.159 (binary string-mining + live `tmux capture-pane` at N=1/2/3) established the real model — **one tabbed widget** with a per-question advance row labelled `Next` (non-final) / `Submit` (final) and a single end-of-widget `Ready to submit your answers?` confirm screen — and `inject_answers` was rewritten to drive it: place the cursor on each row (verified by re-reading the pane), let single-select selections / free-text commits auto-advance, navigate multi-select to its `Next`/`Submit` row, then confirm once at the end. Works for single-select, multi-select, free-text (`Type something`), and any mix across N questions.
+- **No more stray keystrokes / blind Enters.** Cursor placement is verified against the live pane and **fails closed** if it can't confirm the target (the old "best-effort Enter" that leaked keys is gone). Every screen transition is awaited (next question active / confirm screen) rather than slept through.
+- **Free-text answers inject cleanly.** Free-text is typed literally into the `Type something` row via a new no-trailing-Enter injection path (the previous path appended an Enter that could submit prematurely) and is sanitized (control characters stripped, length-capped).
+- **Safe partial-failure handling.** If injection fails after any keystroke has landed, ctm no longer blind-retries from question 1 (which would corrupt a half-advanced widget) — it marks the answers terminal and asks you to finish at the terminal, where the widget is still on screen. If nothing was delivered, it safely restores the Telegram buttons for a retry.
+- **Submit-All validation.** Out-of-range option selections are rejected, and an empty multi-select (nothing picked, no typed answer) is blocked with a clear prompt instead of attempting an un-submittable injection.
+
 ## [0.2.21] - 2026-05-31
 
 ### Fixed (ADR-015 — multi-select AskUserQuestion injection)
