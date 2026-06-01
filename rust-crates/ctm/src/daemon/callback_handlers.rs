@@ -47,30 +47,26 @@ const CURSOR_MARKER: char = '\u{276F}'; // ❯
 
 /// ADR-015: Return the line in the captured pane that the cursor (`❯`) is on, if any.
 ///
-/// The real Claude Code 2.1.159 AskUserQuestion multi-select widget prints `❯` (plus
-/// surrounding spaces) as the prefix of exactly one row. We scan for the first line
-/// containing `❯` and return it verbatim (untrimmed) so callers can inspect it.
-fn cursor_line(pane: &str) -> Option<&str> {
-    pane.lines().find(|line| line.contains(CURSOR_MARKER))
-}
-
-/// ADR-015: Is the cursor currently parked on the inline `Submit` row?
+/// ADR-015: Is the AskUserQuestion widget's cursor parked on the inline `Submit` row?
 ///
-/// True iff the cursor line, with the `❯` marker (and any list/whitespace decoration)
-/// stripped, is exactly `Submit`. This is the deterministic stop condition for the
-/// navigate-to-Submit loop in `inject_answers`: once it holds, pressing Enter once
-/// submits the whole widget (there is NO separate "review your answers" screen — the
-/// Submit button is inline on the same widget). Pure string check so it is
-/// unit-testable without a live tmux.
+/// Deterministic stop condition for the navigate-to-Submit loop in `inject_answers`:
+/// once true, pressing Enter once submits the whole widget (there is NO separate
+/// "review your answers" screen — the Submit button is inline on the same widget).
+///
+/// We scan **all** `❯`-marked lines, NOT just the first. The captured pane includes
+/// Claude Code's scrollback, where prior user prompts are ALSO prefixed with `❯`
+/// (e.g. "❯ yes, both"). Keying off the *first* `❯` line (an earlier bug) always matched
+/// a scrollback prompt and never the widget, so `cursor_is_on_submit` was silently always
+/// false — the navigate-to-Submit loop never detected Submit and fell through to a blind
+/// `total_options + slack` Down count that overshot Submit (the multi-select "clarify"
+/// regression; single-select was unaffected because the digit press submits it directly).
+/// The widget's Submit row is the only `❯` line that strips to exactly "Submit", so rows
+/// like "❯ Submit answers" or "❯ 1. Submit later" never false-positive. Pure string check,
+/// unit-tested without a live tmux.
 fn cursor_is_on_submit(pane: &str) -> bool {
-    match cursor_line(pane) {
-        // Strip the cursor marker, then any surrounding list/whitespace decoration
-        // (e.g. "❯ Submit" or "  ❯  Submit"), and require the residue to be exactly
-        // "Submit" so a row like "❯ Submit answers" or "❯ 1. Submit later" never
-        // false-positives.
-        Some(line) => line.replace(CURSOR_MARKER, "").trim() == "Submit",
-        None => false,
-    }
+    pane.lines().any(|line| {
+        line.contains(CURSOR_MARKER) && line.replace(CURSOR_MARKER, "").trim() == "Submit"
+    })
 }
 
 /// Handle callback queries (button presses).
@@ -1895,21 +1891,18 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
         // No cursor anywhere / empty → no match.
         assert!(!cursor_is_on_submit("1. [ ] Rust\n2. [ ] Go"));
         assert!(!cursor_is_on_submit(""));
-    }
 
-    /// ADR-015: `cursor_line` returns the single line bearing the `❯` cursor marker, or
-    /// None when no row is focused.
-    #[test]
-    fn cursor_line_extraction() {
-        assert_eq!(
-            cursor_line(PANE_CURSOR_ON_OPTION).map(str::trim),
-            Some("❯ 1. [ ] Rust")
-        );
-        assert_eq!(
-            cursor_line(PANE_CURSOR_ON_SUBMIT).map(str::trim),
-            Some("❯    Submit")
-        );
-        assert_eq!(cursor_line("no cursor here\nor here"), None);
-        assert_eq!(cursor_line(""), None);
+        // Regression (ADR-015 multi-select "clarify" bug): the captured pane includes
+        // Claude Code's scrollback, whose prior prompts are ALSO `❯`-prefixed. Detection
+        // must key off the WIDGET's Submit row by scanning ALL lines — not the FIRST `❯`
+        // line (which is a scrollback prompt). Keying off the first `❯` always read false,
+        // so the navigate-to-Submit loop blind-counted past Submit and mis-submitted.
+        let scrollback = "❯ yes, both\n❯ ask again\n❯ I'm not seeing our session\n";
+        assert!(!cursor_is_on_submit(&format!(
+            "{scrollback}{PANE_CURSOR_ON_OPTION}"
+        )));
+        assert!(cursor_is_on_submit(&format!(
+            "{scrollback}{PANE_CURSOR_ON_SUBMIT}"
+        )));
     }
 }
