@@ -15,6 +15,12 @@ const MULTISELECT_KEY_DELAY_MS: u64 = 300;
 /// We never need more than `total_options + NAV_TO_SUBMIT_SLACK` steps; the cap just
 /// prevents an infinite loop if `capture_pane` never reports the cursor on Submit.
 const NAV_TO_SUBMIT_SLACK: usize = 4;
+/// Max `capture_pane` polls (× `READY_POLL_INTERVAL_MS`) to wait for the multi-select
+/// "Ready to submit your answers?" confirm screen to render after the inline Submit
+/// before giving up. Generous enough for a slow Ink repaint; capture-driven so it acts
+/// the instant the screen appears. If it never appears (single-select), the caller does
+/// not invoke this at all.
+const REVIEW_CONFIRM_MAX_POLLS: usize = 15;
 
 /// Collected answer for tmux injection, preserving type information so multi-select
 /// can be injected as a key sequence instead of literal text. ADR-015: ALL answers
@@ -1767,6 +1773,17 @@ async fn inject_answers(
             return false;
         }
     }
+    // ADR-015: a MULTI-select shows a second "Review your answers / Ready to submit your
+    // answers? → 1. Submit answers / 2. Cancel" confirm screen after the inline Submit;
+    // it needs one more Enter (the cursor defaults to "1. Submit answers"). Single-select
+    // submits directly and never shows it. Confirm only when a multi-select was injected,
+    // and only if/when the screen actually appears (never a blind Enter).
+    let has_multiselect = answers
+        .iter()
+        .any(|(_, _, a)| matches!(a, CollectedAnswer::MultiSelect { .. }));
+    if has_multiselect {
+        return confirm_submit_answers_screen(&inj).await;
+    }
     true
 }
 
@@ -1833,6 +1850,45 @@ async fn navigate_to_submit_and_enter(
 
     // Either the cursor is on Submit, or best-effort: press Enter ONCE.
     matches!(inj.send_key("Enter"), Ok(true))
+}
+
+/// ADR-015: Does the pane show the multi-select "Ready to submit your answers?" confirm
+/// screen with the cursor on "Submit answers"? That screen renders AFTER the inline
+/// Submit Enter on a multi-select; its row is `❯ 1. Submit answers` (with `2. Cancel`
+/// below). We require BOTH the cursor marker AND the literal "Submit answers" on one line
+/// so neither scrollback nor the first-screen inline `Submit` row (which is just
+/// "Submit", never "Submit answers") false-positives. Pure check, unit-tested.
+fn pane_shows_submit_answers(pane: &str) -> bool {
+    pane.lines()
+        .any(|line| line.contains(CURSOR_MARKER) && line.contains("Submit answers"))
+}
+
+/// ADR-015: Confirm the multi-select "Ready to submit your answers?" screen.
+///
+/// After the inline Submit Enter, a multi-select advances to a confirm screen
+/// (`❯ 1. Submit answers` / `2. Cancel`); the cursor defaults to "Submit answers", so one
+/// Enter finalizes. Single-select submits directly and never shows this screen — so we
+/// poll `capture_pane` for it and press Enter ONLY if/when it appears, never a blind
+/// Enter (which could otherwise land on the prompt). Returns `false` only on a hard
+/// keystroke failure; if the screen never appears within the bound we return `true`
+/// (nothing to confirm). Caller invokes this only when a multi-select was injected.
+async fn confirm_submit_answers_screen(
+    inj: &tokio::sync::MutexGuard<'_, crate::injector::InputInjector>,
+) -> bool {
+    let interval = tokio::time::Duration::from_millis(READY_POLL_INTERVAL_MS);
+    for _ in 0..REVIEW_CONFIRM_MAX_POLLS {
+        if inj
+            .capture_pane()
+            .as_deref()
+            .is_some_and(pane_shows_submit_answers)
+        {
+            return matches!(inj.send_key("Enter"), Ok(true));
+        }
+        tokio::time::sleep(interval).await;
+    }
+    // Confirm screen never rendered — nothing to finalize (e.g. it auto-submitted).
+    tracing::debug!("ADR-015: multi-select confirm screen not seen; nothing to confirm");
+    true
 }
 
 #[cfg(test)]
@@ -1904,5 +1960,38 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
         assert!(cursor_is_on_submit(&format!(
             "{scrollback}{PANE_CURSOR_ON_SUBMIT}"
         )));
+    }
+
+    /// The REAL Claude Code 2.1.159 multi-select "Ready to submit your answers?" confirm
+    /// screen that renders AFTER the inline Submit Enter (captured live). The cursor
+    /// defaults to "1. Submit answers".
+    const PANE_REVIEW_SUBMIT: &str = "\
+←  ☒ capture 2nd  ✔ Submit  →
+Review your answers
+ ● Which storylines? → Big 12 title, Beat Utah, Playoff push
+Ready to submit your answers?
+❯ 1. Submit answers
+  2. Cancel";
+
+    /// ADR-015: `pane_shows_submit_answers` gates the second-Enter confirm. TRUE only when
+    /// the cursor is on the "Submit answers" row of the confirm screen — never on the
+    /// first-screen inline `Submit`, on scrollback, or on a cursorless "Submit answers".
+    #[test]
+    fn submit_answers_screen_detection() {
+        // The confirm screen, cursor on "Submit answers" → detected.
+        assert!(pane_shows_submit_answers(PANE_REVIEW_SUBMIT));
+        // Detected even behind `❯`-prefixed scrollback prompts.
+        assert!(pane_shows_submit_answers(&format!(
+            "❯ yes\n❯ ask again\n{PANE_REVIEW_SUBMIT}"
+        )));
+        // The FIRST-screen widget (inline "Submit", never "Submit answers") → NOT detected,
+        // so the confirm step can't false-fire on the page we just submitted.
+        assert!(!pane_shows_submit_answers(PANE_CURSOR_ON_SUBMIT));
+        assert!(!pane_shows_submit_answers(PANE_CURSOR_ON_OPTION));
+        // "Submit answers" present but the cursor is NOT on it → NOT actionable yet.
+        assert!(!pane_shows_submit_answers(
+            "  1. Submit answers\n  2. Cancel"
+        ));
+        assert!(!pane_shows_submit_answers(""));
     }
 }
