@@ -2,26 +2,38 @@
 
 use super::*;
 
-/// ADR-015: Readiness-poll budget for the AskUserQuestion review screen. After the
-/// answer keystrokes are injected, Claude transitions to its "Review your answers"
-/// screen; we poll `capture_pane` up to this long (in ~150ms steps) for that screen's
-/// signature before sending Enter, instead of a blind sleep.
-const REVIEW_READY_POLL_MS: u64 = 3000;
-/// Per-poll interval for the readiness loops.
-const READY_POLL_INTERVAL_MS: u64 = 150;
+/// Per-poll interval for the navigate-to-Submit loop (time between a `capture_pane`
+/// read + a single "Down" press while walking the cursor onto the inline Submit row).
+const READY_POLL_INTERVAL_MS: u64 = 200;
 /// Spacing between multi-select keystrokes (Claude's Ink checkbox TUI needs a beat
 /// to register each toggle/cursor move).
 const MULTISELECT_KEY_DELAY_MS: u64 = 300;
+/// Slack added to the option count when bounding the navigate-to-Submit loop. The
+/// real Claude Code 2.1.159 multi-select widget has, below the N numbered options:
+/// an `<N+1>. Type something` free-text row, an inline `Submit` row, and a
+/// `<N+2>. Chat about this` row — so Submit is reachable within a handful of Downs.
+/// We never need more than `total_options + NAV_TO_SUBMIT_SLACK` steps; the cap just
+/// prevents an infinite loop if `capture_pane` never reports the cursor on Submit.
+const NAV_TO_SUBMIT_SLACK: usize = 4;
 
 /// Collected answer for tmux injection, preserving type information so multi-select
 /// can be injected as a key sequence instead of literal text. ADR-015: ALL answers
 /// are delivered by injecting keystrokes into Claude's native CLI widget — there is no
 /// structured/updatedInput path anymore (the hook does not intercept the question).
 enum CollectedAnswer {
-    /// Single-select: the chosen option's label, injected as literal text + Enter.
-    Option(String),
-    /// Multi-select: the chosen option indices/total drive the key sequence
-    /// (digit toggles + Down-to-Submit + Enter).
+    /// Single-select: the chosen option's 0-based index, plus the total option count.
+    /// ADR-015: the native widget selects by digit key (1-based), so single-select is
+    /// delivered as a digit press + navigate-to-Submit + Enter — NOT as the label
+    /// injected as free text. `total_options` bounds the navigate-to-Submit Down loop
+    /// (Submit sits below ALL option rows + the "Type something" row, regardless of
+    /// which option was chosen).
+    Option {
+        selected_index: usize,
+        total_options: usize,
+    },
+    /// Multi-select: the chosen option indices drive the digit toggles; `total_options`
+    /// bounds the navigate-to-Submit Down loop (Submit sits below ALL option rows + the
+    /// "Type something" row, regardless of how many were selected).
     MultiSelect {
         selected_indices: Vec<usize>,
         total_options: usize,
@@ -30,16 +42,35 @@ enum CollectedAnswer {
     FreeText(String),
 }
 
-/// ADR-015: Does the captured tmux pane text look like Claude's "Review your answers"
-/// confirmation screen (the screen shown after all AskUserQuestion answers are
-/// entered, offering "Submit answers" / "Cancel")? Pure string check so it is
+/// The cursor glyph Claude Code's Ink TUI prints to the left of the focused row.
+const CURSOR_MARKER: char = '\u{276F}'; // ❯
+
+/// ADR-015: Return the line in the captured pane that the cursor (`❯`) is on, if any.
+///
+/// The real Claude Code 2.1.159 AskUserQuestion multi-select widget prints `❯` (plus
+/// surrounding spaces) as the prefix of exactly one row. We scan for the first line
+/// containing `❯` and return it verbatim (untrimmed) so callers can inspect it.
+fn cursor_line(pane: &str) -> Option<&str> {
+    pane.lines().find(|line| line.contains(CURSOR_MARKER))
+}
+
+/// ADR-015: Is the cursor currently parked on the inline `Submit` row?
+///
+/// True iff the cursor line, with the `❯` marker (and any list/whitespace decoration)
+/// stripped, is exactly `Submit`. This is the deterministic stop condition for the
+/// navigate-to-Submit loop in `inject_answers`: once it holds, pressing Enter once
+/// submits the whole widget (there is NO separate "review your answers" screen — the
+/// Submit button is inline on the same widget). Pure string check so it is
 /// unit-testable without a live tmux.
-fn pane_shows_review_screen(pane: &str) -> bool {
-    let lc = pane.to_lowercase();
-    // Codex follow-up: require BOTH the review heading AND the submit affordance (AND,
-    // not OR) so scrollback or model/question text that merely mentions one phrase can't
-    // false-positive into an early Enter.
-    lc.contains("review your answers") && lc.contains("submit answers")
+fn cursor_is_on_submit(pane: &str) -> bool {
+    match cursor_line(pane) {
+        // Strip the cursor marker, then any surrounding list/whitespace decoration
+        // (e.g. "❯ Submit" or "  ❯  Submit"), and require the residue to be exactly
+        // "Submit" so a row like "❯ Submit answers" or "❯ 1. Submit later" never
+        // false-positives.
+        Some(line) => line.replace(CURSOR_MARKER, "").trim() == "Submit",
+        None => false,
+    }
 }
 
 /// Handle callback queries (button presses).
@@ -1227,8 +1258,9 @@ pub(super) async fn send_or_update_summary(
 /// Handle "Submit All" callback.
 ///
 /// ADR-015: Locks all tentative answers, injects them into Claude's native CLI widget
-/// via tmux in question order, then auto-submits the review screen, and finally edits
-/// each Telegram question message and the summary to show "Submitted".
+/// via tmux in question order (each answer's keystroke sequence ends with a single
+/// Enter on the inline Submit row — there is NO separate review screen), and finally
+/// edits each Telegram question message and the summary to show "Submitted".
 async fn handle_submitall_callback(ctx: &HandlerContext, data: &str, cb: &CallbackQuery) {
     // Defense-in-depth: verify chat ownership (ADR-006 M4.5)
     if cb.message.as_ref().map(|m| m.chat.id) != Some(ctx.config.chat_id) {
@@ -1303,17 +1335,13 @@ async fn handle_submitall_callback(ctx: &HandlerContext, data: &str, cb: &Callba
             let mut answers: Vec<(usize, String, CollectedAnswer)> = Vec::new();
             for (q_idx, q) in pending.questions.iter().enumerate() {
                 let question_text = q.question.clone();
+                let total_options = q.options.len();
                 let answer = match pending.tentative.get(&q_idx) {
-                    Some(TentativeAnswer::Option(o_idx)) => {
-                        let label = q
-                            .options
-                            .get(*o_idx)
-                            .map(|o| o.label.clone())
-                            .unwrap_or_else(|| format!("{}", o_idx + 1));
-                        CollectedAnswer::Option(label)
-                    }
+                    Some(TentativeAnswer::Option(o_idx)) => CollectedAnswer::Option {
+                        selected_index: *o_idx,
+                        total_options,
+                    },
                     Some(TentativeAnswer::MultiOption(set)) => {
-                        let total_options = q.options.len();
                         let mut sorted: Vec<usize> = set.iter().copied().collect();
                         sorted.sort();
                         CollectedAnswer::MultiSelect {
@@ -1466,8 +1494,10 @@ async fn handle_submitall_callback(ctx: &HandlerContext, data: &str, cb: &Callba
         }
     }
 
-    // Auto-submit the Claude Code "Review your answers" screen.
-    auto_submit_answers(ctx, &session_id).await;
+    // ADR-015: No "Review your answers" screen exists — each answer's injection already
+    // landed Enter on the inline Submit row inside the widget, so the question is
+    // submitted. Do NOT fire another Enter here (it would land on the now-empty Claude
+    // prompt as a stray keystroke).
 
     // Edit each question message to show "Submitted" and strip keyboard.
     for (q_idx, _, _) in &answers {
@@ -1670,18 +1700,26 @@ async fn handle_change_callback(ctx: &HandlerContext, data: &str, cb: &CallbackQ
 /// ADR-015: Inject the collected answers into Claude's native AskUserQuestion widget
 /// via tmux, in question order. Returns `true` only if EVERY keystroke was delivered.
 ///
-/// - Single-select / free-text: literal text + Enter (`inject`).
-/// - Multi-select: Claude's Ink (React CLI) checkbox TUI. Key bindings (from cli.js):
-///   digit keys 1-9 toggle an option by 1-based index; Down/Tab move the cursor (past
-///   the last option focuses Submit); Enter on Submit confirms. The review screen that
-///   follows is then confirmed via `capture_pane` readiness (see `auto_submit_answers`)
-///   rather than a blind sleep.
+/// Both branches drive the SAME native widget and submit the SAME way — by pressing
+/// the option's digit key(s) to toggle the selection, then navigating the cursor onto
+/// the inline `Submit` row (deterministically, via `capture_pane`) and pressing Enter
+/// ONCE. There is NO separate "review your answers" screen; Submit is inline on the
+/// widget. Free-text is the only literal-text path.
+///
+/// - Single-select: press the chosen option's 1-based digit, then navigate-to-Submit +
+///   Enter. (Selecting by digit avoids the old "label injected as free text" risk; the
+///   navigate-to-Submit + Enter is safe even if a digit auto-confirms — the loop simply
+///   finds the cursor already off the widget and the best-effort Enter is harmless.)
+/// - Multi-select: press a digit per selected index (toggles each checkbox), then
+///   navigate-to-Submit + Enter.
+/// - Free-text: literal text + Enter (`inject`).
 ///
 /// Codex B2: `inject`/`send_key` return `Result<bool>` (`Ok(false)` = validation/tmux
 /// soft failure, `Err` = hard failure). Anything other than `Ok(true)` is a delivery
-/// failure: we STOP at the first one and return `false` so the caller does NOT
-/// auto-submit, does NOT mark the Telegram messages "Submitted", and restores the
-/// pending entry for a retry / terminal answer.
+/// failure: we STOP at the first one and return `false` so the caller does NOT mark the
+/// Telegram messages "Submitted" and restores the pending entry for a retry / terminal
+/// answer. The navigate-to-Submit loop's best-effort fallback Enter is NOT a delivery
+/// failure (it logs a warning but lets the submit proceed).
 async fn inject_answers(
     ctx: &HandlerContext,
     target: &str,
@@ -1698,143 +1736,180 @@ async fn inject_answers(
     }
 
     for (_, _, answer) in answers {
-        match answer {
-            CollectedAnswer::Option(text) | CollectedAnswer::FreeText(text) => {
+        // Normalize to the digit indices to press plus the total option count
+        // (single-select = one digit; multi-select = one per toggled option; free-text
+        // = none). `total_options` — NOT how many were selected — sets how far Submit
+        // can be from the top option, so it bounds the navigate-to-Submit Down loop.
+        let (indices, total_options): (Vec<usize>, usize) = match answer {
+            CollectedAnswer::FreeText(text) => {
+                // Free-text is the only literal-text path; it submits on its own Enter.
                 if !delivered(inj.inject(text)) {
                     return false;
                 }
+                continue;
             }
+            CollectedAnswer::Option {
+                selected_index,
+                total_options,
+            } => (vec![*selected_index], *total_options),
             CollectedAnswer::MultiSelect {
                 selected_indices,
                 total_options,
-                ..
-            } => {
-                // Toggle each selected option by its 1-based digit.
-                for &idx in selected_indices {
-                    let digit = format!("{}", idx + 1);
-                    if !delivered(inj.send_key(&digit)) {
-                        return false;
-                    }
-                    tokio::time::sleep(key_delay).await;
-                }
-                // Move the cursor down past every option (+ the "Other" row) to focus
-                // the Submit button, then confirm. We pace each Down; the readiness of
-                // the review screen itself is then confirmed by auto_submit_answers.
-                let downs_needed = total_options + 2; // options + Other + 1
-                for _ in 0..downs_needed {
-                    if !delivered(inj.send_key("Down")) {
-                        return false;
-                    }
-                    tokio::time::sleep(key_delay).await;
-                }
-                if !delivered(inj.send_key("Enter")) {
-                    return false;
-                }
+            } => (selected_indices.clone(), *total_options),
+        };
+
+        // Toggle each selected option by its 1-based digit.
+        for &idx in &indices {
+            let digit = format!("{}", idx + 1);
+            if !delivered(inj.send_key(&digit)) {
+                return false;
             }
+            tokio::time::sleep(key_delay).await;
+        }
+        // Navigate the cursor onto the inline Submit row, then Enter ONCE.
+        if !navigate_to_submit_and_enter(&inj, total_options, key_delay).await {
+            return false;
         }
     }
     true
 }
 
-/// After all AskUserQuestion answers are collected, Claude Code shows a
-/// "Review your answers" confirmation screen with numbered options:
-///   > 1. Submit answers
-///   > 2. Cancel
+/// ADR-015: Walk the cursor onto the inline `Submit` row of the live AskUserQuestion
+/// widget, then press Enter ONCE to submit. Returns `false` only on a hard keystroke
+/// delivery failure (so the caller can fail closed); a best-effort fallback Enter
+/// (loop exhausted without confirming the cursor on Submit) still returns `true`.
 ///
-/// ADR-015: instead of a blind sleep, poll `capture_pane` until that screen's
-/// signature appears (bounded by `REVIEW_READY_POLL_MS`), then send Enter to confirm
-/// the focused "Submit answers" option. If the screen never appears within the budget
-/// we send Enter anyway as a best-effort (the prior behavior), since the operator can
-/// still confirm at the terminal.
-pub(super) async fn auto_submit_answers(ctx: &HandlerContext, session_id: &str) {
-    let tmux_target = ctx.session_tmux.read().await.get(session_id).cloned();
-    let Some(target) = tmux_target else {
-        return;
-    };
-    let sid = session_id.to_string();
-    let socket = ctx
-        .db_op(move |sess| {
-            sess.get_session(&sid)
-                .ok()
-                .flatten()
-                .and_then(|s| s.tmux_socket)
-        })
-        .await;
-
-    let mut inj = ctx.injector.lock().await;
-    inj.set_target(&target, socket.as_deref());
-
-    // Poll for the review screen rather than sleeping blindly.
-    let deadline =
-        std::time::Instant::now() + std::time::Duration::from_millis(REVIEW_READY_POLL_MS);
+/// The widget rows below the N numbered options are: `Type something`, an inline
+/// `Submit`, then `Chat about this`. After toggling, the cursor position is NOT
+/// deterministic, so we read `capture_pane` and, while the cursor is not yet on
+/// Submit, press "Down" and re-check — bounded by `total_options + NAV_TO_SUBMIT_SLACK`
+/// steps. The bound MUST scale with `total_options` (the worst-case distance from the
+/// top option to Submit is all N option rows + the "Type something" row), NOT with how
+/// many options were selected — otherwise a single selection in a long list would
+/// under-shoot and the best-effort Enter could fire on the wrong row.
+///
+/// The parsing (`cursor_is_on_submit`) is unit-tested; this navigation wrapper is thin
+/// (it needs a live tmux) and intentionally untested.
+async fn navigate_to_submit_and_enter(
+    inj: &tokio::sync::MutexGuard<'_, crate::injector::InputInjector>,
+    total_options: usize,
+    key_delay: tokio::time::Duration,
+) -> bool {
+    // Bound by the TOTAL option count: Submit sits below all N option rows + the
+    // "Type something" row, so the cursor may be up to ~N+1 Downs above it regardless
+    // of how many options were selected. The slack covers that "Type something" row
+    // plus a small safety margin; `cursor_is_on_submit` is the real stop condition.
+    let max_steps = total_options + NAV_TO_SUBMIT_SLACK;
     let interval = tokio::time::Duration::from_millis(READY_POLL_INTERVAL_MS);
-    let mut ready = false;
-    loop {
+
+    let mut landed = false;
+    for step in 0..=max_steps {
+        // Re-read the pane each iteration: the cursor glyph (`❯`) marks exactly one row.
         if inj
             .capture_pane()
             .as_deref()
-            .is_some_and(pane_shows_review_screen)
+            .is_some_and(cursor_is_on_submit)
         {
-            ready = true;
+            landed = true;
             break;
         }
-        if std::time::Instant::now() >= deadline {
-            break;
+        if step == max_steps {
+            break; // exhausted — fall through to best-effort Enter
+        }
+        // Not on Submit yet: step down one row and pace before re-checking.
+        match inj.send_key("Down") {
+            Ok(true) => {}
+            // Hard failure (Err) or rejected (Ok(false)) → fail closed.
+            _ => return false,
         }
         tokio::time::sleep(interval).await;
+        // Small extra beat lets the Ink TUI repaint the moved cursor before recapture.
+        tokio::time::sleep(key_delay).await;
     }
 
-    // "Submit answers" is already focused (option 1). Send Enter to confirm it.
-    let _ = inj.send_key("Enter");
-    tracing::info!(
-        session_id,
-        review_screen_detected = ready,
-        "ADR-015: auto-submitted AskUserQuestion review screen"
-    );
+    if !landed {
+        tracing::warn!(
+            max_steps,
+            "ADR-015: navigate-to-Submit exhausted without confirming cursor on Submit; \
+             firing best-effort Enter"
+        );
+    }
+
+    // Either the cursor is on Submit, or best-effort: press Enter ONCE.
+    matches!(inj.send_key("Enter"), Ok(true))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// ADR-015 (Codex follow-up): the readiness parser requires BOTH the review heading
-    /// AND the submit affordance (AND, not OR), case-insensitively, so it can't
-    /// false-positive on scrollback or question text that merely mentions one phrase.
+    /// The captured layout of the REAL Claude Code 2.1.159 AskUserQuestion multi-select
+    /// widget, with the cursor (`❯`) parked on a numbered OPTION (not Submit). Captured
+    /// live via tmux capture-pane.
+    const PANE_CURSOR_ON_OPTION: &str = "\
+←  ☒ Capture  ✔ Submit  →
+🏈 Which languages?
+❯ 1. [ ] Rust
+    A systems language
+  2. [✔] Go
+    A cloud language
+  3. [ ] Type something
+     Submit
+  ──────────
+  4. Chat about this
+Enter to select · ↑/↓ to navigate · Esc to cancel";
+
+    /// Same widget, but the cursor has been walked down onto the inline `Submit` row.
+    const PANE_CURSOR_ON_SUBMIT: &str = "\
+←  ☒ Capture  ✔ Submit  →
+🏈 Which languages?
+  1. [✔] Rust
+    A systems language
+  2. [✔] Go
+    A cloud language
+  3. [ ] Type something
+❯    Submit
+  ──────────
+  4. Chat about this
+Enter to select · ↑/↓ to navigate · Esc to cancel";
+
+    /// ADR-015: `cursor_is_on_submit` is the deterministic stop condition for the
+    /// navigate-to-Submit loop. It must be TRUE only when the cursor (`❯`) line, with
+    /// the marker + decoration stripped, is exactly "Submit".
     #[test]
-    fn review_screen_signature_detection() {
-        // Both signatures present → match (case-insensitive).
-        assert!(pane_shows_review_screen(
-            "Review your answers\n  1. Submit answers\n  2. Cancel"
-        ));
-        assert!(pane_shows_review_screen(
-            "REVIEW YOUR ANSWERS\n  > 1. SUBMIT ANSWERS"
-        ));
-        // Only one signature present → NO match (the AND tightening).
-        assert!(!pane_shows_review_screen("please submit answers below"));
-        assert!(!pane_shows_review_screen(
-            "Review your answers later in the docs"
-        ));
-        // Unrelated content / empty → no match.
-        assert!(!pane_shows_review_screen(
-            "Which language?\n  1. Rust\n  2. Go"
-        ));
-        assert!(!pane_shows_review_screen(""));
+    fn cursor_on_submit_detection() {
+        // Cursor on an option row → NOT on Submit.
+        assert!(!cursor_is_on_submit(PANE_CURSOR_ON_OPTION));
+        // Cursor walked onto the inline Submit row → on Submit.
+        assert!(cursor_is_on_submit(PANE_CURSOR_ON_SUBMIT));
+
+        // Minimal positive: the exact "❯    Submit" line match used live.
+        assert!(cursor_is_on_submit("❯    Submit"));
+        assert!(cursor_is_on_submit("  ❯ Submit"));
+
+        // A "Submit" row WITHOUT the cursor on it → no match.
+        assert!(!cursor_is_on_submit("     Submit"));
+        // Cursor on a Submit-LIKE row that isn't exactly "Submit" → no match.
+        assert!(!cursor_is_on_submit("❯ Submit answers"));
+        assert!(!cursor_is_on_submit("❯ 1. Submit later"));
+        // No cursor anywhere / empty → no match.
+        assert!(!cursor_is_on_submit("1. [ ] Rust\n2. [ ] Go"));
+        assert!(!cursor_is_on_submit(""));
     }
 
-    /// ADR-015: the multi-select "downs needed" arithmetic (options + Other + 1) must
-    /// move the cursor strictly past the last toggleable row to focus Submit. This
-    /// locks the off-by-one the keystroke sequence depends on.
+    /// ADR-015: `cursor_line` returns the single line bearing the `❯` cursor marker, or
+    /// None when no row is focused.
     #[test]
-    fn multiselect_downs_needed_reaches_submit() {
-        // For N options, rows are: N option rows + 1 "Other" row. Submit sits after
-        // them, so we need at least N+1 Down presses to leave the last row; +1 more is
-        // the harmless safety margin the injector uses.
-        for total_options in [1usize, 3, 5, 9] {
-            let downs_needed = total_options + 2;
-            assert!(
-                downs_needed > total_options + 1,
-                "downs_needed must move past the last option + Other row"
-            );
-        }
+    fn cursor_line_extraction() {
+        assert_eq!(
+            cursor_line(PANE_CURSOR_ON_OPTION).map(str::trim),
+            Some("❯ 1. [ ] Rust")
+        );
+        assert_eq!(
+            cursor_line(PANE_CURSOR_ON_SUBMIT).map(str::trim),
+            Some("❯    Submit")
+        );
+        assert_eq!(cursor_line("no cursor here\nor here"), None);
+        assert_eq!(cursor_line(""), None);
     }
 }
