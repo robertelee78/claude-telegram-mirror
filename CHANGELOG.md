@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.20] - 2026-05-31
+
+### Fixed (ADR-015 — restore AskUserQuestion to both surfaces)
+- **AskUserQuestion renders in BOTH the CLI and Telegram again, answerable from either.** ADR-014 PR-E (0.2.18) delivered option answers via a blocking `PreToolUse` hook returning `updatedInput`, which suppressed Claude's native terminal widget — so questions appeared *only* in Telegram. This reverts that interception: Claude renders the question in the CLI as before, ctm mirrors it to Telegram from the fire-and-forget `tool_start`, answers inject back via tmux, and the Telegram buttons stale ("✅ Answered at terminal") when the question is answered at the keyboard (detected via the `PostToolUse` result). Restores ctm's bidirectional-mirror model.
+- **Multi-select submit is race-free and faster.** The fixed ~3,500 ms of blind sleeps (1500 ms render wait + 2000 ms auto-submit) that could fire the confirming Enter *before* Claude's review screen rendered is replaced with adaptive `tmux capture-pane` readiness polling (150 ms steps, 3 s cap) — typically ~150–450 ms and never premature.
+- **Concurrency-hardened question handlers.** A `QuestionLifecycle` state machine is the single arbiter across all answer paths; no daemon lock is held across Telegram I/O; `pending_q` removals are `Arc::ptr_eq` identity-checked; every keyboard-arming edit re-stales if the question resolved mid-edit. Closes the lock-order deadlock, render-window, lock-across-I/O, and orphaned-button classes surfaced by multi-pass adversarial (Codex) review.
+
+### Changed
+- The approval hook timeout is now its own constant (`DEFAULT_APPROVAL_WAIT_SECS`, 300s + 10s buffer); the `question_wait_secs` / `TELEGRAM_QUESTION_WAIT_SECS` knob is removed (the question hook no longer blocks).
+
 ## [0.2.19] - 2026-05-31
 
 ### Fixed (ADR-014 post-release field defects)
