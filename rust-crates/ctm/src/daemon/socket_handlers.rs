@@ -1401,7 +1401,12 @@ pub(super) async fn cleanup_pending_questions(ctx: &HandlerContext, session_id: 
         if let Some(mid) = summary_message_id {
             let _ = ctx
                 .bot
-                .edit_message(ctx.config.chat_id, mid, "\u{2705} Answered at terminal", None)
+                .edit_message(
+                    ctx.config.chat_id,
+                    mid,
+                    "\u{2705} Answered at terminal",
+                    None,
+                )
                 .await;
         }
     }
@@ -1472,7 +1477,10 @@ pub(super) async fn resolve_pending_question(ctx: &HandlerContext, session_id: &
     //    and any already-Resolved leftover.
     {
         let mut pq = ctx.pending_q.write().await;
-        if pq.get(session_id).is_some_and(|cur| Arc::ptr_eq(cur, &entry)) {
+        if pq
+            .get(session_id)
+            .is_some_and(|cur| Arc::ptr_eq(cur, &entry))
+        {
             pq.remove(session_id);
         }
     }
@@ -1492,7 +1500,12 @@ pub(super) async fn resolve_pending_question(ctx: &HandlerContext, session_id: &
     if let Some(mid) = summary_message_id {
         let _ = ctx
             .bot
-            .edit_message(ctx.config.chat_id, mid, "\u{2705} Answered at terminal", None)
+            .edit_message(
+                ctx.config.chat_id,
+                mid,
+                "\u{2705} Answered at terminal",
+                None,
+            )
             .await;
     }
 }

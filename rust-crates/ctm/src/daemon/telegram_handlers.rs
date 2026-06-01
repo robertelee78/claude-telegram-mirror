@@ -981,8 +981,8 @@ pub(super) async fn handle_free_text_answer(
                         .insert(q_idx, TentativeAnswer::FreeText(text.to_string()));
 
                     let all_answered = pending.tentative.len() == pending.questions.len();
-                    let short =
-                        pending.session_id[..std::cmp::min(20, pending.session_id.len())].to_string();
+                    let short = pending.session_id[..std::cmp::min(20, pending.session_id.len())]
+                        .to_string();
                     // Clone the QuestionDef so the edit can be rendered AFTER the lock drops.
                     let q = pending.questions[q_idx].clone();
                     let mut updated_text = super::render_question_text(&q);

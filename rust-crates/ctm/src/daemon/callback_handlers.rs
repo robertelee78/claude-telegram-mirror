@@ -747,7 +747,13 @@ async fn handle_answer_callback(ctx: &HandlerContext, data: &str, cb: &CallbackQ
             new_buttons,
             msg_id,
             all_answered,
-        } => (option_label, updated_text, new_buttons, msg_id, all_answered),
+        } => (
+            option_label,
+            updated_text,
+            new_buttons,
+            msg_id,
+            all_answered,
+        ),
     };
 
     // Toast feedback (entry lock already dropped).
@@ -1144,8 +1150,7 @@ pub(super) async fn send_or_update_summary(
                 // the live "Review your answers" markup ON TOP of that. Re-lock: if no
                 // longer Active, stale this summary (terminal text, NO buttons) so no live
                 // review markup is left behind, and do NOT keep the id.
-                let still_active =
-                    { entry.lock().await.lifecycle == QuestionLifecycle::Active };
+                let still_active = { entry.lock().await.lifecycle == QuestionLifecycle::Active };
                 if still_active {
                     return Some(mid);
                 }
@@ -1381,7 +1386,12 @@ async fn handle_submitall_callback(ctx: &HandlerContext, data: &str, cb: &Callba
             session_id,
             question_message_ids,
             summary_message_id,
-        } => (answers, session_id, question_message_ids, summary_message_id),
+        } => (
+            answers,
+            session_id,
+            question_message_ids,
+            summary_message_id,
+        ),
     };
     let target = tmux_target.expect("tmux_target checked present under the entry mutex");
 
@@ -1448,7 +1458,10 @@ async fn handle_submitall_callback(ctx: &HandlerContext, data: &str, cb: &Callba
     // the key maps to the NEW (active) entry — removing by key would orphan it.
     {
         let mut pq = ctx.pending_q.write().await;
-        if pq.get(&full_key).is_some_and(|cur| Arc::ptr_eq(cur, &entry)) {
+        if pq
+            .get(&full_key)
+            .is_some_and(|cur| Arc::ptr_eq(cur, &entry))
+        {
             pq.remove(&full_key);
         }
     }
@@ -1550,8 +1563,8 @@ async fn handle_change_callback(ctx: &HandlerContext, data: &str, cb: &CallbackQ
                         .copied()
                         .unwrap_or(0);
                     let summary_message_id = pending.summary_message_id.take();
-                    let short =
-                        pending.session_id[..std::cmp::min(20, pending.session_id.len())].to_string();
+                    let short = pending.session_id[..std::cmp::min(20, pending.session_id.len())]
+                        .to_string();
                     ChangeOutcome::Reselect {
                         q,
                         msg_id,
