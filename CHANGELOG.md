@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.21] - 2026-05-31
+
+### Fixed (ADR-015 — multi-select AskUserQuestion injection)
+- **Answering an AskUserQuestion from Telegram now submits cleanly.** Live validation on Claude Code 2.1.159 revealed the multi-select widget has **no separate "review your answers" screen** (submit is an inline "Submit" button) and has rows *below* Submit ("Type something", "Chat about this"). The 0.2.20 path used a fixed Down-count plus a second blind auto-submit Enter, which could overshoot or fire a stray post-submit keystroke (surfacing as a spurious "clarify"). Replaced with **capture-pane-driven navigation**: toggle the chosen options by digit key, then press Down until the cursor sits on "Submit", then a **single** Enter — bounded by the total option count so it never under- or over-shoots, and the redundant second Enter is gone.
+- **Single-select answers from Telegram** now select by the option's digit key instead of injecting the label as literal text (which risked being treated as free-text by the widget).
+
 ## [0.2.20] - 2026-05-31
 
 ### Fixed (ADR-015 — restore AskUserQuestion to both surfaces)
