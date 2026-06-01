@@ -368,15 +368,6 @@ pub(super) async fn handle_session_end(ctx: &HandlerContext, msg: &BridgeMessage
             session_id = %msg.session_id,
             "ADR-014 A3: SessionEnd reason=resume — suspending, not tearing down"
         );
-        // Review fix (MED-3): a suspending session's blocked-question client is no
-        // longer reachable (its hook process is going away), so drop the mapping now
-        // rather than leaking it until the next cleanup sweep. Keyed by session_id so
-        // this is cheap. (Approval entries are keyed by approval_id and are reaped by
-        // the cleanup sweep.)
-        ctx.pending_question_clients
-            .write()
-            .await
-            .remove(&msg.session_id);
         return;
     }
 
@@ -459,11 +450,6 @@ pub(super) async fn handle_session_end(ctx: &HandlerContext, msg: &BridgeMessage
         // Clean up caches
         ctx.session_tmux.write().await.remove(&msg.session_id);
         ctx.custom_titles.write().await.remove(&msg.session_id);
-        // ADR-014 E1: drop any blocked-question client mapping for this session.
-        ctx.pending_question_clients
-            .write()
-            .await
-            .remove(&msg.session_id);
         cleanup_pending_questions(ctx, &msg.session_id).await;
 
         // ADR-014 B4: capture this session's pending approval IDs BEFORE end_session
@@ -607,11 +593,13 @@ pub(super) async fn handle_tool_start(ctx: &HandlerContext, msg: &BridgeMessage)
     let meta = msg.meta();
     let tool_name = meta.tool().unwrap_or("Unknown");
 
-    // ADR-014 E1: AskUserQuestion is no longer rendered from ToolStart — it is
-    // rendered from the blocking QuestionRequest (handle_question_request). The hook
-    // also suppresses the AskUserQuestion ToolStart, so this is a defensive guard:
-    // never render a question from the (late, non-blocking) ToolStart path.
+    // ADR-015: AskUserQuestion is mirrored to Telegram FROM its ToolStart (the
+    // restored ADR-012 render trigger). The hook no longer intercepts the question;
+    // Claude renders its native CLI widget and we mirror OUT here, injecting answers
+    // IN via tmux. tool_start carries the same `input` (questions) field that
+    // handle_ask_user_question reads, so it works unchanged.
     if tool_name == "AskUserQuestion" {
+        handle_ask_user_question(ctx, msg).await;
         return;
     }
 
@@ -705,6 +693,16 @@ pub(super) async fn handle_tool_start(ctx: &HandlerContext, msg: &BridgeMessage)
 
 /// Handler 5: tool_result
 pub(super) async fn handle_tool_result(ctx: &HandlerContext, msg: &BridgeMessage) {
+    // ADR-015: An AskUserQuestion tool_result means the question was answered — at the
+    // terminal (Claude's native widget) or via Telegram "Submit All". Stale the
+    // Telegram question (idempotently) and stop here. We deliberately do NOT post the
+    // raw answer text as a tool result: that would be echo noise, and runs regardless
+    // of verbose mode (the hook always emits this ToolResult).
+    if msg.meta().tool() == Some("AskUserQuestion") {
+        resolve_pending_question(ctx, &msg.session_id).await;
+        return;
+    }
+
     if !ctx.config.verbose {
         return;
     }
@@ -1055,64 +1053,47 @@ pub(super) async fn handle_session_rename(
 
 // ====================================================================== AskUserQuestion (Epic 3)
 
-/// ADR-014 E1: Handle a blocking AskUserQuestion request from the hook.
-///
-/// Records the originating socket client (so `handle_submitall_callback` can route
-/// the answer back to the exact hook that is blocked), then renders the question UI
-/// via the existing `handle_ask_user_question` path. The hook stays blocked on
-/// `send_and_wait` until "Submit All" replies with a `QuestionResponse`.
-pub(super) async fn handle_question_request(ctx: &HandlerContext, msg: &BridgeMessage) {
-    if let Some(client_id) = msg.meta().client_id() {
-        let prev = ctx
-            .pending_question_clients
-            .write()
-            .await
-            .insert(msg.session_id.clone(), client_id.to_string());
-        // ADR-014 (review follow-up): if a different hook was already blocked on this
-        // session (two overlapping AskUserQuestion calls), the old client mapping was
-        // just overwritten. Release that previous hook to its TUI now, otherwise it
-        // would hang for the full 300s timeout with no way to answer.
-        if let Some(prev_client) = prev {
-            if prev_client != client_id {
-                let _ = super::callback_handlers::send_question_response(
-                    ctx,
-                    &msg.session_id,
-                    crate::types::FREETEXT_FALLBACK_SENTINEL,
-                    &prev_client,
-                )
-                .await;
-                tracing::warn!(
-                    session_id = %msg.session_id,
-                    "ADR-014: superseding AskUserQuestion — released previous blocked hook"
-                );
-            }
-        }
-    } else {
-        // No client to answer back to — without it the structured reply cannot be
-        // routed. Log loudly; the hook will time out and fall back to its own TUI.
-        tracing::warn!(
-            session_id = %msg.session_id,
-            "ADR-014 E1: QuestionRequest missing _client_id — answer cannot be routed back"
-        );
-    }
-    handle_ask_user_question(ctx, msg).await;
+/// ADR-015 (Codex render-window TOCTOU): what the AskUserQuestion render store-back
+/// must do, given the entry's `lifecycle` observed after the render `.await` window.
+#[derive(Debug, PartialEq, Eq)]
+enum StoreBackAction {
+    /// `Active` — normal path: save the captured message ids for in-place edits.
+    Save,
+    /// `Resolved` — the question was answered (CLI tool_result) or superseded/cleaned up
+    /// during the render window, with no ids to stale at that time. Stale the messages we
+    /// just rendered ourselves so no live buttons orphan.
+    StaleRendered,
+    /// `Submitting` — the Submit-All flow owns these messages; do nothing.
+    Ignore,
 }
 
+/// Pure decision for the render store-back (unit-testable without a live bot/tmux).
+fn store_back_action(lifecycle: QuestionLifecycle) -> StoreBackAction {
+    match lifecycle {
+        QuestionLifecycle::Active => StoreBackAction::Save,
+        QuestionLifecycle::Resolved => StoreBackAction::StaleRendered,
+        QuestionLifecycle::Submitting => StoreBackAction::Ignore,
+    }
+}
+
+/// ADR-015: Render an AskUserQuestion to Telegram from its `tool_start`.
+///
+/// The hook no longer intercepts the question — Claude renders its native CLI widget,
+/// and we mirror OUT to Telegram here. Answers are injected back IN via tmux (see
+/// `handle_submitall_callback`). There is NO blocked hook to release: on any
+/// error/empty path we simply log and return; the CLI widget renders natively
+/// regardless, and the user can answer at the terminal.
 pub(super) async fn handle_ask_user_question(ctx: &HandlerContext, msg: &BridgeMessage) {
     let thread_id = ctx.wait_for_topic(&msg.session_id).await;
     if thread_id.is_none() && ctx.config.use_threads {
-        tracing::warn!(session_id = %msg.session_id, "No topic — dropping ask_user_question");
-        // ADR-014 (review follow-up): release the blocked hook instead of leaving it
-        // to hang for the full 300s timeout with the user seeing nothing.
-        super::callback_handlers::release_question_hook(ctx, &msg.session_id).await;
+        tracing::warn!(session_id = %msg.session_id, "No topic — dropping ask_user_question (CLI widget still renders)");
         return;
     }
 
     let tool_input = match msg.meta().input() {
         Some(v) => v,
         None => {
-            tracing::warn!(session_id = %msg.session_id, "QuestionRequest missing metadata.input — releasing hook");
-            super::callback_handlers::release_question_hook(ctx, &msg.session_id).await;
+            tracing::warn!(session_id = %msg.session_id, "AskUserQuestion tool_start missing metadata.input — not mirrored (CLI widget still renders)");
             return;
         }
     };
@@ -1120,8 +1101,7 @@ pub(super) async fn handle_ask_user_question(ctx: &HandlerContext, msg: &BridgeM
     let questions_val = match tool_input.get("questions").and_then(|v| v.as_array()) {
         Some(q) if !q.is_empty() => q,
         _ => {
-            tracing::warn!(session_id = %msg.session_id, "QuestionRequest missing/empty questions — releasing hook");
-            super::callback_handlers::release_question_hook(ctx, &msg.session_id).await;
+            tracing::warn!(session_id = %msg.session_id, "AskUserQuestion missing/empty questions — not mirrored (CLI widget still renders)");
             return;
         }
     };
@@ -1186,20 +1166,35 @@ pub(super) async fn handle_ask_user_question(ctx: &HandlerContext, msg: &BridgeM
         finalized: vec![false; questions.len()],
         question_message_ids: Vec::new(),
         summary_message_id: None,
+        lifecycle: QuestionLifecycle::Active,
     }));
     let old_entry = {
         let mut pq = ctx.pending_q.write().await;
         pq.insert(pending_key.clone(), Arc::clone(&new_entry))
     };
     if let Some(old_arc) = old_entry {
-        let old_pq = old_arc.lock().await;
+        // ADR-015 (Codex lock-across-I/O sweep): under the old entry's lock, mark it
+        // terminal (Resolved) and CLONE its message ids; DROP the lock; THEN await the
+        // edit/delete I/O. Marking Resolved means a still-in-flight render of the
+        // superseded entry sees `Resolved` at store-back and stales its own messages
+        // instead of resurrecting obsolete live buttons.
+        let (old_count, old_question_ids, old_summary_id) = {
+            let mut old_pq = old_arc.lock().await;
+            old_pq.lifecycle = QuestionLifecycle::Resolved;
+            (
+                old_pq.questions.len(),
+                old_pq.question_message_ids.clone(),
+                old_pq.summary_message_id,
+            )
+            // old entry mutex drops here
+        };
         tracing::info!(
             session_id = %msg.session_id,
-            old_questions = old_pq.questions.len(),
+            old_questions = old_count,
             "Superseding previous AskUserQuestion"
         );
         // Dismiss old question messages.
-        for &mid in &old_pq.question_message_ids {
+        for mid in old_question_ids {
             if mid != 0 {
                 let _ = ctx
                     .bot
@@ -1208,7 +1203,7 @@ pub(super) async fn handle_ask_user_question(ctx: &HandlerContext, msg: &BridgeM
             }
         }
         // Delete old summary if present.
-        if let Some(mid) = old_pq.summary_message_id {
+        if let Some(mid) = old_summary_id {
             let _ = ctx.bot.delete_message(ctx.config.chat_id, mid).await;
         }
     }
@@ -1290,81 +1285,215 @@ pub(super) async fn handle_ask_user_question(ctx: &HandlerContext, msg: &BridgeM
                 thread_id,
             )
             .await;
-        // ADR-014 (review follow-up): a partial/total render failure means the widget
-        // can never be completed ("Submit All" requires every question answered), so the
-        // blocked hook would hang for the full 300s timeout. Release it to its TUI now —
-        // the E4 notice above already directs the user to the terminal.
-        super::callback_handlers::release_question_hook(ctx, &msg.session_id).await;
+        // ADR-015: nothing to release — the CLI widget renders natively, so a partial
+        // render failure just means the user answers at the terminal. The matching
+        // tool_result will stale whatever did render (resolve_pending_question).
     }
 
-    // Store captured message_ids back into the pending question.
-    {
-        let pq = ctx.pending_q.read().await;
-        if let Some(entry) = pq.get(&pending_key) {
-            let mut pending = entry.lock().await;
-            pending.question_message_ids = question_message_ids;
+    // ADR-015 (Codex render-window TOCTOU): store the message_ids THROUGH the captured
+    // `new_entry` Arc, NOT via a fresh pending_q lookup. During the render `.await`
+    // window above, a CLI-answer tool_result can have run resolve_pending_question, which
+    // transitioned this entry Active→Resolved and removed it from the map while
+    // `question_message_ids` was still empty (so resolve staled nothing). A fresh lookup
+    // would then find no entry and leave the just-rendered messages with LIVE buttons —
+    // orphaned. Instead we arbitrate on the entry's own lifecycle:
+    //   - Active     → normal path: save the ids for in-place edits.
+    //   - Resolved   → already answered (CLI) or superseded during render: stale the
+    //                  messages we just rendered ourselves so no live buttons orphan.
+    //   - Submitting → the submit flow owns these messages; do nothing.
+    let stale_now: Option<Vec<i64>> = {
+        let mut pending = new_entry.lock().await;
+        match store_back_action(pending.lifecycle) {
+            StoreBackAction::Save => {
+                pending.question_message_ids = question_message_ids;
+                None
+            }
+            StoreBackAction::StaleRendered => Some(question_message_ids),
+            StoreBackAction::Ignore => None,
         }
-    }
-
-    // ADR-014 D8c: pre-emptive expiry nudge. If the widget rendered cleanly but is
-    // still unanswered at ~80% of the wait window, post one low-priority notice so the
-    // user isn't left tapping a widget whose blocked hook is about to time out (the
-    // #28508-class "silent dead widget"). Skipped when the render failed (the hook was
-    // already released to its TUI). The timer self-cancels if the question is answered
-    // (key removed) or superseded (Arc replaced — detected via ptr_eq). A benign race
-    // remains: if the question is answered in the brief gap between the live-check and
-    // the send, one extra "about to expire" notice may post — harmless.
-    if failed_renders == 0 {
-        let wait_secs = ctx.config.question_wait_secs as u64;
-        if wait_secs >= 30 {
-            let nudge_after = std::time::Duration::from_secs(wait_secs * 4 / 5);
-            let bot = Arc::clone(&ctx.bot);
-            let pending_q = Arc::clone(&ctx.pending_q);
-            let entry_ref = Arc::clone(&new_entry);
-            let key = pending_key.clone();
-            let tid = thread_id;
-            tokio::spawn(async move {
-                tokio::time::sleep(nudge_after).await;
-                let still_live = {
-                    let pq = pending_q.read().await;
-                    pq.get(&key).is_some_and(|cur| Arc::ptr_eq(cur, &entry_ref))
-                };
-                if !still_live {
-                    return;
-                }
-                if entry_ref.lock().await.finalized.iter().all(|f| *f) {
-                    return; // mid-submit; no nudge
-                }
-                bot.send_message_low(
-                    "\u{23F3} This question is about to expire \u{2014} if the buttons stop responding, answer at the terminal.",
-                    None,
-                    tid,
-                )
-                .await;
-            });
+    };
+    if let Some(message_ids) = stale_now {
+        tracing::info!(
+            session_id = %msg.session_id,
+            "ADR-015: question resolved during render — staling just-rendered messages"
+        );
+        for mid in message_ids {
+            if mid != 0 {
+                let _ = ctx
+                    .bot
+                    .edit_message_text_no_markup(mid, "\u{2705} Answered at terminal")
+                    .await;
+            }
         }
     }
 }
 
 /// Clean up pending questions for a session.
+///
+/// LOCK ORDER (ADR-015, Codex deadlock fix): never `.await` an `entry.lock()` while the
+/// `pending_q` guard is held, and never hold an entry lock across Telegram I/O. We
+/// snapshot `(key, Arc)` pairs under the READ guard, DROP it, inspect/transition each
+/// entry under its OWN lock (dropped before the next, capturing rendered message ids),
+/// take ONE `pending_q.write()` to remove the keys, and ONLY THEN await the message
+/// edits with no lock held.
 pub(super) async fn cleanup_pending_questions(ctx: &HandlerContext, session_id: &str) {
-    // Collect keys whose PendingQuestion belongs to this session.
-    let keys_to_remove: Vec<String> = {
+    // 1. Snapshot all (key, Arc) pairs under the read guard, then DROP the guard.
+    let candidates: Vec<(String, Arc<Mutex<PendingQuestion>>)> = {
         let pq = ctx.pending_q.read().await;
-        let mut keys = Vec::new();
-        for (k, v) in pq.iter() {
-            let entry = v.lock().await;
-            if entry.session_id == session_id {
-                keys.push(k.clone());
+        pq.iter().map(|(k, v)| (k.clone(), Arc::clone(v))).collect()
+    };
+
+    // 2. With NO pending_q guard held, inspect each entry under its own lock. ADR-015
+    //    (Codex render-window TOCTOU): mark matching entries terminal (Resolved) and
+    //    CAPTURE any already-rendered message ids so we can stale them after the locks
+    //    are dropped. Entries with NO rendered ids yet are an in-flight render: leaving
+    //    them Resolved makes that render's own store-back self-stale (do not capture).
+    let mut to_remove: Vec<(String, Arc<Mutex<PendingQuestion>>)> = Vec::new();
+    let mut to_stale: Vec<(Vec<i64>, Option<i64>)> = Vec::new();
+    for (k, entry) in candidates {
+        let captured = {
+            let mut pending = entry.lock().await;
+            if pending.session_id == session_id {
+                pending.lifecycle = QuestionLifecycle::Resolved;
+                let ids = pending.question_message_ids.clone();
+                let summary = pending.summary_message_id;
+                // Only stale here if this entry already rendered messages; otherwise the
+                // in-flight render's store-back (which sees Resolved) handles staling.
+                let has_rendered = ids.iter().any(|&m| m != 0) || summary.is_some();
+                Some((has_rendered, ids, summary))
+            } else {
+                None
+            }
+            // entry mutex drops here
+        };
+        if let Some((has_rendered, ids, summary)) = captured {
+            to_remove.push((k, entry));
+            if has_rendered {
+                to_stale.push((ids, summary));
             }
         }
-        keys
-    };
-    if !keys_to_remove.is_empty() {
+    }
+
+    // 3. One write guard to remove the matched keys (no entry lock held). ADR-015 (Codex
+    //    identity-checked removal): remove a key ONLY if it still points at the SAME Arc
+    //    we transitioned. A new AskUserQuestion superseding this session between snapshot
+    //    and now installs a NEW active entry under the same key — don't orphan it.
+    if !to_remove.is_empty() {
         let mut pq = ctx.pending_q.write().await;
-        for k in keys_to_remove {
-            pq.remove(&k);
+        for (k, entry) in to_remove {
+            if pq.get(&k).is_some_and(|cur| Arc::ptr_eq(cur, &entry)) {
+                pq.remove(&k);
+            }
         }
+    }
+
+    // 4. With NO lock held, stale the already-rendered Telegram messages so a torn-down
+    //    session leaves no orphaned live buttons.
+    for (question_message_ids, summary_message_id) in to_stale {
+        for mid in question_message_ids {
+            if mid != 0 {
+                let _ = ctx
+                    .bot
+                    .edit_message_text_no_markup(mid, "\u{2705} Answered at terminal")
+                    .await;
+            }
+        }
+        if let Some(mid) = summary_message_id {
+            let _ = ctx
+                .bot
+                .edit_message(ctx.config.chat_id, mid, "\u{2705} Answered at terminal", None)
+                .await;
+        }
+    }
+}
+
+/// ADR-015: Resolve a session's pending AskUserQuestion because it was answered.
+///
+/// Called from `handle_tool_result` when an AskUserQuestion tool_result arrives — the
+/// signal that the question was answered (at the terminal via Claude's native widget,
+/// or via Telegram "Submit All"). Stales the Telegram question messages (edit to
+/// "answered at terminal", removing the inline keyboards) and drops the pending entry.
+///
+/// MUST be idempotent. ADR-015 (Codex B3): a Telegram "Submit All" injects keystrokes
+/// that ALSO make Claude emit this tool_result, so BOTH paths run for one answer. The
+/// `lifecycle` field is the arbiter, checked-and-set under the per-entry mutex:
+///   - `Submitting` → Submit All owns the message edits; we no-op.
+///   - `Active` → we win: set `Resolved`, capture the message ids, then (after dropping
+///     the entry lock) remove the map key and stale the messages.
+///   - `Resolved`, or no entry → already done; no-op.
+///
+/// LOCK ORDER (ADR-015, Codex deadlock fix): NEVER hold the `pending_q` guard across
+/// `entry.lock()`, and NEVER hold `entry.lock()` across `pending_q.write()`. The
+/// `lifecycle` flag (not co-holding both locks) is what guarantees a single owner; map
+/// removal after the entry lock is dropped is safe because a late resolve sees
+/// `Resolved`/absent and no-ops.
+pub(super) async fn resolve_pending_question(ctx: &HandlerContext, session_id: &str) {
+    // 1. Clone the Arc under the pending_q READ guard, then DROP the guard.
+    let entry: Option<Arc<Mutex<PendingQuestion>>> =
+        { ctx.pending_q.read().await.get(session_id).cloned() };
+    let Some(entry) = entry else {
+        return; // No pending question — already resolved/removed. Idempotent no-op.
+    };
+
+    // 2. Under the entry mutex ONLY (no pending_q guard held): arbitrate and capture the
+    //    message ids. `won` = we transitioned Active→Resolved (so WE remove the key and
+    //    stale the messages). On `Submitting`, Submit All owns both removal and edits, so
+    //    we must NOT remove its still-in-flight map entry. Then DROP the entry lock.
+    let outcome: Option<(Vec<i64>, Option<i64>)> = {
+        let mut pending = entry.lock().await;
+        match pending.lifecycle {
+            QuestionLifecycle::Submitting => {
+                // Submit All is mid-flight and owns the entry + terminal edits — leave it.
+                tracing::debug!(
+                    session_id,
+                    "ADR-015: tool_result arrived while Submit All in flight — resolve no-op"
+                );
+                return;
+            }
+            QuestionLifecycle::Resolved => {
+                // A duplicate tool_result after we (or Submit All) already finished. Fall
+                // through to remove any stale key, but do not re-edit messages.
+                None
+            }
+            QuestionLifecycle::Active => {
+                pending.lifecycle = QuestionLifecycle::Resolved;
+                Some((
+                    pending.question_message_ids.clone(),
+                    pending.summary_message_id,
+                ))
+            }
+        }
+    };
+
+    // 3. With NO lock held, remove the map key — but ONLY if it still points at OUR Arc
+    //    (ADR-015 Codex identity-checked removal). If a new AskUserQuestion superseded
+    //    this entry between the snapshot and now, the key maps to the NEW active entry;
+    //    removing by key would orphan it. Idempotent: clears the Active→Resolved winner
+    //    and any already-Resolved leftover.
+    {
+        let mut pq = ctx.pending_q.write().await;
+        if pq.get(session_id).is_some_and(|cur| Arc::ptr_eq(cur, &entry)) {
+            pq.remove(session_id);
+        }
+    }
+
+    let Some((question_message_ids, summary_message_id)) = outcome else {
+        return; // Already Resolved — key cleaned up above, no edits.
+    };
+
+    for mid in question_message_ids {
+        if mid != 0 {
+            let _ = ctx
+                .bot
+                .edit_message_text_no_markup(mid, "\u{2705} Answered at terminal")
+                .await;
+        }
+    }
+    if let Some(mid) = summary_message_id {
+        let _ = ctx
+            .bot
+            .edit_message(ctx.config.chat_id, mid, "\u{2705} Answered at terminal", None)
+            .await;
     }
 }
 
@@ -1424,6 +1553,28 @@ mod tests {
     #[test]
     fn test_escape_markdown_v1() {
         assert_eq!(escape_markdown_v1("hello `world`"), "hello 'world'");
+    }
+
+    /// ADR-015 (Codex render-window TOCTOU): the store-back must SAVE only when the entry
+    /// is still Active; if a CLI tool_result / supersede / session-end resolved it during
+    /// the render window (Resolved), the store-back must stale the just-rendered messages
+    /// (so no live buttons orphan); while a Submit-All is mid-flight (Submitting) it must
+    /// leave the messages to that flow.
+    #[test]
+    fn store_back_action_branches_on_lifecycle() {
+        assert_eq!(
+            store_back_action(QuestionLifecycle::Active),
+            StoreBackAction::Save
+        );
+        assert_eq!(
+            store_back_action(QuestionLifecycle::Resolved),
+            StoreBackAction::StaleRendered,
+            "resolved-during-render must stale its own messages, not orphan live buttons"
+        );
+        assert_eq!(
+            store_back_action(QuestionLifecycle::Submitting),
+            StoreBackAction::Ignore
+        );
     }
 
     #[test]

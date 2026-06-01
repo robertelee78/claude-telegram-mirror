@@ -205,9 +205,6 @@ fn message_type_serialization_all_variants() {
         (MessageType::PreCompact, "pre_compact"),
         (MessageType::SessionRename, "session_rename"),
         (MessageType::SendImage, "send_image"),
-        // ADR-014 E1
-        (MessageType::QuestionRequest, "question_request"),
-        (MessageType::QuestionResponse, "question_response"),
     ];
 
     for (variant, expected_str) in &cases {
@@ -808,7 +805,6 @@ fn config_validation_missing_credentials() {
         chunk_size: 4000,
         rate_limit: 20,
         session_timeout: 30,
-        question_wait_secs: 300,
         stale_session_timeout_hours: 72,
         auto_delete_topics: true,
         topic_delete_delay_minutes: 15,
@@ -840,7 +836,6 @@ fn config_validation_bad_chunk_size() {
         chunk_size: 500, // Too small
         rate_limit: 20,
         session_timeout: 30,
-        question_wait_secs: 300,
         stale_session_timeout_hours: 72,
         auto_delete_topics: true,
         topic_delete_delay_minutes: 15,
