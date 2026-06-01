@@ -9,7 +9,7 @@ All notable changes to this project will be documented in this file.
 - **No more stray keystrokes / blind Enters.** Cursor placement is verified against the live pane and **fails closed** if it can't confirm the target (the old "best-effort Enter" that leaked keys is gone). Every screen transition is awaited (next question active / confirm screen) rather than slept through.
 - **Free-text answers inject cleanly.** Free-text is typed literally into the `Type something` row via a new no-trailing-Enter injection path (the previous path appended an Enter that could submit prematurely) and is sanitized (control characters stripped, length-capped).
 - **Safe partial-failure handling.** If injection fails after any keystroke has landed, ctm no longer blind-retries from question 1 (which would corrupt a half-advanced widget) — it marks the answers terminal and asks you to finish at the terminal, where the widget is still on screen. If nothing was delivered, it safely restores the Telegram buttons for a retry.
-- **Submit-All validation.** Out-of-range option selections are rejected, and an empty multi-select (nothing picked, no typed answer) is blocked with a clear prompt instead of attempting an un-submittable injection.
+- **Submit-All validation & stale-button safety.** Answers are validated per-question before submitting: an unanswered question, an out-of-range option, or an empty multi-select is rejected with a clear prompt (previously a stale button — e.g. tapping an old question's message after a new question replaced it — could finalize a partial/empty submit as success). Tapping such a stale option button now shows "no longer available" instead of crashing the daemon.
 
 ## [0.2.21] - 2026-05-31
 

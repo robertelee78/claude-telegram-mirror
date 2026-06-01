@@ -32,6 +32,7 @@ const LABEL_CONFIRM_PROMPT: &str = "Ready to submit your answers?";
 /// against the question's option count at collection time). The per-question `multiSelect`
 /// flag is carried alongside this in the answers tuple — it (not the variant) decides the
 /// advance mechanism, because free-text can answer either a single- or multi-select Q.
+#[derive(Debug, PartialEq, Eq)]
 enum CollectedAnswer {
     /// Single-select: the chosen option's 0-based index (`< options.len()`).
     Single(usize),
@@ -809,6 +810,11 @@ async fn handle_answer_callback(ctx: &HandlerContext, data: &str, cb: &CallbackQ
     // `Resolved`, a raced tap must NOT mutate tentative state or edit messages.
     enum AnswerOutcome {
         NotActive,
+        /// ADR-015 v4: the callback's `q_idx`/`o_idx` are out of range for the CURRENT
+        /// pending question — a STALE button (e.g. an old question's message tapped after a
+        /// same-key supersede). Treat as a graceful no-op instead of panicking on a direct
+        /// `pending.questions[q_idx]` index.
+        Stale,
         Selected {
             option_label: String,
             updated_text: String,
@@ -824,6 +830,13 @@ async fn handle_answer_callback(ctx: &HandlerContext, data: &str, cb: &CallbackQ
 
         if pending.lifecycle != QuestionLifecycle::Active {
             AnswerOutcome::NotActive
+        } else if pending
+            .questions
+            .get(q_idx)
+            .is_none_or(|q| o_idx >= q.options.len())
+        {
+            // Stale/out-of-range callback — do NOT index directly below.
+            AnswerOutcome::Stale
         } else {
             let option_label = pending
                 .questions
@@ -889,6 +902,13 @@ async fn handle_answer_callback(ctx: &HandlerContext, data: &str, cb: &CallbackQ
             let _ = ctx
                 .bot
                 .answer_callback_query(&cb.id, Some("Answer already being submitted"), false)
+                .await;
+            return;
+        }
+        AnswerOutcome::Stale => {
+            let _ = ctx
+                .bot
+                .answer_callback_query(&cb.id, Some("This option is no longer available"), true)
                 .await;
             return;
         }
@@ -1455,67 +1475,23 @@ async fn handle_submitall_callback(ctx: &HandlerContext, data: &str, cb: &Callba
             // Codex B1: leave the entry Active (do NOT finalize / set Submitting / remove).
             SubmitAllOutcome::NoTmux
         } else {
-            // ADR-015 v4: collect + VALIDATE answers in question order BEFORE claiming
-            // ownership. Every option index is validated against the question's option
-            // count (Telegram callback data is otherwise trusted unchecked — an out-of-
-            // range index would land the cursor on the `Type something`/advance row). An
-            // empty multi-select (no toggles, no free-text) is rejected (the widget can't
-            // submit an unanswered tab). On any invalid answer we DON'T transition to
-            // Submitting — the entry stays Active and the user is told to fix it.
-            let mut answers: Vec<InjItem> = Vec::new();
-            let mut bad: Option<String> = None;
-            for (q_idx, q) in pending.questions.iter().enumerate() {
-                let total_options = q.options.len();
-                let multi_select = q.multi_select;
-                let answer = match pending.tentative.get(&q_idx) {
-                    Some(TentativeAnswer::Option(o_idx)) => {
-                        if *o_idx >= total_options {
-                            bad = Some(format!(
-                                "Q{} selection is out of range — please re-select.",
-                                q_idx + 1
-                            ));
-                            break;
-                        }
-                        CollectedAnswer::Single(*o_idx)
-                    }
-                    Some(TentativeAnswer::MultiOption(set)) => {
-                        let mut sorted: Vec<usize> =
-                            set.iter().copied().filter(|&i| i < total_options).collect();
-                        sorted.sort_unstable();
-                        sorted.dedup();
-                        if sorted.is_empty() {
-                            bad = Some(format!(
-                                "Select at least one option (or type an answer) for Q{}.",
-                                q_idx + 1
-                            ));
-                            break;
-                        }
-                        CollectedAnswer::Multi(sorted)
-                    }
-                    Some(TentativeAnswer::FreeText(s)) => CollectedAnswer::FreeText(s.clone()),
-                    None => continue,
-                };
-                answers.push(InjItem {
-                    q_idx,
-                    total_options,
-                    multi_select,
-                    answer,
-                });
-            }
+            // ADR-015 v4: collect + VALIDATE all answers BEFORE claiming ownership. On any
+            // invalid/missing answer we DON'T transition to Submitting — the entry stays
+            // Active and the user is told to fix it (see `collect_and_validate_answers`).
+            match collect_and_validate_answers(&pending.questions, &pending.tentative) {
+                Err(reason) => SubmitAllOutcome::BadSelection(reason),
+                Ok(answers) => {
+                    // Claim ownership: Active → Submitting. resolve_pending_question now
+                    // no-ops, and the map entry is NOT yet removed (a duplicate tap hits
+                    // Submitting).
+                    pending.lifecycle = QuestionLifecycle::Submitting;
 
-            if let Some(reason) = bad {
-                // Leave the entry Active; do not claim ownership.
-                SubmitAllOutcome::BadSelection(reason)
-            } else {
-                // Claim ownership: Active → Submitting. resolve_pending_question now no-ops,
-                // and the map entry is NOT yet removed (so a duplicate tap hits Submitting).
-                pending.lifecycle = QuestionLifecycle::Submitting;
-
-                SubmitAllOutcome::Proceed {
-                    answers,
-                    session_id: pending.session_id.clone(),
-                    question_message_ids: pending.question_message_ids.clone(),
-                    summary_message_id: pending.summary_message_id,
+                    SubmitAllOutcome::Proceed {
+                        answers,
+                        session_id: pending.session_id.clone(),
+                        question_message_ids: pending.question_message_ids.clone(),
+                        summary_message_id: pending.summary_message_id,
+                    }
                 }
             }
         }
@@ -1917,6 +1893,7 @@ async fn handle_change_callback(ctx: &HandlerContext, data: &str, cb: &CallbackQ
 }
 
 /// ADR-015 v4: one question's collected answer plus the structural facts injection needs.
+#[derive(Debug, PartialEq, Eq)]
 struct InjItem {
     /// Question index (tab order); used by the caller for per-question message edits.
     q_idx: usize,
@@ -1926,6 +1903,73 @@ struct InjItem {
     /// auto-advances on commit; multi-select must navigate to the `Next`/`Submit` row).
     multi_select: bool,
     answer: CollectedAnswer,
+}
+
+/// ADR-015 v4: collect + validate the tentative answers for ALL questions into injection
+/// items, in question order. `Err(reason)` (user-facing) if any question is unanswered, has
+/// an out-of-range option index, an empty multi-select, or empty free-text — the caller then
+/// leaves the entry `Active` without injecting.
+///
+/// Iterating by question index (NOT `tentative.len()`) is the real all-answered gate: a count
+/// check can pass with a STALE/bad question-index key (after a same-key supersede) while a
+/// real question is unanswered, which previously let injection finalize a partial/empty
+/// submit as a (false) success. Out-of-range option indices from stale callbacks are rejected
+/// (not silently filtered) so we never inject a selection the user didn't make.
+fn collect_and_validate_answers(
+    questions: &[QuestionDef],
+    tentative: &HashMap<usize, TentativeAnswer>,
+) -> std::result::Result<Vec<InjItem>, String> {
+    let mut answers = Vec::with_capacity(questions.len());
+    for (q_idx, q) in questions.iter().enumerate() {
+        let total_options = q.options.len();
+        let multi_select = q.multi_select;
+        let answer = match tentative.get(&q_idx) {
+            Some(TentativeAnswer::Option(o)) => {
+                if *o >= total_options {
+                    return Err(format!(
+                        "Q{} selection is out of range — please re-select.",
+                        q_idx + 1
+                    ));
+                }
+                CollectedAnswer::Single(*o)
+            }
+            Some(TentativeAnswer::MultiOption(set)) => {
+                if set.iter().any(|&i| i >= total_options) {
+                    return Err(format!(
+                        "Q{} has an out-of-range selection — please re-select.",
+                        q_idx + 1
+                    ));
+                }
+                let mut sorted: Vec<usize> = set.iter().copied().collect();
+                sorted.sort_unstable();
+                sorted.dedup();
+                if sorted.is_empty() {
+                    return Err(format!(
+                        "Select at least one option (or type an answer) for Q{}.",
+                        q_idx + 1
+                    ));
+                }
+                CollectedAnswer::Multi(sorted)
+            }
+            Some(TentativeAnswer::FreeText(s)) => {
+                if sanitize_freetext(s).is_empty() {
+                    return Err(format!(
+                        "Q{} answer is empty — please re-answer.",
+                        q_idx + 1
+                    ));
+                }
+                CollectedAnswer::FreeText(s.clone())
+            }
+            None => return Err("Please answer all questions first.".to_string()),
+        };
+        answers.push(InjItem {
+            q_idx,
+            total_options,
+            multi_select,
+            answer,
+        });
+    }
+    Ok(answers)
 }
 
 /// Where to park the cursor inside the current question screen.
@@ -2393,5 +2437,117 @@ Ready to submit your answers?
     fn fail_outcome_maps_mutated() {
         assert_eq!(fail_outcome(false), InjectOutcome::FailedClean);
         assert_eq!(fail_outcome(true), InjectOutcome::FailedDirty);
+    }
+
+    // ───────────────────── collect_and_validate_answers (Codex diff review) ─────────────────
+    use std::collections::HashMap as TMap;
+    use std::collections::HashSet as TSet;
+
+    fn qdef(header: &str, n_options: usize, multi: bool) -> QuestionDef {
+        QuestionDef {
+            question: format!("{header}?"),
+            header: header.to_string(),
+            options: (0..n_options)
+                .map(|i| OptionDef {
+                    label: format!("opt{i}"),
+                    description: String::new(),
+                })
+                .collect(),
+            multi_select: multi,
+        }
+    }
+
+    #[test]
+    fn collect_validates_happy_path_mixed() {
+        let questions = vec![qdef("Single", 3, false), qdef("Multi", 4, true)];
+        let mut t: TMap<usize, TentativeAnswer> = TMap::new();
+        t.insert(0, TentativeAnswer::Option(2));
+        t.insert(1, TentativeAnswer::MultiOption(TSet::from([0, 2])));
+        let got = collect_and_validate_answers(&questions, &t).expect("valid");
+        assert_eq!(got.len(), 2);
+        assert_eq!(
+            got[0],
+            InjItem {
+                q_idx: 0,
+                total_options: 3,
+                multi_select: false,
+                answer: CollectedAnswer::Single(2)
+            }
+        );
+        assert_eq!(
+            got[1],
+            InjItem {
+                q_idx: 1,
+                total_options: 4,
+                multi_select: true,
+                answer: CollectedAnswer::Multi(vec![0, 2]) // sorted + deduped
+            }
+        );
+    }
+
+    #[test]
+    fn collect_rejects_unanswered_question() {
+        // Two questions but only Q0 answered — must NOT silently drop Q1 (the old bug that
+        // let a partial/empty submit finalize as success). Also covers a stale/bad key:
+        // a tentative for index 5 doesn't satisfy the real question at index 1.
+        let questions = vec![qdef("A", 2, false), qdef("B", 2, false)];
+        let mut t: TMap<usize, TentativeAnswer> = TMap::new();
+        t.insert(0, TentativeAnswer::Option(0));
+        t.insert(5, TentativeAnswer::Option(1)); // stale/out-of-range key
+        let err = collect_and_validate_answers(&questions, &t).unwrap_err();
+        assert!(err.contains("answer all questions"));
+    }
+
+    #[test]
+    fn collect_rejects_out_of_range_indices() {
+        let questions = vec![qdef("Single", 3, false)];
+        let mut t: TMap<usize, TentativeAnswer> = TMap::new();
+        t.insert(0, TentativeAnswer::Option(3)); // valid indices are 0..=2
+        assert!(collect_and_validate_answers(&questions, &t)
+            .unwrap_err()
+            .contains("out of range"));
+
+        let questions = vec![qdef("Multi", 3, true)];
+        let mut t: TMap<usize, TentativeAnswer> = TMap::new();
+        t.insert(0, TentativeAnswer::MultiOption(TSet::from([0, 9]))); // 9 is out of range
+        assert!(collect_and_validate_answers(&questions, &t)
+            .unwrap_err()
+            .contains("out-of-range"));
+    }
+
+    #[test]
+    fn collect_rejects_empty_multiselect_and_freetext() {
+        let questions = vec![qdef("Multi", 3, true)];
+        let mut t: TMap<usize, TentativeAnswer> = TMap::new();
+        t.insert(0, TentativeAnswer::MultiOption(TSet::new())); // nothing picked
+        assert!(collect_and_validate_answers(&questions, &t)
+            .unwrap_err()
+            .contains("at least one"));
+
+        let questions = vec![qdef("FT", 2, false)];
+        let mut t: TMap<usize, TentativeAnswer> = TMap::new();
+        t.insert(0, TentativeAnswer::FreeText("\n\t".to_string())); // sanitizes to empty
+        assert!(collect_and_validate_answers(&questions, &t)
+            .unwrap_err()
+            .contains("empty"));
+    }
+
+    #[test]
+    fn collect_freetext_on_multiselect_is_accepted() {
+        // Free-text answers a multi-select question (carried with multi_select=true so the
+        // injector navigates to the advance row rather than auto-advancing).
+        let questions = vec![qdef("Multi", 3, true)];
+        let mut t: TMap<usize, TentativeAnswer> = TMap::new();
+        t.insert(0, TentativeAnswer::FreeText("frogs".to_string()));
+        let got = collect_and_validate_answers(&questions, &t).expect("valid");
+        assert_eq!(
+            got[0],
+            InjItem {
+                q_idx: 0,
+                total_options: 3,
+                multi_select: true,
+                answer: CollectedAnswer::FreeText("frogs".to_string())
+            }
+        );
     }
 }
