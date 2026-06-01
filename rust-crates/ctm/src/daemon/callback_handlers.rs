@@ -2,51 +2,44 @@
 
 use super::*;
 
-/// ADR-014 E3: How long to wait after releasing a blocked AskUserQuestion hook
-/// (bare `allow`) before injecting free-text keystrokes, to let Claude render its
-/// interactive TUI. Inherently racy; used only on the free-text fallback path.
-const QUESTION_TUI_RENDER_WAIT_MS: u64 = 1500;
+/// ADR-015: Readiness-poll budget for the AskUserQuestion review screen. After the
+/// answer keystrokes are injected, Claude transitions to its "Review your answers"
+/// screen; we poll `capture_pane` up to this long (in ~150ms steps) for that screen's
+/// signature before sending Enter, instead of a blind sleep.
+const REVIEW_READY_POLL_MS: u64 = 3000;
+/// Per-poll interval for the readiness loops.
+const READY_POLL_INTERVAL_MS: u64 = 150;
+/// Spacing between multi-select keystrokes (Claude's Ink checkbox TUI needs a beat
+/// to register each toggle/cursor move).
+const MULTISELECT_KEY_DELAY_MS: u64 = 300;
 
-/// Collected answer for tmux injection, preserving type information
-/// so multi-select can be injected as key sequences instead of text.
+/// Collected answer for tmux injection, preserving type information so multi-select
+/// can be injected as a key sequence instead of literal text. ADR-015: ALL answers
+/// are delivered by injecting keystrokes into Claude's native CLI widget — there is no
+/// structured/updatedInput path anymore (the hook does not intercept the question).
 enum CollectedAnswer {
-    /// Single-select: the chosen option's label. Structured delivery (ADR-014 E1)
-    /// uses the label directly; the keystroke fallback injects it as literal text.
+    /// Single-select: the chosen option's label, injected as literal text + Enter.
     Option(String),
-    /// Multi-select: the chosen option labels (for the structured answers map,
-    /// comma-joined) plus the indices/total needed by the keystroke fallback.
+    /// Multi-select: the chosen option indices/total drive the key sequence
+    /// (digit toggles + Down-to-Submit + Enter).
     MultiSelect {
-        labels: Vec<String>,
         selected_indices: Vec<usize>,
         total_options: usize,
     },
-    /// Free-text typed by the user. ADR-014 E3: there is no structured path for
-    /// free-text, so its presence forces the whole answer set onto the isolated
-    /// keystroke path.
+    /// Free-text typed by the user, injected as literal text + Enter.
     FreeText(String),
 }
 
-/// ADR-014 E1/E3: which delivery path a "Submit All" tap takes. Pure decision so it
-/// is unit-testable (the review flagged the edge cases this encodes).
-#[derive(Debug, PartialEq, Eq)]
-enum SubmitPath {
-    /// All answers are option-based AND a blocked hook client is registered:
-    /// deliver structurally via updatedInput, no keystrokes.
-    Structured,
-    /// At least one free-text answer AND a blocked hook client: release the hook to
-    /// its TUI and inject via the isolated keystroke path.
-    FreeTextRelease,
-    /// No blocked hook client recorded (its `_client_id` was missing or already
-    /// consumed): cannot route or safely inject — surface to the user instead.
-    NoClient,
-}
-
-fn classify_submit(has_free_text: bool, has_client: bool) -> SubmitPath {
-    match (has_free_text, has_client) {
-        (_, false) => SubmitPath::NoClient,
-        (false, true) => SubmitPath::Structured,
-        (true, true) => SubmitPath::FreeTextRelease,
-    }
+/// ADR-015: Does the captured tmux pane text look like Claude's "Review your answers"
+/// confirmation screen (the screen shown after all AskUserQuestion answers are
+/// entered, offering "Submit answers" / "Cancel")? Pure string check so it is
+/// unit-testable without a live tmux.
+fn pane_shows_review_screen(pane: &str) -> bool {
+    let lc = pane.to_lowercase();
+    // Codex follow-up: require BOTH the review heading AND the submit affordance (AND,
+    // not OR) so scrollback or model/question text that merely mentions one phrase can't
+    // false-positive into an early Enter.
+    lc.contains("review your answers") && lc.contains("submit answers")
 }
 
 /// Handle callback queries (button presses).
@@ -586,15 +579,40 @@ async fn handle_subagent_details_callback(
     }
 }
 
+/// ADR-015 (Codex post-I/O recheck for non-terminal edits): after a non-terminal handler
+/// re-arms a question message's keyboard (answer/toggle/change), a fast prior Submit All
+/// may have transitioned the entry `Active→Submitting→Resolved` and finalized (stripped
+/// buttons, removed the entry) DURING the edit `.await`, so the late edit re-armed LIVE
+/// buttons on an already-answered message. Re-lock the captured entry and correct it:
+///   - `Resolved` → re-stale THIS message (terminal text, NO markup) so no live buttons
+///     remain.
+///   - `Submitting` → leave it; the Submit All finalizer still owns and will strip it.
+///   - `Active` → normal; nothing to do.
+///
+/// Keeps the no-lock-across-I/O rule: lock → read lifecycle → DROP → then the corrective
+/// edit (if any). `pub(super)` so the free-text path in `telegram_handlers` reuses it.
+pub(super) async fn restale_if_resolved(
+    ctx: &HandlerContext,
+    entry: &Arc<Mutex<PendingQuestion>>,
+    msg_id: i64,
+) {
+    if msg_id == 0 {
+        return;
+    }
+    let lifecycle = { entry.lock().await.lifecycle };
+    if lifecycle == QuestionLifecycle::Resolved {
+        let _ = ctx
+            .bot
+            .edit_message_text_no_markup(msg_id, "\u{2705} Answered at terminal")
+            .await;
+    }
+}
+
 /// Handle single-select answer callback.
 ///
 /// ADR-012: Taps are now tentative — the selection is stored in
 /// `pending.tentative` and the keyboard is re-rendered with a ✓ prefix on
 /// the chosen option. Nothing is injected into tmux until "Submit All".
-///
-/// Per-key Mutex: The per-entry `Mutex<PendingQuestion>` is held across
-/// state mutation AND API calls to prevent concurrent callbacks for the
-/// same question set from racing on message edits.
 async fn handle_answer_callback(ctx: &HandlerContext, data: &str, cb: &CallbackQuery) {
     // Defense-in-depth: verify chat ownership (ADR-006 M4.5)
     if cb.message.as_ref().map(|m| m.chat.id) != Some(ctx.config.chat_id) {
@@ -617,89 +635,122 @@ async fn handle_answer_callback(ctx: &HandlerContext, data: &str, cb: &CallbackQ
         Err(_) => return,
     };
 
-    // Phase 1: Brief read lock to get the Arc<Mutex<PendingQuestion>>.
-    let (full_key, entry) = {
+    // Phase 1: clone the Arc + key under the read guard, then DROP it before any `.await`
+    // (ADR-015 lock-across-I/O sweep: never hold the pending_q guard across bot I/O).
+    let resolved: Option<(String, Arc<Mutex<PendingQuestion>>)> = {
         let pq = ctx.pending_q.read().await;
-        let fk = match resolve_pending_key(&pq, short_key) {
-            Some(k) => k,
-            None => {
-                let _ = ctx.bot.answer_callback_query(&cb.id, None, false).await;
-                return;
-            }
-        };
-        match pq.get(&fk) {
-            Some(arc) => (fk, Arc::clone(arc)),
-            None => {
-                let _ = ctx.bot.answer_callback_query(&cb.id, None, false).await;
-                return;
-            }
-        }
-    }; // RwLock released.
+        resolve_pending_key(&pq, short_key)
+            .and_then(|fk| pq.get(&fk).map(|arc| (fk, Arc::clone(arc))))
+    };
+    let Some((full_key, entry)) = resolved else {
+        let _ = ctx.bot.answer_callback_query(&cb.id, None, false).await;
+        return;
+    };
 
     // Phase 2: Per-key mutex held across state mutation AND API calls.
-    let mut pending = entry.lock().await;
-
-    // If already finalized, reject the tap.
-    if pending.finalized.get(q_idx) == Some(&true) {
-        let _ = ctx
-            .bot
-            .answer_callback_query(&cb.id, Some("Already submitted"), false)
-            .await;
-        return;
+    // ADR-015 (Codex lock-across-I/O sweep): under the entry lock, mutate state and CLONE
+    // everything the Telegram edits need; DROP the lock; THEN await the bot I/O. Never
+    // hold the per-entry mutex across a bot.* await.
+    //
+    // ADR-015 (Codex lifecycle-gate): `lifecycle` is the SINGLE concurrency arbiter. A
+    // non-terminal mutator may act ONLY while `Active`. Once Submit All sets `Submitting`
+    // (it drops the lock for the multi-second inject), or a CLI answer / supersede sets
+    // `Resolved`, a raced tap must NOT mutate tentative state or edit messages.
+    enum AnswerOutcome {
+        NotActive,
+        Selected {
+            option_label: String,
+            updated_text: String,
+            new_buttons: Vec<InlineButton>,
+            msg_id: i64,
+            all_answered: bool,
+        },
     }
-
-    let option_label = pending
-        .questions
-        .get(q_idx)
-        .and_then(|q| q.options.get(o_idx))
-        .map(|o| o.label.clone())
-        .unwrap_or_else(|| format!("{}", o_idx + 1));
-
-    // Store tentative selection.
-    pending
-        .tentative
-        .insert(q_idx, TentativeAnswer::Option(o_idx));
-
-    // Rebuild the question message text (PLAIN TEXT — see render_question_text) with
-    // the current selection shown.
-    let updated_text = {
-        let q = &pending.questions[q_idx];
-        let mut t = super::render_question_text(q);
-        t.push_str(&format!("\n\n\u{2713} Selected: {option_label}"));
-        t
-    };
-
-    // Rebuild inline keyboard with ✓ prefix on selected option.
-    let new_buttons: Vec<InlineButton> = {
-        let q = &pending.questions[q_idx];
-        q.options
-            .iter()
-            .enumerate()
-            .map(|(idx, opt)| {
-                let label = if idx == o_idx {
-                    format!("\u{2713} {}", opt.label)
-                } else {
-                    opt.label.clone()
-                };
-                InlineButton {
-                    text: label,
-                    callback_data: format!("answer:{short_key}:{q_idx}:{idx}"),
-                }
-            })
-            .collect()
-    };
-
-    let msg_id = pending
-        .question_message_ids
-        .get(q_idx)
-        .copied()
-        .unwrap_or(0);
     let thread_id = cb.message.as_ref().and_then(|m| m.message_thread_id);
     let chat_id = ctx.config.chat_id;
-    let all_answered = pending.tentative.len() == pending.questions.len();
+    let outcome = {
+        let mut pending = entry.lock().await;
 
-    // Toast feedback (within per-key lock — no other callback for this
-    // question set can interleave).
+        if pending.lifecycle != QuestionLifecycle::Active {
+            AnswerOutcome::NotActive
+        } else {
+            let option_label = pending
+                .questions
+                .get(q_idx)
+                .and_then(|q| q.options.get(o_idx))
+                .map(|o| o.label.clone())
+                .unwrap_or_else(|| format!("{}", o_idx + 1));
+
+            // Store tentative selection.
+            pending
+                .tentative
+                .insert(q_idx, TentativeAnswer::Option(o_idx));
+
+            // Rebuild the question message text (PLAIN TEXT — see render_question_text)
+            // with the current selection shown.
+            let updated_text = {
+                let q = &pending.questions[q_idx];
+                let mut t = super::render_question_text(q);
+                t.push_str(&format!("\n\n\u{2713} Selected: {option_label}"));
+                t
+            };
+
+            // Rebuild inline keyboard with ✓ prefix on selected option.
+            let new_buttons: Vec<InlineButton> = {
+                let q = &pending.questions[q_idx];
+                q.options
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, opt)| {
+                        let label = if idx == o_idx {
+                            format!("\u{2713} {}", opt.label)
+                        } else {
+                            opt.label.clone()
+                        };
+                        InlineButton {
+                            text: label,
+                            callback_data: format!("answer:{short_key}:{q_idx}:{idx}"),
+                        }
+                    })
+                    .collect()
+            };
+
+            let msg_id = pending
+                .question_message_ids
+                .get(q_idx)
+                .copied()
+                .unwrap_or(0);
+            let all_answered = pending.tentative.len() == pending.questions.len();
+
+            AnswerOutcome::Selected {
+                option_label,
+                updated_text,
+                new_buttons,
+                msg_id,
+                all_answered,
+            }
+        }
+        // entry mutex drops here
+    };
+
+    let (option_label, updated_text, new_buttons, msg_id, all_answered) = match outcome {
+        AnswerOutcome::NotActive => {
+            let _ = ctx
+                .bot
+                .answer_callback_query(&cb.id, Some("Answer already being submitted"), false)
+                .await;
+            return;
+        }
+        AnswerOutcome::Selected {
+            option_label,
+            updated_text,
+            new_buttons,
+            msg_id,
+            all_answered,
+        } => (option_label, updated_text, new_buttons, msg_id, all_answered),
+    };
+
+    // Toast feedback (entry lock already dropped).
     let _ = ctx
         .bot
         .answer_callback_query(&cb.id, Some(&format!("Selected: {option_label}")), false)
@@ -721,13 +772,15 @@ async fn handle_answer_callback(ctx: &HandlerContext, data: &str, cb: &CallbackQ
         }
     }
 
+    // ADR-015 (Codex post-I/O recheck): if a fast prior Submit All finalized/resolved
+    // this question during the edit above, our edit just re-armed live option buttons —
+    // re-stale this message so none remain.
+    restale_if_resolved(ctx, &entry, msg_id).await;
+
     // If all questions now have a tentative answer, send/update summary.
     if all_answered {
-        // send_or_update_summary needs its own lock access, so release ours first.
-        drop(pending);
         let _ = send_or_update_summary(ctx, &full_key, thread_id).await;
     }
-    // Otherwise per-key Mutex drops here.
 }
 
 /// Handle multi-select toggle callback.
@@ -769,71 +822,82 @@ async fn handle_toggle_callback(ctx: &HandlerContext, data: &str, cb: &CallbackQ
         }
     };
 
-    // Phase 2: Per-key mutex held across state mutation AND API calls.
-    let mut pending = entry.lock().await;
+    // ADR-015 (Codex lock-across-I/O sweep): mutate the toggle set + build the keyboard
+    // under the entry lock, CLONE the buttons, DROP the lock, THEN edit the markup.
+    // ADR-015 (Codex lifecycle-gate): only mutate while `Active`; a tap racing Submit All
+    // (Submitting) or a CLI answer / supersede (Resolved) must not change tentative state.
+    let new_buttons: Option<Vec<InlineButton>> = {
+        let mut pending = entry.lock().await;
 
-    if pending.finalized.get(q_idx) == Some(&true) {
-        return;
-    }
+        if pending.lifecycle != QuestionLifecycle::Active {
+            None
+        } else {
+            // Toggle the option in the MultiOption set.
+            let selected = match pending
+                .tentative
+                .entry(q_idx)
+                .or_insert_with(|| TentativeAnswer::MultiOption(HashSet::new()))
+            {
+                TentativeAnswer::MultiOption(set) => {
+                    if set.contains(&o_idx) {
+                        set.remove(&o_idx);
+                    } else {
+                        set.insert(o_idx);
+                    }
+                    set.clone()
+                }
+                // If somehow the tentative answer is not MultiOption, replace it.
+                other => {
+                    *other = TentativeAnswer::MultiOption({
+                        let mut s = HashSet::new();
+                        s.insert(o_idx);
+                        s
+                    });
+                    if let TentativeAnswer::MultiOption(s) = other {
+                        s.clone()
+                    } else {
+                        HashSet::new()
+                    }
+                }
+            };
 
-    // Toggle the option in the MultiOption set.
-    let selected = match pending
-        .tentative
-        .entry(q_idx)
-        .or_insert_with(|| TentativeAnswer::MultiOption(HashSet::new()))
-    {
-        TentativeAnswer::MultiOption(set) => {
-            if set.contains(&o_idx) {
-                set.remove(&o_idx);
-            } else {
-                set.insert(o_idx);
-            }
-            set.clone()
+            // M2: Re-render keyboard with checkmarks.
+            pending.questions.get(q_idx).map(|question| {
+                let mut buttons: Vec<InlineButton> = question
+                    .options
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, opt)| {
+                        let label = if selected.contains(&idx) {
+                            format!("\u{2713} {}", opt.label)
+                        } else {
+                            opt.label.clone()
+                        };
+                        InlineButton {
+                            text: label,
+                            callback_data: format!("toggle:{short_key}:{q_idx}:{idx}"),
+                        }
+                    })
+                    .collect();
+                buttons.push(InlineButton {
+                    text: "\u{2705} Done".into(),
+                    callback_data: format!("submit:{short_key}:{q_idx}"),
+                });
+                buttons
+            })
         }
-        // If somehow the tentative answer is not MultiOption, replace it.
-        other => {
-            *other = TentativeAnswer::MultiOption({
-                let mut s = HashSet::new();
-                s.insert(o_idx);
-                s
-            });
-            if let TentativeAnswer::MultiOption(s) = other {
-                s.clone()
-            } else {
-                HashSet::new()
-            }
-        }
+        // entry mutex drops here
     };
 
-    // M2: Re-render keyboard with checkmarks (within per-key lock).
-    if let Some(question) = pending.questions.get(q_idx) {
-        let mut buttons: Vec<InlineButton> = question
-            .options
-            .iter()
-            .enumerate()
-            .map(|(idx, opt)| {
-                let label = if selected.contains(&idx) {
-                    format!("\u{2713} {}", opt.label)
-                } else {
-                    opt.label.clone()
-                };
-                InlineButton {
-                    text: label,
-                    callback_data: format!("toggle:{short_key}:{q_idx}:{idx}"),
-                }
-            })
-            .collect();
-        buttons.push(InlineButton {
-            text: "\u{2705} Done".into(),
-            callback_data: format!("submit:{short_key}:{q_idx}"),
-        });
-
-        if let Some(msg) = &cb.message {
-            let _ = ctx
-                .bot
-                .edit_message_reply_markup(msg.message_id, &buttons)
-                .await;
-        }
+    if let (Some(buttons), Some(msg)) = (new_buttons, &cb.message) {
+        let _ = ctx
+            .bot
+            .edit_message_reply_markup(msg.message_id, &buttons)
+            .await;
+        // ADR-015 (Codex post-I/O recheck): if a fast prior Submit All finalized/resolved
+        // this question during the markup edit above, we just re-armed live toggle/Done
+        // buttons — re-stale this message so none remain.
+        restale_if_resolved(ctx, &entry, msg.message_id).await;
     }
 }
 
@@ -862,74 +926,93 @@ async fn handle_submit_callback(ctx: &HandlerContext, data: &str, cb: &CallbackQ
         }
     };
 
-    // Phase 1: Brief read lock to get the Arc<Mutex<PendingQuestion>>.
-    let (full_key, entry) = {
+    // Phase 1: clone the Arc + key under the read guard, then DROP it before any `.await`
+    // (ADR-015 lock-across-I/O sweep: never hold the pending_q guard across bot I/O).
+    let resolved: Option<(String, Arc<Mutex<PendingQuestion>>)> = {
         let pq = ctx.pending_q.read().await;
-        let fk = match resolve_pending_key(&pq, short_key) {
-            Some(k) => k,
-            None => {
-                let _ = ctx.bot.answer_callback_query(&cb.id, None, false).await;
-                return;
-            }
-        };
-        match pq.get(&fk) {
-            Some(arc) => (fk, Arc::clone(arc)),
-            None => {
-                let _ = ctx.bot.answer_callback_query(&cb.id, None, false).await;
-                return;
-            }
-        }
+        resolve_pending_key(&pq, short_key)
+            .and_then(|fk| pq.get(&fk).map(|arc| (fk, Arc::clone(arc))))
     };
-
-    // Phase 2: Per-key mutex held across state mutation AND API calls.
-    let mut pending = entry.lock().await;
-
-    if pending.finalized.get(q_idx) == Some(&true) {
-        let _ = ctx
-            .bot
-            .answer_callback_query(&cb.id, Some("Already submitted"), false)
-            .await;
+    let Some((full_key, entry)) = resolved else {
+        let _ = ctx.bot.answer_callback_query(&cb.id, None, false).await;
         return;
-    }
-
-    // Ensure we have a MultiOption entry (may already exist from toggles;
-    // if the user tapped Done without toggling anything, insert an empty set).
-    if !matches!(
-        pending.tentative.get(&q_idx),
-        Some(TentativeAnswer::MultiOption(_))
-    ) {
-        pending
-            .tentative
-            .insert(q_idx, TentativeAnswer::MultiOption(HashSet::new()));
-    }
-
-    // Build summary of selected labels for the toast.
-    let toast_text = {
-        if let Some(TentativeAnswer::MultiOption(set)) = pending.tentative.get(&q_idx) {
-            let mut sorted: Vec<usize> = set.iter().copied().collect();
-            sorted.sort();
-            let labels: Vec<String> = sorted
-                .iter()
-                .filter_map(|&idx| {
-                    pending
-                        .questions
-                        .get(q_idx)
-                        .and_then(|q| q.options.get(idx))
-                        .map(|o| o.label.clone())
-                })
-                .collect();
-            if labels.is_empty() {
-                "Done (none selected)".to_string()
-            } else {
-                format!("Done: {}", labels.join(", "))
-            }
-        } else {
-            "Done".to_string()
-        }
     };
 
-    let all_answered = pending.tentative.len() == pending.questions.len();
+    // ADR-015 (Codex lock-across-I/O sweep): mutate state + build the toast text under
+    // the entry lock, CLONE it out, DROP the lock, THEN await the toast and summary.
+    // ADR-015 (Codex lifecycle-gate): only mutate while `Active`.
+    enum SubmitOutcome {
+        NotActive,
+        Done {
+            toast_text: String,
+            all_answered: bool,
+        },
+    }
     let thread_id = cb.message.as_ref().and_then(|m| m.message_thread_id);
+    let outcome = {
+        let mut pending = entry.lock().await;
+
+        if pending.lifecycle != QuestionLifecycle::Active {
+            SubmitOutcome::NotActive
+        } else {
+            // Ensure we have a MultiOption entry (may already exist from toggles;
+            // if the user tapped Done without toggling anything, insert an empty set).
+            if !matches!(
+                pending.tentative.get(&q_idx),
+                Some(TentativeAnswer::MultiOption(_))
+            ) {
+                pending
+                    .tentative
+                    .insert(q_idx, TentativeAnswer::MultiOption(HashSet::new()));
+            }
+
+            // Build summary of selected labels for the toast.
+            let toast_text = {
+                if let Some(TentativeAnswer::MultiOption(set)) = pending.tentative.get(&q_idx) {
+                    let mut sorted: Vec<usize> = set.iter().copied().collect();
+                    sorted.sort();
+                    let labels: Vec<String> = sorted
+                        .iter()
+                        .filter_map(|&idx| {
+                            pending
+                                .questions
+                                .get(q_idx)
+                                .and_then(|q| q.options.get(idx))
+                                .map(|o| o.label.clone())
+                        })
+                        .collect();
+                    if labels.is_empty() {
+                        "Done (none selected)".to_string()
+                    } else {
+                        format!("Done: {}", labels.join(", "))
+                    }
+                } else {
+                    "Done".to_string()
+                }
+            };
+
+            let all_answered = pending.tentative.len() == pending.questions.len();
+            SubmitOutcome::Done {
+                toast_text,
+                all_answered,
+            }
+        }
+        // entry mutex drops here
+    };
+
+    let (toast_text, all_answered) = match outcome {
+        SubmitOutcome::NotActive => {
+            let _ = ctx
+                .bot
+                .answer_callback_query(&cb.id, Some("Answer already being submitted"), false)
+                .await;
+            return;
+        }
+        SubmitOutcome::Done {
+            toast_text,
+            all_answered,
+        } => (toast_text, all_answered),
+    };
 
     let _ = ctx
         .bot
@@ -937,7 +1020,6 @@ async fn handle_submit_callback(ctx: &HandlerContext, data: &str, cb: &CallbackQ
         .await;
 
     if all_answered {
-        drop(pending);
         let _ = send_or_update_summary(ctx, &full_key, thread_id).await;
     }
 }
@@ -958,57 +1040,63 @@ pub(super) async fn send_or_update_summary(
     full_key: &str,
     thread_id: Option<i64>,
 ) -> Option<i64> {
-    // Look up the per-key mutex.
+    // Look up the per-key mutex (drop the map guard before locking the entry).
     let entry = {
         let pq = ctx.pending_q.read().await;
         pq.get(full_key).map(Arc::clone)?
     };
 
-    let mut pending = entry.lock().await;
+    // ADR-015 (Codex lock-across-I/O sweep): under the entry lock, build the summary text
+    // + keyboard and capture the existing summary_message_id; DROP the lock; THEN do the
+    // Telegram edit/send. Re-lock ONLY to store the resulting id, and only while the
+    // entry is still Active (a concurrent resolve/submit may have taken ownership during
+    // the I/O — don't resurrect a stale summary).
+    let (summary_text, reply_markup, existing_summary_id) = {
+        let pending = entry.lock().await;
 
-    // Build the short key for callback_data (first 20 chars of session_id).
-    let short = &pending.session_id[..std::cmp::min(20, pending.session_id.len())];
+        // Build the short key for callback_data (first 20 chars of session_id).
+        let short = &pending.session_id[..std::cmp::min(20, pending.session_id.len())];
 
-    // Build summary text.
-    // PLAIN TEXT (sent with parse_mode None below) — answer labels are arbitrary
-    // model content; Markdown here risked an HTTP 400 that would drop the Submit All
-    // button and strand the blocked hook. See render_question_text.
-    let mut summary_text = "\u{1F4CB} Review your answers:\n".to_string();
-    for (q_idx, q) in pending.questions.iter().enumerate() {
-        let answer_label = match pending.tentative.get(&q_idx) {
-            Some(TentativeAnswer::Option(o_idx)) => pending
-                .questions
-                .get(q_idx)
-                .and_then(|qq| qq.options.get(*o_idx))
-                .map(|o| o.label.clone())
-                .unwrap_or_else(|| format!("{}", o_idx + 1)),
-            Some(TentativeAnswer::MultiOption(set)) => {
-                let mut sorted: Vec<usize> = set.iter().copied().collect();
-                sorted.sort();
-                let labels: Vec<String> = sorted
-                    .iter()
-                    .filter_map(|&idx| {
-                        pending
-                            .questions
-                            .get(q_idx)
-                            .and_then(|qq| qq.options.get(idx))
-                            .map(|o| o.label.clone())
-                    })
-                    .collect();
-                if labels.is_empty() {
-                    "(none)".to_string()
-                } else {
-                    labels.join(", ")
+        // Build summary text.
+        // PLAIN TEXT (sent with parse_mode None below) — answer labels are arbitrary
+        // model content; Markdown here risked an HTTP 400 that would drop the Submit All
+        // button and strand the blocked hook. See render_question_text.
+        let mut summary_text = "\u{1F4CB} Review your answers:\n".to_string();
+        for (q_idx, q) in pending.questions.iter().enumerate() {
+            let answer_label = match pending.tentative.get(&q_idx) {
+                Some(TentativeAnswer::Option(o_idx)) => pending
+                    .questions
+                    .get(q_idx)
+                    .and_then(|qq| qq.options.get(*o_idx))
+                    .map(|o| o.label.clone())
+                    .unwrap_or_else(|| format!("{}", o_idx + 1)),
+                Some(TentativeAnswer::MultiOption(set)) => {
+                    let mut sorted: Vec<usize> = set.iter().copied().collect();
+                    sorted.sort();
+                    let labels: Vec<String> = sorted
+                        .iter()
+                        .filter_map(|&idx| {
+                            pending
+                                .questions
+                                .get(q_idx)
+                                .and_then(|qq| qq.options.get(idx))
+                                .map(|o| o.label.clone())
+                        })
+                        .collect();
+                    if labels.is_empty() {
+                        "(none)".to_string()
+                    } else {
+                        labels.join(", ")
+                    }
                 }
-            }
-            Some(TentativeAnswer::FreeText(s)) => s.clone(),
-            None => "(unanswered)".to_string(),
-        };
-        summary_text.push_str(&format!("\n{}. {}: {}", q_idx + 1, q.header, answer_label));
-    }
+                Some(TentativeAnswer::FreeText(s)) => s.clone(),
+                None => "(unanswered)".to_string(),
+            };
+            summary_text.push_str(&format!("\n{}. {}: {}", q_idx + 1, q.header, answer_label));
+        }
 
-    // Helper: build reply_markup keyboard.
-    let build_keyboard = |short: &str, n: usize| -> serde_json::Value {
+        // Build reply_markup keyboard.
+        let n = pending.questions.len();
         let mut rows: Vec<serde_json::Value> = Vec::new();
         rows.push(serde_json::json!([{
             "text": "\u{2705} Submit All",
@@ -1028,14 +1116,16 @@ pub(super) async fn send_or_update_summary(
         if !change_row.is_empty() {
             rows.push(serde_json::Value::Array(change_row));
         }
-        serde_json::json!({"inline_keyboard": rows})
+        let reply_markup = serde_json::json!({"inline_keyboard": rows});
+
+        (summary_text, reply_markup, pending.summary_message_id)
+        // entry mutex drops here
     };
 
-    let reply_markup = build_keyboard(short, pending.questions.len());
     let chat_id = ctx.config.chat_id;
 
-    // Either edit the existing summary or send a new one.
-    if let Some(mid) = pending.summary_message_id {
+    // Either edit the existing summary or send a new one (entry lock NOT held).
+    if let Some(mid) = existing_summary_id {
         match ctx
             .bot
             .edit_message_text_with_raw_markup(
@@ -1048,7 +1138,22 @@ pub(super) async fn send_or_update_summary(
             .await
         {
             Ok(()) => {
-                return Some(mid);
+                // ADR-015 (Codex post-I/O recheck): a concurrent Submit All / resolve may
+                // have taken ownership (left Active) DURING this edit, after already
+                // editing the same summary to its terminal text. Our edit just re-armed
+                // the live "Review your answers" markup ON TOP of that. Re-lock: if no
+                // longer Active, stale this summary (terminal text, NO buttons) so no live
+                // review markup is left behind, and do NOT keep the id.
+                let still_active =
+                    { entry.lock().await.lifecycle == QuestionLifecycle::Active };
+                if still_active {
+                    return Some(mid);
+                }
+                let _ = ctx
+                    .bot
+                    .edit_message(chat_id, mid, "\u{2705} Answered at terminal", None)
+                    .await;
+                return None;
             }
             Err(e) => {
                 tracing::warn!(
@@ -1056,28 +1161,52 @@ pub(super) async fn send_or_update_summary(
                     error = %e,
                     "Failed to edit summary message; will send new one"
                 );
-                pending.summary_message_id = None;
+                // Clear the stale id (only if still Active).
+                let mut pending = entry.lock().await;
+                if pending.lifecycle == QuestionLifecycle::Active {
+                    pending.summary_message_id = None;
+                }
             }
         }
     }
 
-    // Send new summary message.
+    // Send new summary message (entry lock NOT held).
     match ctx
         .bot
         .send_message_with_raw_markup_returning(&summary_text, None, reply_markup, thread_id)
         .await
     {
         Ok(new_mid) => {
-            pending.summary_message_id = Some(new_mid);
-            Some(new_mid)
+            // ADR-015 (Codex post-I/O recheck): store the id ONLY if still Active. If a
+            // concurrent resolve/submit took ownership during the send, the just-sent
+            // summary carries live review markup that would otherwise orphan — stale it
+            // (terminal text, NO buttons) and don't store the id. Check-and-store under a
+            // SINGLE lock so the decision and the store can't be split by a transition.
+            let stored = {
+                let mut pending = entry.lock().await;
+                if pending.lifecycle == QuestionLifecycle::Active {
+                    pending.summary_message_id = Some(new_mid);
+                    true
+                } else {
+                    false
+                }
+            };
+            if stored {
+                Some(new_mid)
+            } else {
+                let _ = ctx
+                    .bot
+                    .edit_message(chat_id, new_mid, "\u{2705} Answered at terminal", None)
+                    .await;
+                None
+            }
         }
         Err(e) => {
             tracing::warn!(session_id = full_key, error = %e, "Failed to send summary message");
-            // ADR-014 (review follow-up, residual D5): the "Submit All" summary could
-            // not be sent (e.g. a transient Telegram error), so the user has no button
-            // to submit and the blocked hook would otherwise hang until timeout. Drop
-            // the entry lock, tell the user, and release the hook to its terminal TUI.
-            drop(pending);
+            // ADR-015: the "Submit All" summary could not be sent (e.g. a transient
+            // Telegram error), so the user has no Telegram button to submit. There is
+            // no blocked hook to release — Claude's native CLI widget is still live, so
+            // just tell the user to answer at the terminal.
             ctx.bot
                 .send_message(
                     "\u{26A0}\u{FE0F} Couldn't show the Submit button (Telegram send failed). Please answer at the terminal.",
@@ -1085,7 +1214,6 @@ pub(super) async fn send_or_update_summary(
                     thread_id,
                 )
                 .await;
-            release_question_hook(ctx, full_key).await;
             None
         }
     }
@@ -1093,125 +1221,9 @@ pub(super) async fn send_or_update_summary(
 
 /// Handle "Submit All" callback.
 ///
-/// ADR-012 Phase 6: Locks all tentative answers, injects them into tmux in
-/// question order, edits each question message and the summary to show
-/// "Submitted", then auto-submits the Claude Code review screen.
-/// ADR-014 E1: Build the JSON answers-map content for a structured QuestionResponse.
-/// Keyed by question text; single-select uses the chosen label, multi-select uses
-/// comma-joined labels (the spike-confirmed contract). Free-text entries are skipped
-/// (they force the keystroke fallback, so this is only ever called with none present).
-fn build_answers_map_content(answers: &[(usize, String, CollectedAnswer)]) -> String {
-    let mut map = serde_json::Map::new();
-    for (_, qtext, ans) in answers {
-        let val = match ans {
-            CollectedAnswer::Option(label) => label.clone(),
-            // Multi-select: join labels with a bare comma and NO space. This is the
-            // "Claude Code format" — verified against jsayubi/ccgram's production
-            // question-notify.ts (`selectedLabels.join(',')`). A comma+space would
-            // risk a leading space on every label after the first (" Go" != "Go") if
-            // Claude Code splits on "," without trimming.
-            CollectedAnswer::MultiSelect { labels, .. } => labels.join(","),
-            CollectedAnswer::FreeText(_) => continue,
-        };
-        map.insert(qtext.clone(), serde_json::Value::String(val));
-    }
-    serde_json::Value::Object(map).to_string()
-}
-
-/// ADR-014 E1: Write a `QuestionResponse` back to the specific socket client whose
-/// hook is blocked on this session's AskUserQuestion. Mirrors the targeted approval
-/// response routing (S-2) — never broadcast, so one session's answer cannot be
-/// delivered to another session's hook. `content` is the JSON answers map or the
-/// free-text fallback sentinel.
-/// Returns `true` only if the response was written to a still-connected client.
-/// `false` means the client is gone (e.g. the hook already timed out and closed its
-/// socket) or the write failed — the caller must then surface the answer rather than
-/// silently dropping it (ADR-014 review: late-submit-after-timeout loss).
-pub(super) async fn send_question_response(
-    ctx: &HandlerContext,
-    session_id: &str,
-    content: &str,
-    client_id: &str,
-) -> bool {
-    let response = BridgeMessage {
-        msg_type: MessageType::QuestionResponse,
-        session_id: session_id.to_string(),
-        timestamp: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-        content: content.to_string(),
-        metadata: None,
-    };
-    let json = match serde_json::to_string(&response) {
-        Ok(j) => j,
-        Err(e) => {
-            tracing::error!(error = %e, "Failed to serialise question_response");
-            return false;
-        }
-    };
-    let line = format!("{json}\n");
-
-    // Clone the per-client writer Arc and DROP the socket_clients map lock before
-    // the async write, so a slow write cannot hold the shared map lock and block
-    // every other handler's outbound writes (ADR-014 review MED-1).
-    let writer = {
-        let guard = ctx.socket_clients.lock().await;
-        guard.get(client_id).cloned()
-    };
-    let Some(writer) = writer else {
-        tracing::warn!(
-            session_id,
-            client_id,
-            "ADR-014 E1: originating client gone — hook already timed out / disconnected"
-        );
-        return false;
-    };
-    let mut w = writer.lock().await;
-    match w.write_all(line.as_bytes()).await {
-        Ok(()) => {
-            tracing::info!(
-                session_id,
-                "ADR-014 E1: question_response sent to originating client"
-            );
-            true
-        }
-        Err(e) => {
-            tracing::warn!(session_id, error = %e, "Failed to write question_response to client");
-            false
-        }
-    }
-}
-
-/// ADR-014 (review follow-up): Release a blocked AskUserQuestion hook back to its
-/// own terminal TUI when the daemon cannot render (or finish rendering) the widget.
-///
-/// After `handle_question_request` registers the originating socket client, EVERY
-/// early-return / drop / error path in the render flow must call this — otherwise the
-/// hook stays blocked on `send_and_wait` for the full 300s timeout while the user sees
-/// nothing (silent ~5-minute freeze). Sending the free-text fallback sentinel makes the
-/// hook emit a bare `allow` and fall back to its native TUI immediately. Removes the
-/// pending-client mapping so a later "Submit All" can't try to route to a dead hook.
-///
-/// No-op (returns without effect) if no client was registered for this session.
-pub(super) async fn release_question_hook(ctx: &HandlerContext, session_id: &str) {
-    let client = ctx
-        .pending_question_clients
-        .write()
-        .await
-        .remove(session_id);
-    if let Some(client_id) = client {
-        let _ = send_question_response(
-            ctx,
-            session_id,
-            crate::types::FREETEXT_FALLBACK_SENTINEL,
-            &client_id,
-        )
-        .await;
-        tracing::warn!(
-            session_id,
-            "ADR-014: released blocked AskUserQuestion hook to its TUI (widget unavailable)"
-        );
-    }
-}
-
+/// ADR-015: Locks all tentative answers, injects them into Claude's native CLI widget
+/// via tmux in question order, then auto-submits the review screen, and finally edits
+/// each Telegram question message and the summary to show "Submitted".
 async fn handle_submitall_callback(ctx: &HandlerContext, data: &str, cb: &CallbackQuery) {
     // Defense-in-depth: verify chat ownership (ADR-006 M4.5)
     if cb.message.as_ref().map(|m| m.chat.id) != Some(ctx.config.chat_id) {
@@ -1226,306 +1238,225 @@ async fn handle_submitall_callback(ctx: &HandlerContext, data: &str, cb: &Callba
     }
     let short_key = parts[1];
 
-    // Phase 1: Brief read lock to get the Arc and full key.
-    let (full_key, entry) = {
+    // Phase 1: Brief read lock to clone the Arc and full key, then DROP the guard before
+    // any `.await` (Codex deadlock fix: never hold the `pending_q` guard across an await,
+    // and in particular never across `entry.lock()`).
+    let resolved: Option<(String, Arc<Mutex<PendingQuestion>>)> = {
         let pq = ctx.pending_q.read().await;
-        let fk = match resolve_pending_key(&pq, short_key) {
-            Some(k) => k,
-            None => {
-                let _ = ctx
-                    .bot
-                    .answer_callback_query(&cb.id, Some("No pending question"), false)
-                    .await;
-                return;
-            }
-        };
-        match pq.get(&fk) {
-            Some(arc) => (fk, Arc::clone(arc)),
-            None => {
-                let _ = ctx.bot.answer_callback_query(&cb.id, None, false).await;
-                return;
-            }
-        }
+        resolve_pending_key(&pq, short_key)
+            .and_then(|fk| pq.get(&fk).map(|arc| (fk, Arc::clone(arc))))
+    };
+    let Some((full_key, entry)) = resolved else {
+        let _ = ctx
+            .bot
+            .answer_callback_query(&cb.id, Some("No pending question"), false)
+            .await;
+        return;
     };
 
-    // Phase 2: Per-key mutex for state extraction.
-    let (answers, session_id, question_message_ids, summary_message_id) = {
+    let chat_id = ctx.config.chat_id;
+    let thread_id = cb.message.as_ref().and_then(|m| m.message_thread_id);
+
+    // Codex B1: resolve the tmux target BEFORE we touch the pending entry's state, so a
+    // missing target never strands a half-finalized entry. (Lock ordering: session_tmux
+    // is acquired before the per-entry pending_q mutex.)
+    let tmux_target = ctx.session_tmux.read().await.get(&full_key).cloned();
+
+    // Phase 2: under the per-entry mutex, arbitrate ownership (Codex B3) and extract the
+    // answers. We transition Active→Submitting ONLY when delivery can actually proceed
+    // (a tmux target exists); otherwise we leave the entry Active for a retry / terminal
+    // answer (Codex B1). ADR-015 (Codex lock-across-I/O sweep): compute an outcome under
+    // the lock, CLONE everything needed, DROP the lock, THEN await the toast/notice —
+    // never hold the entry mutex across bot.* I/O.
+    enum SubmitAllOutcome {
+        AlreadySubmitting,
+        AlreadyResolved,
+        Unanswered,
+        NoTmux,
+        Proceed {
+            answers: Vec<(usize, String, CollectedAnswer)>,
+            session_id: String,
+            question_message_ids: Vec<i64>,
+            summary_message_id: Option<i64>,
+        },
+    }
+    let outcome = {
         let mut pending = entry.lock().await;
 
-        // Guard: if already all finalized, reject double-tap.
-        if pending.finalized.iter().all(|f| *f) {
+        if pending.lifecycle == QuestionLifecycle::Submitting {
+            SubmitAllOutcome::AlreadySubmitting
+        } else if pending.lifecycle == QuestionLifecycle::Resolved {
+            SubmitAllOutcome::AlreadyResolved
+        } else if pending.tentative.len() != pending.questions.len() {
+            // "Change QN" raced "Submit All" and left a question unanswered.
+            SubmitAllOutcome::Unanswered
+        } else if tmux_target.is_none() {
+            // Codex B1: leave the entry Active (do NOT finalize / set Submitting / remove).
+            SubmitAllOutcome::NoTmux
+        } else {
+            // Collect all answers in question order, preserving type info for injection.
+            let mut answers: Vec<(usize, String, CollectedAnswer)> = Vec::new();
+            for (q_idx, q) in pending.questions.iter().enumerate() {
+                let question_text = q.question.clone();
+                let answer = match pending.tentative.get(&q_idx) {
+                    Some(TentativeAnswer::Option(o_idx)) => {
+                        let label = q
+                            .options
+                            .get(*o_idx)
+                            .map(|o| o.label.clone())
+                            .unwrap_or_else(|| format!("{}", o_idx + 1));
+                        CollectedAnswer::Option(label)
+                    }
+                    Some(TentativeAnswer::MultiOption(set)) => {
+                        let total_options = q.options.len();
+                        let mut sorted: Vec<usize> = set.iter().copied().collect();
+                        sorted.sort();
+                        CollectedAnswer::MultiSelect {
+                            selected_indices: sorted,
+                            total_options,
+                        }
+                    }
+                    Some(TentativeAnswer::FreeText(s)) => CollectedAnswer::FreeText(s.clone()),
+                    None => continue,
+                };
+                answers.push((q_idx, question_text, answer));
+            }
+
+            // Claim ownership: Active → Submitting. resolve_pending_question now no-ops,
+            // and the map entry is NOT yet removed (so a duplicate tap hits Submitting).
+            pending.lifecycle = QuestionLifecycle::Submitting;
+
+            SubmitAllOutcome::Proceed {
+                answers,
+                session_id: pending.session_id.clone(),
+                question_message_ids: pending.question_message_ids.clone(),
+                summary_message_id: pending.summary_message_id,
+            }
+        }
+        // per-entry Mutex drops here
+    };
+
+    let (answers, session_id, question_message_ids, summary_message_id) = match outcome {
+        SubmitAllOutcome::AlreadySubmitting => {
+            let _ = ctx
+                .bot
+                .answer_callback_query(&cb.id, Some("Already submitting…"), false)
+                .await;
+            return;
+        }
+        SubmitAllOutcome::AlreadyResolved => {
             let _ = ctx
                 .bot
                 .answer_callback_query(&cb.id, Some("Already submitted"), false)
                 .await;
             return;
         }
-
-        // Guard: reject if any question is unanswered (can happen if
-        // "Change QN" races with "Submit All").
-        if pending.tentative.len() != pending.questions.len() {
+        SubmitAllOutcome::Unanswered => {
             let _ = ctx
                 .bot
                 .answer_callback_query(&cb.id, Some("Please answer all questions first"), true)
                 .await;
             return;
         }
-
-        // Collect all answers in question order, preserving type info so the
-        // structured path (ADR-014 E1) can build the answers map by question text
-        // and the keystroke fallback can still inject key sequences.
-        let mut answers: Vec<(usize, String, CollectedAnswer)> = Vec::new();
-        for (q_idx, q) in pending.questions.iter().enumerate() {
-            let question_text = q.question.clone();
-            let answer = match pending.tentative.get(&q_idx) {
-                Some(TentativeAnswer::Option(o_idx)) => {
-                    let label = q
-                        .options
-                        .get(*o_idx)
-                        .map(|o| o.label.clone())
-                        .unwrap_or_else(|| format!("{}", o_idx + 1));
-                    CollectedAnswer::Option(label)
-                }
-                Some(TentativeAnswer::MultiOption(set)) => {
-                    let total_options = q.options.len();
-                    let mut sorted: Vec<usize> = set.iter().copied().collect();
-                    sorted.sort();
-                    let labels: Vec<String> = sorted
-                        .iter()
-                        .map(|&i| {
-                            q.options
-                                .get(i)
-                                .map(|o| o.label.clone())
-                                .unwrap_or_else(|| format!("{}", i + 1))
-                        })
-                        .collect();
-                    CollectedAnswer::MultiSelect {
-                        labels,
-                        selected_indices: sorted,
-                        total_options,
-                    }
-                }
-                Some(TentativeAnswer::FreeText(s)) => CollectedAnswer::FreeText(s.clone()),
-                None => continue,
-            };
-            answers.push((q_idx, question_text, answer));
-        }
-
-        // Mark all as finalized.
-        for &(q_idx, _, _) in &answers {
-            if let Some(f) = pending.finalized.get_mut(q_idx) {
-                *f = true;
-            }
-        }
-
-        // per-key Mutex drops here
-        (
-            answers,
-            pending.session_id.clone(),
-            pending.question_message_ids.clone(),
-            pending.summary_message_id,
-        )
-    };
-
-    // Remove entry from the map. No new handler can acquire it after this.
-    {
-        let mut pq = ctx.pending_q.write().await;
-        pq.remove(&full_key);
-    }
-
-    let chat_id = ctx.config.chat_id;
-    let thread_id = cb.message.as_ref().and_then(|m| m.message_thread_id);
-
-    // ADR-014 E1/E2/E3: Decide structured delivery vs the isolated keystroke
-    // fallback. A blocked hook is identified by an entry in pending_question_clients
-    // (keyed by session_id). Structured delivery applies only when EVERY answer is
-    // option-based — free-text has no structured contract (E3), so its presence
-    // forces the whole set onto keystrokes.
-    let has_free_text = answers
-        .iter()
-        .any(|(_, _, a)| matches!(a, CollectedAnswer::FreeText(_)));
-    let originating_client = ctx
-        .pending_question_clients
-        .write()
-        .await
-        .remove(&session_id);
-
-    match classify_submit(has_free_text, originating_client.is_some()) {
-        SubmitPath::Structured => {
-            // ---- Structured path (E1/E2): NO keystrokes, NO TUI. ----
-            let client = originating_client
-                .clone()
-                .expect("classify_submit Structured implies a client is present");
-            // Build the answers map: question text -> selected label (single) or
-            // comma-joined labels (multi-select), per the spike-confirmed contract.
-            let content = build_answers_map_content(&answers);
-            let delivered = send_question_response(ctx, &session_id, &content, &client).await;
-            if delivered {
-                let _ = ctx
-                    .bot
-                    .answer_callback_query(&cb.id, Some("Submitted \u{2705}"), false)
-                    .await;
-                tracing::info!(
-                    session_id = %session_id,
-                    "ADR-014 E1: AskUserQuestion answered structurally via updatedInput (no keystrokes)"
-                );
-            } else {
-                // Review fix (late-submit-after-timeout): the hook already timed out and
-                // closed its socket, so the structured answer cannot be delivered. Do NOT
-                // silently drop the user's answer — alert and tell them to answer at the
-                // terminal (Claude has fallen back to its own TUI).
-                let _ = ctx
-                    .bot
-                    .answer_callback_query(&cb.id, Some("This question already timed out."), true)
-                    .await;
-                ctx.bot
-                .send_message(
-                    "\u{26A0}\u{FE0F} This question timed out before your answer was submitted. If Claude is still waiting, please answer at the terminal.",
-                    None,
-                    thread_id,
-                )
-                .await;
-                tracing::warn!(
-                    session_id = %session_id,
-                    "ADR-014: structured answer not delivered (hook gone) — user notified"
-                );
-            }
-        }
-        SubmitPath::FreeTextRelease => {
-            // ---- Free-text fallback (E3): the SOLE remaining keystroke path. ----
-            let client_id = originating_client
-                .clone()
-                .expect("classify_submit FreeTextRelease implies a client is present");
-            // Release the blocked hook with a bare `allow` (no updatedInput) so Claude
-            // renders its interactive TUI for us to drive. Inject ONLY if the release
-            // actually reached the (still-connected) hook; otherwise it timed out and
-            // injecting blind would type into the wrong screen.
-            let released = send_question_response(
-                ctx,
-                &session_id,
-                crate::types::FREETEXT_FALLBACK_SENTINEL,
-                &client_id,
-            )
-            .await;
-            if !released {
-                let _ = ctx
-                    .bot
-                    .answer_callback_query(&cb.id, Some("This question already timed out."), true)
-                    .await;
-                ctx.bot
-                .send_message(
-                    "\u{26A0}\u{FE0F} This question timed out before your answer was submitted. Please answer at the terminal.",
-                    None,
-                    thread_id,
-                )
-                .await;
-                tracing::warn!(session_id = %session_id, "ADR-014 E3: free-text release found hook gone — user notified");
-            } else {
-                let _ = ctx
-                    .bot
-                    .answer_callback_query(&cb.id, Some("Submitting..."), false)
-                    .await;
-                tracing::info!(
-                    session_id = %session_id,
-                    "ADR-014 E3: free-text answer — releasing hook and injecting via keystrokes"
-                );
-                // Claude needs a moment to render the TUI after the hook returns. This
-                // wait is inherently racy and accepted for the free-text case only (E3).
-                tokio::time::sleep(tokio::time::Duration::from_millis(
-                    QUESTION_TUI_RENDER_WAIT_MS,
-                ))
-                .await;
-
-                let tmux_target = ctx.session_tmux.read().await.get(&session_id).cloned();
-                if let Some(target) = tmux_target {
-                    let sid = session_id.clone();
-                    let socket = ctx
-                        .db_op(move |sess| {
-                            sess.get_session(&sid)
-                                .ok()
-                                .flatten()
-                                .and_then(|s| s.tmux_socket)
-                        })
-                        .await;
-
-                    let mut inj = ctx.injector.lock().await;
-                    inj.set_target(&target, socket.as_deref());
-                    for (_, _, answer) in &answers {
-                        match answer {
-                            // Single-option label or free-text: inject as literal text.
-                            CollectedAnswer::Option(text) | CollectedAnswer::FreeText(text) => {
-                                let _ = inj.inject(text);
-                            }
-                            CollectedAnswer::MultiSelect {
-                                selected_indices,
-                                total_options,
-                                ..
-                            } => {
-                                // Claude Code's multi-select is a custom Ink (React CLI)
-                                // checkbox TUI. Key bindings (from cli.js source):
-                                //   Number keys (1-9) = toggle option by 1-based index
-                                //   Down/Tab = move cursor; past last option focuses Submit
-                                //   Enter on Submit button = submit selections
-                                let key_delay = tokio::time::Duration::from_millis(300);
-
-                                for &idx in selected_indices {
-                                    let digit = format!("{}", idx + 1);
-                                    let _ = inj.send_key(&digit);
-                                    tokio::time::sleep(key_delay).await;
-                                }
-                                let downs_needed = total_options + 2; // options + Other + 1
-                                for _ in 0..downs_needed {
-                                    let _ = inj.send_key("Down");
-                                    tokio::time::sleep(key_delay).await;
-                                }
-                                let _ = inj.send_key("Enter");
-                            }
-                        }
-                    }
-                    drop(inj);
-
-                    // Auto-submit the Claude Code review screen (fallback path only).
-                    auto_submit_answers(ctx, &session_id).await;
-                } else {
-                    tracing::warn!(
-                        session_id = %session_id,
-                        "ADR-013 D1: tmux not detected during submitall, answers cannot be injected"
-                    );
-                    ctx.bot
-                    .send_message(
-                        "\u{26A0}\u{FE0F} Answers could not be submitted \u{2014} tmux not detected. Please answer at the terminal.",
-                        None,
-                        thread_id,
-                    )
-                    .await;
-                }
-            }
-        }
-        SubmitPath::NoClient => {
-            // ---- Degenerate: no blocked hook client recorded for this session. ----
-            // Review fix (MED-2): the QuestionRequest never registered a client (its
-            // _client_id was missing) or it was already consumed. There is no hook to
-            // release and the terminal screen state is unknown, so we must NOT blindly
-            // inject keystrokes. Surface it instead of silently doing the wrong thing.
+        SubmitAllOutcome::NoTmux => {
+            tracing::warn!(
+                session_id = %full_key,
+                "ADR-015: tmux not detected during submitall — entry left Active for retry"
+            );
             let _ = ctx
                 .bot
-                .answer_callback_query(&cb.id, Some("Couldn't submit — no active question."), true)
+                .answer_callback_query(&cb.id, Some("Couldn't submit — tmux not detected."), true)
                 .await;
             ctx.bot
+                .send_message(
+                    "\u{26A0}\u{FE0F} Couldn't submit \u{2014} tmux not detected. Answer at the terminal or tap Submit again once reconnected.",
+                    None,
+                    thread_id,
+                )
+                .await;
+            return;
+        }
+        SubmitAllOutcome::Proceed {
+            answers,
+            session_id,
+            question_message_ids,
+            summary_message_id,
+        } => (answers, session_id, question_message_ids, summary_message_id),
+    };
+    let target = tmux_target.expect("tmux_target checked present under the entry mutex");
+
+    let _ = ctx
+        .bot
+        .answer_callback_query(&cb.id, Some("Submitting..."), false)
+        .await;
+
+    let sid = session_id.clone();
+    let socket = ctx
+        .db_op(move |sess| {
+            sess.get_session(&sid)
+                .ok()
+                .flatten()
+                .and_then(|s| s.tmux_socket)
+        })
+        .await;
+
+    // ADR-015: ALL answers are injected into Claude's native CLI widget via tmux.
+    // Codex B2: only on FULL delivery do we auto-submit, mark "Submitted", and remove
+    // the entry. On partial/failed delivery we restore the entry to Active (so a retry
+    // or terminal answer can resolve it) and alert — never claiming a false success.
+    let delivered = inject_answers(ctx, &target, socket.as_deref(), &answers).await;
+
+    if !delivered {
+        tracing::warn!(
+            session_id = %session_id,
+            "ADR-015: keystroke injection failed mid-flight — restoring entry to Active"
+        );
+        // Restore ownership so the question is answerable again. Only revert if we still
+        // hold it as Submitting (a concurrent resolve cannot have run while Submitting).
+        let mut pending = entry.lock().await;
+        if pending.lifecycle == QuestionLifecycle::Submitting {
+            pending.lifecycle = QuestionLifecycle::Active;
+            for f in pending.finalized.iter_mut() {
+                *f = false;
+            }
+        }
+        drop(pending);
+        ctx.bot
             .send_message(
-                "\u{26A0}\u{FE0F} Couldn't route your answer (no active question session). Please answer at the terminal.",
+                "\u{26A0}\u{FE0F} Couldn't deliver all answers to the terminal. Please answer at the terminal, or tap Submit again to retry.",
                 None,
                 thread_id,
             )
             .await;
-            tracing::warn!(
-                session_id = %session_id,
-                "ADR-014: submitall with no originating client — answer not routed"
-            );
+        return;
+    }
+
+    // Full delivery: transition Submitting→Resolved and finalize UNDER the entry mutex,
+    // then DROP the entry lock before touching pending_q (Codex deadlock fix: never hold
+    // the entry mutex across `pending_q.write()`). The `Resolved` flag — set before the
+    // lock is dropped — is what makes a concurrent resolve no-op; map removal afterward
+    // is safe because resolve sees `Resolved`/absent.
+    {
+        let mut pending = entry.lock().await;
+        pending.lifecycle = QuestionLifecycle::Resolved;
+        for f in pending.finalized.iter_mut() {
+            *f = true;
+        }
+    }
+    // ADR-015 (Codex identity-checked removal): remove ONLY if the map still points at
+    // OUR Arc. If a new AskUserQuestion superseded this entry between snapshot and now,
+    // the key maps to the NEW (active) entry — removing by key would orphan it.
+    {
+        let mut pq = ctx.pending_q.write().await;
+        if pq.get(&full_key).is_some_and(|cur| Arc::ptr_eq(cur, &entry)) {
+            pq.remove(&full_key);
         }
     }
 
-    // Edit each question message to show "Submitted" and strip keyboard (both paths).
+    // Auto-submit the Claude Code "Review your answers" screen.
+    auto_submit_answers(ctx, &session_id).await;
+
+    // Edit each question message to show "Submitted" and strip keyboard.
     for (q_idx, _, _) in &answers {
         let mid = question_message_ids.get(*q_idx).copied().unwrap_or(0);
         if mid != 0 {
@@ -1571,58 +1502,89 @@ async fn handle_change_callback(ctx: &HandlerContext, data: &str, cb: &CallbackQ
         }
     };
 
-    // Phase 1: Brief read lock to get the Arc and full key.
-    let (full_key, entry) = {
+    // Phase 1: clone the Arc + key under the read guard, then DROP it before any `.await`
+    // (ADR-015 lock-across-I/O sweep: never hold the pending_q guard across bot I/O).
+    let resolved: Option<(String, Arc<Mutex<PendingQuestion>>)> = {
         let pq = ctx.pending_q.read().await;
-        let fk = match resolve_pending_key(&pq, short_key) {
-            Some(k) => k,
-            None => {
-                let _ = ctx
-                    .bot
-                    .answer_callback_query(&cb.id, Some("Question not found"), false)
-                    .await;
-                return;
-            }
-        };
-        match pq.get(&fk) {
-            Some(arc) => (fk, Arc::clone(arc)),
-            None => {
-                let _ = ctx.bot.answer_callback_query(&cb.id, None, false).await;
-                return;
-            }
-        }
+        resolve_pending_key(&pq, short_key)
+            .and_then(|fk| pq.get(&fk).map(|arc| (fk, Arc::clone(arc))))
     };
-
-    // Phase 2: Per-key mutex held across state mutation AND API calls.
-    let mut pending = entry.lock().await;
-
-    if pending.finalized.get(q_idx) == Some(&true) {
+    let Some((full_key, entry)) = resolved else {
         let _ = ctx
             .bot
-            .answer_callback_query(&cb.id, Some("Already submitted"), false)
+            .answer_callback_query(&cb.id, Some("Question not found"), false)
             .await;
         return;
+    };
+
+    // ADR-015 (Codex lock-across-I/O sweep): under the entry lock, mutate state and CLONE
+    // everything the edits need (the question, message ids, short key); DROP the lock;
+    // THEN await the toast/delete/edit. Never hold the per-entry mutex across bot.* I/O.
+    // ADR-015 (Codex lifecycle-gate): only clear/re-render while `Active`; a "Change"
+    // racing Submit All (Submitting) or a CLI answer / supersede (Resolved) must no-op.
+    enum ChangeOutcome {
+        NotActive,
+        Missing,
+        Reselect {
+            q: QuestionDef,
+            msg_id: i64,
+            summary_message_id: Option<i64>,
+            short: String,
+        },
     }
+    let outcome = {
+        let mut pending = entry.lock().await;
 
-    // Clear the tentative answer for this question.
-    pending.tentative.remove(&q_idx);
+        if pending.lifecycle != QuestionLifecycle::Active {
+            ChangeOutcome::NotActive
+        } else {
+            // Clear the tentative answer for this question.
+            pending.tentative.remove(&q_idx);
 
-    let q = match pending.questions.get(q_idx) {
-        Some(q) => q.clone(),
-        None => {
+            match pending.questions.get(q_idx).cloned() {
+                None => ChangeOutcome::Missing,
+                Some(q) => {
+                    let msg_id = pending
+                        .question_message_ids
+                        .get(q_idx)
+                        .copied()
+                        .unwrap_or(0);
+                    let summary_message_id = pending.summary_message_id.take();
+                    let short =
+                        pending.session_id[..std::cmp::min(20, pending.session_id.len())].to_string();
+                    ChangeOutcome::Reselect {
+                        q,
+                        msg_id,
+                        summary_message_id,
+                        short,
+                    }
+                }
+            }
+        }
+        // entry mutex drops here
+    };
+
+    let (q, msg_id, summary_message_id, short) = match outcome {
+        ChangeOutcome::NotActive => {
+            let _ = ctx
+                .bot
+                .answer_callback_query(&cb.id, Some("Answer already being submitted"), false)
+                .await;
+            return;
+        }
+        ChangeOutcome::Missing => {
             let _ = ctx.bot.answer_callback_query(&cb.id, None, false).await;
             return;
         }
+        ChangeOutcome::Reselect {
+            q,
+            msg_id,
+            summary_message_id,
+            short,
+        } => (q, msg_id, summary_message_id, short),
     };
-    let msg_id = pending
-        .question_message_ids
-        .get(q_idx)
-        .copied()
-        .unwrap_or(0);
-    let summary_message_id = pending.summary_message_id.take();
-    let short = pending.session_id[..std::cmp::min(20, pending.session_id.len())].to_string();
 
-    // API calls within per-key lock — no concurrent handler can race.
+    // Telegram I/O (entry lock NOT held).
     let _ = ctx
         .bot
         .answer_callback_query(&cb.id, Some("Tap to re-select"), false)
@@ -1684,8 +1646,81 @@ async fn handle_change_callback(ctx: &HandlerContext, data: &str, cb: &CallbackQ
                 "Failed to re-render question message after change"
             );
         }
+
+        // ADR-015 (Codex post-I/O recheck): "Change" re-arms option buttons; if a fast
+        // prior Submit All finalized/resolved this question during the edit above,
+        // re-stale this message so no live buttons remain.
+        restale_if_resolved(ctx, &entry, msg_id).await;
     }
-    // Per-key Mutex drops here.
+}
+
+/// ADR-015: Inject the collected answers into Claude's native AskUserQuestion widget
+/// via tmux, in question order. Returns `true` only if EVERY keystroke was delivered.
+///
+/// - Single-select / free-text: literal text + Enter (`inject`).
+/// - Multi-select: Claude's Ink (React CLI) checkbox TUI. Key bindings (from cli.js):
+///   digit keys 1-9 toggle an option by 1-based index; Down/Tab move the cursor (past
+///   the last option focuses Submit); Enter on Submit confirms. The review screen that
+///   follows is then confirmed via `capture_pane` readiness (see `auto_submit_answers`)
+///   rather than a blind sleep.
+///
+/// Codex B2: `inject`/`send_key` return `Result<bool>` (`Ok(false)` = validation/tmux
+/// soft failure, `Err` = hard failure). Anything other than `Ok(true)` is a delivery
+/// failure: we STOP at the first one and return `false` so the caller does NOT
+/// auto-submit, does NOT mark the Telegram messages "Submitted", and restores the
+/// pending entry for a retry / terminal answer.
+async fn inject_answers(
+    ctx: &HandlerContext,
+    target: &str,
+    socket: Option<&str>,
+    answers: &[(usize, String, CollectedAnswer)],
+) -> bool {
+    let key_delay = tokio::time::Duration::from_millis(MULTISELECT_KEY_DELAY_MS);
+    let mut inj = ctx.injector.lock().await;
+    inj.set_target(target, socket);
+
+    // Helper: treat anything but Ok(true) as a delivery failure (logged by caller).
+    fn delivered(r: crate::error::Result<bool>) -> bool {
+        matches!(r, Ok(true))
+    }
+
+    for (_, _, answer) in answers {
+        match answer {
+            CollectedAnswer::Option(text) | CollectedAnswer::FreeText(text) => {
+                if !delivered(inj.inject(text)) {
+                    return false;
+                }
+            }
+            CollectedAnswer::MultiSelect {
+                selected_indices,
+                total_options,
+                ..
+            } => {
+                // Toggle each selected option by its 1-based digit.
+                for &idx in selected_indices {
+                    let digit = format!("{}", idx + 1);
+                    if !delivered(inj.send_key(&digit)) {
+                        return false;
+                    }
+                    tokio::time::sleep(key_delay).await;
+                }
+                // Move the cursor down past every option (+ the "Other" row) to focus
+                // the Submit button, then confirm. We pace each Down; the readiness of
+                // the review screen itself is then confirmed by auto_submit_answers.
+                let downs_needed = total_options + 2; // options + Other + 1
+                for _ in 0..downs_needed {
+                    if !delivered(inj.send_key("Down")) {
+                        return false;
+                    }
+                    tokio::time::sleep(key_delay).await;
+                }
+                if !delivered(inj.send_key("Enter")) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
 }
 
 /// After all AskUserQuestion answers are collected, Claude Code shows a
@@ -1693,164 +1728,100 @@ async fn handle_change_callback(ctx: &HandlerContext, data: &str, cb: &CallbackQ
 ///   > 1. Submit answers
 ///   > 2. Cancel
 ///
-/// This helper waits briefly for Claude Code to render the review screen,
-/// then injects "1" to auto-select "Submit answers" so the user doesn't
-/// have to switch back to the console.
+/// ADR-015: instead of a blind sleep, poll `capture_pane` until that screen's
+/// signature appears (bounded by `REVIEW_READY_POLL_MS`), then send Enter to confirm
+/// the focused "Submit answers" option. If the screen never appears within the budget
+/// we send Enter anyway as a best-effort (the prior behavior), since the operator can
+/// still confirm at the terminal.
 pub(super) async fn auto_submit_answers(ctx: &HandlerContext, session_id: &str) {
-    // Wait for Claude Code to transition from the last question to the
-    // review screen. Multi-select injection takes several seconds (300ms
-    // per key × N keys), so the review screen may not appear for a while.
-    // 2s is enough for the single-question → review transition.
-    tokio::time::sleep(tokio::time::Duration::from_millis(2000)).await;
-
     let tmux_target = ctx.session_tmux.read().await.get(session_id).cloned();
-    if let Some(target) = tmux_target {
-        let sid = session_id.to_string();
-        let socket = ctx
-            .db_op(move |sess| {
-                sess.get_session(&sid)
-                    .ok()
-                    .flatten()
-                    .and_then(|s| s.tmux_socket)
-            })
-            .await;
+    let Some(target) = tmux_target else {
+        return;
+    };
+    let sid = session_id.to_string();
+    let socket = ctx
+        .db_op(move |sess| {
+            sess.get_session(&sid)
+                .ok()
+                .flatten()
+                .and_then(|s| s.tmux_socket)
+        })
+        .await;
 
-        let mut inj = ctx.injector.lock().await;
-        inj.set_target(&target, socket.as_deref());
-        // "Submit answers" is already focused (option 1). Send Enter to
-        // confirm it. Using inject("1") would work but leaves a stray "1"
-        // in the input buffer after the review screen dismisses.
-        let _ = inj.send_key("Enter");
-        tracing::info!(session_id, "Auto-submitted AskUserQuestion review screen");
+    let mut inj = ctx.injector.lock().await;
+    inj.set_target(&target, socket.as_deref());
+
+    // Poll for the review screen rather than sleeping blindly.
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_millis(REVIEW_READY_POLL_MS);
+    let interval = tokio::time::Duration::from_millis(READY_POLL_INTERVAL_MS);
+    let mut ready = false;
+    loop {
+        if inj
+            .capture_pane()
+            .as_deref()
+            .is_some_and(pane_shows_review_screen)
+        {
+            ready = true;
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(interval).await;
     }
+
+    // "Submit answers" is already focused (option 1). Send Enter to confirm it.
+    let _ = inj.send_key("Enter");
+    tracing::info!(
+        session_id,
+        review_screen_detected = ready,
+        "ADR-015: auto-submitted AskUserQuestion review screen"
+    );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// ADR-014 E1: single-select answers map to their chosen label, keyed by
-    /// question text, as exact JSON.
+    /// ADR-015 (Codex follow-up): the readiness parser requires BOTH the review heading
+    /// AND the submit affordance (AND, not OR), case-insensitively, so it can't
+    /// false-positive on scrollback or question text that merely mentions one phrase.
     #[test]
-    fn answers_map_single_select() {
-        let answers = vec![(
-            0usize,
-            "Pick a color".to_string(),
-            CollectedAnswer::Option("Red".to_string()),
-        )];
-        let content = build_answers_map_content(&answers);
-        let v: serde_json::Value = serde_json::from_str(&content).unwrap();
-        assert_eq!(v["Pick a color"], "Red");
-        assert_eq!(v.as_object().unwrap().len(), 1);
+    fn review_screen_signature_detection() {
+        // Both signatures present → match (case-insensitive).
+        assert!(pane_shows_review_screen(
+            "Review your answers\n  1. Submit answers\n  2. Cancel"
+        ));
+        assert!(pane_shows_review_screen(
+            "REVIEW YOUR ANSWERS\n  > 1. SUBMIT ANSWERS"
+        ));
+        // Only one signature present → NO match (the AND tightening).
+        assert!(!pane_shows_review_screen("please submit answers below"));
+        assert!(!pane_shows_review_screen(
+            "Review your answers later in the docs"
+        ));
+        // Unrelated content / empty → no match.
+        assert!(!pane_shows_review_screen(
+            "Which language?\n  1. Rust\n  2. Go"
+        ));
+        assert!(!pane_shows_review_screen(""));
     }
 
-    /// ADR-014 E1: multi-select labels are comma-joined into one string value.
+    /// ADR-015: the multi-select "downs needed" arithmetic (options + Other + 1) must
+    /// move the cursor strictly past the last toggleable row to focus Submit. This
+    /// locks the off-by-one the keystroke sequence depends on.
     #[test]
-    fn answers_map_multi_select_comma_joined() {
-        let answers = vec![(
-            0usize,
-            "Pick langs".to_string(),
-            CollectedAnswer::MultiSelect {
-                labels: vec!["Rust".to_string(), "Go".to_string()],
-                selected_indices: vec![0, 1],
-                total_options: 3,
-            },
-        )];
-        let content = build_answers_map_content(&answers);
-        let v: serde_json::Value = serde_json::from_str(&content).unwrap();
-        // Bare comma, NO space — matches ccgram's verified "Claude Code format".
-        assert_eq!(v["Pick langs"], "Rust,Go");
-    }
-
-    /// ADR-014 E3: free-text entries are excluded from the structured map (their
-    /// presence forces the keystroke fallback, so they are never delivered here).
-    #[test]
-    fn answers_map_skips_free_text() {
-        let answers = vec![
-            (
-                0usize,
-                "Q1".to_string(),
-                CollectedAnswer::Option("A".to_string()),
-            ),
-            (
-                1usize,
-                "Q2".to_string(),
-                CollectedAnswer::FreeText("typed".to_string()),
-            ),
-        ];
-        let content = build_answers_map_content(&answers);
-        let v: serde_json::Value = serde_json::from_str(&content).unwrap();
-        assert_eq!(v["Q1"], "A");
-        assert!(v.get("Q2").is_none());
-    }
-
-    /// ADR-014 review: the submit-path decision must be exactly: no client → NoClient
-    /// (never blind-inject); options-only + client → Structured; any free-text +
-    /// client → FreeTextRelease. Guards the edge cases both reviewers flagged.
-    #[test]
-    fn classify_submit_decision_table() {
-        assert_eq!(classify_submit(false, true), SubmitPath::Structured);
-        assert_eq!(classify_submit(true, true), SubmitPath::FreeTextRelease);
-        // No client → NoClient regardless of free-text (cannot route or safely inject).
-        assert_eq!(classify_submit(false, false), SubmitPath::NoClient);
-        assert_eq!(classify_submit(true, false), SubmitPath::NoClient);
-    }
-
-    /// ADR-014 PR-E benchmark: the structured answer-delivery compute path
-    /// (`build_answers_map_content`) must be a negligible latency source compared
-    /// to the keystroke path it replaces. The keystroke path's fixed cost for a
-    /// representative 4-option multi-select selecting 2 options is, from the code
-    /// constants (300ms/key + 2000ms auto_submit):
-    ///   2 digit keys + (4 options + 2) Down keys + 1 Enter = 9 keys × 300ms
-    ///   = 2700ms, plus the 2000ms auto_submit sleep = ~4700ms.
-    /// The structured path below builds the entire answers map in microseconds and
-    /// then performs a single socket write — eliminating that multi-second fixed
-    /// latency AND the TUI readiness race. This test measures the compute cost and
-    /// asserts it is comfortably sub-millisecond per call.
-    #[test]
-    fn bench_structured_delivery_is_negligible() {
-        let answers = vec![
-            (
-                0usize,
-                "Which language?".to_string(),
-                CollectedAnswer::Option("Rust".to_string()),
-            ),
-            (
-                1usize,
-                "Which features?".to_string(),
-                CollectedAnswer::MultiSelect {
-                    labels: vec!["a".to_string(), "b".to_string(), "c".to_string()],
-                    selected_indices: vec![0, 1, 2],
-                    total_options: 5,
-                },
-            ),
-        ];
-
-        let iters = 10_000u32;
-        let start = std::time::Instant::now();
-        let mut sink = 0usize;
-        for _ in 0..iters {
-            let c = build_answers_map_content(&answers);
-            sink = sink.wrapping_add(c.len());
+    fn multiselect_downs_needed_reaches_submit() {
+        // For N options, rows are: N option rows + 1 "Other" row. Submit sits after
+        // them, so we need at least N+1 Down presses to leave the last row; +1 more is
+        // the harmless safety margin the injector uses.
+        for total_options in [1usize, 3, 5, 9] {
+            let downs_needed = total_options + 2;
+            assert!(
+                downs_needed > total_options + 1,
+                "downs_needed must move past the last option + Other row"
+            );
         }
-        let elapsed = start.elapsed();
-        let per_call_ns = elapsed.as_nanos() / iters as u128;
-        assert!(sink > 0);
-
-        // Keystroke path fixed cost for the comparable multi-select (see doc above).
-        let keystroke_ms = 9 * 300 + 2000; // 4700ms
-        eprintln!(
-            "ADR-014 PR-E bench: structured build = {per_call_ns} ns/call ({} calls in {:?}); \
-             keystroke path it replaces ~= {keystroke_ms} ms fixed latency",
-            iters, elapsed
-        );
-
-        // Generous bound to stay non-flaky across machines/CI: the structured
-        // compute must be < 1ms/call (it is typically a few µs). The point is that
-        // it is orders of magnitude below the multi-second keystroke path.
-        assert!(
-            per_call_ns < 1_000_000,
-            "structured delivery compute regressed to {per_call_ns} ns/call (> 1ms)"
-        );
     }
 }

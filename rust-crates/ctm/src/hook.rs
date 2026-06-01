@@ -2,10 +2,7 @@ use crate::config;
 use crate::error::{AppError, Result};
 use crate::formatting;
 use crate::injector::{self, InputInjector};
-use crate::types::{
-    self, BridgeMessage, HookEvent, MessageType, FREETEXT_FALLBACK_SENTINEL, MAX_LINE_BYTES,
-    SAFE_COMMANDS,
-};
+use crate::types::{self, BridgeMessage, HookEvent, MessageType, MAX_LINE_BYTES, SAFE_COMMANDS};
 use std::io::Read;
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -300,29 +297,26 @@ async fn build_messages(
 
     match event {
         HookEvent::PreToolUse(e) => {
-            // ADR-014 E1: AskUserQuestion is rendered from the blocking QuestionRequest
-            // (sent in get_hook_output), not from this ToolStart. Crucially, ToolStart
-            // is sent AFTER get_hook_output returns (process_hook ordering), i.e. after
-            // the question is already answered — so a ToolStart-driven render would be
-            // both duplicate and too late. Suppress it.
-            if e.tool_name != "AskUserQuestion" {
-                // Send tool_start (fire-and-forget preview)
-                let mut tool_meta = meta.clone();
-                tool_meta.insert(
-                    "tool".into(),
-                    serde_json::Value::String(e.tool_name.clone()),
-                );
-                tool_meta.insert("input".into(), e.tool_input.clone());
-                if let Some(id) = &e.tool_use_id {
-                    tool_meta.insert("toolUseId".into(), serde_json::Value::String(id.clone()));
-                }
-                messages.push(make_message(
-                    MessageType::ToolStart,
-                    session_id,
-                    &e.tool_name,
-                    tool_meta,
-                ));
+            // ADR-015: AskUserQuestion is mirrored to Telegram from this ToolStart,
+            // exactly like every other tool (the ADR-012 render trigger). The hook
+            // does NOT intercept the question — Claude renders its native CLI widget
+            // and the daemon mirrors OUT from the tool_start, injecting answers IN via
+            // tmux. Sent fire-and-forget (no blocking).
+            let mut tool_meta = meta.clone();
+            tool_meta.insert(
+                "tool".into(),
+                serde_json::Value::String(e.tool_name.clone()),
+            );
+            tool_meta.insert("input".into(), e.tool_input.clone());
+            if let Some(id) = &e.tool_use_id {
+                tool_meta.insert("toolUseId".into(), serde_json::Value::String(id.clone()));
             }
+            messages.push(make_message(
+                MessageType::ToolStart,
+                session_id,
+                &e.tool_name,
+                tool_meta,
+            ));
         }
         HookEvent::PostToolUse(e) => {
             // H2: fall back to tool_error when tool_output is absent
@@ -335,7 +329,12 @@ async fn build_messages(
             // M4.2: Send full output — let the daemon's formatting/chunking layer
             // handle display truncation. Truncating here at 2000 chars lost
             // important tool output (stack traces, large diffs, etc.).
-            if cfg.verbose || (output.len() >= 10 && !output.trim().is_empty()) {
+            //
+            // ADR-015: AskUserQuestion ALWAYS emits a ToolResult (bypassing the
+            // verbose/length gate) so the daemon reliably learns the question was
+            // answered (at the terminal or via Telegram) and can stale the buttons.
+            let is_question = e.tool_name == "AskUserQuestion";
+            if is_question || cfg.verbose || (output.len() >= 10 && !output.trim().is_empty()) {
                 let mut tool_meta = meta.clone();
                 tool_meta.insert(
                     "tool".into(),
@@ -514,30 +513,22 @@ async fn build_messages(
 /// How a `PreToolUse` event is routed by `get_hook_output`.
 #[derive(Debug, PartialEq, Eq)]
 enum HookRoute {
-    /// `AskUserQuestion` — deliver structurally via a blocking QuestionRequest +
-    /// `updatedInput` (no keystrokes). Takes precedence over `BypassAllow`.
-    Question,
-    /// `bypassPermissions` is active and the tool is not a question — there is no
-    /// approval to perform, so the hook returns `None` and Claude proceeds.
+    /// `bypassPermissions` is active — there is no approval to perform, so the hook
+    /// returns `None` and Claude proceeds.
     BypassAllow,
     /// Normal tool — fall through to the approval-required check.
     ApprovalCheck,
 }
 
-/// Pure routing decision for `get_hook_output` (ADR-014 E1).
+/// Pure routing decision for `get_hook_output`.
 ///
-/// The `AskUserQuestion` check MUST come before the `bypassPermissions` check.
-/// AskUserQuestion is a genuine user *question*, not a tool-execution permission
-/// gate, so bypassing permissions (`--dangerously-skip-permissions`) must still
-/// surface it to Telegram. The original code ordered the bypass short-circuit first,
-/// which silently swallowed every question in bypass mode — the hook returned `None`
-/// before sending the QuestionRequest, the daemon never rendered the widget, and
-/// Claude fell back to its terminal TUI. This function exists to make that ordering
-/// explicit and unit-testable without any socket/daemon I/O.
-fn classify_hook_route(tool_name: &str, permission_mode: Option<&str>) -> HookRoute {
-    if tool_name == "AskUserQuestion" {
-        return HookRoute::Question;
-    }
+/// ADR-015: AskUserQuestion is NO LONGER intercepted here. It renders natively in
+/// the CLI and is mirrored to Telegram from its `tool_start` (see `build_messages`),
+/// with answers injected via tmux. The PreToolUse hook never blocks on a question.
+/// `tool_requires_approval` returns false for AskUserQuestion, so in default mode it
+/// falls through `ApprovalCheck` to `None`; in bypass mode it returns `BypassAllow`.
+/// This function is kept pure and unit-testable without any socket/daemon I/O.
+fn classify_hook_route(_tool_name: &str, permission_mode: Option<&str>) -> HookRoute {
     if permission_mode == Some("bypassPermissions") {
         return HookRoute::BypassAllow;
     }
@@ -555,15 +546,11 @@ async fn get_hook_output(
         _ => return None,
     };
 
-    // Route the event. The ordering here is load-bearing (see HookRoute docs):
-    // AskUserQuestion MUST win over the bypassPermissions short-circuit.
+    // Route the event (ADR-015: AskUserQuestion is no longer intercepted here).
     match classify_hook_route(
         &pre_tool.tool_name,
         pre_tool.base.permission_mode.as_deref(),
     ) {
-        HookRoute::Question => {
-            return get_question_hook_output(pre_tool, session_id, cfg).await;
-        }
         HookRoute::BypassAllow => return None,
         HookRoute::ApprovalCheck => {}
     }
@@ -661,124 +648,6 @@ async fn get_hook_output(
             )
         }
     }
-}
-
-/// ADR-014 E1/E2/E3: Structured AskUserQuestion answer delivery.
-///
-/// Blocks on the daemon (the same `send_and_wait` correlation the approval flow
-/// uses) by sending a `QuestionRequest` carrying the original `questions`. The
-/// daemon renders the tentative-selection Telegram UI and, when the user taps
-/// "Submit All", replies with a `QuestionResponse` whose `content` is either:
-///   - a JSON answers map (question text → label; multi-select comma-joined) →
-///     we return `permissionDecision: allow` + `updatedInput { questions, answers }`
-///     so Claude proceeds with NO TUI and NO keystrokes (E1/E2), or
-///   - the sentinel `__freetext_fallback__` → there is no structured path for a
-///     free-text answer (E3), so we return a bare `allow`; Claude shows its TUI
-///     and the daemon injects the answers via the isolated keystroke path.
-///
-/// On timeout / daemon-not-running we return `None` (Claude shows its own TUI),
-/// mirroring the approval flow's daemon-down behavior.
-async fn get_question_hook_output(
-    pre_tool: &crate::types::PreToolUseEvent,
-    session_id: &str,
-    cfg: &config::Config,
-) -> Option<String> {
-    if !cfg.socket_path.exists() {
-        return None;
-    }
-
-    let tmux_info = InputInjector::detect_tmux_session();
-    let hostname = injector::get_hostname();
-    let mut question_meta = build_metadata(
-        &tmux_info,
-        &hostname,
-        pre_tool.base.transcript_path.as_deref(),
-        pre_tool.base.cwd.as_deref(),
-        pre_tool.base.agent_id.as_deref(),
-        pre_tool.base.agent_type.as_deref(),
-    );
-    // The daemon's render path reads the questions from metadata.input.
-    question_meta.insert(
-        "tool".into(),
-        serde_json::Value::String("AskUserQuestion".into()),
-    );
-    question_meta.insert("input".into(), pre_tool.tool_input.clone());
-    if let Some(hook_id) = &pre_tool.base.hook_id {
-        question_meta.insert("hookId".into(), serde_json::Value::String(hook_id.clone()));
-    }
-
-    let msg = make_message(
-        MessageType::QuestionRequest,
-        session_id,
-        "AskUserQuestion",
-        question_meta,
-    );
-
-    match send_and_wait(
-        &cfg.socket_path,
-        &msg,
-        Duration::from_secs(cfg.question_wait_secs as u64),
-        MessageType::QuestionResponse,
-    )
-    .await
-    {
-        Ok(response) => {
-            let questions = pre_tool
-                .tool_input
-                .get("questions")
-                .cloned()
-                .unwrap_or(serde_json::Value::Array(vec![]));
-            question_hook_output_from_response(&response.content, &questions)
-        }
-        Err(AppError::Socket(ref m)) if m.contains("Failed to connect") => {
-            tracing::debug!(
-                "Question socket connect failed (daemon not running), letting Claude continue"
-            );
-            None
-        }
-        Err(_) => {
-            // Timeout — let Claude fall back to its own TUI rather than blocking.
-            tracing::debug!("AskUserQuestion daemon wait timed out, letting Claude show its TUI");
-            None
-        }
-    }
-}
-
-/// ADR-014 E1: Pure, testable core of the AskUserQuestion hook output.
-///
-/// Given the daemon's `QuestionResponse` content and the original `questions`,
-/// produce the stdout the hook must emit:
-///   - sentinel `__freetext_fallback__` → bare `permissionDecision: allow` (no
-///     updatedInput); Claude shows its TUI and the daemon injects keystrokes (E3).
-///   - a JSON answers map → `permissionDecision: allow` + `updatedInput`
-///     `{ questions, answers }` so Claude proceeds with no TUI (E1).
-///   - invalid JSON → `None` (let Claude show its own TUI rather than emit garbage).
-fn question_hook_output_from_response(
-    content: &str,
-    questions: &serde_json::Value,
-) -> Option<String> {
-    if content.trim() == FREETEXT_FALLBACK_SENTINEL {
-        return Some(
-            "{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"allow\"}}"
-                .to_string(),
-        );
-    }
-
-    let answers: serde_json::Value = match serde_json::from_str(content) {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!(error = %e, "QuestionResponse answers not valid JSON; letting Claude show its TUI");
-            return None;
-        }
-    };
-    let out = serde_json::json!({
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": "allow",
-            "updatedInput": { "questions": questions, "answers": answers }
-        }
-    });
-    Some(out.to_string())
 }
 
 /// H5: Format a rich approval prompt matching TypeScript's formatToolDescription()
@@ -1090,29 +959,58 @@ async fn send_and_wait(
 mod tests {
     use super::*;
 
-    /// ADR-014 (regression): AskUserQuestion must route to the structured Question
-    /// path EVEN in bypassPermissions mode (`--dangerously-skip-permissions`). The
-    /// original bug ordered the bypass short-circuit first, so questions were silently
-    /// swallowed and never rendered to Telegram. This locks the ordering.
+    /// Minimal Config for build_messages tests (non-verbose; only `verbose` is read
+    /// by the PostToolUse gate we exercise here).
+    fn test_cfg() -> config::Config {
+        config::Config {
+            bot_token: "999:FAKE".into(),
+            chat_id: -100999,
+            enabled: true,
+            verbose: false,
+            approvals: true,
+            use_threads: false,
+            chunk_size: 4000,
+            rate_limit: 20,
+            session_timeout: 30,
+            stale_session_timeout_hours: 72,
+            auto_delete_topics: false,
+            topic_delete_delay_minutes: 15,
+            inactivity_delete_threshold_minutes: 720,
+            socket_path: std::path::PathBuf::from("/tmp/ctm-test.sock"),
+            config_dir: std::path::PathBuf::from("/tmp"),
+            config_path: std::path::PathBuf::from("/tmp/config.json"),
+            forum_enabled: false,
+        }
+    }
+
+    /// ADR-015: AskUserQuestion is NO LONGER routed specially. The hook never blocks
+    /// on a question — it renders natively in the CLI and mirrors to Telegram from
+    /// `tool_start`. In default mode it falls through to `ApprovalCheck` (and then to
+    /// `None`, since `tool_requires_approval` is false for it); in bypass mode it
+    /// short-circuits to `BypassAllow`, exactly like any non-approval tool.
     #[test]
-    fn askuserquestion_routes_to_question_even_in_bypass() {
+    fn askuserquestion_routes_like_a_normal_tool() {
         assert_eq!(
             classify_hook_route("AskUserQuestion", Some("bypassPermissions")),
-            HookRoute::Question,
-            "AskUserQuestion must reach the Question path in bypass mode (the original bug)"
+            HookRoute::BypassAllow
         );
         assert_eq!(
             classify_hook_route("AskUserQuestion", None),
-            HookRoute::Question
+            HookRoute::ApprovalCheck
         );
         assert_eq!(
             classify_hook_route("AskUserQuestion", Some("default")),
-            HookRoute::Question
+            HookRoute::ApprovalCheck
         );
+        // And it never requires approval, so the ApprovalCheck path returns None.
+        assert!(!tool_requires_approval(
+            "AskUserQuestion",
+            &serde_json::Value::Null
+        ));
     }
 
-    /// Non-question tools keep the original semantics: bypass short-circuits to allow,
-    /// everything else falls through to the approval-required check.
+    /// Non-question tools: bypass short-circuits to allow, everything else falls
+    /// through to the approval-required check.
     #[test]
     fn non_question_tools_route_normally() {
         assert_eq!(
@@ -1126,61 +1024,46 @@ mod tests {
         assert_eq!(classify_hook_route("Write", None), HookRoute::ApprovalCheck);
     }
 
-    /// ADR-014 E1: a JSON answers map yields permissionDecision:allow + updatedInput
-    /// carrying the original questions and the answers, keyed by question text.
-    #[test]
-    fn question_output_structured_builds_updated_input() {
-        let questions = serde_json::json!([
-            {"question": "Pick a color", "header": "Color",
-             "options": [{"label": "Red", "description": ""}]}
-        ]);
-        let answers = r#"{"Pick a color":"Red"}"#;
-        let out = question_hook_output_from_response(answers, &questions).expect("Some output");
-        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
-        let hso = &v["hookSpecificOutput"];
-        assert_eq!(hso["hookEventName"], "PreToolUse");
-        assert_eq!(hso["permissionDecision"], "allow");
-        assert_eq!(hso["updatedInput"]["answers"]["Pick a color"], "Red");
-        // Original questions are echoed back in updatedInput.
-        assert_eq!(hso["updatedInput"]["questions"][0]["header"], "Color");
-    }
-
-    /// ADR-014 E1: multi-select labels arrive comma-joined in the answers map and
-    /// are passed through verbatim.
-    #[test]
-    fn question_output_passes_through_multiselect_join() {
-        let questions =
-            serde_json::json!([{"question": "Pick langs", "header": "L", "options": []}]);
-        let answers = r#"{"Pick langs":"Rust,Go"}"#;
-        let out = question_hook_output_from_response(answers, &questions).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(
-            v["hookSpecificOutput"]["updatedInput"]["answers"]["Pick langs"],
-            "Rust,Go"
-        );
-    }
-
-    /// ADR-014 E3: the free-text fallback sentinel yields a bare `allow` with NO
-    /// updatedInput, so Claude shows its TUI for the keystroke path.
-    #[test]
-    fn question_output_freetext_fallback_is_bare_allow() {
-        let questions = serde_json::json!([]);
-        let out =
-            question_hook_output_from_response(FREETEXT_FALLBACK_SENTINEL, &questions).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "allow");
+    /// ADR-015: AskUserQuestion emits a `ToolStart` on PreToolUse (so the daemon can
+    /// mirror it to Telegram) — it is NOT suppressed.
+    #[tokio::test]
+    async fn askuserquestion_pretooluse_emits_tool_start() {
+        let event: HookEvent = serde_json::from_value(serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "session_id": "sess-1",
+            "tool_name": "AskUserQuestion",
+            "tool_input": {"questions": [{"question": "Pick", "header": "H", "options": []}]},
+            "tool_use_id": "tu_1"
+        }))
+        .expect("PreToolUse event");
+        let cfg = test_cfg();
+        let msgs = build_messages(&event, "sess-1", &None, "host", &cfg).await;
         assert!(
-            v["hookSpecificOutput"].get("updatedInput").is_none(),
-            "free-text fallback must NOT carry updatedInput"
+            msgs.iter().any(|m| m.msg_type == MessageType::ToolStart
+                && m.meta().tool() == Some("AskUserQuestion")),
+            "AskUserQuestion PreToolUse must emit a ToolStart"
         );
     }
 
-    /// Invalid answers JSON → None, so the hook stays silent and Claude shows its
-    /// own TUI rather than emitting malformed output.
-    #[test]
-    fn question_output_invalid_json_returns_none() {
-        let questions = serde_json::json!([]);
-        assert!(question_hook_output_from_response("not json{", &questions).is_none());
+    /// ADR-015: AskUserQuestion ALWAYS emits a `ToolResult` on PostToolUse, even when
+    /// the output is short/empty, so the daemon reliably learns it was answered.
+    #[tokio::test]
+    async fn askuserquestion_posttooluse_always_emits_tool_result() {
+        // "ok" is < 10 bytes; for any other tool this would be gated out.
+        let event: HookEvent = serde_json::from_value(serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "session_id": "sess-1",
+            "tool_name": "AskUserQuestion",
+            "tool_input": {"questions": []},
+            "tool_output": "ok"
+        }))
+        .expect("PostToolUse event");
+        let cfg = test_cfg();
+        let msgs = build_messages(&event, "sess-1", &None, "host", &cfg).await;
+        assert!(
+            msgs.iter().any(|m| m.msg_type == MessageType::ToolResult),
+            "AskUserQuestion PostToolUse must always emit a ToolResult"
+        );
     }
 
     #[test]

@@ -179,6 +179,40 @@ impl InputInjector {
         Ok(true)
     }
 
+    /// ADR-015: Capture the visible text of the configured tmux pane.
+    ///
+    /// Read-only (`tmux capture-pane -t <target> -p`); reuses the validated target and
+    /// socket. `Command::arg()` only — NO shell interpolation. Returns the pane's
+    /// visible text, or `None` if no target is set / capture fails. Used by the submit
+    /// flow's readiness detection (poll until Claude's multi-select / review screen has
+    /// rendered) instead of blind sleeps.
+    pub fn capture_pane(&self) -> Option<String> {
+        let target = self.tmux_target.as_deref()?;
+
+        let mut cmd = Command::new("tmux");
+        for arg in self.socket_args() {
+            cmd.arg(arg);
+        }
+        cmd.arg("capture-pane").arg("-t").arg(target).arg("-p");
+
+        match cmd.output() {
+            Ok(output) if output.status.success() => {
+                Some(String::from_utf8_lossy(&output.stdout).into_owned())
+            }
+            Ok(output) => {
+                tracing::debug!(
+                    stderr = %String::from_utf8_lossy(&output.stderr),
+                    "tmux capture-pane returned non-zero status"
+                );
+                None
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "tmux capture-pane failed to spawn");
+                None
+            }
+        }
+    }
+
     /// Send a slash command (like /clear).
     /// Validates against character whitelist, sends with -l flag.
     pub fn send_slash_command(&self, command: &str) -> Result<bool> {

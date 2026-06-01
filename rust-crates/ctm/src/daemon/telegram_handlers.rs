@@ -932,69 +932,140 @@ pub(super) async fn handle_free_text_answer(
         }
     };
 
-    // Phase 2: Per-key mutex held across state mutation AND API calls.
-    let mut pending = entry.lock().await;
+    // Phase 2: under the entry lock, gate + mutate + CLONE everything the edits need;
+    // DROP the lock; THEN do the Telegram I/O (ADR-015 sweep: no lock across bot.* I/O).
+    //
+    // ADR-015 (Codex lifecycle-gate): `lifecycle` is the single concurrency arbiter — a
+    // free-text answer may mutate ONLY while `Active`. A reply racing Submit All
+    // (`Submitting`) or a CLI answer / supersede (`Resolved`) must NOT mutate or edit.
+    enum FreeTextOutcome {
+        NotActive,
+        NoTarget,
+        Answered {
+            q: QuestionDef,
+            q_idx: usize,
+            msg_id: i64,
+            updated_text: String,
+            short: String,
+            all_answered: bool,
+            session_id_for_thread: String,
+        },
+    }
+    let chat_id = ctx.config.chat_id;
+    let outcome = {
+        let mut pending = entry.lock().await;
 
-    // ADR-012 D4 targeting rules:
-    //   a. First question with no tentative answer, OR
-    //   b. First question that already has a FreeText tentative answer (allow replacement).
-    //   Questions with Option/MultiOption tentative answers are skipped.
-    let q_idx = match (0..pending.questions.len()).find(|&i| match pending.tentative.get(&i) {
-        None => !pending.finalized.get(i).copied().unwrap_or(false),
-        Some(TentativeAnswer::FreeText(_)) => true,
-        Some(TentativeAnswer::Option(_)) | Some(TentativeAnswer::MultiOption(_)) => false,
-    }) {
-        Some(i) => i,
-        None => return false,
+        if pending.lifecycle != QuestionLifecycle::Active {
+            FreeTextOutcome::NotActive
+        } else {
+            // ADR-012 D4 targeting rules:
+            //   a. First question with no tentative answer, OR
+            //   b. First question that already has a FreeText tentative answer (replace).
+            //   Questions with Option/MultiOption tentative answers are skipped.
+            let target = (0..pending.questions.len()).find(|&i| match pending.tentative.get(&i) {
+                None => !pending.finalized.get(i).copied().unwrap_or(false),
+                Some(TentativeAnswer::FreeText(_)) => true,
+                Some(TentativeAnswer::Option(_)) | Some(TentativeAnswer::MultiOption(_)) => false,
+            });
+            match target {
+                None => FreeTextOutcome::NoTarget,
+                Some(q_idx) => {
+                    let msg_id = pending
+                        .question_message_ids
+                        .get(q_idx)
+                        .copied()
+                        .unwrap_or(0);
+
+                    pending
+                        .tentative
+                        .insert(q_idx, TentativeAnswer::FreeText(text.to_string()));
+
+                    let all_answered = pending.tentative.len() == pending.questions.len();
+                    let short =
+                        pending.session_id[..std::cmp::min(20, pending.session_id.len())].to_string();
+                    // Clone the QuestionDef so the edit can be rendered AFTER the lock drops.
+                    let q = pending.questions[q_idx].clone();
+                    let mut updated_text = super::render_question_text(&q);
+                    updated_text.push_str(&format!("\n\n\u{1F4DD} Your answer: {text}"));
+
+                    FreeTextOutcome::Answered {
+                        q,
+                        q_idx,
+                        msg_id,
+                        updated_text,
+                        short,
+                        all_answered,
+                        session_id_for_thread: pending.session_id.clone(),
+                    }
+                }
+            }
+        }
+        // entry mutex drops here
     };
 
-    let msg_id = pending
-        .question_message_ids
-        .get(q_idx)
-        .copied()
-        .unwrap_or(0);
+    let (q, q_idx, msg_id, updated_text, short, all_answered, session_id_for_thread) = match outcome
+    {
+        FreeTextOutcome::NotActive => {
+            // The reply is no longer applicable (being submitted / already answered).
+            // Treat as "handled" so it isn't routed elsewhere, but make NO edits.
+            return true;
+        }
+        FreeTextOutcome::NoTarget => return false,
+        FreeTextOutcome::Answered {
+            q,
+            q_idx,
+            msg_id,
+            updated_text,
+            short,
+            all_answered,
+            session_id_for_thread,
+        } => (
+            q,
+            q_idx,
+            msg_id,
+            updated_text,
+            short,
+            all_answered,
+            session_id_for_thread,
+        ),
+    };
 
-    pending
-        .tentative
-        .insert(q_idx, TentativeAnswer::FreeText(text.to_string()));
-
-    let all_answered = pending.tentative.len() == pending.questions.len();
-    let chat_id = ctx.config.chat_id;
-
-    // Edit question message to show the free-text answer (keep keyboard).
+    // Edit question message to show the free-text answer (entry lock NOT held).
     if msg_id != 0 {
-        if let Some(q) = pending.questions.get(q_idx) {
-            // PLAIN TEXT (parse_mode None below) — see render_question_text.
-            let mut updated_text = super::render_question_text(q);
-            updated_text.push_str(&format!("\n\n\u{1F4DD} Your answer: {text}"));
-
-            if q.options.is_empty() {
-                let _ = ctx
-                    .bot
-                    .edit_message_text_no_markup(msg_id, &updated_text)
-                    .await;
-            } else {
-                let short = &pending.session_id[..std::cmp::min(20, pending.session_id.len())];
-                let buttons: Vec<InlineButton> = q
-                    .options
-                    .iter()
-                    .enumerate()
-                    .map(|(o_idx, opt)| InlineButton {
-                        text: opt.label.clone(),
-                        callback_data: format!("answer:{short}:{q_idx}:{o_idx}"),
-                    })
-                    .collect();
-                let _ = ctx
-                    .bot
-                    .edit_message_text_with_markup(chat_id, msg_id, &updated_text, None, &[buttons])
-                    .await;
-            }
+        if q.options.is_empty() {
+            // No option keyboard to re-arm, but a late edit can still OVERWRITE a
+            // terminal "Submitted"/"Answered at terminal" state that a concurrent
+            // Submit All / resolve_pending_question wrote while this edit was in
+            // flight (message corruption). Re-terminalize if this question resolved
+            // during the edit (ADR-015, Codex post-I/O recheck — applies to the
+            // no-markup branch too, not only to keyboard re-arms).
+            let _ = ctx
+                .bot
+                .edit_message_text_no_markup(msg_id, &updated_text)
+                .await;
+            callback_handlers::restale_if_resolved(ctx, &entry, msg_id).await;
+        } else {
+            let buttons: Vec<InlineButton> = q
+                .options
+                .iter()
+                .enumerate()
+                .map(|(o_idx, opt)| InlineButton {
+                    text: opt.label.clone(),
+                    callback_data: format!("answer:{short}:{q_idx}:{o_idx}"),
+                })
+                .collect();
+            let _ = ctx
+                .bot
+                .edit_message_text_with_markup(chat_id, msg_id, &updated_text, None, &[buttons])
+                .await;
+            // ADR-015 (Codex post-I/O recheck): the edit above re-armed option buttons; if
+            // a fast prior Submit All finalized/resolved this question during the edit,
+            // re-stale this message so no live buttons remain.
+            callback_handlers::restale_if_resolved(ctx, &entry, msg_id).await;
         }
     }
 
     if all_answered {
-        let session_id_for_thread = pending.session_id.clone();
-        drop(pending);
         let thread_id = ctx.get_thread_id(&session_id_for_thread).await;
         let _ = callback_handlers::send_or_update_summary(ctx, &pending_key, thread_id).await;
     }

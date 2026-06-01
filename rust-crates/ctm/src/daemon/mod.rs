@@ -75,6 +75,26 @@ pub(super) enum TentativeAnswer {
     FreeText(String),
 }
 
+/// ADR-015 (Codex B3): the ownership state of a pending AskUserQuestion. The two
+/// terminal-edit paths — `handle_submitall_callback` (Telegram "Submit All") and
+/// `resolve_pending_question` (the AskUserQuestion PostToolUse tool_result) — BOTH run
+/// for a single Telegram answer (Submit All injects keystrokes, which makes Claude emit
+/// the tool_result that then drives resolve). To stop them both editing the same
+/// Telegram message_ids ("Submitted" vs "Answered at terminal"), they check-and-set
+/// this field under the per-entry `Mutex<PendingQuestion>`; whoever leaves `Active`
+/// first wins and owns the message edits, the other no-ops.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum QuestionLifecycle {
+    /// Unanswered / awaiting input. Either path may transition out of this.
+    Active,
+    /// "Submit All" is mid-flight injecting keystrokes; it owns the terminal edits.
+    /// `resolve_pending_question` must no-op while in this state.
+    Submitting,
+    /// Fully resolved (Submit All succeeded, or answered at the terminal). The map
+    /// entry is removed and the messages have been edited by the winner.
+    Resolved,
+}
+
 /// Pending AskUserQuestion state.
 ///
 /// ADR-012: Replaced `answered`/`selected_options`/`timestamp` with the
@@ -93,6 +113,8 @@ pub(super) struct PendingQuestion {
     question_message_ids: Vec<i64>,
     /// Telegram message_id of the summary confirmation message, if sent.
     summary_message_id: Option<i64>,
+    /// ADR-015 (Codex B3): ownership arbiter between the Submit All and resolve paths.
+    lifecycle: QuestionLifecycle,
 }
 
 #[derive(Clone)]
@@ -183,10 +205,6 @@ pub(super) struct DaemonState {
     // the specific socket client that submitted the approval_request, not
     // broadcast to all connected clients.
     pub(super) pending_approval_clients: Arc<RwLock<HashMap<String, String>>>,
-
-    // ADR-014 E1: Map session_id -> client_id of the hook blocked on an
-    // AskUserQuestion, so its QuestionResponse routes back to that exact client.
-    pub(super) pending_question_clients: Arc<RwLock<HashMap<String, String>>>,
 }
 
 /// Bridge Daemon — orchestrates all components.
@@ -233,7 +251,6 @@ impl Daemon {
             config: Arc::new(config),
             running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pending_approval_clients: Arc::new(RwLock::new(HashMap::new())),
-            pending_question_clients: Arc::new(RwLock::new(HashMap::new())),
         });
 
         Ok(Self {
@@ -462,6 +479,18 @@ type SocketClients = Arc<Mutex<HashMap<String, Arc<Mutex<tokio::net::unix::Owned
 //
 // Most handlers acquire only one lock at a time (short-lived guards).
 // When multiple locks must be held simultaneously, follow this order.
+//
+// ADR-015 (Codex deadlock fix) — `pending_q` map vs. per-entry `Mutex<PendingQuestion>`:
+// the map's `RwLock` and each entry's inner `Mutex` are DIFFERENT locks and must NEVER
+// be co-held across an `.await`. The established order on the question path is:
+//   (a) take the `pending_q` READ guard ONLY long enough to clone the entry `Arc`, then
+//       DROP it;
+//   (b) take `entry.lock()` to read/mutate state (incl. the `lifecycle` arbiter), then
+//       DROP it;
+//   (c) only then take `pending_q.write()` to remove the key.
+// Atomicity between the Submit-All and tool_result-resolve paths is guaranteed by the
+// `lifecycle` flag set in (b), NOT by co-holding (a)+(b) or (b)+(c). Holding both the
+// map guard and an entry mutex simultaneously is a lock-order inversion (deadlock).
 #[derive(Clone)]
 struct HandlerContext {
     bot: Arc<TelegramBot>,
@@ -485,9 +514,6 @@ struct HandlerContext {
     socket_clients: SocketClients,
     /// S-2: Maps approval_id -> client_id for targeted approval response routing.
     pending_approval_clients: Arc<RwLock<HashMap<String, String>>>,
-    /// ADR-014 E1: Maps session_id -> client_id of the hook blocked on an
-    /// AskUserQuestion, so the QuestionResponse routes back to that exact client.
-    pending_question_clients: Arc<RwLock<HashMap<String, String>>>,
 }
 
 impl HandlerContext {
@@ -634,17 +660,12 @@ async fn handle_socket_message(ctx: HandlerContext, msg: BridgeMessage) {
     // Epic 1: Toggle gating — skip outbound messages when mirroring is disabled.
     // Safety-critical paths (approvals, commands) always proceed.
     //
-    // ADR-014 E1: AskUserQuestion is a BLOCKING path just like approvals — the hook
-    // waits up to 300s for a QuestionResponse. If mirroring is off and we drop the
-    // QuestionRequest here, the hook hangs for the full timeout. So the question
-    // request/response pair must also be always-active.
+    // ADR-015: AskUserQuestion is no longer a blocking request/response pair. It rides
+    // the normal ToolStart/ToolResult path (gated by mirroring like any other tool),
+    // so it is intentionally NOT listed here.
     let is_always_active = matches!(
         msg.msg_type,
-        MessageType::ApprovalRequest
-            | MessageType::ApprovalResponse
-            | MessageType::Command
-            | MessageType::QuestionRequest
-            | MessageType::QuestionResponse
+        MessageType::ApprovalRequest | MessageType::ApprovalResponse | MessageType::Command
     );
     if !is_always_active
         && !ctx
@@ -754,14 +775,6 @@ async fn handle_socket_message(ctx: HandlerContext, msg: BridgeMessage) {
         MessageType::SendImage => {
             if ensure_session_exists(&ctx, &msg).await {
                 socket_handlers::handle_send_image(&ctx, &msg).await;
-            }
-        }
-        // ADR-014 E1: A blocking AskUserQuestion request from the hook. Register the
-        // originating socket client (so the answer routes back to it) and render the
-        // question UI. The hook stays blocked until "Submit All" sends QuestionResponse.
-        MessageType::QuestionRequest => {
-            if ensure_session_exists(&ctx, &msg).await {
-                socket_handlers::handle_question_request(&ctx, &msg).await;
             }
         }
         _ => {
