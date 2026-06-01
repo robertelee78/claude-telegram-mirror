@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.2.19] - 2026-05-31
 
 ### Fixed (ADR-014 post-release field defects)
 - **AskUserQuestion now reaches Telegram under `--dangerously-skip-permissions`** (D1, root cause) — the `PreToolUse` hook short-circuited on `bypassPermissions` *before* the AskUserQuestion branch, so in the operator's normal mode the question was never sent and Claude fell back to its terminal TUI. AskUserQuestion is now routed ahead of the bypass check (it's input collection, not a permission gate).
