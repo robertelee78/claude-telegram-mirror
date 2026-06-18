@@ -301,7 +301,7 @@ ctm install-hooks --project
 - **Topic routing**: Each daemon only processes topics it created (multi-bot safe)
 - **Rate limiting**: Governor-based with exponential backoff retry queue
 - **Token scrubbing**: All log output filtered through regex to strip bot tokens
-- **Test suite**: 512 Rust tests (unit + 10 integration test files)
+- **Test suite**: 470+ Rust tests (unit + 11 integration test files)
 
 ## Troubleshooting
 
@@ -367,7 +367,7 @@ cargo test
 ./target/release/ctm start
 ```
 
-### Project Structure (30 source files)
+### Project Structure (33 source files)
 
 ```
 rust-crates/ctm/src/
@@ -382,16 +382,19 @@ rust-crates/ctm/src/
   injector.rs       # tmux input injection
   formatting.rs     # Message formatting, chunking, ANSI stripping
   summarize.rs      # Tool action summarizer (30+ patterns)
+  liveness.rs       # tmux pane liveness checks for topic reconciliation
+  prune.rs          # prune-topics subcommand (bulk stale-topic cleanup)
   colors.rs         # ANSI color helpers for terminal output
   doctor.rs         # Diagnostic checks with --fix
   installer.rs      # Hook installer
   setup.rs          # Interactive setup wizard
-  bot/              # Telegram API client (client.rs, queue.rs, types.rs)
+  bot/              # Telegram API client (mod.rs, client.rs, queue.rs, types.rs)
   daemon/           # Bridge daemon (mod.rs, event_loop.rs, socket_handlers.rs,
-                    #   telegram_handlers.rs, callback_handlers.rs, cleanup.rs, files.rs)
+                    #   telegram_handlers.rs, callback_handlers.rs, cleanup.rs,
+                    #   reconcile.rs, files.rs)
   service/          # OS service management (mod.rs, systemd.rs, launchd.rs, env.rs)
 
-rust-crates/ctm/tests/   # 10 integration test files
+rust-crates/ctm/tests/   # 11 integration test files
 ```
 
 </details>

@@ -51,11 +51,11 @@ flowchart LR
 
 ## 2. Module Structure
 
-The crate lives at `rust-crates/ctm/` and compiles to both a binary (`main.rs`) and a library (`lib.rs`). There are 30 source files across 16 top-level modules and three sub-module groups (`bot/`, `daemon/`, `service/`).
+The crate lives at `rust-crates/ctm/` and compiles to both a binary (`main.rs`) and a library (`lib.rs`). There are 33 source files across 18 top-level modules and three sub-module groups (`bot/`, `daemon/`, `service/`).
 
 ### Top-level modules
 
-**main.rs** -- Binary entry point. Defines the `clap` CLI with subcommands (`hook`, `start`, `stop`, `restart`, `status`, `config`, `install-hooks`, `uninstall-hooks`, `hooks`, `setup`, `doctor`, `service`, `toggle`). Initializes the `tracing` subscriber with a custom `ScrubWriter` that strips Telegram bot tokens from all log output before it reaches stderr. Handles SIGINT and SIGTERM via `tokio::signal` for graceful async shutdown.
+**main.rs** -- Binary entry point. Defines the `clap` CLI with subcommands (`hook`, `start`, `stop`, `restart`, `status`, `config`, `install-hooks`, `uninstall-hooks`, `hooks`, `setup`, `doctor`, `service`, `toggle`, `prune-topics`). Initializes the `tracing` subscriber with a custom `ScrubWriter` that strips Telegram bot tokens from all log output before it reaches stderr. Handles SIGINT and SIGTERM via `tokio::signal` for graceful async shutdown.
 
 **lib.rs** -- Library re-exports. Makes all modules public so downstream Rust consumers can depend on the crate (e.g., `use ctm::session::SessionManager`).
 
@@ -69,13 +69,13 @@ The crate lives at `rust-crates/ctm/` and compiles to both a binary (`main.rs`) 
 
 **injector.rs** -- Input injection via tmux. All tmux commands use `Command::arg()` with no shell interpolation, preventing command injection. Validates tmux socket paths (must be absolute, no `..`, max 256 chars). Provides `inject()` (text with `-l` literal flag + Enter), `send_key()` (from a whitelist of safe keys), and `send_slash_command()` (character-validated). Includes `detect_tmux_session()` which reads `$TMUX` and queries tmux for session/window/pane, `find_claude_code_session()` as a fallback that searches running pane commands, and `is_pane_alive()` for stale session detection.
 
-**session.rs** -- SQLite-backed session and approval manager. Uses `rusqlite` with file permissions set to `0o600`. Schema has two tables: `sessions` (columns: `id`, `chat_id`, `thread_id`, `hostname`, `tmux_target`, `tmux_socket`, `started_at`, `last_activity`, `status`, `project_dir`, `metadata`, `parent_session_id`, `agent_id`, `agent_type`, `custom_title`) and `pending_approvals` (with expiry tracking). The `Session` struct has 15 fields matching these columns. Supports session creation (with auto-heal of tmux/hostname metadata on re-insert), reactivation, thread ID management, tmux info storage, parent-child tracking (`set_parent_info`, `get_child_sessions`), stale candidate queries, orphaned thread detection, and approval lifecycle (create, resolve, expire). Uses ISO 8601 TEXT timestamps. Includes automatic schema migrations for tmux columns, ADR-013 parent columns (`parent_session_id`, `agent_id`, `agent_type`), and the ADR-014 `custom_title` column (persists the `/rename` title so it survives a daemon restart). `set_custom_title` / `pending_approval_ids` were added in ADR-014. Session IDs validated via `is_valid_session_id()` at the persistence boundary (ADR-010 C-5). `end_session` wraps its two SQL statements in a single transaction for atomicity (ADR-010 C-4).
+**session.rs** -- SQLite-backed session and approval manager. Uses `rusqlite` with file permissions set to `0o600`. Schema has three tables: `sessions` (columns: `id`, `chat_id`, `thread_id`, `hostname`, `tmux_target`, `tmux_socket`, `started_at`, `last_activity`, `status`, `project_dir`, `metadata`, `parent_session_id`, `agent_id`, `agent_type`, `custom_title`), `pending_approvals` (with expiry tracking), and `topics` (the STALE-TOPICS persistent ledger, keyed by `thread_id`, recording every forum topic created so reconciliation can prune stale ones across restarts). The `Session` struct has 15 fields matching these columns. Supports session creation (with auto-heal of tmux/hostname metadata on re-insert), reactivation, thread ID management, tmux info storage, parent-child tracking (`set_parent_info`, `get_child_sessions`), stale candidate queries, orphaned thread detection, and approval lifecycle (create, resolve, expire). Uses ISO 8601 TEXT timestamps. Includes automatic schema migrations for tmux columns, ADR-013 parent columns (`parent_session_id`, `agent_id`, `agent_type`), and the ADR-014 `custom_title` column (persists the `/rename` title so it survives a daemon restart). `set_custom_title` / `pending_approval_ids` were added in ADR-014. Session IDs validated via `is_valid_session_id()` at the persistence boundary (ADR-010 C-5). `end_session` wraps its two SQL statements in a single transaction for atomicity (ADR-010 C-4).
 
 **socket.rs** -- Unix domain socket server and client with NDJSON framing. The server uses `flock(2)` on the PID file for atomic single-instance enforcement. After `bind()`, applies `chmod(0o600)` to the socket file (ADR-009). Supports up to 64 concurrent connections. Each client is handled in a spawned tokio task that reads NDJSON lines and broadcasts them via `tokio::sync::broadcast`. The client side provides `connect`, `send`, `send_and_wait` (with timeout and session ID correlation), and `disconnect`.
 
 **bot/ (module)** -- Telegram Bot API client. Split into three sub-modules: `client.rs` (the `TelegramBot` struct with dual HTTP clients -- a 15s-timeout client for API calls and a 45s-timeout `poll_client` for `getUpdates` long polling, kept in separate connection pools so long-poll latency never blocks API calls; AIMD adaptive rate control via `AimdState` with additive increase of 0.5 msg/sec on success and multiplicative decrease by 0.5x on 429, debounced to at most once per second; `governor` rate limiter clamped to `[1, 30]` msgs/sec (ADR-009)), `queue.rs` (three-tier priority message queue `PriorityMessageQueue` with per-tier caps: `MAX_CRITICAL = 50`, `MAX_NORMAL = 300`, `MAX_LOW = 150` (500 total), with oldest-eviction per tier, RAII `ProcessingGuard` to prevent permanent queue stalls on task cancellation (ADR-010 C-2), overflow-safe exponential backoff using `saturating_mul`, jitter on 429 retry via `simple_jitter_fraction()`, TOPIC_CLOSED recovery with immediate error return on failed reopen (ADR-010 C-3), and entity parse error fallback to plain text), and `types.rs` (Telegram API response types including `Update`, `TgMessage`, `CallbackQuery`, `InlineButton`, `ResponseParameters` with a `retry_after` field for 429 handling, etc.). Bot token scrubbing uses a compiled regex `bot\d+:[A-Za-z0-9_-]+/` applied globally.
 
-**daemon/ (module)** -- The bridge daemon, the central orchestrator. Split into seven sub-modules: `mod.rs` (the `Daemon` struct with `start()`/`stop()`, `DaemonState` with all shared state, the `HandlerContext` passed to all handlers with 17 fields, documented lock ordering, `ensure_session_exists` with atomic topic creation locks, `get_tmux_target` with three-tier detection (cache, DB, live fallback via `find_claude_code_session`), startup cache warming from DB, echo prevention via null-separated keys, and `db_op` returning `R::default()` instead of panicking on task cancellation (ADR-010 S-3)), `event_loop.rs` (the main `tokio::select!` loop multiplexing socket messages, Telegram long-polling, and a 20-minute cleanup timer (ADR-014 A6, raised from 5 min now that `SessionEnd` drives teardown), with bounded concurrency via `Semaphore(50)` and poll backoff with jitter), `socket_handlers.rs` (handlers for each `MessageType` including parent-child routing via `extract_parent_session_id`, child message prefix via `get_child_prefix`, orphan cascade on parent `session_end`, spawn notifications with agent_type, and SubagentStop completion with Details button), `telegram_handlers.rs` (handlers for Telegram messages and commands, ADR-012 tentative free-text answers via `handle_free_text_answer`, and ADR-013 injection failure warnings on every attempt), `callback_handlers.rs` (handlers for inline keyboard callbacks: approval responses, tool detail expansion, ADR-012 tentative selection with `TentativeAnswer` enum, multi-select toggle, review screen with "Submit All"/"Change QN" buttons, a `QuestionLifecycle { Active, Submitting, Resolved }` state machine on `PendingQuestion` as the sole concurrency arbiter; ADR-015 "Submit All" injects answers into the live CLI widget via tmux `send-keys` (`inject_answers`, fail-closed `InjectOutcome`, driving the one tabbed widget by reading the pane with `capture_pane`/`parse_widget` and polling for readiness instead of blind sleeps), and `resolve_pending_question` stales the Telegram buttons when the question is answered at the terminal (PostToolUse `ToolResult`); approvals are sent at Critical priority with the resolved message edited to a decision+time audit line; and ADR-013 sub-agent Details button with `.md` file attachment), `cleanup.rs` (stale session detection with differentiated timeouts; an inactivity sweep that deletes topics for sessions idle past `inactivity_delete_threshold_minutes` — a safety net now that ADR-014 A4 deletes topics immediately on a true `SessionEnd` (the former two-stage `schedule_topic_deletion` was removed; `cancel_pending_topic_deletion` is retained as a no-op guard); also evicts orphaned `pending_approval_clients` entries (ADR-014 B4), cache size limits (`MAX_SESSION_CACHE=200`, `MAX_TOOL_CACHE=500`), download directory cleanup, `.last_line_*` state file cleanup (ADR-009), and `/tmp/ctm-subagent-*.md` temp file cleanup), and `files.rs` (file download handling for photos and documents, `sanitize_filename`, `validate_send_image_path`, `is_image_extension`).
+**daemon/ (module)** -- The bridge daemon, the central orchestrator. Split into eight sub-modules: `mod.rs` (the `Daemon` struct with `start()`/`stop()`, `DaemonState` with all shared state, the `HandlerContext` passed to all handlers with 17 fields, documented lock ordering, `ensure_session_exists` with atomic topic creation locks, `get_tmux_target` with three-tier detection (cache, DB, live fallback via `find_claude_code_session`), startup cache warming from DB, echo prevention via null-separated keys, and `db_op` returning `R::default()` instead of panicking on task cancellation (ADR-010 S-3)), `event_loop.rs` (the main `tokio::select!` loop multiplexing socket messages, Telegram long-polling, and a 20-minute cleanup timer (ADR-014 A6, raised from 5 min now that `SessionEnd` drives teardown), with bounded concurrency via `Semaphore(50)` and poll backoff with jitter), `socket_handlers.rs` (handlers for each `MessageType` including parent-child routing via `extract_parent_session_id`, child message prefix via `get_child_prefix`, orphan cascade on parent `session_end`, spawn notifications with agent_type, and SubagentStop completion with Details button), `telegram_handlers.rs` (handlers for Telegram messages and commands, ADR-012 tentative free-text answers via `handle_free_text_answer`, and ADR-013 injection failure warnings on every attempt), `callback_handlers.rs` (handlers for inline keyboard callbacks: approval responses, tool detail expansion, ADR-012 tentative selection with `TentativeAnswer` enum, multi-select toggle, review screen with "Submit All"/"Change QN" buttons, a `QuestionLifecycle { Active, Submitting, Resolved }` state machine on `PendingQuestion` as the sole concurrency arbiter; ADR-015 "Submit All" injects answers into the live CLI widget via tmux `send-keys` (`inject_answers`, fail-closed `InjectOutcome`, driving the one tabbed widget by reading the pane with `capture_pane`/`parse_widget` and polling for readiness instead of blind sleeps), and `resolve_pending_question` stales the Telegram buttons when the question is answered at the terminal (PostToolUse `ToolResult`); approvals are sent at Critical priority with the resolved message edited to a decision+time audit line; and ADR-013 sub-agent Details button with `.md` file attachment), `cleanup.rs` (stale session detection with differentiated timeouts; an inactivity sweep that deletes topics for sessions idle past `inactivity_delete_threshold_minutes` — a safety net now that ADR-014 A4 deletes topics immediately on a true `SessionEnd` (the former two-stage `schedule_topic_deletion` was removed; `cancel_pending_topic_deletion` is retained as a no-op guard); also evicts orphaned `pending_approval_clients` entries (ADR-014 B4), cache size limits (`MAX_SESSION_CACHE=200`, `MAX_TOOL_CACHE=500`), download directory cleanup, `.last_line_*` state file cleanup (ADR-009), and `/tmp/ctm-subagent-*.md` temp file cleanup), `files.rs` (file download handling for photos and documents, `sanitize_filename`, `validate_send_image_path`, `is_image_extension`), and `reconcile.rs` (liveness-driven topic/session reconciliation run from the cleanup cycle — cross-checks the `topics` ledger against live tmux panes via `liveness.rs` and prunes topics whose sessions are gone).
 
 **formatting.rs** -- Message formatting and chunking for Telegram display. ANSI escape stripping, MarkdownV2 escaping, message chunking that respects code block boundaries, tool-specific detail formatting, heuristic language detection, and path truncation. All chunking uses `char_indices()` for char-boundary safety with multibyte UTF-8 (ADR-010 U-1, U-2).
 
@@ -84,6 +84,10 @@ The crate lives at `rust-crates/ctm/` and compiles to both a binary (`main.rs`) 
 **installer.rs** -- Hook installer that modifies Claude Code's `settings.json`. Installs hooks for 7 event types (`PreToolUse`, `PostToolUse`, `Notification`, `Stop`, `UserPromptSubmit`, `PreCompact`, and `SessionEnd` — the last added in ADR-014 A1; `PreToolUse` carries a 310s timeout for the approval/question blocking path, the rest none). Idempotent with Added/Updated/Unchanged reporting.
 
 **service/ (module)** -- OS service management for systemd (Linux) and launchd (macOS). Four sub-modules: `mod.rs`, `systemd.rs`, `launchd.rs`, and `env.rs`.
+
+**liveness.rs** -- tmux pane liveness checks. Resolves whether a session's recorded tmux target is still alive, used by `daemon/reconcile.rs` to reconcile the topic ledger against reality.
+
+**prune.rs** -- Implements the `prune-topics` CLI subcommand for bulk cleanup of stale forum topics, including an `--ids` mode and MTProto-based topic enumeration.
 
 **setup.rs** -- Interactive setup wizard using `dialoguer`. **doctor.rs** -- Diagnostic checker with `--fix` auto-remediation. **colors.rs** -- ANSI color helpers for terminal output.
 
@@ -202,7 +206,7 @@ For full details, see `docs/SECURITY.md`. Key properties:
 
 **Approval response routing (ADR-010 S-2).** Routed to the specific socket client that submitted the request.
 
-**Agent ID validation (ADR-013 GAP-1).** `is_valid_agent_id()` rejects `/`, `\`, `..`, and non-ASCII-alphanumeric characters. Prevents path traversal when constructing `/tmp/ctm-subagent-{agent_id}.md` file paths from user-controlled callback data.
+**Agent ID validation (ADR-013 GAP-1).** `is_valid_agent_id()` rejects `/`, `\`, `..`, and any character that is not ASCII alphanumeric, `-`, `_`, or `.`. Prevents path traversal when constructing `/tmp/ctm-subagent-{agent_id}.md` file paths from user-controlled callback data.
 
 **Bot token scrubbing.** Global `ScrubWriter` on stderr with regex. `Config` implements `Debug` with `bot_token` redacted (ADR-010 S-4).
 
@@ -222,18 +226,20 @@ The application uses the tokio async runtime with a multi-threaded executor.
 
 ### Event loop
 
-The daemon's main event loop (`event_loop.rs`) uses `tokio::select!` to multiplex three event sources:
+The daemon's main event loop (`event_loop.rs`) uses `tokio::select!` to multiplex four event sources:
 
 1. **Socket messages** via `tokio::sync::broadcast::Receiver<BridgeMessage>`. Each spawned in a tokio task bounded by `Semaphore(50)` (ADR-011 Fix #6).
 2. **Telegram updates** via `bot.get_updates()` long polling. Poll failures use exponential backoff with jitter (10s/20s/40s/80s cap, ~20% jitter) (ADR-011 Fix #4).
 3. **Cleanup timer** every 20 minutes via `tokio::time::interval` (ADR-014 A6). Exempt from the semaphore.
+4. **Topic-invalidated channel** (`topic_invalidated_rx`) — when a send fails because a `thread_id` points at a deleted topic, the bot signals this channel so the daemon nulls the stale mapping and re-creates the session's topic (self-heal).
 
 ### Shared state
 
-The `HandlerContext` struct has 18 fields. Lock types use `Arc<RwLock<T>>` for read-heavy data and `Arc<Mutex<T>>` for write-heavy or externally-synchronized data:
+The `HandlerContext` struct has 17 fields. Lock types use `Arc<RwLock<T>>` for read-heavy data and `Arc<Mutex<T>>` for write-heavy or externally-synchronized data:
 
 | State | Type | Rationale |
 |-------|------|-----------|
+| `bot` | `Arc<TelegramBot>` | Shared Telegram API client (internally synchronized) |
 | `sessions` | `Arc<Mutex<SessionManager>>` | SQLite single-writer; `spawn_blocking` via `db_op` |
 | `session_threads` | `Arc<RwLock<HashMap>>` | Read-heavy, writes on topic creation |
 | `session_tmux` | `Arc<RwLock<HashMap>>` | Read-heavy, updated on tmux target change |
@@ -260,7 +266,7 @@ Two-layer rate control on the `TelegramBot`:
 1. **AIMD adaptive delay** (`AimdState`): starts at `max_rate` (from config, default 20 msg/sec). Additive increase of 0.5 msg/sec per successful send, multiplicative decrease by 0.5x on Telegram 429. Debounced to at most one decrease per second. Floor of 0.5 msg/sec.
 2. **Governor ceiling**: `governor::RateLimiter` clamped to `[1, 30]` msgs/sec.
 
-Queue bound: 500 total (50 critical + 300 normal + 150 low). Retry: overflow-safe exponential backoff with `saturating_mul` (3 retries at 1s/2s/4s). Jitter on 429 via `simple_jitter_fraction()`. TOPIC_CLOSED recovery: reopen + retry. Entity parse error: strip formatting, retry as plain text.
+Queue bound: 500 total (50 critical + 300 normal + 150 low). Retry: overflow-safe exponential backoff with `saturating_mul` (3 retries at 2s/4s/8s — `retries` is incremented before the shift). Jitter on 429 via `simple_jitter_fraction()`. TOPIC_CLOSED recovery: reopen + retry. Entity parse error: strip formatting, retry as plain text.
 
 ### Cache size limits (ADR-011 Fix #7)
 
@@ -276,15 +282,15 @@ SIGINT and SIGTERM trigger graceful shutdown: notification to Telegram, socket c
 
 ## 8. Test Suite
 
-The project has 590+ tests across unit and integration test suites, with 0 failures and 0 clippy warnings (`cargo clippy -- -D warnings`). ADR-014 added coverage for `SessionEnd` deserialization, hook registration, custom-title persistence, teardown invariants, the structured-answer builder, approval idempotency, and the submit-path classifier.
+The project has 470+ tests across unit and integration test suites, with 0 failures and 0 clippy warnings (`cargo clippy -- -D warnings`). ADR-014 added coverage for `SessionEnd` deserialization, hook registration, custom-title persistence, teardown invariants, the structured-answer builder, approval idempotency, and the submit-path classifier.
 
 ### Unit tests
 
-Co-located in each source module (30 source files across `src/`). Cover configuration parsing, session management, formatting, summarization, socket communication, error handling, security validation, AIMD rate control, priority queue ordering, and ADR-013 parent/agent ID extraction.
+Co-located in each source module (33 source files across `src/`). Cover configuration parsing, session management, formatting, summarization, socket communication, error handling, security validation, AIMD rate control, priority queue ordering, and ADR-013 parent/agent ID extraction.
 
 ### Integration tests
 
-Ten integration test files in `rust-crates/ctm/tests/`:
+Eleven integration test files in `rust-crates/ctm/tests/`:
 
 | File | Coverage |
 |------|----------|
@@ -298,12 +304,13 @@ Ten integration test files in `rust-crates/ctm/tests/`:
 | `session_lifecycle.rs` | Session create/end/reactivate, stale cleanup, approval expiry |
 | `socket_roundtrip.rs` | Full NDJSON roundtrip through socket server, connection limits, PID locking |
 | `summarize_tests.rs` | Tool summarizer coverage for all 30+ command patterns |
+| `routing_spike.rs` | ROUTING-001 cross-session mis-routing reproduction (manual, `#[ignore]`-gated; run with `--ignored`) |
 
 ### Running tests
 
 ```bash
 cd rust-crates
-cargo test          # All 590+ tests
+cargo test          # All 470+ tests
 cargo test -- -q    # Quiet output
 cargo clippy        # Lint (0 warnings required)
 ```

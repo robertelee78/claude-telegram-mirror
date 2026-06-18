@@ -62,11 +62,11 @@ metacharacters are rejected.
 
 ### 2. Bot Token Scrubbing
 
-**File:** `rust-crates/ctm/src/bot/client.rs`
+**Files:** `rust-crates/ctm/src/main.rs` (subscriber layer), `rust-crates/ctm/src/bot/mod.rs` (regex)
 
-A `tracing` subscriber layer applies `scrub_bot_token()` to log output.
-The regex `bot\d+:[A-Za-z0-9_-]+/` matches the Telegram bot token pattern
-in API URLs and replaces it with `bot<REDACTED>`.
+A `tracing` subscriber layer (`ScrubWriter` in `main.rs`) applies `scrub_bot_token()`
+to all log output. The regex `bot\d+:[A-Za-z0-9_-]+/` matches the Telegram bot token
+pattern in API URLs and replaces it with `bot[REDACTED]/`.
 
 All log output goes to stderr via the `tracing` subscriber. There is no
 file transport, so tokens cannot leak into log files on disk.
@@ -79,8 +79,9 @@ tokens from error messages before logging.
 **File:** `rust-crates/ctm/src/daemon/telegram_handlers.rs`
 
 A chat ID check verifies `chat.id` against the configured `chat_id` on
-every incoming update. Updates from unauthorized chats receive a static
-"Unauthorized" reply and are not processed further.
+every incoming update. Updates from unauthorized chats are silently dropped
+(logged as a warning, no reply) — by design, since replying would confirm the
+bot's existence and function to an attacker (ADR-006 L4.6).
 
 Approval callback handlers (`approve:`, `reject:`, `abort:`), answer
 handlers (`answer:`, `toggle:`, `submit:`), all verify the chat ID
@@ -94,7 +95,7 @@ different chat.
 
 Session IDs from hook events are validated before any database operation:
 - Maximum length: 128 characters
-- Character set: `[a-zA-Z0-9_-]` only
+- Character set: `[a-zA-Z0-9_.-]` only
 - Empty/null values are rejected
 
 Messages with invalid session IDs are dropped with a warning log.
@@ -118,10 +119,10 @@ socket.
 
 **File:** `rust-crates/ctm/src/config.rs`
 
-`validateSocketPath()` rejects socket paths that:
+`validate_socket_path()` rejects socket paths that:
 - Contain `..` (directory traversal)
 - Are not absolute (do not start with `/`)
-- Exceed 256 characters
+- Exceed 104 characters (the AF_UNIX `sun_path` limit)
 
 Invalid paths fall back to the default socket path in the config directory.
 
@@ -151,7 +152,7 @@ handler logs a warning and exits cleanly without processing the payload.
 
 ### 10. Download File Handling
 
-**File:** `rust-crates/ctm/src/daemon/telegram_handlers.rs`
+**File:** `rust-crates/ctm/src/daemon/files.rs`
 
 Downloaded files from Telegram are handled with several protections:
 - The downloads directory is created with mode 0o700
@@ -179,11 +180,11 @@ Downloaded files from Telegram are handled with several protections:
 
 | Boundary | Validation | Enforcement |
 |---|---|---|
-| Socket messages: session ID | 128 char max, `[a-zA-Z0-9_-]` | `socket_handlers.rs` — `is_valid_session_id()` |
+| Socket messages: session ID | 128 char max, `[a-zA-Z0-9_.-]` | `socket_handlers.rs` — `is_valid_session_id()` |
 | Socket lines | 1 MiB max per NDJSON line | `socket.rs` — `MAX_LINE_BYTES` |
 | Socket connections | 64 concurrent max | `socket.rs` — `MAX_CONNECTIONS` |
 | Hook stdin | 1 MiB max | `hook.rs` — `MAX_STDIN_BYTES` |
-| Socket paths | No `..`, absolute only, 256 char max | `config.rs` — `validate_socket_path()` |
+| Socket paths | No `..`, absolute only, 104 char max | `config.rs` — `validate_socket_path()` |
 | Slash commands | Character whitelist: `[a-zA-Z0-9_- /]` | `injector.rs` — `is_valid_slash_command()` |
 | Download filenames | Sanitized, UUID-prefixed, no `..`, 200 char max | `telegram_handlers.rs` — `sanitize_filename()` |
 | Download file size | 20 MB max | Telegram Bot API server-side limit |
