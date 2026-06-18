@@ -25,6 +25,7 @@ use std::collections::HashSet;
 /// Parsed `prune-topics` arguments.
 pub struct PruneArgs {
     pub ledger: bool,
+    pub ids: Option<std::path::PathBuf>,
     pub from: Option<i64>,
     pub to: Option<i64>,
     pub dry_run: bool,
@@ -57,11 +58,19 @@ fn session_is_alive(mgr: &SessionManager, session_id: &str) -> bool {
 
 /// Entry point for `ctm prune-topics`.
 pub async fn run_prune(args: PruneArgs) -> anyhow::Result<()> {
-    if !args.ledger && (args.from.is_none() || args.to.is_none()) {
+    let has_range = args.from.is_some() || args.to.is_some();
+    let mode_count = [args.ledger, args.ids.is_some(), has_range]
+        .iter()
+        .filter(|b| **b)
+        .count();
+    if mode_count == 0 {
         anyhow::bail!(
-            "specify a mode: `--ledger`, or a range with `--from <id> --to <id>`\n\
+            "specify a mode: `--ledger`, `--ids <file>`, or a range `--from <id> --to <id>`\n\
              (see `ctm prune-topics --help`)"
         );
+    }
+    if mode_count > 1 {
+        anyhow::bail!("choose exactly one of --ledger / --ids / --from..--to");
     }
 
     let config = config::load_config(true)?;
@@ -81,11 +90,84 @@ pub async fn run_prune(args: PruneArgs) -> anyhow::Result<()> {
 
     if args.ledger {
         run_ledger_mode(&bot, &mgr, &protected, args.dry_run, args.yes).await
+    } else if let Some(path) = args.ids {
+        run_ids_mode(&bot, &mgr, &protected, &path, args.dry_run, args.yes).await
     } else {
         let from = args.from.unwrap();
         let to = args.to.unwrap();
         run_range_mode(&bot, &mgr, &protected, from, to, args.dry_run, args.yes).await
     }
+}
+
+/// `--ids FILE`: delete exactly the topic ids listed in `path` (one per line). Blank lines
+/// and `#` comments are ignored. This is the precise companion to scripts/list_topics.py,
+/// which enumerates every existing topic via MTProto (the Bot API cannot list them).
+async fn run_ids_mode(
+    bot: &TelegramBot,
+    mgr: &SessionManager,
+    protected: &HashSet<i64>,
+    path: &std::path::Path,
+    dry_run: bool,
+    yes: bool,
+) -> anyhow::Result<()> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("cannot read --ids file {}: {e}", path.display()))?;
+
+    let mut ids: Vec<i64> = Vec::new();
+    let mut malformed = 0usize;
+    for line in text.lines() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        match t.parse::<i64>() {
+            Ok(id) => ids.push(id),
+            Err(_) => malformed += 1,
+        }
+    }
+    // De-dup and drop protected ids up front.
+    ids.sort_unstable();
+    ids.dedup();
+    let before = ids.len();
+    ids.retain(|id| !protected.contains(id));
+    let skipped_protected = before - ids.len();
+
+    println!(
+        "Ids mode: {} id(s) from {} ({} malformed line(s) ignored, {} protected/active skipped).",
+        ids.len(),
+        path.display(),
+        malformed,
+        skipped_protected
+    );
+    if ids.is_empty() {
+        println!("Nothing to prune.");
+        return Ok(());
+    }
+    if dry_run {
+        for id in &ids {
+            println!("  would delete topic {id}");
+        }
+        println!("(dry run — nothing deleted)");
+        return Ok(());
+    }
+    if !yes && !confirm(&format!("Delete {} topic(s)?", ids.len()))? {
+        println!("Aborted.");
+        return Ok(());
+    }
+
+    let mut deleted = 0usize;
+    for id in &ids {
+        if delete_one(bot, mgr, *id).await {
+            deleted += 1;
+        }
+        // Rate-limit Telegram API calls.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    }
+    println!(
+        "Done. Deleted/confirmed-gone {deleted} of {} topic(s).",
+        ids.len()
+    );
+    Ok(())
 }
 
 /// `--ledger`: prune recorded topics whose session is dead.

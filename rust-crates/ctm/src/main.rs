@@ -147,19 +147,27 @@ enum Commands {
 
     /// Prune stale Telegram forum topics (clear an accumulated backlog).
     ///
-    /// Two modes:
+    /// Three modes:
     ///   --ledger              delete every topic in the persistent ledger whose Claude
     ///                         session is no longer alive (the surefire path for topics
     ///                         this build created).
-    ///   --from N --to M       sweep a numeric topic-id range with deleteForumTopic — the
-    ///                         only way to reach legacy orphan topics that predate the
-    ///                         ledger and are not recorded anywhere. Non-topic ids in the
-    ///                         range are skipped harmlessly. Currently-active sessions'
-    ///                         topics and the General topic (id 1) are always skipped.
+    ///   --ids FILE            delete exactly the topic ids listed in FILE (one id per
+    ///                         line). Pair with scripts/list_topics.py, which enumerates
+    ///                         every existing topic via MTProto — the precise way to clear
+    ///                         legacy orphans the Bot API cannot list.
+    ///   --from N --to M       sweep a numeric topic-id range with deleteForumTopic — a
+    ///                         blunt fallback for legacy orphans when you have no id list.
+    ///                         Non-topic ids in the range are skipped harmlessly.
+    ///
+    /// All modes always skip the General topic (id 1) and any currently-active session's
+    /// topic.
     PruneTopics {
         /// Ledger mode: prune all recorded topics whose session is dead.
         #[arg(long)]
         ledger: bool,
+        /// Ids mode: file of topic ids to delete (one per line).
+        #[arg(long, value_name = "FILE")]
+        ids: Option<std::path::PathBuf>,
         /// Range mode: first topic id (inclusive).
         #[arg(long)]
         from: Option<i64>,
@@ -242,6 +250,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Toggle { on, off } => cmd_toggle(on, off).await,
         Commands::PruneTopics {
             ledger,
+            ids,
             from,
             to,
             dry_run,
@@ -249,6 +258,7 @@ async fn main() -> anyhow::Result<()> {
         } => {
             prune::run_prune(prune::PruneArgs {
                 ledger,
+                ids,
                 from,
                 to,
                 dry_run,
