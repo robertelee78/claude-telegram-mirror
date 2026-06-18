@@ -268,6 +268,12 @@ pub(super) async fn handle_session_start(ctx: &HandlerContext, msg: &BridgeMessa
                             if let Err(e) = sess.set_session_thread(&sid, tid) {
                                 tracing::error!(session_id = %sid, thread_id = tid, error = %e, "Failed to save thread_id to DB");
                             }
+                            // STALE-TOPICS: record in the persistent ledger so this topic can
+                            // always be found and pruned later, even if the session row is
+                            // ended / thread_id cleared / row deleted.
+                            if let Err(e) = sess.record_topic(tid, &sid) {
+                                tracing::warn!(session_id = %sid, thread_id = tid, error = %e, "STALE-TOPICS: failed to record topic in ledger");
+                            }
                         })
                         .await;
                         ctx.session_threads
@@ -411,34 +417,38 @@ pub(super) async fn handle_session_end(ctx: &HandlerContext, msg: &BridgeMessage
                 // still exist from the inactivity sweep (cleanup.rs).
                 cleanup::cancel_pending_topic_deletion(ctx, &msg.session_id).await;
 
-                // Review fix (HIGH-3): clear thread_id from BOTH the cache and the DB
-                // BEFORE deleting the Telegram topic. These two steps cannot be made
-                // atomic across an API call + DB write, so order them for a benign
-                // failure mode: if the daemon crashes between them, the worst case is a
-                // leaked empty topic (cosmetic) rather than a stale thread_id pointing
-                // at a deleted topic (which would break sends until the self-heal
-                // fires). Clearing first also closes the window where a concurrent
-                // resume reads a thread_id for a topic that is about to vanish.
+                // Always drop the in-memory routing cache — the session is ending and
+                // must not keep receiving sends on the hot path.
                 ctx.session_threads.write().await.remove(&msg.session_id);
-                let sid_clear = msg.session_id.clone();
-                ctx.db_op(move |sess| {
-                    let _ = sess.clear_thread_id(&sid_clear);
-                })
-                .await;
 
-                // Tolerate "topic already deleted": delete_forum_topic returns
-                // Ok(false)/Err for an already-gone topic. The mapping is already
-                // cleared, so the goal state (no topic, no thread_id) holds regardless.
+                // STALE-TOPICS (leak fix): clear the DB thread_id + ledger entry ONLY when
+                // the topic is confirmed gone. `Ok(true)` = deleted; `Ok(false)` = HTTP 400
+                // (topic already gone / invalid id) — both mean the topic no longer exists.
+                // `Err` = a TRANSIENT failure (429 exhausted / 5xx / network): RETAIN the
+                // thread_id so `cleanup_orphaned_threads` retries the delete. The previous
+                // code cleared thread_id BEFORE deleting and on every outcome — which is
+                // exactly how a failed/crashed delete left a permanent, unrecoverable
+                // row-less orphan topic. The persistent ledger (kept on `Err`) is the
+                // backstop so even a never-retried orphan stays findable by prune-topics.
                 match ctx.bot.delete_forum_topic(tid).await {
-                    Ok(true) => tracing::info!(
+                    Ok(_) => {
+                        let sid_clear = msg.session_id.clone();
+                        ctx.db_op(move |sess| {
+                            let _ = sess.clear_thread_id(&sid_clear);
+                            let _ = sess.forget_topic(tid);
+                        })
+                        .await;
+                        tracing::info!(
+                            session_id = %msg.session_id,
+                            thread_id = tid,
+                            "ADR-014 A4: Forum topic deleted/confirmed-gone on SessionEnd"
+                        );
+                    }
+                    Err(e) => tracing::warn!(
                         session_id = %msg.session_id,
                         thread_id = tid,
-                        "ADR-014 A4: Deleted forum topic immediately on SessionEnd"
-                    ),
-                    Ok(false) | Err(_) => tracing::info!(
-                        session_id = %msg.session_id,
-                        thread_id = tid,
-                        "ADR-014 A4: Topic already gone or delete failed (mapping already cleared)"
+                        error = %e,
+                        "STALE-TOPICS: topic delete failed (transient) — retaining thread_id + ledger for retry"
                     ),
                 }
             } else {

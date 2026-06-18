@@ -17,6 +17,7 @@ mod callback_handlers;
 mod cleanup;
 mod event_loop;
 mod files;
+mod reconcile;
 mod socket_handlers;
 mod telegram_handlers;
 

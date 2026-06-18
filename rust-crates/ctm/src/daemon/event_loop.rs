@@ -56,6 +56,20 @@ pub(super) async fn run_event_loop(
         pending_approval_clients: Arc::clone(&state.pending_approval_clients),
     };
 
+    // STALE-TOPICS: reconcile topics against live tmux/Claude state ONCE at startup,
+    // before entering the loop. After a daemon restart or machine reboot the DB can hold
+    // many "active" sessions whose panes are long gone; this drains that backlog
+    // immediately instead of waiting out the first 20-minute cleanup tick (and the old
+    // 24h pane-liveness gate). Higher cap than the per-cycle sweep so a large backlog
+    // clears in one pass.
+    let startup_pruned = reconcile::reconcile_topics_startup(&base_ctx).await;
+    if startup_pruned > 0 {
+        tracing::info!(
+            startup_pruned,
+            "STALE-TOPICS: startup reconcile pruned dead topics"
+        );
+    }
+
     loop {
         tokio::select! {
             // Socket messages from hook clients

@@ -120,6 +120,12 @@ impl SessionManager {
         let db_path = config_dir.join("sessions.db");
         let conn = Connection::open(&db_path).map_err(|e| AppError::Database(e.to_string()))?;
 
+        // STALE-TOPICS: tolerate brief cross-process lock contention. `ctm doctor --fix`
+        // opens its own connection to reconcile stale topics while the daemon may be
+        // writing; a 5s busy timeout lets such writes wait for the lock instead of
+        // failing immediately with SQLITE_BUSY.
+        let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
+
         // Secure file permissions: 0o600
         #[cfg(unix)]
         {
@@ -172,10 +178,24 @@ impl SessionManager {
                 FOREIGN KEY (session_id) REFERENCES sessions(id)
             );
 
+            -- STALE-TOPICS: persistent ledger of every Telegram forum topic this bot has
+            -- created. This is the surefire record of what exists on Telegram, decoupled
+            -- from the session-row lifecycle: a row lives here from topic creation until
+            -- the topic's deletion is CONFIRMED, so a topic can never become an
+            -- unrecoverable orphan just because its session row was ended, had its
+            -- thread_id cleared, or was deleted outright. `ctm prune-topics` and the
+            -- daemon's reconcile sweep both consult it.
+            CREATE TABLE IF NOT EXISTS topics (
+                thread_id   INTEGER PRIMARY KEY,
+                session_id  TEXT,
+                created_at  TEXT NOT NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_sessions_chat     ON sessions(chat_id);
             CREATE INDEX IF NOT EXISTS idx_sessions_status   ON sessions(status);
             CREATE INDEX IF NOT EXISTS idx_approvals_session ON pending_approvals(session_id);
             CREATE INDEX IF NOT EXISTS idx_approvals_status  ON pending_approvals(status);
+            CREATE INDEX IF NOT EXISTS idx_topics_session    ON topics(session_id);
             ",
             )
             .map_err(|e| AppError::Database(e.to_string()))?;
@@ -616,6 +636,56 @@ impl SessionManager {
                 Err(e)
             }
         }
+    }
+
+    // ---------------------------------------------------------- topic ledger
+
+    /// STALE-TOPICS: record a freshly-created forum topic in the persistent ledger.
+    /// Called right after `create_forum_topic` succeeds. Idempotent (INSERT OR REPLACE):
+    /// re-recording the same thread_id just refreshes its session_id.
+    pub fn record_topic(&self, thread_id: i64, session_id: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO topics (thread_id, session_id, created_at)
+                 VALUES (?1, ?2, ?3)",
+                params![thread_id, session_id, now_iso()],
+            )
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// STALE-TOPICS: drop a topic from the ledger once its deletion is CONFIRMED.
+    /// Callers MUST only invoke this after `delete_forum_topic` returned success — never
+    /// on a failed/uncertain delete, or the surefire record would be lost.
+    pub fn forget_topic(&self, thread_id: i64) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM topics WHERE thread_id = ?1",
+                params![thread_id],
+            )
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// STALE-TOPICS: every topic believed to still exist on Telegram, as
+    /// `(thread_id, session_id)`. `session_id` may be `None` for rows recorded without
+    /// one. Used by `ctm prune-topics --ledger` and reconciliation to find topics whose
+    /// session is gone even after the session row itself was deleted.
+    pub fn get_ledger_topics(&self) -> Result<Vec<(i64, Option<String>)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT thread_id, session_id FROM topics ORDER BY thread_id ASC")
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
+            })
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(|e| AppError::Database(e.to_string()))?);
+        }
+        Ok(out)
     }
 
     /// BUG-009: Reactivate an ended/aborted session.

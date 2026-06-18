@@ -19,6 +19,29 @@ use std::process::Command;
 /// eliminates that class of bug entirely.
 pub struct InputInjector;
 
+/// STALE-TOPICS: What `InputInjector::pane_claude_state` observed running in a pane.
+/// See that method for the precise meaning of each variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaneClaudeState {
+    /// The pane title contains "Claude Code" — Claude's TUI is in the foreground.
+    RunningClaude,
+    /// The foreground command is a known shell — Claude has exited to a prompt.
+    Shell,
+    /// Neither could be confirmed (e.g. an editor, or tmux not queryable).
+    Unknown,
+}
+
+/// STALE-TOPICS: Does `cmd` name a known interactive shell? Used to detect that a
+/// Claude pane has fallen back to a shell prompt. tmux reports `pane_current_command`
+/// as the bare program name; a login shell may be prefixed with `-` (e.g. `-zsh`).
+fn is_shell_command(cmd: &str) -> bool {
+    let c = cmd.trim().trim_start_matches('-').to_ascii_lowercase();
+    matches!(
+        c.as_str(),
+        "zsh" | "bash" | "sh" | "fish" | "dash" | "ksh" | "tcsh" | "csh" | "ash" | "login"
+    )
+}
+
 impl Default for InputInjector {
     fn default() -> Self {
         Self::new()
@@ -313,6 +336,56 @@ impl InputInjector {
         cmd.output().map(|o| o.status.success()).unwrap_or(false)
     }
 
+    /// STALE-TOPICS: Classify what is running in a (presumed-alive) tmux pane, so the
+    /// daemon can tell whether the *specific Claude session* it routed there is still
+    /// alive — the pane being alive is necessary but not sufficient (a pane outlives
+    /// its Claude session when the user exits Claude back to a shell prompt).
+    ///
+    /// A single `tmux display-message` reads the pane title and foreground command:
+    ///   - `RunningClaude` — the pane title contains "Claude Code" (the TUI sets the
+    ///     terminal title to "✳ Claude Code", with spinner-glyph variants). This is the
+    ///     confident-alive signal; such a pane is NEVER pruned, regardless of idle time.
+    ///   - `Shell` — the foreground command is a known shell (zsh/bash/…), i.e. Claude
+    ///     exited and the pane fell back to a prompt. Confident-dead → prune.
+    ///   - `Unknown` — neither (e.g. an editor left open). We do NOT prune on this alone
+    ///     (avoids deleting a live session's topic on a flaky title); the inactivity
+    ///     backstop handles it only after the long threshold.
+    ///
+    /// Returns `Unknown` if tmux cannot be queried (the caller has already established
+    /// pane liveness separately via `is_pane_alive`).
+    pub fn pane_claude_state(target: &str, socket: Option<&str>) -> PaneClaudeState {
+        // Unit separator (0x1f) cannot appear in a tmux command name and is vanishingly
+        // unlikely in a pane title — a safe field delimiter for the format string.
+        let mut cmd = Command::new("tmux");
+        if let Some(s) = socket {
+            cmd.arg("-S").arg(s);
+        }
+        cmd.arg("display-message")
+            .arg("-p")
+            .arg("-t")
+            .arg(target)
+            .arg("-F")
+            .arg("#{pane_title}\u{1f}#{pane_current_command}");
+
+        let output = match cmd.output() {
+            Ok(o) if o.status.success() => o,
+            _ => return PaneClaudeState::Unknown,
+        };
+        let raw = String::from_utf8_lossy(&output.stdout);
+        let line = raw.trim_end_matches(['\n', '\r']);
+        let (title, command) = line.split_once('\u{1f}').unwrap_or(("", line));
+
+        // Confident-alive: the Claude Code TUI owns this pane.
+        if title.contains("Claude Code") {
+            return PaneClaudeState::RunningClaude;
+        }
+        // Confident-dead: Claude exited and the pane is back at a shell prompt.
+        if is_shell_command(command) {
+            return PaneClaudeState::Shell;
+        }
+        PaneClaudeState::Unknown
+    }
+
     /// Detect current tmux session from environment
     pub fn detect_tmux_session() -> Option<TmuxInfo> {
         let tmux_env = std::env::var("TMUX").ok()?;
@@ -461,5 +534,25 @@ mod tests {
         assert!(is_valid_slash_command("/rename My Feature"));
         assert!(!is_valid_slash_command("/clear;rm -rf /"));
         assert!(!is_valid_slash_command(""));
+    }
+
+    #[test]
+    fn test_is_shell_command() {
+        // STALE-TOPICS: a pane back at a shell prompt means Claude exited → prunable.
+        for shell in [
+            "zsh", "bash", "sh", "fish", "dash", "ksh", "-zsh", "-bash", "  ZSH  ",
+        ] {
+            assert!(is_shell_command(shell), "{shell:?} should be a shell");
+        }
+        // Claude renames its arg0 to a version string; never a shell. Editors/other
+        // programs must NOT be treated as a shell (kept Unknown, never falsely pruned).
+        for not_shell in [
+            "2.1.181", "claude", "node", "vim", "nvim", "less", "python", "",
+        ] {
+            assert!(
+                !is_shell_command(not_shell),
+                "{not_shell:?} should not be a shell"
+            );
+        }
     }
 }

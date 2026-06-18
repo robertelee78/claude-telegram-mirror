@@ -592,6 +592,146 @@ fn check_pid_file(fix: bool) -> CheckResult {
     }
 }
 
+/// STALE-TOPICS: reconcile Telegram forum topics against live tmux/Claude state.
+///
+/// Mirrors the daemon's `daemon::reconcile` sweep but runs as a one-shot from the CLI,
+/// using the SAME pure policy (`crate::liveness::liveness_decision`) so the two never
+/// drift. With `--fix` it deletes (or, when `auto_delete_topics` is off, closes) the
+/// topic of every active session whose specific Claude process is provably gone — pane
+/// killed, pane reassigned to a newer session, or pane fallen back to a shell prompt —
+/// clearing an accumulated backlog immediately instead of waiting for the daemon's
+/// periodic sweeps. Sessions whose pane still shows a running Claude are never touched.
+async fn check_stale_topics(fix: bool) -> CheckResult {
+    use crate::injector::{InputInjector, PaneClaudeState};
+    use crate::liveness::{liveness_decision, Disposition};
+
+    let config = match config::load_config(false) {
+        Ok(c) => c,
+        Err(_) => return CheckResult::warn("Stale Topics", "No usable config -- skipped"),
+    };
+
+    if !config_dir().join("sessions.db").exists() {
+        return CheckResult::pass("Stale Topics", "No database yet -- nothing to reconcile");
+    }
+
+    let mgr = match crate::session::SessionManager::new(&config.config_dir, config.session_timeout)
+    {
+        Ok(m) => m,
+        Err(e) => {
+            return CheckResult::fail("Stale Topics", "Cannot open session DB")
+                .with_details(&e.to_string())
+        }
+    };
+
+    let sessions = mgr.get_active_sessions().unwrap_or_default();
+    let now = chrono::Utc::now();
+    let no_tmux_cutoff =
+        now - chrono::TimeDelta::try_hours(1).unwrap_or_else(|| chrono::TimeDelta::hours(1));
+
+    // Evaluate liveness for each topic-owning, non-child session.
+    let mut dead: Vec<crate::session::Session> = Vec::new();
+    for s in &sessions {
+        if s.parent_session_id.is_some() || s.thread_id.is_none() {
+            continue;
+        }
+        let has_tmux = s.tmux_target.is_some();
+        let (pane_alive, reassigned, state) = match s.tmux_target.as_deref() {
+            Some(target) => {
+                let socket = s.tmux_socket.as_deref();
+                if !InputInjector::is_pane_alive(target, socket) {
+                    (false, false, PaneClaudeState::Unknown)
+                } else {
+                    let reassigned = mgr
+                        .is_tmux_target_owned_by_other(target, &s.id)
+                        .unwrap_or(false);
+                    let state = if reassigned {
+                        PaneClaudeState::Unknown
+                    } else {
+                        InputInjector::pane_claude_state(target, socket)
+                    };
+                    (true, reassigned, state)
+                }
+            }
+            None => (false, false, PaneClaudeState::Unknown),
+        };
+        let no_tmux_inactive = !has_tmux
+            && chrono::DateTime::parse_from_rfc3339(&s.last_activity)
+                .map(|la| la.to_utc() < no_tmux_cutoff)
+                .unwrap_or(false);
+
+        if let Disposition::Dead(_) =
+            liveness_decision(has_tmux, pane_alive, reassigned, state, no_tmux_inactive)
+        {
+            dead.push(s.clone());
+        }
+    }
+
+    if dead.is_empty() {
+        return CheckResult::pass(
+            "Stale Topics",
+            &format!("No stale topics ({} active session(s))", sessions.len()),
+        );
+    }
+
+    if !fix {
+        return CheckResult::warn(
+            "Stale Topics",
+            &format!("{} stale topic(s) detected", dead.len()),
+        )
+        .with_details("Run `ctm doctor --fix` to delete them");
+    }
+
+    let bot = match crate::bot::TelegramBot::new(&config) {
+        Ok(b) => b,
+        Err(e) => {
+            return CheckResult::fail("Stale Topics", "Cannot build Telegram client")
+                .with_details(&e.to_string())
+        }
+    };
+
+    let mut pruned = 0usize;
+    for s in &dead {
+        let Some(tid) = s.thread_id else { continue };
+        if config.auto_delete_topics {
+            // STALE-TOPICS (leak fix): clear mapping + ledger ONLY on a confirmed-gone
+            // outcome (Ok). On a transient Err, leave the row active so a later run/sweep
+            // retries instead of orphaning the topic.
+            match bot.delete_forum_topic(tid).await {
+                Ok(_) => {
+                    let _ = mgr.clear_thread_id(&s.id);
+                    let _ = mgr.forget_topic(tid);
+                    let _ = mgr.end_session(&s.id, crate::types::SessionStatus::Ended);
+                    if let Ok(children) = mgr.get_child_sessions(&s.id) {
+                        for child in children {
+                            let _ = mgr.end_session(&child.id, crate::types::SessionStatus::Ended);
+                        }
+                    }
+                    pruned += 1;
+                }
+                Err(_) => { /* transient — retain for retry */ }
+            }
+        } else {
+            let _ = bot.close_forum_topic(tid).await;
+            let _ = mgr.end_session(&s.id, crate::types::SessionStatus::Ended);
+        }
+        // Rate-limit Telegram API calls.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    }
+
+    CheckResult::pass(
+        "Stale Topics",
+        &format!("{} dead session(s) detected", dead.len()),
+    )
+    .into_fixed(&format!(
+        "pruned {pruned} topic(s){}",
+        if config.auto_delete_topics {
+            ""
+        } else {
+            " (closed; auto-delete is off)"
+        }
+    ))
+}
+
 fn check_database() -> CheckResult {
     let db_path = config_dir().join("sessions.db");
     if !db_path.exists() {
@@ -682,61 +822,67 @@ pub async fn run_doctor(fix: bool) -> anyhow::Result<()> {
 
     // [1/9] Binary
     let c = check_binary_version();
-    print!("[1/10] ");
+    print!("[1/11] ");
     print_result(&c);
     checks.push(c);
 
     // [2/9] Config directory
     let c = check_config_dir(fix);
-    print!("[2/10] ");
+    print!("[2/11] ");
     print_result(&c);
     checks.push(c);
 
     // [3/9] Configuration (env vars / config file)
     let c = check_env_vars();
-    print!("[3/10] ");
+    print!("[3/11] ");
     print_result(&c);
     checks.push(c);
 
     // [4/9] Hooks
     let c = check_hooks(fix);
-    print!("[4/10] ");
+    print!("[4/11] ");
     print_result(&c);
     checks.push(c);
 
     // [5/9] PID file
     let c = check_pid_file(fix);
-    print!("[5/10] ");
+    print!("[5/11] ");
     print_result(&c);
     checks.push(c);
 
     // [6/9] Socket
     let c = check_socket(fix);
-    print!("[6/10] ");
+    print!("[6/11] ");
     print_result(&c);
     checks.push(c);
 
-    // [7/10] Tmux
+    // [7/11] Tmux
     let c = check_tmux();
-    print!("[7/10] ");
+    print!("[7/11] ");
     print_result(&c);
     checks.push(c);
 
-    // [8/10] Service
+    // [8/11] Service
     let c = check_service();
-    print!("[8/10] ");
+    print!("[8/11] ");
     print_result(&c);
     checks.push(c);
 
-    // [9/10] Telegram API
+    // [9/11] Telegram API
     let c = check_telegram().await;
-    print!("[9/10] ");
+    print!("[9/11] ");
     print_result(&c);
     checks.push(c);
 
-    // [10/10] Database
+    // [10/11] Database
     let c = check_database();
-    print!("[10/10] ");
+    print!("[10/11] ");
+    print_result(&c);
+    checks.push(c);
+
+    // [11/11] Stale topics (liveness-driven reconciliation)
+    let c = check_stale_topics(fix).await;
+    print!("[11/11] ");
     print_result(&c);
     checks.push(c);
 

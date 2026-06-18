@@ -14,6 +14,8 @@ pub mod formatting;
 pub mod hook;
 pub mod injector;
 pub mod installer;
+pub mod liveness;
+pub mod prune;
 pub mod service;
 pub mod session;
 pub mod setup;

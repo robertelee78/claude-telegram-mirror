@@ -7,6 +7,11 @@ use super::*;
 const MAX_SESSION_CACHE: usize = 200;
 const MAX_TOOL_CACHE: usize = 500;
 
+/// STALE-TOPICS: max topics the per-cycle reconcile sweep prunes in one pass. A large
+/// accumulated backlog drains in rate-limited batches across cycles rather than firing
+/// hundreds of Telegram delete calls at once. The startup sweep uses a higher cap.
+const RECONCILE_CYCLE_CAP: u32 = 100;
+
 /// ADR-013 E2: Default inactivity threshold for topic deletion (12 hours).
 /// Topics are CLOSED after `topic_delete_delay_minutes` (stage 1, typically 15 min),
 /// then DELETED after this inactivity threshold (stage 2).
@@ -16,6 +21,13 @@ const INACTIVITY_DELETE_THRESHOLD_MINUTES: u64 = 720;
 
 /// BUG-003: Periodic cleanup of stale sessions, orphaned threads, expired caches, old downloads.
 pub(super) async fn run_cleanup(ctx: HandlerContext) {
+    // STALE-TOPICS: liveness-driven reconciliation runs FIRST, every cycle. It prunes the
+    // topics of sessions whose tmux pane is gone / reassigned / fell back to a shell —
+    // promptly and independent of the (unreliable) SessionEnd hook. Running it before the
+    // inactivity-based sweeps means those sweeps only ever see genuinely-live or
+    // indeterminate sessions.
+    super::reconcile::reconcile_topics(&ctx, RECONCILE_CYCLE_CAP).await;
+
     // Expire old approvals
     ctx.db_op(|sess| {
         let _ = sess.expire_old_approvals();
@@ -235,7 +247,7 @@ async fn cleanup_stale_sessions(ctx: &HandlerContext) {
 /// NOTE: Stale sessions are deleted immediately (no delay) because they represent
 /// abandoned sessions where the user is no longer monitoring. Using the normal
 /// topic_delete_delay_minutes delay would accumulate dead topics.
-async fn handle_stale_session_cleanup(
+pub(super) async fn handle_stale_session_cleanup(
     ctx: &HandlerContext,
     session: &crate::session::Session,
     reason: &str,
@@ -243,36 +255,45 @@ async fn handle_stale_session_cleanup(
     let thread_id = ctx.get_thread_id(&session.id).await;
 
     if let Some(tid) = thread_id {
-        let _ = ctx
-            .bot
-            .send_message(
-                &format!("\u{1F50C} *Session ended* (terminal closed)\n\n_{reason}_"),
-                Some(&SendOptions {
-                    parse_mode: Some("Markdown".into()),
-                    ..Default::default()
-                }),
-                Some(tid),
-            )
-            .await;
+        // When auto-deleting, skip the farewell message: the topic is about to be deleted
+        // (the message would vanish with it), and suppressing it avoids a wasted Telegram
+        // call per pruned topic — material when reconcile drains a large backlog.
+        if !ctx.config.auto_delete_topics {
+            let _ = ctx
+                .bot
+                .send_message(
+                    &format!("\u{1F50C} *Session ended* (terminal closed)\n\n_{reason}_"),
+                    Some(&SendOptions {
+                        parse_mode: Some("Markdown".into()),
+                        ..Default::default()
+                    }),
+                    Some(tid),
+                )
+                .await;
+        }
 
         if ctx.config.auto_delete_topics {
-            if ctx.bot.delete_forum_topic(tid).await.unwrap_or(false) {
-                let sid = session.id.clone();
-                ctx.db_op(move |sess| {
-                    let _ = sess.clear_thread_id(&sid);
-                })
-                .await;
-            } else {
-                let _ = ctx.bot.close_forum_topic(tid).await;
-                // Clear thread_id so orphaned cleanup doesn't retry endlessly
-                // on a closed-but-not-deleted topic.
-                let sid = session.id.clone();
-                ctx.db_op(move |sess| {
-                    let _ = sess.clear_thread_id(&sid);
-                })
-                .await;
+            // STALE-TOPICS (leak fix): clear thread_id + ledger ONLY when the topic is
+            // confirmed gone (Ok(_): deleted, or HTTP-400 already-gone). On a TRANSIENT
+            // failure (Err) RETAIN the thread_id so `cleanup_orphaned_threads` retries —
+            // the old code cleared on the failure path too, stranding the topic as an
+            // unrecoverable row-less orphan.
+            match ctx.bot.delete_forum_topic(tid).await {
+                Ok(_) => {
+                    let sid = session.id.clone();
+                    ctx.db_op(move |sess| {
+                        let _ = sess.clear_thread_id(&sid);
+                        let _ = sess.forget_topic(tid);
+                    })
+                    .await;
+                }
+                Err(e) => {
+                    tracing::warn!(session_id = %session.id, thread_id = tid, error = %e, "STALE-TOPICS: stale-session topic delete failed (transient) — retaining for retry");
+                }
             }
         } else {
+            // auto-delete off: close (don't delete) and retain thread_id + ledger so the
+            // user can later prune deliberately.
             let _ = ctx.bot.close_forum_topic(tid).await;
         }
     }
@@ -293,6 +314,23 @@ async fn handle_stale_session_cleanup(
         let _ = sess.end_session(&sid, crate::types::SessionStatus::Ended);
     })
     .await;
+
+    // ADR-013 GAP-5 parity: cascade end to child sub-agent sessions sharing this topic,
+    // so a parent pruned by reconcile/stale-cleanup does not leave active orphans behind.
+    let parent_sid = session.id.clone();
+    let children = ctx
+        .db_op(move |sess| sess.get_child_sessions(&parent_sid).unwrap_or_default())
+        .await;
+    for child in &children {
+        let child_id = child.id.clone();
+        ctx.db_op(move |sess| {
+            let _ = sess.end_session(&child_id, crate::types::SessionStatus::Ended);
+        })
+        .await;
+        ctx.session_threads.write().await.remove(&child.id);
+        ctx.session_tmux.write().await.remove(&child.id);
+        ctx.custom_titles.write().await.remove(&child.id);
+    }
 }
 
 /// Clean up orphaned threads (ended sessions still with thread_ids).
@@ -308,23 +346,24 @@ async fn cleanup_orphaned_threads(ctx: &HandlerContext) {
     let mut cleaned = 0;
     for session in &orphans {
         if let Some(tid) = session.thread_id {
+            // STALE-TOPICS (leak fix): clear thread_id + ledger ONLY on a confirmed-gone
+            // outcome (Ok). On a transient Err, RETAIN so the next sweep retries — never
+            // discard the only handle to a topic that still exists.
             match ctx.bot.delete_forum_topic(tid).await {
-                Ok(true) => {
-                    tracing::debug!(thread_id = tid, session_id = %session.id, "Deleted orphaned topic")
-                }
-                Ok(false) => {
-                    tracing::warn!(thread_id = tid, session_id = %session.id, "Failed to delete orphaned topic (may already be deleted)")
+                Ok(_) => {
+                    tracing::debug!(thread_id = tid, session_id = %session.id, "Deleted/confirmed-gone orphaned topic");
+                    let sid = session.id.clone();
+                    ctx.db_op(move |sess| {
+                        let _ = sess.clear_thread_id(&sid);
+                        let _ = sess.forget_topic(tid);
+                    })
+                    .await;
+                    cleaned += 1;
                 }
                 Err(e) => {
-                    tracing::warn!(thread_id = tid, session_id = %session.id, error = %e, "Failed to delete orphaned topic")
+                    tracing::warn!(thread_id = tid, session_id = %session.id, error = %e, "STALE-TOPICS: orphaned topic delete failed (transient) — retaining for retry");
                 }
             }
-            let sid = session.id.clone();
-            ctx.db_op(move |sess| {
-                let _ = sess.clear_thread_id(&sid);
-            })
-            .await;
-            cleaned += 1;
 
             // Rate limit
             tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
@@ -403,6 +442,21 @@ async fn cleanup_inactive_topics(ctx: &HandlerContext) {
             continue;
         }
 
+        // STALE-TOPICS: never delete a topic whose Claude session is provably ALIVE on
+        // inactivity alone — a long-idle but still-running session must keep its topic.
+        // (The reconcile sweep already ran this cycle and ended any dead tmux session, so
+        // the only tmux-backed sessions left here are confirmed-live or indeterminate;
+        // this guard preserves the confirmed-live ones.)
+        if let Some(target) = session.tmux_target.as_deref() {
+            let socket = session.tmux_socket.as_deref();
+            if crate::injector::InputInjector::is_pane_alive(target, socket)
+                && crate::injector::InputInjector::pane_claude_state(target, socket)
+                    == crate::injector::PaneClaudeState::RunningClaude
+            {
+                continue;
+            }
+        }
+
         let hours_inactive = (now - last_activity).num_hours();
         tracing::info!(
             session_id = %session.id,
@@ -413,24 +467,21 @@ async fn cleanup_inactive_topics(ctx: &HandlerContext) {
 
         // Stage 2: Delete the topic
         if ctx.config.auto_delete_topics {
+            // STALE-TOPICS (leak fix): clear thread_id + ledger ONLY when confirmed gone
+            // (Ok). On a transient Err, retain the thread_id + ledger so the orphaned
+            // sweep retries rather than orphaning the topic permanently.
             match ctx.bot.delete_forum_topic(thread_id).await {
-                Ok(true) => {
+                Ok(_) => {
                     let sid = session.id.clone();
                     ctx.db_op(move |sess| {
                         let _ = sess.clear_thread_id(&sid);
+                        let _ = sess.forget_topic(thread_id);
                     })
                     .await;
                     ctx.session_threads.write().await.remove(&session.id);
                 }
-                _ => {
-                    // Fallback: close if delete fails
-                    let _ = ctx.bot.close_forum_topic(thread_id).await;
-                    let sid = session.id.clone();
-                    ctx.db_op(move |sess| {
-                        let _ = sess.clear_thread_id(&sid);
-                    })
-                    .await;
-                    ctx.session_threads.write().await.remove(&session.id);
+                Err(e) => {
+                    tracing::warn!(session_id = %session.id, thread_id, error = %e, "STALE-TOPICS: inactive topic delete failed (transient) — retaining for retry");
                 }
             }
         } else {

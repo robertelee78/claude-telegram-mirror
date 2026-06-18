@@ -11,6 +11,8 @@ mod formatting;
 mod hook;
 mod injector;
 mod installer;
+mod liveness;
+mod prune;
 mod service;
 mod session;
 mod setup;
@@ -142,6 +144,35 @@ enum Commands {
         #[arg(long)]
         off: bool,
     },
+
+    /// Prune stale Telegram forum topics (clear an accumulated backlog).
+    ///
+    /// Two modes:
+    ///   --ledger              delete every topic in the persistent ledger whose Claude
+    ///                         session is no longer alive (the surefire path for topics
+    ///                         this build created).
+    ///   --from N --to M       sweep a numeric topic-id range with deleteForumTopic — the
+    ///                         only way to reach legacy orphan topics that predate the
+    ///                         ledger and are not recorded anywhere. Non-topic ids in the
+    ///                         range are skipped harmlessly. Currently-active sessions'
+    ///                         topics and the General topic (id 1) are always skipped.
+    PruneTopics {
+        /// Ledger mode: prune all recorded topics whose session is dead.
+        #[arg(long)]
+        ledger: bool,
+        /// Range mode: first topic id (inclusive).
+        #[arg(long)]
+        from: Option<i64>,
+        /// Range mode: last topic id (inclusive).
+        #[arg(long)]
+        to: Option<i64>,
+        /// Show what would be deleted without deleting anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Skip the interactive confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 // ServiceAction is defined in service.rs for lib crate compatibility.
@@ -209,6 +240,22 @@ async fn main() -> anyhow::Result<()> {
         Commands::Doctor { fix } => doctor::run_doctor(fix).await,
         Commands::Service { action } => service::handle_service_command(&action),
         Commands::Toggle { on, off } => cmd_toggle(on, off).await,
+        Commands::PruneTopics {
+            ledger,
+            from,
+            to,
+            dry_run,
+            yes,
+        } => {
+            prune::run_prune(prune::PruneArgs {
+                ledger,
+                from,
+                to,
+                dry_run,
+                yes,
+            })
+            .await
+        }
     }
 }
 
