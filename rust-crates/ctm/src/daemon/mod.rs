@@ -342,28 +342,12 @@ impl Daemon {
             }
         }
 
-        // H9: Auto-detect tmux session at startup
-        {
-            let mut inj = self.state.injector.lock().await;
-            if let Some(info) = InputInjector::detect_tmux_session() {
-                inj.set_target(&info.target, info.socket.as_deref());
-                tracing::info!(
-                    target = %info.target,
-                    session = %info.session,
-                    "Input injector auto-detected tmux session at startup"
-                );
-            } else if let Some(session) = InputInjector::find_claude_code_session() {
-                inj.set_target(&session, None);
-                tracing::info!(
-                    target = %session,
-                    "Input injector found Claude Code tmux session at startup"
-                );
-            } else {
-                tracing::info!(
-                    "No tmux session detected at startup — will use per-session targets"
-                );
-            }
-        }
+        // ROUTING-001: The injector is stateless — it no longer carries a default
+        // tmux target. Per-session targets are resolved at injection time from the
+        // session row / cache (see `get_tmux_target`). A process-wide default was
+        // actively harmful: it biased every session toward whatever pane happened
+        // to be detected first (typically pane 0), which is exactly how a reply for
+        // one session leaked into another's pane. Nothing to seed here anymore.
 
         // ADR-013 F8: Warm session_tmux_targets cache from DB on startup.
         // After a daemon restart, the in-memory cache is empty. Populate it from
@@ -808,6 +792,33 @@ async fn check_and_update_tmux_target(ctx: &HandlerContext, msg: &BridgeMessage)
 
     let current = ctx.session_tmux.read().await.get(&msg.session_id).cloned();
     if current.as_deref() == Some(new_target) {
+        // ROUTING-001: target unchanged, but the SOCKET may still have changed
+        // (e.g. a new tmux server with the same `session:win.pane` string).
+        // Injection now reads the socket from the session row, so a stale `-S`
+        // would route to the wrong tmux server. Reconcile the socket without
+        // claiming a target "change" (return false → no reconnect notification).
+        let sid = msg.session_id.clone();
+        let stored_socket = ctx
+            .db_op(move |sess| {
+                sess.get_tmux_info(&sid)
+                    .ok()
+                    .flatten()
+                    .and_then(|(_t, s)| s)
+            })
+            .await;
+        if stored_socket.as_deref() != new_socket {
+            let sid = msg.session_id.clone();
+            let target = new_target.to_string();
+            let socket = new_socket.map(|s| s.to_string());
+            ctx.db_op(move |sess| {
+                let _ = sess.set_tmux_info(&sid, Some(&target), socket.as_deref());
+            })
+            .await;
+            tracing::info!(
+                session_id = %msg.session_id,
+                "ROUTING-001: tmux socket changed (target unchanged) — reconciled"
+            );
+        }
         return false;
     }
 
@@ -1262,57 +1273,27 @@ async fn get_tmux_target(
         return Some(target);
     }
 
-    // Tier 3: ADR-013 F6 — Live detection fallback (~100ms).
-    // Try detect_tmux_session first (uses $TMUX env), then find_claude_code_session
-    // (scans all tmux panes for a "claude" process).
-    if let Some(info) = InputInjector::detect_tmux_session() {
-        let target = info.target.clone();
-        let socket = info.socket.clone();
-        tracing::info!(
-            session_id,
-            target = %target,
-            "ADR-013 F6: Live tmux detection succeeded (detect_tmux_session)"
-        );
-        // Store in cache
-        ctx.session_tmux
-            .write()
-            .await
-            .insert(session_id.to_string(), target.clone());
-        // Store in DB
-        let sid = session_id.to_string();
-        let t = target.clone();
-        let s = socket.clone();
-        ctx.db_op(move |sess| {
-            let _ = sess.set_tmux_info(&sid, Some(&t), s.as_deref());
-        })
-        .await;
-        return Some(target);
-    }
-
-    if let Some(session_name) = InputInjector::find_claude_code_session() {
-        // find_claude_code_session returns just a session name, not a full target.
-        // Use "session_name:0.0" as the target (first window, first pane).
-        let target = format!("{session_name}:0.0");
-        tracing::info!(
-            session_id,
-            target = %target,
-            "ADR-013 F6: Live tmux detection succeeded (find_claude_code_session)"
-        );
-        // Store in cache
-        ctx.session_tmux
-            .write()
-            .await
-            .insert(session_id.to_string(), target.clone());
-        // Store in DB
-        let sid = session_id.to_string();
-        let t = target.clone();
-        ctx.db_op(move |sess| {
-            let _ = sess.set_tmux_info(&sid, Some(&t), None);
-        })
-        .await;
-        return Some(target);
-    }
-
+    // ROUTING-001 (H2 fix): NO live-detection fallback for per-session routing.
+    //
+    // The previous Tier 3 tried `detect_tmux_session()` (the *daemon's* own $TMUX
+    // pane) and then `find_claude_code_session()`, which scans for the FIRST tmux
+    // pane running a "claude" process and manufactures `"{session}:0.0"` — pane 0.
+    // It then PERSISTED that guess into this session's cache + DB. For a session
+    // whose pane mapping is genuinely missing, that silently and permanently bound
+    // its inbound Telegram input to pane 0 (some *other* session). This is precisely
+    // the reported failure: text typed in session-2's topic landing in pane 0.
+    //
+    // A guessed target is never safe: tmux pane indices are not stable identifiers
+    // and "first claude pane" has no relationship to the requesting session. Fail
+    // closed instead — the only tmux target we trust is the one the Claude hook
+    // reported for THIS session (recorded at session_start, see socket_handlers).
+    // Callers surface a clear "tmux not detected" message to the user, which is
+    // strictly better than misdelivering keystrokes to the wrong Claude session.
+    tracing::warn!(
+        session_id,
+        "ROUTING-001: no tmux target in cache or DB for this session — refusing to \
+         guess a pane (would risk misrouting to another session). Failing closed."
+    );
     None
 }
 

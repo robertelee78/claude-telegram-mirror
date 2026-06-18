@@ -465,11 +465,19 @@ impl SessionManager {
     }
 
     pub fn get_session_by_thread_id(&self, thread_id: i64) -> Result<Option<Session>> {
+        // ROUTING-001: ORDER BY last_activity DESC makes this DETERMINISTIC when
+        // more than one active session shares a topic. Sub-agent (child) sessions
+        // deliberately reuse the parent's thread_id (ADR-013), so a topic can map
+        // to several active rows. A bare `LIMIT 1` returned whichever row SQLite
+        // happened to surface, which could route a Telegram reply to a stale/idle
+        // session. Picking the most-recently-active row routes input to the
+        // session the user is actually interacting with in that topic.
         let mut stmt = self
             .conn
             .prepare(
                 "SELECT * FROM sessions
                  WHERE thread_id = ?1 AND status = 'active'
+                 ORDER BY last_activity DESC
                  LIMIT 1",
             )
             .map_err(|e| AppError::Database(e.to_string()))?;

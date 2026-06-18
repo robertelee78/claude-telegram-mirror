@@ -279,9 +279,8 @@ async fn handle_confirm_abort_callback(ctx: &HandlerContext, session_id: &str, c
                 })
                 .await
             };
-            let mut inj = ctx.injector.lock().await;
-            inj.set_target(&target, socket.as_deref());
-            let _ = inj.send_key("Ctrl-C");
+            let inj = ctx.injector.lock().await;
+            let _ = inj.send_key(&target, socket.as_deref(), "Ctrl-C");
         }
 
         // Clear attached session state for this thread
@@ -2023,16 +2022,31 @@ fn sanitize_freetext(s: &str) -> String {
 }
 
 /// Capture the live pane and parse the widget view (`None` if no widget / capture failed).
-fn capture_view(inj: &crate::injector::InputInjector) -> Option<WidgetView> {
-    let pane = inj.capture_pane()?;
-    parse_widget(&pane)
+/// ROUTING-001: the tmux pane a submit flow drives. Passed explicitly through the
+/// stateless injector helpers so the shared `InputInjector` never holds mutable
+/// per-session target state (which previously could be clobbered by a concurrent
+/// handler and misroute keystrokes to the wrong pane).
+#[derive(Clone, Copy)]
+struct Pane<'a> {
+    target: &'a str,
+    socket: Option<&'a str>,
+}
+
+fn capture_view(inj: &crate::injector::InputInjector, pane: Pane<'_>) -> Option<WidgetView> {
+    let text = inj.capture_pane(pane.target, pane.socket)?;
+    parse_widget(&text)
 }
 
 /// Send a whitelisted key; on tmux ack set `mutated` and pace for the Ink repaint.
 /// Returns false on any non-`Ok(true)` (fail closed). A Down/Up navigation key counts as
 /// a mutation (conservative): once any key is acknowledged, a later failure is "dirty".
-async fn press(inj: &crate::injector::InputInjector, key: &str, mutated: &mut bool) -> bool {
-    match inj.send_key(key) {
+async fn press(
+    inj: &crate::injector::InputInjector,
+    pane: Pane<'_>,
+    key: &str,
+    mutated: &mut bool,
+) -> bool {
+    match inj.send_key(pane.target, pane.socket, key) {
         Ok(true) => {
             *mutated = true;
             tokio::time::sleep(tokio::time::Duration::from_millis(KEY_DELAY_MS)).await;
@@ -2043,8 +2057,13 @@ async fn press(inj: &crate::injector::InputInjector, key: &str, mutated: &mut bo
 }
 
 /// Type literal free-text (no trailing Enter) into the focused `Type something` row.
-async fn type_text(inj: &crate::injector::InputInjector, text: &str, mutated: &mut bool) -> bool {
-    match inj.inject_literal(text) {
+async fn type_text(
+    inj: &crate::injector::InputInjector,
+    pane: Pane<'_>,
+    text: &str,
+    mutated: &mut bool,
+) -> bool {
+    match inj.inject_literal(pane.target, pane.socket, text) {
         Ok(true) => {
             *mutated = true;
             tokio::time::sleep(tokio::time::Duration::from_millis(KEY_DELAY_MS)).await;
@@ -2063,6 +2082,7 @@ async fn type_text(inj: &crate::injector::InputInjector, text: &str, mutated: &m
 /// fired (that was the old key-leak bug). `mutated` is set as soon as any Down is acked.
 async fn place_cursor_on(
     inj: &crate::injector::InputInjector,
+    pane: Pane<'_>,
     target: RowTarget,
     total_options: usize,
     mutated: &mut bool,
@@ -2070,7 +2090,7 @@ async fn place_cursor_on(
     let interval = tokio::time::Duration::from_millis(READY_POLL_INTERVAL_MS);
     let max_steps = total_options + NAV_SLACK_STEPS;
     for step in 0..=max_steps {
-        match capture_view(inj) {
+        match capture_view(inj, pane) {
             Some(view) => {
                 if view.cursor_row().is_some_and(|k| row_is(k, target)) {
                     return true;
@@ -2081,7 +2101,7 @@ async fn place_cursor_on(
         if step == max_steps {
             break;
         }
-        if !press(inj, "Down", mutated).await {
+        if !press(inj, pane, "Down", mutated).await {
             return false;
         }
         tokio::time::sleep(interval).await;
@@ -2090,10 +2110,10 @@ async fn place_cursor_on(
 }
 
 /// Wait until a question screen with at least one focusable row is rendered.
-async fn wait_for_widget(inj: &crate::injector::InputInjector) -> bool {
+async fn wait_for_widget(inj: &crate::injector::InputInjector, pane: Pane<'_>) -> bool {
     let interval = tokio::time::Duration::from_millis(READY_POLL_INTERVAL_MS);
     for _ in 0..WAIT_STATE_MAX_POLLS {
-        if capture_view(inj).is_some_and(|v| !v.rows.is_empty()) {
+        if capture_view(inj, pane).is_some_and(|v| !v.rows.is_empty()) {
             return true;
         }
         tokio::time::sleep(interval).await;
@@ -2105,10 +2125,14 @@ async fn wait_for_widget(inj: &crate::injector::InputInjector) -> bool {
 /// before the advancing keystroke) — i.e. the widget advanced to the next question. The
 /// signature excludes the volatile status line/clock, so only a real screen change trips
 /// it. Fail closed on timeout.
-async fn wait_for_transition(inj: &crate::injector::InputInjector, pre_sig: Option<&str>) -> bool {
+async fn wait_for_transition(
+    inj: &crate::injector::InputInjector,
+    pane: Pane<'_>,
+    pre_sig: Option<&str>,
+) -> bool {
     let interval = tokio::time::Duration::from_millis(READY_POLL_INTERVAL_MS);
     for _ in 0..WAIT_STATE_MAX_POLLS {
-        if let Some(v) = capture_view(inj) {
+        if let Some(v) = capture_view(inj, pane) {
             if !v.rows.is_empty() && Some(v.signature().as_str()) != pre_sig {
                 return true;
             }
@@ -2121,10 +2145,10 @@ async fn wait_for_transition(inj: &crate::injector::InputInjector, pre_sig: Opti
 /// Wait until the end-of-widget confirm screen is showing AND the cursor is on the
 /// `Submit answers` row (its default). Returns true only when both hold, so the caller's
 /// subsequent Enter can never be a blind press / land on `Cancel`. Fail closed on timeout.
-async fn wait_for_confirm(inj: &crate::injector::InputInjector) -> bool {
+async fn wait_for_confirm(inj: &crate::injector::InputInjector, pane: Pane<'_>) -> bool {
     let interval = tokio::time::Duration::from_millis(READY_POLL_INTERVAL_MS);
     for _ in 0..WAIT_STATE_MAX_POLLS {
-        if let Some(v) = capture_view(inj) {
+        if let Some(v) = capture_view(inj, pane) {
             if v.is_confirm && v.cursor_row() == Some(RowKind::ConfirmSubmit) {
                 return true;
             }
@@ -2153,15 +2177,18 @@ async fn inject_answers(
     socket: Option<&str>,
     answers: &[InjItem],
 ) -> InjectOutcome {
-    let mut inj = ctx.injector.lock().await;
-    inj.set_target(target, socket);
+    // ROUTING-001: hold the injector lock for the whole submit so this flow has
+    // exclusive use of tmux, and drive the stateless injector with an explicit
+    // `Pane` — no shared mutable target that a concurrent handler could clobber.
+    let inj = ctx.injector.lock().await;
+    let pane = Pane { target, socket };
 
     let n = answers.len();
     let any_multi = answers.iter().any(|it| it.multi_select);
     let mut mutated = false;
 
     // Ensure the widget is on screen before the first keystroke.
-    if !wait_for_widget(&inj).await {
+    if !wait_for_widget(&inj, pane).await {
         return fail_outcome(mutated);
     }
 
@@ -2174,34 +2201,35 @@ async fn inject_answers(
         // single-select; the Next/Submit advance row for multi-select).
         match &item.answer {
             CollectedAnswer::Single(idx) => {
-                if !place_cursor_on(&inj, RowTarget::Option(*idx), max, &mut mutated).await {
+                if !place_cursor_on(&inj, pane, RowTarget::Option(*idx), max, &mut mutated).await {
                     return fail_outcome(mutated);
                 }
             }
             CollectedAnswer::Multi(idxs) => {
                 for &idx in idxs {
-                    if !place_cursor_on(&inj, RowTarget::Option(idx), max, &mut mutated).await {
+                    if !place_cursor_on(&inj, pane, RowTarget::Option(idx), max, &mut mutated).await
+                    {
                         return fail_outcome(mutated);
                     }
-                    if !press(&inj, "Enter", &mut mutated).await {
+                    if !press(&inj, pane, "Enter", &mut mutated).await {
                         return fail_outcome(mutated); // toggle
                     }
                 }
-                if !place_cursor_on(&inj, RowTarget::Advance, max, &mut mutated).await {
+                if !place_cursor_on(&inj, pane, RowTarget::Advance, max, &mut mutated).await {
                     return fail_outcome(mutated);
                 }
             }
             CollectedAnswer::FreeText(text) => {
-                if !place_cursor_on(&inj, RowTarget::TypeSomething, max, &mut mutated).await {
+                if !place_cursor_on(&inj, pane, RowTarget::TypeSomething, max, &mut mutated).await {
                     return fail_outcome(mutated);
                 }
-                if !type_text(&inj, &sanitize_freetext(text), &mut mutated).await {
+                if !type_text(&inj, pane, &sanitize_freetext(text), &mut mutated).await {
                     return fail_outcome(mutated);
                 }
                 // Multi-select free-text does NOT auto-advance — navigate to the advance
                 // row. Single-select free-text commits+advances on the common Enter below.
                 if item.multi_select
-                    && !place_cursor_on(&inj, RowTarget::Advance, max, &mut mutated).await
+                    && !place_cursor_on(&inj, pane, RowTarget::Advance, max, &mut mutated).await
                 {
                     return fail_outcome(mutated);
                 }
@@ -2210,8 +2238,8 @@ async fn inject_answers(
 
         // The advancing Enter (selects+advances / commits+advances / activates Next/Submit).
         // Snapshot the signature first so we can verify the advance actually happened.
-        let pre_sig = capture_view(&inj).map(|v| v.signature());
-        if !press(&inj, "Enter", &mut mutated).await {
+        let pre_sig = capture_view(&inj, pane).map(|v| v.signature());
+        if !press(&inj, pane, "Enter", &mut mutated).await {
             return fail_outcome(mutated);
         }
 
@@ -2219,14 +2247,14 @@ async fn inject_answers(
             // End of widget. A confirm screen appears for any N≥2 (incl. all-single-select)
             // and for N=1 multi-select. N=1 single-select submits directly (no confirm).
             if n >= 2 || any_multi {
-                if !wait_for_confirm(&inj).await {
+                if !wait_for_confirm(&inj, pane).await {
                     return InjectOutcome::FailedDirty; // we pressed Enter → dirty
                 }
-                if !press(&inj, "Enter", &mut mutated).await {
+                if !press(&inj, pane, "Enter", &mut mutated).await {
                     return InjectOutcome::FailedDirty;
                 }
             }
-        } else if !wait_for_transition(&inj, pre_sig.as_deref()).await {
+        } else if !wait_for_transition(&inj, pane, pre_sig.as_deref()).await {
             return InjectOutcome::FailedDirty;
         }
     }
