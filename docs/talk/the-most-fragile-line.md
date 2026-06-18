@@ -97,7 +97,7 @@ Robert E. Lee
 - The other room: my wife needs a hand with the baby. **Now.**
 - Leave the terminal → an agent runs wild on my code. Stay → I leave her holding the baby.
 
-> All I needed was to *see* what it was doing — and say "yes," or "no, not like that" — **from my phone. As if I were still sitting there.**
+> I needed to be able to *see everything it was doing* — every command, every edit, not just the questions — and catch it the instant it wandered off, to **interrupt midstream and redirect.** From my phone. As if I were still sitting there.
 
 <span class="small">In 10 minutes I'll do exactly that, live. First: the line of code that made it possible was, for months, the most fragile in the project.</span>
 
@@ -107,7 +107,7 @@ Robert E. Lee
 
 # `ctm` — a Rust bridge: Claude Code ⇄ Telegram
 
-![w:1020](assets/architecture.svg)
+![w:820](assets/architecture.svg)
 
 **The whole point isn't two *copies* of the conversation. It's *one* conversation I can touch from either side.**
 
@@ -123,12 +123,12 @@ Desk → walk away → answer on my phone → sit back down and keep typing. Sam
 # Out is easy. *In* is brutal.
 
 - **Out:** the agent fires events — a *hook* (a script Claude runs at lifecycle moments). I forward them. Fire and forget.
-- **In:** Claude Code has no "inject the answer" API. It reads a **terminal**. That's the only door.
-- A yes/no approval? Fine — the hook can return that. But sometimes it asks a **multiple-choice question**, drawn as an interactive terminal widget — arrow keys and all.
+- **In:** no input API. Claude Code reads a **terminal** — the only door. So *anything* I'd type at the desk — a prompt, a command, `stop` — I inject from my phone (`tmux send-keys`).
+- Free text is the easy case. A yes/no approval the hook hands straight back. The **brutal** one: a **multiple-choice question** — an interactive widget, arrow keys and all.
 
 > You can't pipe text at that. You have to *drive* it.
 
-![w:640](assets/tui-widget.svg)
+![w:600](assets/tui-widget.svg)
 
 ---
 
@@ -200,15 +200,19 @@ So it **stops drawing the question in the terminal at all.**
 # So I put the keystrokes back — and fixed the line that was *actually* broken
 
 - Injection was never a hack here. It's the **one mechanism that keeps the question on both screens.** It was load-bearing the whole time.
-- The broken line wasn't the *layer*. It was the **guess.**
+- The broken line wasn't the *layer*. It was the **guess** — *every* keystroke fired blind, hoping the screen had caught up.
 
 ```diff
-- sleep(Duration::from_millis(2000));   // 2s is enough  (hope)
-+ // read the terminal; press Enter the instant the
-+ // review screen is actually there — capture_pane polling
+- send_key(..); sleep(300ms)     // navigate blind, hope the TUI kept up
+- sleep(2000ms); press(Enter)    // hope the review screen exists yet
++ loop {                              // read → verify → act, every step
++   let view = parse_widget(capture_pane());  // what's ACTUALLY on screen?
++   if view.cursor_on(target) { break }       // verified before any key
++   send_key("Down")
++ }   // Enter only on a verified confirm screen — else fail closed
 ```
 
-**A couple hundred milliseconds** instead of a blind 2-second wait — and it **no longer blind-races** the review screen. The win wasn't a faster constant. It stopped *guessing* and started *checking*.
+It stopped *guessing* and started **checking — every step.** And when a keystroke can't be verified, it **fails closed** instead of corrupting a half-driven widget.
 
 ---
 

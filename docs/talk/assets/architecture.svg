@@ -1,58 +1,80 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 360" font-family="ui-monospace, 'JetBrains Mono', 'SF Mono', Menlo, monospace">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1320 470" font-family="ui-monospace, 'JetBrains Mono', 'SF Mono', Menlo, monospace">
   <defs>
-    <marker id="arrowCyan" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-      <path d="M0,0 L10,5 L0,10 z" fill="#7fb2ff"/>
-    </marker>
-    <marker id="arrowCoral" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-      <path d="M0,0 L10,5 L0,10 z" fill="#ff6b6b"/>
-    </marker>
-    <filter id="glow" x="-40%" y="-40%" width="180%" height="180%">
-      <feGaussianBlur stdDeviation="2.2" result="b"/>
-      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
-    </filter>
+    <marker id="aCyan" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#7fb2ff"/></marker>
+    <marker id="aCoral" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#ff6b6b"/></marker>
+    <marker id="aAmber" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#f1c453"/></marker>
+    <filter id="g" x="-40%" y="-40%" width="180%" height="180%"><feGaussianBlur stdDeviation="1.8"/><feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge></filter>
     <style>
-      .node  { fill:#161b22; stroke:#2f6df6; stroke-width:1.5; }
-      .label { fill:#e6edf3; font-size:21px; }
-      .out   { stroke:#7fb2ff; stroke-width:2.4; fill:none; filter:url(#glow); }
-      .in    { stroke:#ff6b6b; stroke-width:2.4; fill:none; filter:url(#glow); }
-      .tagc  { fill:#7fb2ff; font-size:18px; }
-      .tagr  { fill:#ff6b6b; font-size:18px; }
-      .plate { fill:#0d1117; }
+      .node{fill:#161b22;stroke:#2f6df6;stroke-width:1.5}
+      .chip{fill:#1b2230;stroke:#2a3442;stroke-width:1}
+      .ttl{fill:#e6edf3;font-size:21px}
+      .sub{fill:#8b97a7;font-size:14px}
+      .it{fill:#cdd6e3;font-size:15px}
+      .out{stroke:#7fb2ff;stroke-width:2.4;fill:none;filter:url(#g)}
+      .in{stroke:#ff6b6b;stroke-width:2.4;fill:none;filter:url(#g)}
+      .appr{stroke:#f1c453;stroke-width:1.7;fill:none;stroke-dasharray:6 5}
+      .lc{fill:#7fb2ff;font-size:14px}
+      .lr{fill:#ff6b6b;font-size:14px}
     </style>
   </defs>
 
-  <!-- background panel -->
-  <rect x="2" y="2" width="1196" height="356" rx="14" fill="#0d1117" stroke="#1f2733" stroke-width="1.5"/>
+  <rect x="2" y="2" width="1316" height="466" rx="14" fill="#0d1117" stroke="#1f2733" stroke-width="1.5"/>
+  <text class="lc" x="36" y="28" font-size="15">out · mirror everything (fire-and-forget)</text>
+  <text class="lr" x="36" y="452" font-size="15">in · the daemon drives the live pane</text>
 
-  <!-- top row: OUT path (cyan) -->
+  <!-- Claude Code CLI -->
   <g text-anchor="middle">
-    <rect class="node" x="28"  y="74" width="220" height="56" rx="9"/>
-    <text class="label" x="138" y="108">Claude Code hook</text>
-
-    <rect class="node" x="300" y="74" width="132" height="56" rx="9"/>
-    <text class="label" x="366" y="108">ctm hook</text>
-
-    <rect class="node" x="498" y="74" width="156" height="56" rx="9"/>
-    <text class="label" x="576" y="108">Unix socket</text>
-
-    <rect class="node" x="720" y="74" width="120" height="56" rx="9"/>
-    <text class="label" x="780" y="108">daemon</text>
-
-    <rect class="node" x="906" y="74" width="148" height="56" rx="9"/>
-    <text class="label" x="980" y="108">Telegram</text>
+    <rect class="node" x="36" y="158" width="188" height="150" rx="10"/>
+    <text class="ttl" x="130" y="222">Claude Code</text>
+    <text class="ttl" x="130" y="250">CLI</text>
+    <text class="sub" x="130" y="280">live tmux pane</text>
   </g>
 
-  <!-- forward arrows (out is easy) -->
-  <line class="out" x1="250" y1="102" x2="298" y2="102" marker-end="url(#arrowCyan)"/>
-  <line class="out" x1="432" y1="102" x2="496" y2="102" marker-end="url(#arrowCyan)"/>
-  <line class="out" x1="654" y1="102" x2="718" y2="102" marker-end="url(#arrowCyan)"/>
-  <line class="out" x1="840" y1="102" x2="904" y2="102" marker-end="url(#arrowCyan)"/>
-  <text class="tagc" x="137" y="52" text-anchor="middle">out · fire-and-forget</text>
+  <!-- ctm hook -->
+  <g text-anchor="middle">
+    <rect class="node" x="298" y="92" width="164" height="72" rx="9"/>
+    <text class="ttl" x="380" y="124" font-size="20">ctm hook</text>
+    <text class="sub" x="380" y="148">(same binary)</text>
+  </g>
 
-  <!-- return path (in is brutal): Telegram -> down -> left -> up into Claude Code hook -->
-  <path class="in" d="M 980 130 L 980 268 L 137 268 L 137 130" marker-end="url(#arrowCoral)"/>
-  <!-- label plate on the horizontal return segment -->
-  <rect class="plate" x="470" y="252" width="200" height="32" rx="6"/>
-  <text class="tagr" x="570" y="274" text-anchor="middle">tmux send-keys</text>
-  <text class="tagr" x="980" y="316" text-anchor="middle">in · you have to drive it</text>
+  <!-- ctm daemon -->
+  <rect class="node" x="522" y="96" width="456" height="292" rx="12" fill="#11161e"/>
+  <text x="546" y="132" font-size="24" fill="#7fb2ff">ctm daemon</text>
+  <text class="sub" x="546" y="156">tokio event loop · tokio::select!</text>
+  <rect class="chip" x="546" y="170" width="408" height="38" rx="7"/>
+  <text class="it" x="562" y="195">Unix SocketServer · bridge.sock</text>
+  <rect class="chip" x="546" y="216" width="408" height="38" rx="7"/>
+  <text class="it" x="562" y="241">SessionManager · SQLite + tmux cache</text>
+  <rect class="chip" x="546" y="262" width="408" height="38" rx="7"/>
+  <text class="it" x="562" y="287">InputInjector · tmux send-keys</text>
+  <rect class="chip" x="546" y="308" width="408" height="38" rx="7"/>
+  <text class="it" x="562" y="333">pending approvals / questions</text>
+
+  <!-- Telegram -->
+  <g text-anchor="middle">
+    <rect class="node" x="1082" y="150" width="204" height="180" rx="10"/>
+    <text class="ttl" x="1184" y="186">Telegram</text>
+    <rect class="chip" x="1102" y="204" width="164" height="40" rx="7"/>
+    <text class="it" x="1184" y="229">Bot API</text>
+    <rect class="chip" x="1102" y="256" width="164" height="40" rx="7"/>
+    <text class="it" x="1184" y="281">forum topics</text>
+  </g>
+
+  <!-- OUT (cyan) -->
+  <path class="out" d="M 224 200 L 298 130" marker-end="url(#aCyan)"/>
+  <text class="lc" x="230" y="186">fires hook</text>
+  <path class="out" d="M 462 128 L 520 152" marker-end="url(#aCyan)"/>
+  <text class="lc" x="492" y="84" text-anchor="middle">NDJSON · socket</text>
+  <path class="out" d="M 978 182 L 1082 210" marker-end="url(#aCyan)"/>
+  <text class="lc" x="1000" y="166">sendMessage</text>
+
+  <!-- IN (coral) -->
+  <path class="in" d="M 1082 292 L 978 312" marker-end="url(#aCoral)"/>
+  <text class="lr" x="1076" y="350" text-anchor="end">getUpdates · long poll</text>
+  <path class="in" d="M 522 300 L 224 278" marker-end="url(#aCoral)"/>
+  <text class="lr" x="372" y="322" text-anchor="middle">tmux send-keys -t &lt;pane&gt;</text>
+
+  <!-- approval (dashed amber) -->
+  <path class="appr" d="M 408 166 L 544 190" marker-start="url(#aAmber)" marker-end="url(#aAmber)"/>
+  <text x="402" y="206" font-size="13" fill="#f1c453">PreToolUse · blocks for approval</text>
 </svg>
