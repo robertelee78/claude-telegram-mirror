@@ -177,19 +177,80 @@ pub(super) fn start_launchd_service() -> ServiceResult {
         .stderr(std::process::Stdio::null())
         .status();
 
-    match Command::new("launchctl")
+    let kicked = Command::new("launchctl")
         .args(["start", &format!("com.claude.{SERVICE_NAME}")])
-        .status()
-    {
-        Ok(s) if s.success() => ServiceResult {
-            success: true,
-            message: "Service started.".into(),
-        },
-        _ => ServiceResult {
+        .status();
+
+    if !matches!(kicked, Ok(s) if s.success()) {
+        return ServiceResult {
             success: false,
             message: "Failed to start launchd service.".into(),
-        },
+        };
     }
+
+    // `launchctl start` only confirms launchd *accepted* the request — not that
+    // the daemon survived exec. On macOS a non-notarized / ad-hoc-signed binary
+    // can be SIGKILLed by the kernel for a code-signing or launch-constraint
+    // violation milliseconds after launch (EXC_CRASH / "Code Signature
+    // Invalid"). Without this check we would report "Service started" for a
+    // daemon that was already dead. Poll for a live PID, then confirm it stays
+    // up past the throttle window so we also catch immediate crash-restart loops.
+    use std::{thread::sleep, time::Duration};
+    let mut pid = None;
+    for _ in 0..8 {
+        sleep(Duration::from_millis(250));
+        pid = launchd_pid();
+        if pid.is_some() {
+            break;
+        }
+    }
+
+    match pid {
+        None => ServiceResult {
+            success: false,
+            message: start_failure_hint(
+                "Service was started but is not running — it exited immediately.",
+            ),
+        },
+        Some(_) => {
+            // Confirm it did not die-and-respawn (crash loop) within the window.
+            sleep(Duration::from_millis(600));
+            if launchd_pid().is_some() {
+                ServiceResult {
+                    success: true,
+                    message: "Service started.".into(),
+                }
+            } else {
+                ServiceResult {
+                    success: false,
+                    message: start_failure_hint(
+                        "Service started but exited immediately (possible crash loop).",
+                    ),
+                }
+            }
+        }
+    }
+}
+
+/// Build an actionable error message for a service that launched but did not
+/// stay up. The overwhelmingly common cause on macOS is the kernel killing a
+/// non-notarized binary for a code-signing / launch-constraint violation.
+fn start_failure_hint(headline: &str) -> String {
+    let binary = ctm_binary_path();
+    format!(
+        "{headline}\n\
+         \n\
+         On macOS this is almost always a code-signing / Gatekeeper rejection of\n\
+         the native binary (it is ad-hoc signed, not notarized). Check:\n\
+         \n  • Crash reports:  ls ~/Library/Logs/DiagnosticReports/ctm-*.ips\
+         \n  • Signature:      codesign -dvvv {bin}\
+         \n  • Quarantine:     xattr -dr com.apple.quarantine {bin}\
+         \n  • Then re-run:    ctm doctor\n\
+         \n\
+         If this persists, reinstall the package or build from source\n\
+         (cd rust-crates && cargo build --release).",
+        bin = binary.display(),
+    )
 }
 
 pub(super) fn stop_launchd_service() -> ServiceResult {
@@ -208,18 +269,45 @@ pub(super) fn stop_launchd_service() -> ServiceResult {
     }
 }
 
+/// Return the live PID of the launchd job, or `None` if it is loaded but not
+/// actually running.
+///
+/// `launchctl list` prints one tab-separated line per loaded job in the form
+/// `PID<TAB>Status<TAB>Label`. A job that is *loaded but dead* (e.g. it exited
+/// cleanly and `KeepAlive` did not restart it, or the kernel killed it for a
+/// code-signing violation) still appears in the list, but with `-` in the PID
+/// column. The previous implementation only checked that the label *appeared*
+/// anywhere in the output, so it reported "running" for any loaded job — making
+/// `ctm status`/`doctor` lie and turning `ctm start` into a no-op ("already
+/// running") that could never recover a dead service. We must parse the PID
+/// column and only treat a numeric PID as running.
+pub(super) fn launchd_pid() -> Option<i32> {
+    let label = format!("com.claude.{SERVICE_NAME}");
+    let output = Command::new("launchctl").arg("list").output().ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_launchd_pid(&stdout, &label)
+}
+
+/// Pure parser for `launchctl list` output. Extracted so the PID-column logic
+/// (the fix for the false "running" report) is unit-testable without shelling
+/// out. Returns the live PID for an exact `label` match, or `None` when the job
+/// is absent or loaded-but-dead (PID column `-`).
+fn parse_launchd_pid(stdout: &str, label: &str) -> Option<i32> {
+    for line in stdout.lines() {
+        let cols: Vec<&str> = line.split('\t').collect();
+        if cols.len() >= 3 && cols[2].trim() == label {
+            // PID column is `-` when loaded-but-dead; a real PID is a positive int.
+            return cols[0].trim().parse::<i32>().ok().filter(|&p| p > 0);
+        }
+    }
+    None
+}
+
 pub(super) fn get_launchd_status() -> ServiceStatus {
     let plist = launchd_plist();
     let enabled = plist.exists();
 
-    let running = Command::new("sh")
-        .args(["-c", "launchctl list 2>/dev/null || true"])
-        .output()
-        .map(|o| {
-            let out = String::from_utf8_lossy(&o.stdout);
-            out.contains(&format!("com.claude.{SERVICE_NAME}"))
-        })
-        .unwrap_or(false);
+    let running = launchd_pid().is_some();
 
     let info = if !enabled {
         "Service not installed".into()
@@ -237,6 +325,43 @@ pub(super) fn get_launchd_status() -> ServiceStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const LABEL: &str = "com.claude.claude-telegram-mirror";
+
+    #[test]
+    fn parse_launchd_pid_running_returns_pid() {
+        // A live job: numeric PID in the first column.
+        let out = "PID\tStatus\tLabel\n80739\t0\tcom.claude.claude-telegram-mirror\n";
+        assert_eq!(parse_launchd_pid(out, LABEL), Some(80739));
+    }
+
+    #[test]
+    fn parse_launchd_pid_loaded_but_dead_returns_none() {
+        // The exact bug: job is loaded (appears in list) but not running (`-`).
+        // The old `contains(label)` check reported this as running.
+        let out = "PID\tStatus\tLabel\n-\t0\tcom.claude.claude-telegram-mirror\n";
+        assert_eq!(parse_launchd_pid(out, LABEL), None);
+    }
+
+    #[test]
+    fn parse_launchd_pid_absent_returns_none() {
+        let out = "PID\tStatus\tLabel\n123\t0\tcom.apple.something\n";
+        assert_eq!(parse_launchd_pid(out, LABEL), None);
+    }
+
+    #[test]
+    fn parse_launchd_pid_requires_exact_column_match() {
+        // A different label that merely *contains* ours as a substring must not
+        // match — exact column comparison guards against the substring bug.
+        let out = "456\t0\tcom.claude.claude-telegram-mirror-helper\n";
+        assert_eq!(parse_launchd_pid(out, LABEL), None);
+    }
+
+    #[test]
+    fn parse_launchd_pid_rejects_non_positive() {
+        let out = "0\t0\tcom.claude.claude-telegram-mirror\n";
+        assert_eq!(parse_launchd_pid(out, LABEL), None);
+    }
 
     #[test]
     fn test_generate_launchd_plist_contains_key_fields() {

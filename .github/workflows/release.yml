@@ -59,6 +59,50 @@ jobs:
           strip target/release/ctm
           ls -lh target/release/ctm
 
+      # Sign + notarize AFTER strip (strip rewrites the Mach-O and invalidates any
+      # signature) and BEFORE the checksum/pack step (so checksums.json covers the
+      # signed bytes). Without a trusted Developer ID signature, modern macOS
+      # SIGKILLs the launchd-spawned daemon for a code-signing / launch-constraint
+      # violation. Gated on secrets so forks/PRs still build (ad-hoc fallback).
+      - name: Sign and notarize (Developer ID)
+        working-directory: rust-crates
+        env:
+          APPLE_CERT_P12_BASE64: ${{ secrets.APPLE_CERT_P12_BASE64 }}
+          APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_NOTARY_PASSWORD: ${{ secrets.APPLE_NOTARY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          BIN=target/release/ctm
+          if [ -z "${APPLE_SIGNING_IDENTITY:-}" ] || [ -z "${APPLE_CERT_P12_BASE64:-}" ]; then
+            echo "::warning::Apple signing secrets not set — shipping an ad-hoc-signed binary that macOS Gatekeeper may reject. Configure APPLE_* secrets to notarize."
+            codesign --force --sign - --timestamp=none "$BIN" || true
+            codesign -dvvv "$BIN" 2>&1 || true
+            exit 0
+          fi
+          KEYCHAIN="$RUNNER_TEMP/ctm-signing.keychain-db"
+          KEYCHAIN_PW="$(openssl rand -hex 20)"
+          security create-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          echo "$APPLE_CERT_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$APPLE_CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PW" "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN"
+          # Hardened runtime + secure timestamp are required for notarization.
+          codesign --force --options runtime --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$BIN"
+          codesign --verify --strict --verbose=2 "$BIN"
+          # A bare CLI Mach-O is notarized via a zip (it cannot be stapled; Gatekeeper
+          # validates the registered cdhash online).
+          ditto -c -k --keepParent "$BIN" "$RUNNER_TEMP/ctm.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/ctm.zip" \
+            --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_NOTARY_PASSWORD" --wait
+          codesign -dvvv "$BIN" 2>&1 | grep -E 'Authority|TeamIdentifier' || true
+          rm -f "$RUNNER_TEMP/cert.p12"
+
       - name: Package binary
         run: |
           cp rust-crates/target/release/ctm npm-packages/ctm-darwin-arm64/bin/ctm
@@ -97,6 +141,45 @@ jobs:
           cargo build --release --target x86_64-apple-darwin --bin ctm
           strip target/x86_64-apple-darwin/release/ctm
           ls -lh target/x86_64-apple-darwin/release/ctm
+
+      # See darwin-arm64 job for rationale. Note: `strip` on the x64 cross-built
+      # binary removes its signature entirely, so signing here is mandatory for the
+      # Intel package to be runnable at all.
+      - name: Sign and notarize (Developer ID)
+        working-directory: rust-crates
+        env:
+          APPLE_CERT_P12_BASE64: ${{ secrets.APPLE_CERT_P12_BASE64 }}
+          APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_NOTARY_PASSWORD: ${{ secrets.APPLE_NOTARY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          BIN=target/x86_64-apple-darwin/release/ctm
+          if [ -z "${APPLE_SIGNING_IDENTITY:-}" ] || [ -z "${APPLE_CERT_P12_BASE64:-}" ]; then
+            echo "::warning::Apple signing secrets not set — shipping an ad-hoc-signed binary that macOS Gatekeeper may reject. Configure APPLE_* secrets to notarize."
+            codesign --force --sign - --timestamp=none "$BIN" || true
+            codesign -dvvv "$BIN" 2>&1 || true
+            exit 0
+          fi
+          KEYCHAIN="$RUNNER_TEMP/ctm-signing.keychain-db"
+          KEYCHAIN_PW="$(openssl rand -hex 20)"
+          security create-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          echo "$APPLE_CERT_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$APPLE_CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PW" "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN"
+          codesign --force --options runtime --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$BIN"
+          codesign --verify --strict --verbose=2 "$BIN"
+          ditto -c -k --keepParent "$BIN" "$RUNNER_TEMP/ctm.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/ctm.zip" \
+            --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_NOTARY_PASSWORD" --wait
+          codesign -dvvv "$BIN" 2>&1 | grep -E 'Authority|TeamIdentifier' || true
+          rm -f "$RUNNER_TEMP/cert.p12"
 
       - name: Package binary
         run: |
