@@ -7,10 +7,17 @@ use std::process::Command;
 /// Security: ALL tmux commands use Command::arg() — NO shell interpolation.
 /// This prevents command injection via user-controlled inputs like session names,
 /// socket paths, or message text.
-pub struct InputInjector {
-    tmux_target: Option<String>,
-    tmux_socket: Option<String>,
-}
+///
+/// ROUTING-001 (stateless routing): this type holds **no** tmux target/socket
+/// state. Every action method takes the `(target, socket)` pair explicitly, so a
+/// single shared `InputInjector` (behind a `Mutex` whose only job is to serialize
+/// tmux command execution) can never bleed one session's pane onto another's
+/// injection. The previous design stored a mutable `tmux_target` that callers set
+/// in one critical section and read in another — a TOCTOU race that misrouted a
+/// reply meant for session B into session A's pane when handlers ran concurrently
+/// (each Telegram update is `tokio::spawn`-ed). Passing the target per call
+/// eliminates that class of bug entirely.
+pub struct InputInjector;
 
 impl Default for InputInjector {
     fn default() -> Self {
@@ -20,17 +27,15 @@ impl Default for InputInjector {
 
 impl InputInjector {
     pub fn new() -> Self {
-        Self {
-            tmux_target: None,
-            tmux_socket: None,
-        }
+        Self
     }
 
-    /// Set the tmux target and optional socket path.
-    /// Validates socket path to prevent directory traversal.
-    pub fn set_target(&mut self, target: &str, socket: Option<&str>) {
-        self.tmux_target = Some(target.to_string());
-        self.tmux_socket = socket.and_then(|s| {
+    /// Validate + sanitize a tmux socket path, rejecting traversal / non-absolute /
+    /// oversized paths. A rejected socket degrades to `None` (default tmux server),
+    /// matching the historical `set_target` behavior. Centralized here so every
+    /// stateless entry point applies the same guard.
+    fn sanitized_socket(socket: Option<&str>) -> Option<String> {
+        socket.and_then(|s| {
             if s.contains("..") {
                 tracing::warn!(path = %s, "Rejecting tmux socket path with '..' traversal");
                 return None;
@@ -44,26 +49,22 @@ impl InputInjector {
                 return None;
             }
             Some(s.to_string())
-        });
+        })
     }
 
-    /// Get the socket args for tmux commands
-    fn socket_args(&self) -> Vec<&str> {
-        match &self.tmux_socket {
+    /// Build the `-S <socket>` args for a tmux command from a sanitized socket.
+    fn socket_args(socket: &Option<String>) -> Vec<&str> {
+        match socket {
             Some(s) => vec!["-S", s.as_str()],
             None => vec![],
         }
     }
 
-    /// Validate that the tmux target pane exists (BUG-001 fix)
-    pub fn validate_target(&self) -> std::result::Result<(), String> {
-        let target = self
-            .tmux_target
-            .as_deref()
-            .ok_or_else(|| "No tmux session configured".to_string())?;
-
+    /// Validate that the tmux target pane exists (BUG-001 fix).
+    pub fn validate_target(target: &str, socket: Option<&str>) -> std::result::Result<(), String> {
+        let socket = Self::sanitized_socket(socket);
         let mut cmd = Command::new("tmux");
-        for arg in self.socket_args() {
+        for arg in Self::socket_args(&socket) {
             cmd.arg(arg);
         }
         cmd.arg("list-panes").arg("-t").arg(target);
@@ -78,22 +79,18 @@ impl InputInjector {
         }
     }
 
-    /// Inject text input into the tmux pane.
+    /// Inject text input into the given tmux pane (literal text + trailing Enter).
     /// Uses Command::arg() — no shell interpolation possible.
-    pub fn inject(&self, text: &str) -> Result<bool> {
-        let target = match &self.tmux_target {
-            Some(t) => t,
-            None => return Ok(false),
-        };
-
-        if let Err(reason) = self.validate_target() {
+    pub fn inject(&self, target: &str, socket: Option<&str>, text: &str) -> Result<bool> {
+        if let Err(reason) = Self::validate_target(target, socket) {
             tracing::warn!(%reason, "Target validation failed");
             return Ok(false);
         }
+        let socket = Self::sanitized_socket(socket);
 
         // Send text with -l (literal mode)
         let mut send_cmd = Command::new("tmux");
-        for arg in self.socket_args() {
+        for arg in Self::socket_args(&socket) {
             send_cmd.arg(arg);
         }
         send_cmd
@@ -114,7 +111,7 @@ impl InputInjector {
 
         // Send Enter key separately
         let mut enter_cmd = Command::new("tmux");
-        for arg in self.socket_args() {
+        for arg in Self::socket_args(&socket) {
             enter_cmd.arg(arg);
         }
         enter_cmd
@@ -148,19 +145,15 @@ impl InputInjector {
     /// `Command::arg()` only — no shell interpolation. Callers MUST sanitize/cap the text
     /// (strip control chars/newlines, bound length) before calling. Returns `Ok(false)` on
     /// a missing target or tmux soft failure, `Err` on a hard failure.
-    pub fn inject_literal(&self, text: &str) -> Result<bool> {
-        let target = match &self.tmux_target {
-            Some(t) => t,
-            None => return Ok(false),
-        };
-
-        if let Err(reason) = self.validate_target() {
+    pub fn inject_literal(&self, target: &str, socket: Option<&str>, text: &str) -> Result<bool> {
+        if let Err(reason) = Self::validate_target(target, socket) {
             tracing::warn!(%reason, "Target validation failed (inject_literal)");
             return Ok(false);
         }
+        let socket = Self::sanitized_socket(socket);
 
         let mut send_cmd = Command::new("tmux");
-        for arg in self.socket_args() {
+        for arg in Self::socket_args(&socket) {
             send_cmd.arg(arg);
         }
         send_cmd
@@ -185,12 +178,7 @@ impl InputInjector {
 
     /// Send a special key (from whitelist only).
     /// BUG-004 fix: includes socket flag for correct tmux server targeting.
-    pub fn send_key(&self, key: &str) -> Result<bool> {
-        let target = match &self.tmux_target {
-            Some(t) => t,
-            None => return Ok(false),
-        };
-
+    pub fn send_key(&self, target: &str, socket: Option<&str>, key: &str) -> Result<bool> {
         let tmux_key = match key {
             "Enter" => "Enter",
             "Escape" => "Escape",
@@ -207,8 +195,9 @@ impl InputInjector {
             return Ok(false);
         }
 
+        let socket = Self::sanitized_socket(socket);
         let mut cmd = Command::new("tmux");
-        for arg in self.socket_args() {
+        for arg in Self::socket_args(&socket) {
             cmd.arg(arg);
         }
         cmd.arg("send-keys").arg("-t").arg(target).arg(tmux_key);
@@ -233,11 +222,10 @@ impl InputInjector {
     /// visible text, or `None` if no target is set / capture fails. Used by the submit
     /// flow's readiness detection (poll until Claude's multi-select / review screen has
     /// rendered) instead of blind sleeps.
-    pub fn capture_pane(&self) -> Option<String> {
-        let target = self.tmux_target.as_deref()?;
-
+    pub fn capture_pane(&self, target: &str, socket: Option<&str>) -> Option<String> {
+        let socket = Self::sanitized_socket(socket);
         let mut cmd = Command::new("tmux");
-        for arg in self.socket_args() {
+        for arg in Self::socket_args(&socket) {
             cmd.arg(arg);
         }
         cmd.arg("capture-pane").arg("-t").arg(target).arg("-p");
@@ -262,20 +250,21 @@ impl InputInjector {
 
     /// Send a slash command (like /clear).
     /// Validates against character whitelist, sends with -l flag.
-    pub fn send_slash_command(&self, command: &str) -> Result<bool> {
-        let target = match &self.tmux_target {
-            Some(t) => t,
-            None => return Ok(false),
-        };
-
+    pub fn send_slash_command(
+        &self,
+        target: &str,
+        socket: Option<&str>,
+        command: &str,
+    ) -> Result<bool> {
         if !is_valid_slash_command(command) {
             tracing::warn!(%command, "Slash command rejected: contains unsafe characters");
             return Ok(false);
         }
 
+        let socket = Self::sanitized_socket(socket);
         // Send command text with -l (literal mode)
         let mut cmd = Command::new("tmux");
-        for arg in self.socket_args() {
+        for arg in Self::socket_args(&socket) {
             cmd.arg(arg);
         }
         cmd.arg("send-keys")
@@ -291,7 +280,7 @@ impl InputInjector {
 
         // Send Enter
         let mut enter_cmd = Command::new("tmux");
-        for arg in self.socket_args() {
+        for arg in Self::socket_args(&socket) {
             enter_cmd.arg(arg);
         }
         enter_cmd
@@ -383,88 +372,13 @@ impl InputInjector {
         })
     }
 
-    /// Find a tmux session running Claude Code (fallback when $TMUX not set)
-    pub fn find_claude_code_session() -> Option<String> {
-        // Search pane commands
-        let output = Command::new("tmux")
-            .args([
-                "list-panes",
-                "-a",
-                "-F",
-                "#{session_name}:#{pane_current_command}",
-            ])
-            .output()
-            .ok()?;
-
-        if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            for line in stdout.lines() {
-                if let Some((session, command)) = line.split_once(':') {
-                    // "node" match removed — was legacy from when ctm was a Node.js process
-                    if command.contains("claude") {
-                        return Some(session.to_string());
-                    }
-                }
-            }
-        }
-
-        // Fallback: session names
-        let output = Command::new("tmux")
-            .args(["list-sessions", "-F", "#{session_name}"])
-            .output()
-            .ok()?;
-
-        if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            for line in stdout.lines() {
-                let lower = line.to_lowercase();
-                if lower.contains("claude") || lower.contains("code") {
-                    return Some(line.to_string());
-                }
-            }
-        }
-
-        None
-    }
-}
-
-/// L3.4: Get the injection method name.
-impl InputInjector {
-    /// Returns the injection method: "tmux" if a target is configured, "none" otherwise.
-    #[allow(dead_code)] // Library API
-    pub fn get_method(&self) -> &str {
-        if self.tmux_target.is_some() {
-            "tmux"
-        } else {
-            "none"
-        }
-    }
-
-    /// Returns the configured tmux session target, if any.
-    #[allow(dead_code)] // Library API
-    pub fn get_tmux_session(&self) -> Option<&str> {
-        self.tmux_target.as_deref()
-    }
-
-    /// Returns the configured tmux socket path, if any.
-    #[allow(dead_code)] // Library API
-    pub fn get_tmux_socket(&self) -> Option<&str> {
-        self.tmux_socket.as_deref()
-    }
-}
-
-/// L3.5: Factory function that creates a fully-configured InputInjector.
-///
-/// Detects the current tmux session automatically if tmux is available.
-#[allow(dead_code)] // Library API
-pub fn create_injector() -> InputInjector {
-    let mut inj = InputInjector::new();
-    if InputInjector::is_tmux_available() {
-        if let Some(info) = InputInjector::detect_tmux_session() {
-            inj.set_target(&info.target, info.socket.as_deref());
-        }
-    }
-    inj
+    // ROUTING-001: `find_claude_code_session()` was removed. It scanned for the
+    // FIRST tmux pane running a "claude" process and returned only its session
+    // name (caller manufactured `"{name}:0.0"` — pane 0). Using it for per-session
+    // routing bound a session with a missing pane mapping to an unrelated pane 0,
+    // causing cross-session misrouting. There is no safe way to recover a specific
+    // session's pane by guessing; the only trusted source is the Claude hook's
+    // `tmuxTarget` recorded at session_start.
 }
 
 /// L3.6: Escape text for tmux send-keys.
@@ -494,6 +408,7 @@ pub fn get_hostname() -> String {
 
 #[derive(Debug, Clone)]
 pub struct TmuxInfo {
+    #[allow(dead_code)] // Populated by detect_tmux_session; part of the struct's shape
     pub session: String,
     #[allow(dead_code)] // Library API
     pub pane: String,
@@ -515,31 +430,29 @@ mod tests {
     }
 
     #[test]
-    fn test_injector_no_target() {
+    fn test_injector_nonexistent_target() {
+        // A target that does not exist fails validation and injects nothing
+        // (returns Ok(false)) rather than misrouting.
         let injector = InputInjector::new();
-        assert!(!injector.inject("test").unwrap());
+        assert!(!injector
+            .inject("ctm-no-such-session:9.9", None, "test")
+            .unwrap());
     }
 
     #[test]
-    fn test_socket_path_validation() {
-        let mut injector = InputInjector::new();
-
-        // Valid absolute path
-        injector.set_target("session:0.0", Some("/tmp/tmux-1000/default"));
-        assert!(injector.tmux_socket.is_some());
-
-        // Path traversal rejected
-        injector.set_target("session:0.0", Some("/tmp/../etc/evil"));
-        assert!(injector.tmux_socket.is_none());
-
-        // Relative path rejected
-        injector.set_target("session:0.0", Some("relative/path"));
-        assert!(injector.tmux_socket.is_none());
-
-        // Oversized path rejected
+    fn test_socket_path_sanitization() {
+        // Valid absolute path is preserved.
+        assert_eq!(
+            InputInjector::sanitized_socket(Some("/tmp/tmux-1000/default")).as_deref(),
+            Some("/tmp/tmux-1000/default")
+        );
+        // Path traversal rejected -> None (degrades to default server).
+        assert!(InputInjector::sanitized_socket(Some("/tmp/../etc/evil")).is_none());
+        // Relative path rejected.
+        assert!(InputInjector::sanitized_socket(Some("relative/path")).is_none());
+        // Oversized path rejected.
         let long = format!("/{}", "a".repeat(256));
-        injector.set_target("session:0.0", Some(&long));
-        assert!(injector.tmux_socket.is_none());
+        assert!(InputInjector::sanitized_socket(Some(&long)).is_none());
     }
 
     #[test]

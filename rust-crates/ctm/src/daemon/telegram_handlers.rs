@@ -85,38 +85,39 @@ async fn handle_telegram_text(ctx: &HandlerContext, msg: &TgMessage, text: &str)
         None => return,
     };
 
-    // Get tmux info
+    // Get tmux info. ROUTING-001: resolve the per-session pane target and socket
+    // into locals and pass them explicitly to every injector call below. The
+    // injector is stateless, so there is no shared `set_target` that a concurrent
+    // handler for another session could clobber between resolution and injection.
     let tmux_target = get_tmux_target(ctx, &session.id, session.tmux_socket.as_deref()).await;
-
-    if let Some(target) = &tmux_target {
-        let mut inj = ctx.injector.lock().await;
-        let socket = session.tmux_socket.as_deref();
-        inj.set_target(target, socket);
-    }
 
     // ADR-013 D1/D2: If no tmux target is available, warn the user immediately
     // on every attempt (D2: no suppression after first occurrence). Commands
     // that depend on tmux injection (cc, interrupt, kill, free-text injection)
     // all short-circuit here.
-    if tmux_target.is_none() {
-        // Check for pending AskUserQuestion free-text answer first — those
-        // are stored as tentative answers and don't require tmux injection yet.
-        if handle_free_text_answer(ctx, &session.id, text).await {
+    let target = match tmux_target.as_deref() {
+        Some(t) => t,
+        None => {
+            // Check for pending AskUserQuestion free-text answer first — those
+            // are stored as tentative answers and don't require tmux injection yet.
+            if handle_free_text_answer(ctx, &session.id, text).await {
+                return;
+            }
+            tracing::warn!(
+                session_id = %session.id,
+                "ADR-013 D1: tmux not detected, cannot inject Telegram reply"
+            );
+            ctx.bot
+                .send_message(
+                    "\u{26A0}\u{FE0F} Reply failed \u{2014} tmux not detected. Start Claude Code inside tmux for bidirectional chat.",
+                    None,
+                    Some(thread_id),
+                )
+                .await;
             return;
         }
-        tracing::warn!(
-            session_id = %session.id,
-            "ADR-013 D1: tmux not detected, cannot inject Telegram reply"
-        );
-        ctx.bot
-            .send_message(
-                "\u{26A0}\u{FE0F} Reply failed \u{2014} tmux not detected. Start Claude Code inside tmux for bidirectional chat.",
-                None,
-                Some(thread_id),
-            )
-            .await;
-        return;
-    }
+    };
+    let socket = session.tmux_socket.as_deref();
 
     // cc command prefix: "cc clear" -> "/clear"
     if text.to_lowercase().starts_with("cc ") {
@@ -124,14 +125,14 @@ async fn handle_telegram_text(ctx: &HandlerContext, msg: &TgMessage, text: &str)
         // Track for echo prevention
         add_echo_key(ctx, &session.id, &command).await;
         let inj = ctx.injector.lock().await;
-        let _ = inj.send_slash_command(&command);
+        let _ = inj.send_slash_command(target, socket, &command);
         return;
     }
 
     // BUG-004: Interrupt commands (Escape)
     if is_interrupt_command(text) {
         let inj = ctx.injector.lock().await;
-        let ok = inj.send_key("Escape").unwrap_or(false);
+        let ok = inj.send_key(target, socket, "Escape").unwrap_or(false);
         let msg_text = if ok {
             "\u{23F8}\u{FE0F} *Interrupt sent* (Escape)\n\n_Claude should pause the current operation._"
         } else {
@@ -153,7 +154,7 @@ async fn handle_telegram_text(ctx: &HandlerContext, msg: &TgMessage, text: &str)
     // BUG-004: Kill commands (Ctrl-C)
     if is_kill_command(text) {
         let inj = ctx.injector.lock().await;
-        let ok = inj.send_key("Ctrl-C").unwrap_or(false);
+        let ok = inj.send_key(target, socket, "Ctrl-C").unwrap_or(false);
         let msg_text = if ok {
             "\u{1F6D1} *Kill sent* (Ctrl-C)\n\n_Claude should exit entirely._"
         } else {
@@ -202,7 +203,7 @@ async fn handle_telegram_text(ctx: &HandlerContext, msg: &TgMessage, text: &str)
     // Inject into CLI via tmux
     let injected = {
         let inj = ctx.injector.lock().await;
-        inj.inject(&inject_text).unwrap_or(false)
+        inj.inject(target, socket, &inject_text).unwrap_or(false)
     };
 
     if !injected {
@@ -408,9 +409,10 @@ async fn inject_to_session(
     let tmux_target = get_tmux_target(ctx, &session.id, session.tmux_socket.as_deref()).await;
 
     if let Some(target) = tmux_target {
-        let mut inj = ctx.injector.lock().await;
-        inj.set_target(&target, session.tmux_socket.as_deref());
-        let ok = inj.inject(text).unwrap_or(false);
+        let inj = ctx.injector.lock().await;
+        let ok = inj
+            .inject(&target, session.tmux_socket.as_deref(), text)
+            .unwrap_or(false);
         if ok {
             ctx.bot
                 .send_message(&format!("{what} sent to Claude"), None, Some(thread_id))
@@ -614,10 +616,12 @@ async fn handle_bot_command(ctx: &HandlerContext, msg: &TgMessage, text: &str) {
                 let tmux_target =
                     get_tmux_target(ctx, &session.id, session.tmux_socket.as_deref()).await;
                 if let Some(target) = tmux_target {
-                    let mut inj = ctx.injector.lock().await;
-                    inj.set_target(&target, session.tmux_socket.as_deref());
+                    let inj = ctx.injector.lock().await;
                     let command = format!("/rename {args}");
-                    if inj.send_slash_command(&command).unwrap_or(false) {
+                    if inj
+                        .send_slash_command(&target, session.tmux_socket.as_deref(), &command)
+                        .unwrap_or(false)
+                    {
                         ctx.bot
                             .send_message(
                                 &format!("Sending rename to Claude Code: *{args}*"),
@@ -832,9 +836,8 @@ async fn handle_bot_command(ctx: &HandlerContext, msg: &TgMessage, text: &str) {
                                 })
                                 .await
                             };
-                            let mut inj = ctx.injector.lock().await;
-                            inj.set_target(&target, socket.as_deref());
-                            let _ = inj.send_key("Escape");
+                            let inj = ctx.injector.lock().await;
+                            let _ = inj.send_key(&target, socket.as_deref(), "Escape");
                         }
 
                         // Broadcast abort command to socket clients (matches TS behaviour)
