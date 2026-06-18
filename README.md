@@ -22,7 +22,7 @@ This installs a native Rust binary (`ctm`) via platform-specific optional packag
 - **CLI to Telegram**: Mirror Claude's responses, tool usage, and notifications
 - **Telegram to CLI**: Send prompts from Telegram directly to Claude Code
 - **Tool Summarizer**: Human-readable summaries for 30+ command patterns ("Running tests" instead of "Running: Bash")
-- **AskUserQuestion (no keystrokes)**: Inline buttons for Claude's interactive questions; option answers are returned to Claude structurally via the hook's `updatedInput` instead of fragile keystroke injection
+- **AskUserQuestion (both surfaces)**: Claude's interactive multiple-choice question renders natively in the CLI *and* as inline buttons on Telegram — answer from either side. Telegram answers drive the live CLI widget via `tmux send-keys`, with `capture-pane` readiness pacing on multi-select so the confirming Enter only fires once Claude's review screen is on-screen (ADR-015)
 - **Photo & Document Upload**: Send images/files from Telegram, path injected into Claude
 - **Stop/Interrupt**: Type `stop` to send Escape, `kill` to send Ctrl-C
 - **Session Threading**: Each Claude session gets its own Forum Topic
@@ -153,10 +153,10 @@ Approval buttons only appear in normal mode, not with `--dangerously-skip-permis
 
 **Flow:**
 1. Claude Code hooks invoke `ctm hook`, which reads the event from stdin
-2. PreToolUse: sends an approval request (or, for AskUserQuestion, a question request) via socket and blocks for the Telegram response
+2. PreToolUse: for tool approvals, sends an approval request via socket and blocks for the Telegram response. **AskUserQuestion is *not* intercepted here** — the hook returns fast so Claude renders its native widget in the CLI; the daemon mirrors the question to Telegram from the standard `tool_start` event (ADR-015)
 3. Other hooks: sends JSON to daemon via socket and exits immediately
 4. Daemon forwards messages to Telegram Forum Topic with summarized tool actions
-5. Telegram text replies are injected into the CLI via `tmux send-keys`. **AskUserQuestion option/multi-select answers are returned structurally via the hook's `updatedInput` — no keystrokes** (only free-text answers fall back to injection)
+5. Telegram replies are injected into the live CLI via `tmux send-keys` — including AskUserQuestion option/multi-select answers, which drive the native widget directly. **Multi-select uses `tmux capture-pane` readiness pacing** so each keystroke and the confirming Enter only fire once the expected screen has rendered — no blind sleeps (ADR-015). The question shows in **both** the CLI (native) and Telegram, answerable from either
 6. Stop/kill commands send Escape or Ctrl-C to interrupt Claude
 
 ## Multi-System Architecture

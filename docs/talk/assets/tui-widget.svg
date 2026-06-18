@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 446" font-family="ui-monospace, 'JetBrains Mono', 'SF Mono', Menlo, monospace">
+  <defs>
+    <style>
+      .win{fill:#0d1117;stroke:#2a3442;stroke-width:1.5}
+      .bar{fill:#161b22}
+      .dim{fill:#8b97a7}
+      .ink{fill:#e6edf3}
+      .cy{fill:#7fb2ff}
+      .gn{fill:#3fb950}
+      .q{fill:#fff;font-weight:700}
+    </style>
+  </defs>
+
+  <rect class="win" x="3" y="3" width="1194" height="440" rx="15"/>
+  <path class="bar" d="M3,18 a15,15 0 0 1 15,-15 h1164 a15,15 0 0 1 15,15 v30 h-1194 z"/>
+  <circle cx="32" cy="26" r="6.5" fill="#ff6b6b"/>
+  <circle cx="54" cy="26" r="6.5" fill="#f1c453"/>
+  <circle cx="76" cy="26" r="6.5" fill="#3fb950"/>
+  <text class="dim" x="110" y="32" font-size="18">claude · AskUserQuestion</text>
+
+  <text class="q" x="52" y="98" font-size="28">How should ctm answer the multiple-choice question?</text>
+
+  <rect x="36" y="190" width="1128" height="50" rx="9" fill="rgba(127,178,255,.12)" stroke="#7fb2ff" stroke-width="1.4"/>
+
+  <g font-size="25">
+    <text class="dim" x="58" y="158">  [ ]  Blind sleep(2000) — hope it rendered</text>
+
+    <text class="cy"  x="52" y="223">❯</text>
+    <text class="gn"  x="82" y="223">[✓]</text>
+    <text class="ink" x="138" y="223">Drive the live widget via tmux send-keys</text>
+
+    <text class="gn"  x="82" y="288">[✓]</text>
+    <text class="ink" x="138" y="288">Poll capture-pane for the review screen</text>
+
+    <text class="dim" x="58" y="353">  [ ]  Return updatedInput (suppresses CLI render)</text>
+  </g>
+
+  <line x1="36" y1="392" x2="1164" y2="392" stroke="#222b36" stroke-width="1.2"/>
+  <text class="dim" x="52" y="425" font-size="19">space toggle · ↑/↓ move · enter submit</text>
+  <text class="cy"  x="1164" y="425" font-size="19" text-anchor="end">2 selected</text>
+</svg>

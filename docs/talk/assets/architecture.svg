@@ -1,0 +1,58 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 360" font-family="ui-monospace, 'JetBrains Mono', 'SF Mono', Menlo, monospace">
+  <defs>
+    <marker id="arrowCyan" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#7fb2ff"/>
+    </marker>
+    <marker id="arrowCoral" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#ff6b6b"/>
+    </marker>
+    <filter id="glow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="2.2" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <style>
+      .node  { fill:#161b22; stroke:#2f6df6; stroke-width:1.5; }
+      .label { fill:#e6edf3; font-size:21px; }
+      .out   { stroke:#7fb2ff; stroke-width:2.4; fill:none; filter:url(#glow); }
+      .in    { stroke:#ff6b6b; stroke-width:2.4; fill:none; filter:url(#glow); }
+      .tagc  { fill:#7fb2ff; font-size:18px; }
+      .tagr  { fill:#ff6b6b; font-size:18px; }
+      .plate { fill:#0d1117; }
+    </style>
+  </defs>
+
+  <!-- background panel -->
+  <rect x="2" y="2" width="1196" height="356" rx="14" fill="#0d1117" stroke="#1f2733" stroke-width="1.5"/>
+
+  <!-- top row: OUT path (cyan) -->
+  <g text-anchor="middle">
+    <rect class="node" x="28"  y="74" width="220" height="56" rx="9"/>
+    <text class="label" x="138" y="108">Claude Code hook</text>
+
+    <rect class="node" x="300" y="74" width="132" height="56" rx="9"/>
+    <text class="label" x="366" y="108">ctm hook</text>
+
+    <rect class="node" x="498" y="74" width="156" height="56" rx="9"/>
+    <text class="label" x="576" y="108">Unix socket</text>
+
+    <rect class="node" x="720" y="74" width="120" height="56" rx="9"/>
+    <text class="label" x="780" y="108">daemon</text>
+
+    <rect class="node" x="906" y="74" width="148" height="56" rx="9"/>
+    <text class="label" x="980" y="108">Telegram</text>
+  </g>
+
+  <!-- forward arrows (out is easy) -->
+  <line class="out" x1="250" y1="102" x2="298" y2="102" marker-end="url(#arrowCyan)"/>
+  <line class="out" x1="432" y1="102" x2="496" y2="102" marker-end="url(#arrowCyan)"/>
+  <line class="out" x1="654" y1="102" x2="718" y2="102" marker-end="url(#arrowCyan)"/>
+  <line class="out" x1="840" y1="102" x2="904" y2="102" marker-end="url(#arrowCyan)"/>
+  <text class="tagc" x="137" y="52" text-anchor="middle">out · fire-and-forget</text>
+
+  <!-- return path (in is brutal): Telegram -> down -> left -> up into Claude Code hook -->
+  <path class="in" d="M 980 130 L 980 268 L 137 268 L 137 130" marker-end="url(#arrowCoral)"/>
+  <!-- label plate on the horizontal return segment -->
+  <rect class="plate" x="470" y="252" width="200" height="32" rx="6"/>
+  <text class="tagr" x="570" y="274" text-anchor="middle">tmux send-keys</text>
+  <text class="tagr" x="980" y="316" text-anchor="middle">in · you have to drive it</text>
+</svg>

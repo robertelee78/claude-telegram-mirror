@@ -6,41 +6,78 @@ author: "Robert E. Lee"
 description: "Controlling an AI agent from your phone — a 10-minute talk."
 theme: default
 style: |
+  @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=JetBrains+Mono:wght@400;700&display=swap');
+  :root {
+    --bg:#0d1117; --bg2:#161b22; --ink:#e6edf3; --mut:#8b97a7;
+    --cyan:#7fb2ff; --coral:#ff6b6b; --green:#3fb950; --line:#222b36;
+    --sans:'Space Grotesk', -apple-system, 'Segoe UI', system-ui, sans-serif;
+    --mono:'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+  }
   section {
-    font-size: 26px;
-    padding: 56px 64px;
-    background: #ffffff;
-    color: #14181f;
+    font-family: var(--sans);
+    font-size: 25px; line-height: 1.5;
+    padding: 60px 72px;
+    background: var(--bg) !important; color: var(--ink) !important;
+    color-scheme: dark;
+    justify-content: flex-start !important;
   }
-  section.title {
-    background: #0d1117;
-    color: #f4f6fb;
-    justify-content: center;
+  h1 {
+    font-family: var(--sans); font-weight: 700; color:#fff;
+    font-size: 40px; line-height: 1.12;
+    margin: 0 0 .55em; padding-bottom: .26em;
+    border-bottom: 3px solid var(--cyan);
   }
-  section.title h1 { font-size: 56px; color: #ffffff; line-height: 1.05; }
-  section.title h2 { color: #7fb2ff; font-weight: 500; font-size: 30px; }
-  section.title p { color: #aab4c5; font-size: 22px; }
-  section.big { justify-content: center; text-align: center; background:#0d1117; color:#f4f6fb; }
-  section.big h1 { font-size: 88px; color:#ff6b6b; font-family: ui-monospace, monospace; }
-  section.big p { color:#aab4c5; }
-  h1 { color: #0d4f8b; font-size: 40px; }
-  h2 { color: #0d4f8b; font-size: 30px; }
-  strong { color: #b3261e; }
-  em { color: #14181f; }
-  code { background:#eef1f6; color:#0b3d62; padding:1px 6px; border-radius:4px; }
-  pre { background:#0d1117; border-radius:8px; font-size: 21px; }
-  pre code { background: transparent; color:#e6edf3; }
-  blockquote { border-left: 5px solid #7fb2ff; color:#33414f; font-style: italic; }
-  .small { font-size: 20px; color:#55606e; }
-  .accent { color:#b3261e; font-weight:700; }
-  table { font-size: 22px; }
-  footer { color:#8a94a3; font-size:16px; }
-footer: "The Most Fragile Line of Code · Robert E. Lee"
+  h2 { font-family: var(--sans); color: var(--cyan); font-size: 29px; font-weight: 600; }
+  h3 { color: var(--coral); font-size: 26px; }
+  strong { color: var(--coral); font-weight: 700; }
+  em { color:#fff; font-style: italic; }
+  a { color: var(--cyan); }
+  ul, ol { margin-top:.2em; } li { margin:.34em 0; }
+  code {
+    font-family: var(--mono); font-size:.9em;
+    background:#1b2230; color:#9ecbff; padding:2px 7px;
+    border-radius:5px; border:1px solid #263041;
+  }
+  pre {
+    background:#161b22; border:1px solid var(--line); border-radius:10px;
+    font-size:21px; padding:.2em .1em; box-shadow:0 8px 26px rgba(0,0,0,.35);
+  }
+  pre code { font-family: var(--mono); background:transparent; border:0; color:#e6edf3; }
+  blockquote {
+    border-left:4px solid var(--cyan); background:rgba(127,178,255,.06);
+    color:#c6d2e2; font-style:italic; padding:.5em 1em; border-radius:0 8px 8px 0;
+  }
+  table { font-family: var(--sans); font-size:21px; border-collapse:collapse; color: var(--ink); }
+  th { color: var(--cyan); border-bottom:2px solid var(--line); padding:.3em .55em; text-align:left; }
+  td { color: var(--ink) !important; border-bottom:1px solid var(--line); padding:.3em .55em; vertical-align:top; }
+  table tr, table tr:nth-child(2n) { background: transparent !important; border-top:1px solid var(--line); }
+  tr:nth-child(even) td { background:rgba(255,255,255,.02); }
+  section.receipts { font-size:18px; }
+  section.receipts table { font-size:15.5px; line-height:1.32; }
+  section.receipts code { font-size:.82em; padding:1px 5px; }
+  img { border-radius:10px; }
+  section > p > img, section img[src$=".svg"] { display:block; margin:.2em auto; }
+  .small { font-size:19px; color: var(--mut); }
+  .accent { color: var(--coral); font-weight:700; }
+  footer { color:#5b6776; font-size:15px; font-family: var(--mono); }
+  section::after { color:#465263; font-family: var(--mono); font-size:16px; }
+  section.title, section.big { justify-content:center !important; }
+  section.title h1 { font-size:60px; color:#fff; border:0; padding:0; margin:0 0 .25em; }
+  section.title h2 { color: var(--cyan); font-weight:500; font-size:30px; }
+  section.title p  { color: var(--mut); font-size:22px; margin:.15em 0; }
+  section.title code { background:#161b22; color: var(--cyan); }
+  section.big { text-align:center; }
+  section.big h1 { font-family: var(--mono); font-size:88px; color: var(--coral); border:0; padding:0; }
+  section.big h1 code { background:transparent !important; border:0 !important; color: var(--coral) !important; font-size:1em; padding:0; text-shadow:0 0 26px rgba(255,107,107,.35); }
+  section.big p { color: var(--mut); }
+footer: "The Most Fragile Line of Code · Robert E. Lee · linkedin.com/in/robertgpt"
 ---
 
 <!-- _class: title -->
 <!-- _paginate: false -->
 <!-- _footer: "" -->
+
+![bg right:42% fit](assets/hero-title.png)
 
 # The Most Fragile Line of Code
 
@@ -70,11 +107,7 @@ Robert E. Lee
 
 # `ctm` — a Rust bridge: Claude Code ⇄ Telegram
 
-```
-Claude Code hook ─▶ ctm hook ─▶ Unix socket ─▶ daemon ─▶ Telegram
-        ▲                                                   │
-        └───────────────  tmux send-keys  ◀─────────────────┘
-```
+![w:1020](assets/architecture.svg)
 
 **The whole point isn't two *copies* of the conversation. It's *one* conversation I can touch from either side.**
 
@@ -85,6 +118,7 @@ Desk → walk away → answer on my phone → sit back down and keep typing. Sam
 ---
 
 <!-- Beat 3 — THE ASYMMETRY + VILLAIN WIDGET (1:45–2:45). Humor starts. -->
+<!-- _footer: "" -->
 
 # Out is easy. *In* is brutal.
 
@@ -94,7 +128,7 @@ Desk → walk away → answer on my phone → sit back down and keep typing. Sam
 
 > You can't pipe text at that. You have to *drive* it.
 
-<div class="small">[ ASSET: screenshot of Claude Code's AskUserQuestion multiple-choice TUI widget → assets/tui-widget.png ]</div>
+![w:640](assets/tui-widget.svg)
 
 ---
 
@@ -212,7 +246,7 @@ Tap the answer on the phone → the <strong style="color:#7fb2ff">terminal</stro
 
 # One footnote, then I'll stop
 
-> While I was deep in this, Anthropic shipped **Channels** — an official Claude Code bridge, to **Telegram**, the same platform I'd picked. Nice validation. But notice how the *headless* version handles the hard part: it just **turns the interactive questions off** so the session can't stall. The honest tell — answering the question from your phone is hard enough that the official shortcut was to *not have the question.* I didn't want to give it up.
+> While I was deep in this, Anthropic shipped **Channels** — an official Claude Code → **Telegram** bridge. Good validation, and genuinely good: its live mode even relays **yes/no** approvals to phone *and* terminal at once — first answer wins. Two things it still doesn't do: it never mirrors the **multiple-choice** question (that stays terminal-only), and it tells you to *"run separate sessions"* — one bot, one session. `ctm` puts the multiple-choice question on **both** screens *and* multiplexes every session on the box into its own Telegram topic. The headless shortcut for the hard part? It just **turns the questions off.** I didn't want to give that up.
 
 ### The fix was never faster keystrokes.
 Sometimes the most fragile line isn't in the wrong place — it just never checked whether the thing it was waiting for had actually happened.
@@ -222,6 +256,7 @@ Sometimes the most fragile line isn't in the wrong place — it just never check
 ---
 
 <!-- HANDOUT / APPENDIX — not presented; for the leave-behind PDF and Q&A. -->
+<!-- _class: receipts -->
 
 # Appendix — the receipts
 
@@ -231,6 +266,6 @@ Sometimes the most fragile line isn't in the wrong place — it just never check
 | **v1 (fragile)** | 300ms/key; ~9-key multi-select ≈ 2.7s + a blind `sleep(2000)` "2s is enough" ⇒ ~4.7s/answer, racing the review screen |
 | **v2 (false summit, ADR-014 PR-E)** | answer via `updatedInput`; µs to build — *but* `updatedInput` suppresses the CLI render (+ the `tool_start` Telegram signal) → broke both-surfaces |
 | **v3 (real fix, ADR-015)** | injection restored; `tmux capture-pane` readiness polling (`READY_POLL_INTERVAL_MS=200`, 25-poll / 5s cap), Enter only on the verified review screen; no blind race |
-| **Channels** | official docs: ships a Telegram plugin; non-interactive `-p` mode *"tools that need terminal input, such as multiple-choice questions and plan mode approval, are disabled so the session never stalls"* |
+| **Channels** (research preview, v2.1.80+) | Official Claude Code → Telegram bridge (an MCP plugin spawned over stdio). Live mode **relays `Bash`/`Write`/`Edit` *yes/no* approvals to terminal *and* phone — first-answer-wins** (v2.1.81+) — but does **not** mirror the AskUserQuestion multiple-choice widget (terminal-only), and the docs say *"to process independent event streams concurrently, run separate sessions"* (one bot ≈ one session). Headless `-p`: *"tools that need terminal input, such as multiple-choice questions and plan mode approval, are disabled so the session never stalls."* |
 
-<span class="small">ADR-014 → ADR-015 (supersedes PR-E) in `docs/adr/`. Claude Code render-suppression contract: anthropics/claude-code #29547.</span>
+<span class="small">ADR-014 → ADR-015 (supersedes PR-E) in `docs/adr/`. Claude Code render-suppression contract: anthropics/claude-code #29547. Channels: `code.claude.com/docs/en/channels-reference`.</span>
