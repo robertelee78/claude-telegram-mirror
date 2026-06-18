@@ -31,7 +31,7 @@ style: |
   h3 { color: var(--coral); font-size: 26px; }
   strong { color: var(--coral); font-weight: 700; }
   em { color:#fff; font-style: italic; }
-  a { color: var(--cyan); }
+  a { color: inherit; text-decoration: none; }
   ul, ol { margin-top:.2em; } li { margin:.34em 0; }
   code {
     font-family: var(--mono); font-size:.9em;
@@ -70,7 +70,7 @@ style: |
   section.big h1 { font-family: var(--mono); font-size:88px; color: var(--coral); border:0; padding:0; }
   section.big h1 code { background:transparent !important; border:0 !important; color: var(--coral) !important; font-size:1em; padding:0; text-shadow:0 0 26px rgba(255,107,107,.35); }
   section.big p { color: var(--mut); }
-footer: "The Most Fragile Line of Code · Robert E. Lee · linkedin.com/in/robertgpt"
+footer: "The Most Fragile Line of Code · Robert E. Lee · [linkedin.com/in/robertgpt](https://www.linkedin.com/in/robertgpt)"
 ---
 
 <!-- _class: title -->
@@ -84,8 +84,8 @@ footer: "The Most Fragile Line of Code · Robert E. Lee · linkedin.com/in/rober
 ## Controlling an AI Agent From Your Phone
 
 Robert E. Lee
-`github.com/robertelee78/claude-telegram-mirror`
-`linkedin.com/in/robertgpt`
+[`github.com/robertelee78/claude-telegram-mirror`](https://github.com/robertelee78/claude-telegram-mirror)
+[`linkedin.com/in/robertgpt`](https://www.linkedin.com/in/robertgpt)
 
 ---
 
@@ -251,7 +251,7 @@ Tap the answer on the phone → the <strong style="color:#7fb2ff">terminal</stro
 ### The fix was never faster keystrokes.
 Sometimes the most fragile line isn't in the wrong place — it just never checked whether the thing it was waiting for had actually happened.
 
-<span class="small">`github.com/robertelee78/claude-telegram-mirror` · Robert E. Lee · `linkedin.com/in/robertgpt`</span>
+<span class="small">[`github.com/robertelee78/claude-telegram-mirror`](https://github.com/robertelee78/claude-telegram-mirror) · Robert E. Lee · [`linkedin.com/in/robertgpt`](https://www.linkedin.com/in/robertgpt)</span>
 
 ---
 
