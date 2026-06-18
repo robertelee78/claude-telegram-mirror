@@ -185,6 +185,11 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
+          # pipefail so `npm publish ... | tee` reports npm's exit status, not tee's.
+          # Without it, a failed publish (e.g. EOTP/auth) is masked as success and only
+          # surfaces ~150s later as a misleading "packages not available on registry"
+          # timeout; this also makes the EPUBLISHCONFLICT skip-branch actually reachable.
+          set -o pipefail
           # Publish platform packages first
           for pkg in ctm-linux-x64 ctm-linux-arm64 ctm-darwin-arm64 ctm-darwin-x64; do
             tgz=$(find artifacts/$pkg -name "*.tgz" | head -1)
