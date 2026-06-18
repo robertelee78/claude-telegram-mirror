@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.25] - 2026-06-18
+
+### Fixed (macOS `ctm start` reported a false failure when launchd auto-recovered)
+- **`ctm start` no longer cries "Service was started but is not running — it exited immediately" when the daemon actually comes up a few seconds later.** The 0.2.24 liveness check (added so a launch that gets SIGKILLed isn't falsely reported as "started") only waited ~2.6s. But when macOS kills a non-notarized binary at first launch, the service's `KeepAlive { Crashed: true }` policy relaunches it only after the 10s throttle interval — so the check saw no process in its short window, reported a code-signing failure, and *then* launchd quietly brought the daemon up (a subsequent `ctm status` showed it Running). The error was accurate for that instant but misleading. The check now polls for a **stable PID** for up to 14s (longer than the throttle window): a healthy start still returns in ~1s, a first-launch kill is ridden out across launchd's relaunch and reported as success once the daemon is actually up, and only a service that never stabilises is reported as a failure (with a note that launchd keeps retrying in the background). A one-line "waiting…" message is shown so a multi-second wait isn't silent.
+
 ## [0.2.24] - 2026-06-18
 
 ### Fixed (macOS service: false "running" + silent code-signing kills)
