@@ -192,7 +192,9 @@ jobs:
           set -o pipefail
           # Publish platform packages first
           for pkg in ctm-linux-x64 ctm-linux-arm64 ctm-darwin-arm64 ctm-darwin-x64; do
-            tgz=$(find artifacts/$pkg -name "*.tgz" | head -1)
+            # -print -quit (not `| head -1`): emits the first match and stops with no
+            # pipe, so it can't SIGPIPE-fail (exit 141) under the set -o pipefail above.
+            tgz=$(find artifacts/$pkg -name "*.tgz" -print -quit)
             if [ -n "$tgz" ]; then
               echo "Publishing $pkg..."
               if ! npm publish "$tgz" --access public --provenance 2>&1 | tee /tmp/npm-publish-$pkg.log; then
