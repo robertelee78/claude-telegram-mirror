@@ -18,7 +18,8 @@ flowchart LR
     subgraph Daemon["Bridge Daemon"]
         Socket["Unix Socket Server<br/>bridge.sock"]
         EventLoop["Async Event Loop<br/>tokio::select!"]
-        Sessions["SessionManager<br/>SQLite"]
+        Sessions["SessionManager (SQLite)<br/>+ per-session tmux cache"]
+        Pending["Pending approvals<br/>&amp; questions"]
         Injector["InputInjector<br/>tmux send-keys"]
     end
 
@@ -31,11 +32,13 @@ flowchart LR
     Hooks -->|stdin JSON| HookProc
     HookProc -->|NDJSON via Unix socket| Socket
     Socket --> EventLoop
-    EventLoop -->|sendMessage| BotAPI
+    EventLoop -->|"sendMessage / createForumTopic<br/>(message_thread_id)"| BotAPI
     BotAPI --> Forum
 
-    Forum -->|long polling getUpdates| EventLoop
-    EventLoop -->|lookup session + tmux target| Sessions
+    EventLoop -->|getUpdates long poll| BotAPI
+    BotAPI -->|"updates: text &amp; button callbacks"| EventLoop
+    EventLoop -->|"cache → SQLite,<br/>else fail closed"| Sessions
+    EventLoop --> Pending
     EventLoop --> Injector
     Injector -->|"tmux send-keys -t target"| CC
 
@@ -45,9 +48,11 @@ flowchart LR
 
 **Outbound (CLI to Telegram):** Claude Code fires hook events on tool use, completions, notifications, and prompts. Each event invokes the `ctm hook` binary, which reads the JSON event from stdin, converts it to one or more `BridgeMessage` structs, and writes them as NDJSON lines over a Unix domain socket. The bridge daemon receives these messages via a `tokio::sync::broadcast` channel, routes them to the correct Telegram forum topic, and sends them through the Bot API.
 
-**Inbound (Telegram to CLI):** The daemon long-polls Telegram for updates. When a user replies in a forum topic, the daemon looks up the associated session in SQLite, resolves the tmux target via a three-tier lookup (in-memory cache, DB, live detection), and injects the text into the correct tmux pane using `tmux send-keys`.
+**Inbound (Telegram to CLI):** The daemon long-polls Telegram for updates. When a user replies in a forum topic, the daemon looks up the associated session by `message_thread_id` in SQLite, then resolves the tmux target from its per-session in-memory cache, falling back to the session DB. If that session's hook never recorded a tmux target, the daemon **fails closed** rather than guessing a pane — the former live-detection fallback was removed (ROUTING-001) because guessing "the first `claude` pane" silently misrouted one session's keystrokes into another. The daemon's `InputInjector` then injects the text into the resolved pane with `tmux send-keys`.
 
 **Approval workflow (PreToolUse):** For tools that require permission (Write, Edit, Bash with non-safe commands), the hook binary sends an `approval_request` message and blocks on the socket waiting for a correlated `approval_response`. The daemon presents inline keyboard buttons in Telegram. When the user taps Approve, Reject, or Abort, the daemon writes the response back to the hook's socket connection. The hook returns a `hookSpecificOutput` JSON to Claude Code with the permission decision. Timeout is 5 minutes; connection-refused means the daemon is not running, so the hook returns `None` and Claude continues normally.
+
+`AskUserQuestion` is deliberately **excluded** from this blocking path (ADR-015). The hook does *not* block on it; instead the daemon mirrors the multiple-choice question to Telegram from the ordinary `tool_start` event, and when the user answers from Telegram, the daemon drives Claude's native CLI widget via `tmux send-keys` (reading the pane with `capture-pane` to pace keystrokes). A `PostToolUse` `ToolResult` then stales the Telegram buttons if the question was answered at the terminal — so the question stays answerable on **both** surfaces.
 
 ## 2. Module Structure
 

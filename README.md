@@ -137,19 +137,32 @@ Approval buttons only appear in normal mode, not with `--dangerously-skip-permis
 ## Architecture
 
 ```
-┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│   Claude Code   │────▶│   ctm daemon    │────▶│    Telegram     │
-│      CLI        │◀────│  (Rust binary)  │◀────│      Bot        │
-└─────────────────┘     └─────────────────┘     └─────────────────┘
-        │                       │
-        │ hooks                 │ Unix socket
-        ▼                       ▼
-┌─────────────────┐     ┌─────────────────┐
-│  ctm hook       │────▶│  Socket Server  │
-│  (same binary,  │◀────│  (bidirectional)│
-│   hook mode)    │     │                 │
-└─────────────────┘     └─────────────────┘
+OUTBOUND  (CLI → Telegram) — Claude Code mirrors all activity out:
+
+  ┌─────────────┐  fires   ┌──────────┐  NDJSON over  ┌──────────────┐  Bot API   ┌──────────────┐
+  │ Claude Code │  hook    │ ctm hook │  Unix socket  │  ctm daemon  │  sendMsg   │  Telegram    │
+  │ CLI (tmux)  │ ───────▶ │ (binary) │ ────────────▶ │ (event loop) │ ─────────▶ │ forum topic  │
+  └─────────────┘          └──────────┘               └──────────────┘            └──────────────┘
+
+INBOUND  (Telegram → CLI) — daemon injects into the live pane:
+
+  ┌─────────────┐  tmux send-keys  ┌──────────────┐  getUpdates long poll    ┌──────────────┐
+  │ Claude Code │ ◀─────────────── │  ctm daemon  │ ◀─────────────────────── │  Telegram    │
+  │ CLI (tmux)  │  -t <pane>       │ InputInjector│  text & button callbacks │  forum topic │
+  └─────────────┘                  └──────────────┘                          └──────────────┘
+
+  Approvals (PreToolUse): the hook blocks on the Unix socket for an approval_response;
+  the daemon shows inline buttons in Telegram and writes the verdict back to the hook.
+
+  ctm daemon = tokio event loop · Unix SocketServer · SessionManager (SQLite) + per-session tmux cache
+               · TelegramBot (Bot API) · InputInjector (tmux) · pending approval / question state
 ```
+
+> The `ctm hook` and the daemon are the **same binary** in different modes. Outbound rides
+> hook → Unix socket → daemon → Bot API; inbound rides daemon long-poll → `InputInjector`
+> (`tmux send-keys`) into the live CLI pane. The daemon resolves a session's tmux pane from
+> its cache then SQLite, and **fails closed** if that session never reported one (ROUTING-001) —
+> it never guesses a pane, to avoid misrouting keystrokes into another session.
 
 **Flow:**
 1. Claude Code hooks invoke `ctm hook`, which reads the event from stdin
