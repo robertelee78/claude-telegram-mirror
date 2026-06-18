@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.26] - 2026-06-18
+
+### Fixed (macOS `ctm restart` left the daemon stopped)
+- **`ctm restart` now reliably brings the daemon back up.** On macOS, restart was implemented as stop-then-start — but `launchctl stop` is asynchronous and returns *before* the process exits, so the following `launchctl start` was coalesced/ignored while launchd was still tearing the old instance down. The old process then exited cleanly (status 0), and because the service's `KeepAlive { SuccessfulExit: false }` policy does not relaunch a clean exit, the daemon was left **stopped** — `ctm restart` failed to recover it (reproducible deterministically, independent of the first-launch code-signing kill). Restart now uses `launchctl kickstart -k`, which kills any running instance and starts a fresh one as a single atomic operation — no race, no dependence on KeepAlive semantics (with a synchronous stop→wait→start fallback). Verified to return in ~1s with a new PID, confirming a real relaunch.
+
 ## [0.2.25] - 2026-06-18
 
 ### Fixed (macOS `ctm start` reported a false failure when launchd auto-recovered)
