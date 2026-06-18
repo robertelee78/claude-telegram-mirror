@@ -190,45 +190,53 @@ pub(super) fn start_launchd_service() -> ServiceResult {
 
     // `launchctl start` only confirms launchd *accepted* the request — not that
     // the daemon survived exec. On macOS a non-notarized / ad-hoc-signed binary
-    // can be SIGKILLed by the kernel for a code-signing or launch-constraint
+    // can be SIGKILLed by the kernel for a code-signing / launch-constraint
     // violation milliseconds after launch (EXC_CRASH / "Code Signature
-    // Invalid"). Without this check we would report "Service started" for a
-    // daemon that was already dead. Poll for a live PID, then confirm it stays
-    // up past the throttle window so we also catch immediate crash-restart loops.
+    // Invalid"). When that happens the plist's `KeepAlive { Crashed: true }`
+    // makes launchd relaunch it — but only after `ThrottleInterval` (10s).
+    //
+    // So we must wait *longer than the throttle window* before declaring
+    // failure, or we false-alarm on exactly the transient kill we describe:
+    // the first launch is killed, our short poll sees no PID, we cry failure —
+    // and then launchd quietly brings it back ~10s later. We instead poll for a
+    // *stable* PID (the same live PID observed across two polls): a healthy
+    // start settles in ~1s and returns immediately; a first-launch kill is
+    // ridden out across the throttle window and reported as success once the
+    // relaunched instance is up. Only a service that never stabilises within
+    // the budget is a failure.
     use std::{thread::sleep, time::Duration};
-    let mut pid = None;
-    for _ in 0..8 {
-        sleep(Duration::from_millis(250));
-        pid = launchd_pid();
-        if pid.is_some() {
-            break;
+    const POLL: Duration = Duration::from_millis(500);
+    const BUDGET: Duration = Duration::from_secs(14); // > ThrottleInterval (10s) + margin
+    let mut elapsed = Duration::ZERO;
+    let mut last_pid: Option<i32> = None;
+    let mut announced_wait = false;
+    while elapsed < BUDGET {
+        let pid = launchd_pid();
+        // Same live PID seen twice in a row ⇒ it survived past launch.
+        if pid.is_some() && pid == last_pid {
+            return ServiceResult {
+                success: true,
+                message: "Service started.".into(),
+            };
         }
+        if !announced_wait && pid.is_none() && elapsed >= Duration::from_millis(1500) {
+            // We only get here when the first launch did not stay up. Tell the
+            // user we are intentionally waiting rather than hanging silently.
+            println!(
+                "Waiting for the service to come up (launchd may be retrying after a launch failure)..."
+            );
+            announced_wait = true;
+        }
+        last_pid = pid;
+        sleep(POLL);
+        elapsed += POLL;
     }
 
-    match pid {
-        None => ServiceResult {
-            success: false,
-            message: start_failure_hint(
-                "Service was started but is not running — it exited immediately.",
-            ),
-        },
-        Some(_) => {
-            // Confirm it did not die-and-respawn (crash loop) within the window.
-            sleep(Duration::from_millis(600));
-            if launchd_pid().is_some() {
-                ServiceResult {
-                    success: true,
-                    message: "Service started.".into(),
-                }
-            } else {
-                ServiceResult {
-                    success: false,
-                    message: start_failure_hint(
-                        "Service started but exited immediately (possible crash loop).",
-                    ),
-                }
-            }
-        }
+    ServiceResult {
+        success: false,
+        message: start_failure_hint(
+            "Service did not stay running — it failed to come up within 14s.",
+        ),
     }
 }
 
@@ -247,7 +255,9 @@ fn start_failure_hint(headline: &str) -> String {
          \n  • Quarantine:     xattr -dr com.apple.quarantine {bin}\
          \n  • Then re-run:    ctm doctor\n\
          \n\
-         If this persists, reinstall the package or build from source\n\
+         launchd will keep retrying in the background, so the daemon may still\n\
+         come up shortly — check `ctm status` again in a moment. If it never\n\
+         stays up, reinstall the package or build from source\n\
          (cd rust-crates && cargo build --release).",
         bin = binary.display(),
     )
