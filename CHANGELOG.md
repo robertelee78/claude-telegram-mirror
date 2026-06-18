@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.24] - 2026-06-18
+
+### Fixed (macOS service: false "running" + silent code-signing kills)
+- **`ctm status` / `ctm doctor` / `ctm service status` no longer report a dead daemon as "Running", and `ctm start` can recover it.** `get_launchd_status()` decided "running" by checking whether the service label merely *appeared* in `launchctl list` — but a loaded-but-dead launchd job still appears there with `-` in the PID column. So a daemon that had cleanly stopped (a clean exit is not auto-restarted by the plist's `KeepAlive`) or been killed was reported as running, and `ctm start` short-circuited to **"Daemon is already running"** — a no-op that made recovery impossible. The status now parses the PID column (via a pure, unit-tested `parse_launchd_pid()`) and is "running" only when a real positive PID is present. (systemd's `is-active` check was already correct — this was launchd-only.)
+- **A service that is SIGKILLed at launch is now reported as a failure instead of a false "Service started."** On macOS the kernel can kill a non-notarized binary milliseconds after `exec` for a code-signing / launch-constraint violation (`EXC_CRASH` / "Code Signature Invalid"). `launchctl start` only confirms launchd *accepted* the request, so the old code reported success for an already-dead daemon. `start_launchd_service()` now verifies the process actually came up and stayed up (~2s), and on failure prints actionable guidance (crash report, `codesign -dvvv`, quarantine removal, `ctm doctor`).
+
+### Changed (macOS binary robustness — defense-in-depth for code signing)
+- **postinstall** now hardens the native binary on macOS: strips any `com.apple.quarantine` flag, re-applies an ad-hoc signature if the existing one is invalid, then verifies and smoke-tests `ctm --version` — warning loudly (without failing the install) if the OS would refuse to run it.
+- **release CI** now Developer-ID-signs and notarizes the darwin binaries (both arm64 and x64) with a `codesign --verify --strict` gate. Gated on `APPLE_*` secrets; until those are configured, builds fall back to ad-hoc signing with a warning. (Note: shipped binaries were previously only ad-hoc/linker-signed; npm provenance is a supply-chain attestation, not Apple notarization.)
+
 ## [0.2.23] - 2026-06-17
 
 ### Fixed (ROUTING-001 — cross-session misrouting of Telegram→CLI input)
