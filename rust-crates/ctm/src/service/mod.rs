@@ -209,11 +209,10 @@ pub fn restart_service() -> ServiceResult {
     if has_systemd() {
         systemd::restart_systemd_service()
     } else if is_macos() {
-        let r = stop_service();
-        if !r.success {
-            return r;
-        }
-        start_service()
+        // launchd restart is atomic (kickstart -k) — NOT stop-then-start, which
+        // races (launchctl stop is async) and strands the service down because
+        // KeepAlive won't relaunch a clean exit. See restart_launchd_service.
+        launchd::restart_launchd_service()
     } else {
         ServiceResult {
             success: false,

@@ -188,22 +188,74 @@ pub(super) fn start_launchd_service() -> ServiceResult {
         };
     }
 
-    // `launchctl start` only confirms launchd *accepted* the request — not that
-    // the daemon survived exec. On macOS a non-notarized / ad-hoc-signed binary
-    // can be SIGKILLed by the kernel for a code-signing / launch-constraint
-    // violation milliseconds after launch (EXC_CRASH / "Code Signature
-    // Invalid"). When that happens the plist's `KeepAlive { Crashed: true }`
-    // makes launchd relaunch it — but only after `ThrottleInterval` (10s).
-    //
-    // So we must wait *longer than the throttle window* before declaring
-    // failure, or we false-alarm on exactly the transient kill we describe:
-    // the first launch is killed, our short poll sees no PID, we cry failure —
-    // and then launchd quietly brings it back ~10s later. We instead poll for a
-    // *stable* PID (the same live PID observed across two polls): a healthy
-    // start settles in ~1s and returns immediately; a first-launch kill is
-    // ridden out across the throttle window and reported as success once the
-    // relaunched instance is up. Only a service that never stabilises within
-    // the budget is a failure.
+    wait_for_stable_start()
+}
+
+/// Restart the launchd service.
+///
+/// We do NOT stop-then-start: `launchctl stop` is asynchronous and returns
+/// before the process has actually exited, so a following `launchctl start` is
+/// coalesced/ignored while launchd is still tearing the old instance down. The
+/// old instance then exits cleanly (status 0), and because the plist's
+/// `KeepAlive { SuccessfulExit: false }` does not relaunch a clean exit, the
+/// service is left DOWN — exactly the "restart failed" symptom.
+///
+/// `launchctl kickstart -k` instead kills any running instance and starts a
+/// fresh one as a single atomic operation, with no race and no dependence on
+/// KeepAlive semantics. We fall back to a synchronous stop→wait→start only if
+/// kickstart is unavailable or fails.
+pub(super) fn restart_launchd_service() -> ServiceResult {
+    let plist = launchd_plist();
+    // Ensure the job is bootstrapped (no-op if already loaded).
+    let _ = Command::new("launchctl")
+        .args(["load", &plist.display().to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+
+    let uid = nix::unistd::getuid().as_raw();
+    let target = format!("gui/{uid}/com.claude.{SERVICE_NAME}");
+    let kicked = Command::new("launchctl")
+        .args(["kickstart", "-k", &target])
+        .status();
+
+    if matches!(kicked, Ok(s) if s.success()) {
+        return wait_for_stable_start();
+    }
+
+    // Fallback: synchronous stop (wait for the process to actually exit) then start.
+    let _ = Command::new("launchctl")
+        .args(["stop", &format!("com.claude.{SERVICE_NAME}")])
+        .status();
+    use std::{thread::sleep, time::Duration};
+    for _ in 0..20 {
+        if launchd_pid().is_none() {
+            break;
+        }
+        sleep(Duration::from_millis(250));
+    }
+    start_launchd_service()
+}
+
+/// Wait for the service to actually come up and stay up after a start/restart
+/// request, returning a truthful `ServiceResult`.
+///
+/// `launchctl start`/`kickstart` only confirm launchd *accepted* the request —
+/// not that the daemon survived `exec`. On macOS a non-notarized / ad-hoc-signed
+/// binary can be SIGKILLed by the kernel for a code-signing / launch-constraint
+/// violation milliseconds after launch (EXC_CRASH / "Code Signature Invalid").
+/// When that happens the plist's `KeepAlive { Crashed: true }` makes launchd
+/// relaunch it — but only after `ThrottleInterval` (10s).
+///
+/// So we must wait *longer than the throttle window* before declaring failure,
+/// or we false-alarm on exactly the transient kill we describe: the first launch
+/// is killed, a short poll sees no PID, we cry failure — and then launchd quietly
+/// brings it back ~10s later. We instead poll for a *stable* PID (the same live
+/// PID observed across two polls): a healthy start settles in ~1s and returns
+/// immediately; a first-launch kill is ridden out across the throttle window and
+/// reported as success once the relaunched instance is up. Only a service that
+/// never stabilises within the budget is a failure.
+fn wait_for_stable_start() -> ServiceResult {
     use std::{thread::sleep, time::Duration};
     const POLL: Duration = Duration::from_millis(500);
     const BUDGET: Duration = Duration::from_secs(14); // > ThrottleInterval (10s) + margin
