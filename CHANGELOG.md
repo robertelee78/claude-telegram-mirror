@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.23] - 2026-06-17
+
+### Fixed (ROUTING-001 — cross-session misrouting of Telegram→CLI input)
+- **A reply typed in one session's topic could be injected into another session's tmux pane** (e.g. text meant for session-2 landed in pane 0 / session-1). Two independent defects, both confirmed by manual real-tmux reproduction spikes and an adversarial Codex review:
+  - **TOCTOU race on a shared, stateful injector.** The single process-wide `InputInjector` held a mutable `tmux_target`. The Telegram text handler set the target under one lock, dropped it, `await`ed, then re-acquired a fresh lock to inject — reading whatever target was current. Because every Telegram update is processed on its own task, a concurrent handler for another session could overwrite the shared target in that window.
+  - **`get_tmux_target` fallback poisoning.** When a session's pane was missing from cache and DB, it guessed the *first* tmux pane running `claude` as `"{session}:0.0"` (pane 0) and persisted that guess — permanently binding the session to the wrong pane.
+- **Fix:** `InputInjector` is now **stateless** — every action (`inject`, `inject_literal`, `send_key`, `send_slash_command`, `capture_pane`, `validate_target`) takes the `(target, socket)` pair explicitly, so the shared injector's `Mutex` serializes tmux execution only and can never bleed one session's pane onto another's. The live-detection fallback was removed: a missing per-session mapping now **fails closed** ("tmux not detected") instead of misrouting. The startup default target (which biased every session toward pane 0) was removed. Hardening: the topic→session lookup is now deterministic (`ORDER BY last_activity DESC`) when a parent and sub-agent share a topic, and a changed tmux socket is reconciled even when the pane string is unchanged. Covered by `tests/routing_spike.rs` (real-tmux: misroute reproduced pre-fix, zero crosstalk post-fix under concurrent stress).
+
+### Fixed (STALE-TOPICS — liveness-driven topic reconciliation)
+- **Dead sessions' Telegram topics no longer pile up.** Topic teardown previously relied on the `SessionEnd` hook (which does not fire on a terminal close, `kill -9`, `tmux kill-session`, or reboot) plus a 24h inactivity timer, so orphaned topics accumulated and a daemon restart never reconciled the backlog. A new reconciliation sweep (`daemon::reconcile`) makes pane/Claude liveness the prompt, authoritative signal, keyed on the *specific Claude session* (pane gone, pane reassigned to a newer session, or pane fell back to a shell prompt → topic pruned). The liveness policy (`liveness.rs`) is a pure, unit-tested rule shared by the daemon sweep and `ctm doctor --fix`, and a persistent topic ledger lets `doctor` reconcile topics created before it started. Also fixes a teardown leak.
+
+### Added
+- **`ctm prune-topics`** — clear an accumulated backlog of stale Telegram forum topics. `--ledger` deletes ledger-recorded topics whose Claude session is no longer alive; `--from`/`--to` (with `--ids` support) sweeps a numeric topic-id range to reach legacy orphans that predate the ledger (the Bot API cannot enumerate forum topics). Both modes refuse to touch the General topic and any currently-active session's topic, so a live conversation can never be pruned.
+
 ## [0.2.22] - 2026-06-01
 
 ### Fixed (ADR-015 — multi-question AskUserQuestion injection, N-generic)
