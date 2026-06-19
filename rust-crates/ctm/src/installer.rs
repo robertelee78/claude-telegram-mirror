@@ -391,9 +391,17 @@ pub fn install_hooks_with_path_forced(
                 base.display()
             );
         }
-        (project_dir.join("settings.json"), project_dir, HookScope::Project)
+        (
+            project_dir.join("settings.json"),
+            project_dir,
+            HookScope::Project,
+        )
     } else {
-        (global_settings_path(), global_claude_dir(), HookScope::Global)
+        (
+            global_settings_path(),
+            global_claude_dir(),
+            HookScope::Global,
+        )
     };
 
     let (changes, warnings) =
@@ -427,12 +435,18 @@ fn print_install_results(changes: &[HookChangeReport], warnings: &[String]) {
             HookChangeStatus::Skipped => "Skipped",
         };
         if report.status == HookChangeStatus::Skipped {
-            println!("  {icon} {}: {label} \u{2014} {}", report.hook_type, report.details);
+            println!(
+                "  {icon} {}: {label} \u{2014} {}",
+                report.hook_type, report.details
+            );
             any_skipped = true;
         } else {
             println!("  {icon} {}: {label}", report.hook_type);
         }
-        if matches!(report.status, HookChangeStatus::Added | HookChangeStatus::Updated) {
+        if matches!(
+            report.status,
+            HookChangeStatus::Added | HookChangeStatus::Updated
+        ) {
             any_changed = true;
         }
     }
@@ -645,7 +659,7 @@ fn install_hooks_to_path(
         let details = match status {
             HookChangeStatus::Added => "added ctm hook".to_string(),
             HookChangeStatus::Updated if prior_ctm > 1 => {
-                format!("consolidated {prior_ctm} ctm entries into one", )
+                format!("consolidated {prior_ctm} ctm entries into one",)
             }
             HookChangeStatus::Updated => "updated ctm hook".to_string(),
             HookChangeStatus::Unchanged => "no changes".to_string(),
@@ -902,7 +916,10 @@ fn normalize_ctm_hook_type_in_file(path: &Path, hook_type: &str) -> anyhow::Resu
     } else {
         create_hook_entry(&command)
     };
-    let existing = settings.get("hooks").and_then(|h| h.get(hook_type)).cloned();
+    let existing = settings
+        .get("hooks")
+        .and_then(|h| h.get(hook_type))
+        .cloned();
     let desired = desired_hook_array(existing.as_ref(), &expected);
     if existing.as_ref().and_then(|v| v.as_array()) == Some(&desired) {
         return Ok(false);
@@ -1035,12 +1052,17 @@ pub fn print_hook_status() -> anyhow::Result<()> {
     let cross = diag.cross_scope_dups();
     let infile = diag.in_file_dups();
     if !cross.is_empty() || !infile.is_empty() {
-        println!("\u{26A0}\u{FE0F}  Duplicate hooks detected (may execute more than once per event):");
+        println!(
+            "\u{26A0}\u{FE0F}  Duplicate hooks detected (may execute more than once per event):"
+        );
         if !cross.is_empty() {
             println!("   - same hook in multiple scopes: {}", cross.join(", "));
         }
         if !infile.is_empty() {
-            println!("   - duplicate entries within a file: {}", infile.join(", "));
+            println!(
+                "   - duplicate entries within a file: {}",
+                infile.join(", ")
+            );
         }
         println!("   Run `ctm doctor --fix` to consolidate to a single scope.");
     } else {
@@ -1050,16 +1072,20 @@ pub fn print_hook_status() -> anyhow::Result<()> {
         // If the present hooks are NOT in global, point completion at the same
         // (project) scope so we don't nudge a global install that would then
         // double-fire alongside the project ones.
-        let global_present = diag.per_type.iter().any(|(_, ps)| {
-            ps.iter().any(|p| matches!(p.scope, HookScope::Global))
-        });
+        let global_present = diag
+            .per_type
+            .iter()
+            .any(|(_, ps)| ps.iter().any(|p| matches!(p.scope, HookScope::Global)));
         let complete_cmd = if global_present {
             "ctm install-hooks"
         } else {
             "ctm install-hooks --project"
         };
         if present_types == HOOK_TYPES.len() {
-            println!("All {} hook types present (no duplicates).", HOOK_TYPES.len());
+            println!(
+                "All {} hook types present (no duplicates).",
+                HOOK_TYPES.len()
+            );
         } else if present_types > 0 {
             println!(
                 "{present_types}/{} hook types present (no duplicates). Run `{complete_cmd}` to complete.",
@@ -1145,9 +1171,14 @@ mod tests {
         let settings_path = dir.path().join("settings.json");
 
         // Install
-        let (changes, _w) =
-            install_hooks_to_path(&settings_path, dir.path(), HookScope::Global, dir.path(), false)
-                .unwrap();
+        let (changes, _w) = install_hooks_to_path(
+            &settings_path,
+            dir.path(),
+            HookScope::Global,
+            dir.path(),
+            false,
+        )
+        .unwrap();
         assert_eq!(changes.len(), HOOK_TYPES.len());
         for c in &changes {
             assert_eq!(c.status, HookChangeStatus::Added);
@@ -1162,7 +1193,14 @@ mod tests {
         }
 
         // Install again — idempotent
-        let (changes2, _w) = install_hooks_to_path(&settings_path, dir.path(), HookScope::Global, dir.path(), false).unwrap();
+        let (changes2, _w) = install_hooks_to_path(
+            &settings_path,
+            dir.path(),
+            HookScope::Global,
+            dir.path(),
+            false,
+        )
+        .unwrap();
         for c in &changes2 {
             assert_eq!(c.status, HookChangeStatus::Unchanged);
         }
@@ -1181,7 +1219,14 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let settings_path = dir.path().join("settings.json");
-        install_hooks_to_path(&settings_path, dir.path(), HookScope::Global, dir.path(), false).unwrap();
+        install_hooks_to_path(
+            &settings_path,
+            dir.path(),
+            HookScope::Global,
+            dir.path(),
+            false,
+        )
+        .unwrap();
         let settings = read_settings(&settings_path);
 
         let arr = settings["hooks"]["SessionEnd"]
@@ -1217,7 +1262,14 @@ mod tests {
         });
         write_settings(&settings_path, &existing).unwrap();
 
-        let (changes, _w) = install_hooks_to_path(&settings_path, dir.path(), HookScope::Global, dir.path(), false).unwrap();
+        let (changes, _w) = install_hooks_to_path(
+            &settings_path,
+            dir.path(),
+            HookScope::Global,
+            dir.path(),
+            false,
+        )
+        .unwrap();
 
         let settings = read_settings(&settings_path);
         let pre_tool = settings["hooks"]["PreToolUse"].as_array().unwrap();
@@ -1331,9 +1383,14 @@ mod tests {
         write_settings(&settings_path, &seeded).unwrap();
 
         assert_eq!(ctm_command_count(&read_settings(&settings_path), "Stop"), 2);
-        let (changes, _w) =
-            install_hooks_to_path(&settings_path, dir.path(), HookScope::Global, dir.path(), false)
-                .unwrap();
+        let (changes, _w) = install_hooks_to_path(
+            &settings_path,
+            dir.path(),
+            HookScope::Global,
+            dir.path(),
+            false,
+        )
+        .unwrap();
         let stop = changes.iter().find(|c| c.hook_type == "Stop").unwrap();
         assert_eq!(stop.status, HookChangeStatus::Updated);
         assert_eq!(

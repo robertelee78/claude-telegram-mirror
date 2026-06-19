@@ -238,9 +238,7 @@ async fn check_bot_permissions(
     bot_id: i64,
 ) -> Result<ChatMemberInfo, String> {
     let resp = client
-        .post(format!(
-            "https://api.telegram.org/bot{token}/getChatMember"
-        ))
+        .post(format!("https://api.telegram.org/bot{token}/getChatMember"))
         .json(&serde_json::json!({
             "chat_id": chat_id,
             "user_id": bot_id,
@@ -648,7 +646,9 @@ pub async fn run_setup() -> anyhow::Result<()> {
                 // runtime (sessions collapsing into the General topic).
                 print!("{}", gray("Checking 'Manage Topics' permission... "));
                 let probe = match get_bot_id(&client, &bot_token).await {
-                    Ok(bot_id) => check_bot_permissions(&client, &bot_token, &chat_id, bot_id).await,
+                    Ok(bot_id) => {
+                        check_bot_permissions(&client, &bot_token, &chat_id, bot_id).await
+                    }
                     Err(e) => Err(e),
                 };
 
@@ -675,10 +675,7 @@ pub async fn run_setup() -> anyhow::Result<()> {
                                 yellow("The bot is an admin but lacks 'Manage Topics'.")
                             );
                         } else {
-                            println!(
-                                "{}",
-                                yellow("The bot is not an admin in this group.")
-                            );
+                            println!("{}", yellow("The bot is not an admin in this group."));
                         }
                         println!(
                             "{}",
@@ -699,10 +696,7 @@ pub async fn run_setup() -> anyhow::Result<()> {
 
                         let choice = Select::new()
                             .with_prompt("How would you like to proceed?")
-                            .items(&[
-                                "Retry (I've enabled the permission)",
-                                "Continue anyway",
-                            ])
+                            .items(&["Retry (I've enabled the permission)", "Continue anyway"])
                             .default(0)
                             .interact()?;
 
@@ -901,7 +895,10 @@ pub async fn run_setup() -> anyhow::Result<()> {
         }
 
         println!();
-        println!("{}", gray("  Global hooks apply to EVERY project automatically —"));
+        println!(
+            "{}",
+            gray("  Global hooks apply to EVERY project automatically —")
+        );
         println!(
             "{}",
             gray("  Claude Code merges hooks across scopes, so a project with its")
@@ -920,7 +917,10 @@ pub async fn run_setup() -> anyhow::Result<()> {
             "{}",
             gray("  Only if you want project-scoped hooks INSTEAD of global (e.g.")
         );
-        println!("{}", gray("  committed team settings): run `ctm install-hooks -p` in"));
+        println!(
+            "{}",
+            gray("  committed team settings): run `ctm install-hooks -p` in")
+        );
         println!(
             "{}",
             gray("  that project and remove the global ones (`ctm uninstall-hooks`).")

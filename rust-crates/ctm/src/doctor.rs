@@ -300,10 +300,16 @@ fn check_hooks(fix: bool) -> CheckResult {
         let infile = diag.in_file_dups();
         let mut parts = Vec::new();
         if !cross.is_empty() {
-            parts.push(format!("same hook in multiple scopes: {}", cross.join(", ")));
+            parts.push(format!(
+                "same hook in multiple scopes: {}",
+                cross.join(", ")
+            ));
         }
         if !infile.is_empty() {
-            parts.push(format!("duplicate entries within a file: {}", infile.join(", ")));
+            parts.push(format!(
+                "duplicate entries within a file: {}",
+                infile.join(", ")
+            ));
         }
         let detail = parts.join("; ");
 

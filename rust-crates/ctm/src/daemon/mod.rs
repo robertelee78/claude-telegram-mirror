@@ -378,7 +378,9 @@ impl Daemon {
                     "ROUTING-002: cleared stale positional tmux targets on startup"
                 ),
                 Ok(_) => {}
-                Err(e) => tracing::warn!(error = %e, "ROUTING-002: failed clearing positional targets"),
+                Err(e) => {
+                    tracing::warn!(error = %e, "ROUTING-002: failed clearing positional targets")
+                }
             }
         }
 
@@ -1219,9 +1221,7 @@ async fn flush_pending_for_session(ctx: &HandlerContext, session_id: &str) {
             MessageType::ToolStart => socket_handlers::handle_tool_start(ctx, m).await,
             MessageType::ToolResult => socket_handlers::handle_tool_result(ctx, m).await,
             MessageType::Error => socket_handlers::handle_error(ctx, m).await,
-            MessageType::ApprovalRequest => {
-                socket_handlers::handle_approval_request(ctx, m).await
-            }
+            MessageType::ApprovalRequest => socket_handlers::handle_approval_request(ctx, m).await,
             other => {
                 tracing::warn!(
                     session_id = %session_id,
