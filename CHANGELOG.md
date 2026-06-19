@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.27] - 2026-06-19
+
+### Fixed (replies misrouted across concurrent sessions; first events lost on restart)
+- **Telegram replies no longer land in the wrong Claude session (ROUTING-002).** With multiple Claude sessions in one tmux server, every session's stored tmux target collapsed onto whichever pane the user was looking at, so a reply meant for one session was injected into another. Root cause (proven via live tmux repro + tmux(1)): the hook captured a **positional** target (`session:window.pane`) from bare `tmux display-message`, which tmux resolves against the attached client's *active* pane — not the pane the hook ran in. The hook now routes on the **stable `$TMUX_PANE` pane id** (e.g. `%24`), which tmux passes to each pane's child processes and never reuses for the pane's lifetime. A one-time startup migration clears stale positional targets so they cannot misroute after upgrade.
+- **No more silently-dropped messages when a session's topic is still being created.** During a bridge restart, a session's first events ("No topic — dropping …") were lost when forum-topic creation hit a transient Telegram error. Topic creation now retries with bounded backoff on transient failures (never on a genuine "not a forum"), and content events are buffered (bounded, per session) and flushed once the topic exists rather than dropped. `approval_request` resolves topic-readiness before creating any approval row, so a replay creates exactly one prompt.
+
+### Added (hook-install duplicate protection)
+- **`ctm doctor --fix` now detects and cleans duplicate / double-firing hooks.** Claude Code merges hooks across global, project, and `settings.local.json` scopes and only de-duplicates *byte-identical* commands at runtime — so the same ctm hook with a differing path/form across scopes, or duplicated within a file, executes more than once per event. `ctm doctor` flags this and `--fix` consolidates to a single canonical scope (broadest wins: global > project > local); `ctm hooks` reports presence per scope and warns on duplicates.
+- **`ctm install-hooks -p` is now cross-scope aware:** it skips a hook type already present in another scope (use `--force` to override), and `ctm uninstall-hooks -p` removes from the project `settings.json` + `settings.local.json`.
+
+### Changed (hook install correctness + setup guidance)
+- Hook install consolidates pre-existing in-file duplicates and stale/old-format entries to a single canonical entry (operating at the inner-command level, always preserving non-ctm hooks), and treats a hook as "already correct" structurally (matcher/format/timeout), not by command string alone.
+- The setup wizard no longer offers to install project-level hooks alongside global (which manufactured the double-fire) and corrects the previous, inaccurate "project settings override global hooks" guidance — global hooks apply to every project.
+
 ## [0.2.26] - 2026-06-18
 
 ### Fixed (macOS `ctm restart` left the daemon stopped)
