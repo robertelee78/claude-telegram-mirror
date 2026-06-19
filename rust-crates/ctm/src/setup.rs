@@ -79,7 +79,19 @@ struct TelegramResponse<T> {
 
 #[derive(serde::Deserialize)]
 struct BotUser {
+    /// The bot's own user id, required to query getChatMember for itself.
+    id: i64,
     username: Option<String>,
+}
+
+/// Subset of Telegram's ChatMember object needed to verify the bot can manage
+/// forum topics. `can_manage_topics` is only present (and meaningful) when the
+/// member is an administrator; it is absent for plain members, so we model it
+/// as `Option<bool>` and treat absence as "not granted".
+#[derive(serde::Deserialize)]
+struct ChatMemberInfo {
+    status: String,
+    can_manage_topics: Option<bool>,
 }
 
 #[derive(serde::Deserialize, Clone)]
@@ -190,6 +202,63 @@ async fn test_chat_send(
         Err(data
             .description
             .unwrap_or_else(|| "Failed to send message".into()))
+    }
+}
+
+/// Fetch the bot's own numeric user id via getMe. Needed because getChatMember
+/// is keyed by user_id, and a bot can only look itself up by its own id.
+async fn get_bot_id(client: &reqwest::Client, token: &str) -> Result<i64, String> {
+    let resp = client
+        .get(format!("https://api.telegram.org/bot{token}/getMe"))
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {e}"))?;
+
+    let data: TelegramResponse<BotUser> =
+        resp.json().await.map_err(|e| format!("Parse error: {e}"))?;
+
+    if data.ok {
+        data.result
+            .map(|r| r.id)
+            .ok_or_else(|| "getMe returned no result".to_string())
+    } else {
+        Err(data.description.unwrap_or_else(|| "getMe failed".into()))
+    }
+}
+
+/// Query the bot's membership in the configured chat so the wizard can verify
+/// the 'Manage Topics' admin permission. `test_chat_send` proves the bot can
+/// post, but it cannot detect whether per-session forum topics will work — a
+/// plain member (or an admin without 'Manage Topics') silently falls back to
+/// the General topic at runtime, with the failure logged only at debug level.
+async fn check_bot_permissions(
+    client: &reqwest::Client,
+    token: &str,
+    chat_id: &str,
+    bot_id: i64,
+) -> Result<ChatMemberInfo, String> {
+    let resp = client
+        .post(format!(
+            "https://api.telegram.org/bot{token}/getChatMember"
+        ))
+        .json(&serde_json::json!({
+            "chat_id": chat_id,
+            "user_id": bot_id,
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {e}"))?;
+
+    let data: TelegramResponse<ChatMemberInfo> =
+        resp.json().await.map_err(|e| format!("Parse error: {e}"))?;
+
+    if data.ok {
+        data.result
+            .ok_or_else(|| "getChatMember returned no result".to_string())
+    } else {
+        Err(data
+            .description
+            .unwrap_or_else(|| "getChatMember failed".into()))
     }
 }
 
@@ -570,7 +639,90 @@ pub async fn run_setup() -> anyhow::Result<()> {
                     "  {}",
                     gray("Check your Telegram group - you should see a test message.")
                 );
-                break;
+                println!();
+
+                // The post test above proves the bot can send, but not that it
+                // can create per-session forum topics. Actively probe getChatMember
+                // for the 'Manage Topics' admin permission so a missing grant is
+                // caught here during setup rather than silently degrading at
+                // runtime (sessions collapsing into the General topic).
+                print!("{}", gray("Checking 'Manage Topics' permission... "));
+                let probe = match get_bot_id(&client, &bot_token).await {
+                    Ok(bot_id) => check_bot_permissions(&client, &bot_token, &chat_id, bot_id).await,
+                    Err(e) => Err(e),
+                };
+
+                match probe {
+                    Ok(member) => {
+                        let is_admin =
+                            member.status == "administrator" || member.status == "creator";
+                        let can_manage = member.can_manage_topics.unwrap_or(false);
+
+                        if is_admin && can_manage {
+                            println!("{}", green("Enabled"));
+                            println!(
+                                "  {} Bot can create a forum topic per session.",
+                                green("OK")
+                            );
+                            break;
+                        }
+
+                        println!("{}", yellow("Missing"));
+                        println!();
+                        if is_admin {
+                            println!(
+                                "{}",
+                                yellow("The bot is an admin but lacks 'Manage Topics'.")
+                            );
+                        } else {
+                            println!(
+                                "{}",
+                                yellow("The bot is not an admin in this group.")
+                            );
+                        }
+                        println!(
+                            "{}",
+                            gray("Per-session forum topics will NOT be created — every")
+                        );
+                        println!(
+                            "{}",
+                            gray("session would share the General topic until this is fixed.")
+                        );
+                        println!();
+                        println!("{}", bold("To fix:"));
+                        println!(
+                            "  {}",
+                            gray("Group Settings -> Administrators -> select the bot")
+                        );
+                        println!("  {}", gray("-> enable 'Manage Topics', then retry."));
+                        println!();
+
+                        let choice = Select::new()
+                            .with_prompt("How would you like to proceed?")
+                            .items(&[
+                                "Retry (I've enabled the permission)",
+                                "Continue anyway",
+                            ])
+                            .default(0)
+                            .interact()?;
+
+                        if choice == 1 {
+                            break;
+                        }
+                        // Retry: re-run the whole permission step.
+                        continue;
+                    }
+                    Err(e) => {
+                        // The permission probe is advisory — the post test already
+                        // passed — so a transient failure here must not block setup.
+                        println!("{}", yellow("skipped"));
+                        println!(
+                            "  {}",
+                            gray(&format!("Could not verify topic permission: {e}"))
+                        );
+                        break;
+                    }
+                }
             }
             Err(e) => {
                 println!("{}", red("Failed"));
