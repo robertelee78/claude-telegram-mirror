@@ -111,10 +111,19 @@ enum Commands {
         /// Install to current project's .claude/settings.json
         #[arg(short, long)]
         project: bool,
+        /// Install even if a ctm hook already exists in another scope
+        /// (by default a project install is skipped to avoid double-firing).
+        #[arg(long)]
+        force: bool,
     },
 
     /// Remove Claude Code hooks
-    UninstallHooks,
+    UninstallHooks {
+        /// Remove from the current project's settings.json + settings.local.json
+        /// instead of the global ~/.claude/settings.json.
+        #[arg(short, long)]
+        project: bool,
+    },
 
     /// Show hook installation status
     Hooks,
@@ -241,8 +250,10 @@ async fn main() -> anyhow::Result<()> {
         Commands::Config { show, test } => cmd_config(show, test).await,
 
         // Phase 4: Native Rust implementations — no TypeScript delegation
-        Commands::InstallHooks { project } => installer::install_hooks(project),
-        Commands::UninstallHooks => installer::uninstall_hooks(),
+        Commands::InstallHooks { project, force } => {
+            installer::install_hooks_with_path_forced(project, None, force)
+        }
+        Commands::UninstallHooks { project } => installer::uninstall_hooks_scoped(project),
         Commands::Hooks => installer::print_hook_status(),
         Commands::Setup => setup::run_setup().await,
         Commands::Doctor { fix } => doctor::run_doctor(fix).await,

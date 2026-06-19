@@ -901,75 +901,34 @@ pub async fn run_setup() -> anyhow::Result<()> {
         }
 
         println!();
-        println!("{}", yellow("  IMPORTANT: PROJECT-LEVEL HOOKS"));
+        println!("{}", gray("  Global hooks apply to EVERY project automatically —"));
+        println!(
+            "{}",
+            gray("  Claude Code merges hooks across scopes, so a project with its")
+        );
+        println!(
+            "{}",
+            gray("  own .claude/settings.json still runs these global hooks.")
+        );
+        println!(
+            "{}",
+            gray("  You do NOT need per-project hooks; installing them too would")
+        );
+        println!("{}", gray("  make each hook fire twice."));
         println!();
-        println!("  If you use Claude Code in projects that have their own");
-        println!("  .claude/settings.json file, the GLOBAL hooks we just");
-        println!("  installed will be IGNORED in those projects.");
-        println!();
-        println!("  To enable Telegram mirroring in a specific project:");
-        println!();
-        println!("    cd /path/to/your/project");
-        println!("    ctm install-hooks --project");
-        println!();
-
-        let has_project = Confirm::new()
-            .with_prompt("Do you have a project with .claude/settings.json that needs hooks?")
-            .default(false)
-            .interact()?;
-
-        if has_project {
-            loop {
-                let project_path: String = Input::new()
-                    .with_prompt("Enter project path (or 'done' to finish)")
-                    .default("done".into())
-                    .interact_text()?;
-
-                if project_path.trim().to_lowercase() == "done" || project_path.trim().is_empty() {
-                    break;
-                }
-
-                let full_path = if project_path.starts_with('/') {
-                    PathBuf::from(&project_path)
-                } else {
-                    std::env::current_dir()?.join(&project_path)
-                };
-
-                let claude_dir = full_path.join(".claude");
-                if !claude_dir.exists() {
-                    println!("{} No .claude/ directory in {project_path}", yellow("WARN"));
-                    println!(
-                        "  {}",
-                        gray("This project doesn't have custom Claude settings.")
-                    );
-                    println!(
-                        "  {}",
-                        gray("Global hooks will work here - no action needed!")
-                    );
-                } else {
-                    // L9: pass project path directly instead of using set_current_dir
-                    match crate::installer::install_hooks_for_project(&full_path) {
-                        Ok(()) => {
-                            println!(
-                                "{} Hooks installed to {project_path}/.claude/settings.json",
-                                green("OK")
-                            );
-                        }
-                        Err(e) => {
-                            println!("{} {e}", yellow("WARN"));
-                        }
-                    }
-                }
-
-                if !Confirm::new()
-                    .with_prompt("Add another project?")
-                    .default(false)
-                    .interact()?
-                {
-                    break;
-                }
-            }
-        }
+        println!(
+            "{}",
+            gray("  Only if you want project-scoped hooks INSTEAD of global (e.g.")
+        );
+        println!("{}", gray("  committed team settings): run `ctm install-hooks -p` in"));
+        println!(
+            "{}",
+            gray("  that project and remove the global ones (`ctm uninstall-hooks`).")
+        );
+        println!(
+            "{}",
+            gray("  `ctm doctor --fix` consolidates any accidental duplicates.")
+        );
         println!();
     }
 
@@ -1079,13 +1038,16 @@ pub async fn run_setup() -> anyhow::Result<()> {
     );
     println!();
 
-    // L3.7: Project-hooks reminder box (L6.7: uses reusable print_box)
+    // L3.7: Project-hooks reminder box (L6.7: uses reusable print_box).
+    // Global hooks already apply to every project (Claude merges hook scopes), so
+    // the box clarifies that project hooks are a REPLACEMENT, not an addition.
     println!();
     print_box(
-        "  REMEMBER: If your project has .claude/settings  \n\
-         \x20 that override global hooks, run:                \n\
-         \x20   ctm install-hooks -p                          \n\
-         \x20 from your project directory.                    ",
+        "  Global hooks already cover every project.          \n\
+         \x20 Project hooks are only for project-scoped INSTEAD \n\
+         \x20 of global (then `ctm uninstall-hooks`):           \n\
+         \x20   ctm install-hooks -p                            \n\
+         \x20 `ctm doctor --fix` cleans accidental duplicates.  ",
     );
     println!();
 

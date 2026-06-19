@@ -287,6 +287,74 @@ fn foreign_pretooluse_command(hooks: Option<&serde_json::Value>) -> Option<Strin
 }
 
 fn check_hooks(fix: bool) -> CheckResult {
+    // Duplicate / cross-scope detection (the "hook mess"): hooks merge across
+    // global/project/local and DIFFERING ctm command strings double-fire. Detect
+    // a ctm hook present in multiple scopes, or duplicated within a single file,
+    // and clean it under `--fix`. Runs before the global-only completeness checks
+    // so a project-scoped mess is caught even when global settings are absent.
+    let base = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let scopes = crate::installer::resolve_scopes(&base);
+    let diag = crate::installer::diagnose_hooks(&scopes);
+    if !diag.is_clean() {
+        let cross = diag.cross_scope_dups();
+        let infile = diag.in_file_dups();
+        let mut parts = Vec::new();
+        if !cross.is_empty() {
+            parts.push(format!("same hook in multiple scopes: {}", cross.join(", ")));
+        }
+        if !infile.is_empty() {
+            parts.push(format!("duplicate entries within a file: {}", infile.join(", ")));
+        }
+        let detail = parts.join("; ");
+
+        if fix {
+            match crate::installer::consolidate_hooks(&scopes) {
+                Ok(log) if !log.is_empty() => {
+                    for line in &log {
+                        println!("    {}", gray(&format!("-> {line}")));
+                    }
+                    return CheckResult::warn(
+                        "Claude Code Hooks",
+                        "Duplicate/cross-scope ctm hooks detected",
+                    )
+                    .with_details(&detail)
+                    .into_fixed("consolidated ctm hooks to a single scope/entry");
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    return CheckResult::warn(
+                        "Claude Code Hooks",
+                        "Failed to consolidate duplicate ctm hooks",
+                    )
+                    .with_details(&format!("{detail} (auto-fix error: {e})"));
+                }
+            }
+        } else {
+            return CheckResult::warn(
+                "Claude Code Hooks",
+                "Duplicate ctm hooks detected — may execute more than once per event",
+            )
+            .with_details(&format!(
+                "{detail}. Run `ctm doctor --fix` to consolidate to one scope."
+            ));
+        }
+    }
+
+    // Hooks are clean here (past the duplicate check). If they live cleanly in a
+    // project/local scope but NOT global, report that instead of steering the user
+    // toward a global install (which would recreate cross-scope duplication).
+    let global_has = diag.per_type.iter().any(|(_, ps)| {
+        ps.iter()
+            .any(|p| matches!(p.scope, crate::installer::HookScope::Global))
+    });
+    if !diag.per_type.is_empty() && !global_has {
+        let n = diag.per_type.len();
+        return CheckResult::pass(
+            "Claude Code Hooks",
+            &format!("{n} hook type(s) installed in project/local scope (no duplicates)"),
+        );
+    }
+
     let path = claude_settings_path();
     if !path.exists() {
         let result = CheckResult::warn("Claude Code Hooks", "Claude settings not found")

@@ -257,6 +257,56 @@ A field report ("AskUserQuestion never reached Telegram") triggered a deep-resea
 
 Every change: `cargo build`/`fmt`/`clippy` clean and the full suite green (151 lib + all integration suites) at each commit, with an independent Codex read-only review (verdicts: APPROVE / APPROVE-WITH-NITS, all nits addressed; Phase-4 PASS). The structured-free-text follow-up flagged above (PR-E "open finding") remains the recommended next step toward a fully keystroke-free design.
 
+## Addendum — Hook-install dedup & cross-scope cleanup (2026-06-19)
+
+**Status:** Implemented (2026-06-19). Extends the hook-install + `ctm doctor`
+surface this ADR owns (the D7 foreign-PreToolUse check that reuses the installer's
+token classifier). Codex-reviewed (plan + implementation); deep-research informed.
+
+### Problem
+
+`ctm install-hooks -p` wrote ctm's hook into a project's `.claude/settings.json`
+with no awareness of the global install, and the setup wizard actively *recommended*
+doing so — on the false premise (stated verbatim in `setup.rs`) that project settings
+*override* global hooks. They do not.
+
+### Verified behavior (primary sources)
+
+Claude Code **merges** hooks across `~/.claude/settings.json` (user),
+`.claude/settings.json` (project), and `.claude/settings.local.json` (local) — a
+higher scope does not suppress a lower one (issue #11392). It **does** dedup
+**identical** handlers at runtime, "deduplicated by command string and `args`"
+(official hooks doc, re-verified directly). So byte-identical duplicates collapse,
+but **DIFFERING** ctm command strings across scopes — a different binary path, a
+legacy `telegram-hook` form, whitespace — defeat dedup and **double-fire** (the
+dedup keys on the raw, unexpanded string; issue #29724).
+
+### Decision
+
+- **Detection** keys on ctm hooks at the **inner command level** (`is_ctm_command`
+  is now token-boundary-aware so `xctm hook` / `my-ctm-wrapper` no longer match).
+- **Install is structural + collapsing:** a hook type is "Unchanged" only when the
+  file already equals the desired single-canonical shape; pre-existing in-file
+  duplicates and stale/old-format entries are consolidated to one. Non-ctm inner
+  hooks are always preserved (collapse operates per-command, never per-item).
+- **Cross-scope:** `install-hooks -p` **skips** any hook type already present in
+  another scope (with a pointer to `doctor --fix`), `--force` overrides; global
+  install proceeds but **warns**. Never edits another scope's file implicitly.
+- **`ctm doctor` detects and `--fix` cleans the mess:** flags ctm hooks present in
+  multiple scopes or duplicated within a file, and consolidates to one — keeping the
+  **broadest** scope present (global > project > local) and removing the narrower
+  ones. `ctm hooks` status and `ctm uninstall-hooks -p` are now scope-aware
+  (global wrappers retained for API compat).
+- **Setup wizard reframed:** removed the project-hook install prompt that manufactured
+  duplicates; it now explains global covers every project and that project scope is a
+  *replacement* (with global removal), not an addition.
+
+### Not done (recorded option)
+
+The documented canonical path for a distributable third-party tool is to ship hooks as
+a **plugin** (`hooks/hooks.json`) rather than editing settings.json. Deferred — larger
+re-architecture, and plugins have their own double-load caveats (#29724).
+
 ## Links
 
 - ADR-003 — Dual hook handlers (hook architecture this builds on)
