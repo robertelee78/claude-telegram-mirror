@@ -529,6 +529,47 @@ impl TelegramBot {
         }
     }
 
+    /// BUG-002 (ROUTING-002 follow-up): create a forum topic, retrying on
+    /// TRANSIENT failures with bounded backoff.
+    ///
+    /// `api_call` already retries Telegram 429s internally, but returns `Err`
+    /// immediately on network errors and 5xx — exactly the failures seen while a
+    /// bridge restart races bot readiness. The old callers collapsed that `Err`
+    /// into `None` and then dropped the session's first events. Here we retry the
+    /// whole call a few times (1s, 2s, 4s) so a transient blip becomes a slightly
+    /// delayed topic instead of permanent message loss.
+    ///
+    /// `Ok(None)` (the chat is not a forum — a PERMANENT condition) is returned
+    /// immediately and never retried.
+    pub async fn create_forum_topic_resilient(
+        &self,
+        name: &str,
+        color_index: usize,
+    ) -> Result<Option<i64>> {
+        const MAX_ATTEMPTS: u32 = 4;
+        let mut last_err: Option<AppError> = None;
+        for attempt in 0..MAX_ATTEMPTS {
+            match self.create_forum_topic(name, color_index).await {
+                Ok(some_or_none) => return Ok(some_or_none),
+                Err(e) => {
+                    last_err = Some(e);
+                    if attempt + 1 < MAX_ATTEMPTS {
+                        let backoff = 1u64 << attempt; // 1s, 2s, 4s
+                        tracing::warn!(
+                            name,
+                            attempt = attempt + 1,
+                            backoff_secs = backoff,
+                            "createForumTopic failed (transient) — retrying after backoff"
+                        );
+                        tokio::time::sleep(tokio::time::Duration::from_secs(backoff)).await;
+                    }
+                }
+            }
+        }
+        Err(last_err
+            .unwrap_or_else(|| AppError::Telegram("createForumTopic exhausted retries".into())))
+    }
+
     /// Close a forum topic.
     pub async fn close_forum_topic(&self, thread_id: i64) -> Result<bool> {
         let resp: TgResponse<bool> = self

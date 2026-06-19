@@ -261,7 +261,11 @@ pub(super) async fn handle_session_start(ctx: &HandlerContext, msg: &BridgeMessa
                     .fold(0u32, |acc, b| acc.wrapping_add(b as u32))
                     as usize
                     % 6;
-                let created = match ctx.bot.create_forum_topic(&topic_name, color_index).await {
+                let created = match ctx
+                    .bot
+                    .create_forum_topic_resilient(&topic_name, color_index)
+                    .await
+                {
                     Ok(Some(tid)) => {
                         let sid = msg.session_id.clone();
                         ctx.db_op(move |sess| {
@@ -353,6 +357,12 @@ pub(super) async fn handle_session_start(ctx: &HandlerContext, msg: &BridgeMessa
             metadata: Some(broadcast_meta),
         };
         broadcast_to_clients(&ctx.socket_clients, &broadcast_msg).await;
+    }
+
+    // BUG-002: if a topic was assigned, flush any content events that were
+    // buffered because they arrived before this session's topic existed.
+    if thread_id.is_some() {
+        super::flush_pending_for_session(ctx, &msg.session_id).await;
     }
 }
 
@@ -460,6 +470,8 @@ pub(super) async fn handle_session_end(ctx: &HandlerContext, msg: &BridgeMessage
         // Clean up caches
         ctx.session_tmux.write().await.remove(&msg.session_id);
         ctx.custom_titles.write().await.remove(&msg.session_id);
+        // BUG-002: drop any never-flushed buffered events so they cannot leak.
+        ctx.pending_topic_msgs.write().await.remove(&msg.session_id);
         cleanup_pending_questions(ctx, &msg.session_id).await;
 
         // ADR-014 B4: capture this session's pending approval IDs BEFORE end_session
@@ -508,6 +520,7 @@ pub(super) async fn handle_session_end(ctx: &HandlerContext, msg: &BridgeMessage
                 .await;
                 ctx.session_tmux.write().await.remove(&child.id);
                 ctx.custom_titles.write().await.remove(&child.id);
+                ctx.pending_topic_msgs.write().await.remove(&child.id);
             }
         }
     }
@@ -517,7 +530,8 @@ pub(super) async fn handle_session_end(ctx: &HandlerContext, msg: &BridgeMessage
 pub(super) async fn handle_agent_response(ctx: &HandlerContext, msg: &BridgeMessage) {
     let thread_id = ctx.wait_for_topic(&msg.session_id).await;
     if thread_id.is_none() && ctx.config.use_threads {
-        tracing::warn!(session_id = %msg.session_id, "No topic — dropping agent_response");
+        // BUG-002: buffer instead of silently dropping; flushed once the topic exists.
+        super::buffer_pending_message(ctx, msg).await;
         return;
     }
 
@@ -622,7 +636,8 @@ pub(super) async fn handle_tool_start(ctx: &HandlerContext, msg: &BridgeMessage)
 
     let thread_id = ctx.wait_for_topic(&msg.session_id).await;
     if thread_id.is_none() && ctx.config.use_threads {
-        tracing::warn!(session_id = %msg.session_id, "No topic — dropping tool_start");
+        // BUG-002: buffer instead of silently dropping; flushed once the topic exists.
+        super::buffer_pending_message(ctx, msg).await;
         return;
     }
 
@@ -731,7 +746,8 @@ pub(super) async fn handle_tool_result(ctx: &HandlerContext, msg: &BridgeMessage
 
     let thread_id = ctx.wait_for_topic(&msg.session_id).await;
     if thread_id.is_none() && ctx.config.use_threads {
-        tracing::warn!(session_id = %msg.session_id, "No topic — dropping tool_result");
+        // BUG-002: buffer instead of silently dropping; flushed once the topic exists.
+        super::buffer_pending_message(ctx, msg).await;
         return;
     }
 
@@ -786,7 +802,8 @@ pub(super) async fn handle_user_input(ctx: &HandlerContext, msg: &BridgeMessage)
 
     let thread_id = ctx.wait_for_topic(&msg.session_id).await;
     if thread_id.is_none() && ctx.config.use_threads {
-        tracing::warn!(session_id = %msg.session_id, "No topic — dropping user_input");
+        // BUG-002: buffer instead of silently dropping; flushed once the topic exists.
+        super::buffer_pending_message(ctx, msg).await;
         return;
     }
 
@@ -804,6 +821,20 @@ pub(super) async fn handle_user_input(ctx: &HandlerContext, msg: &BridgeMessage)
 
 /// Handler 7: approval_request
 pub(super) async fn handle_approval_request(ctx: &HandlerContext, msg: &BridgeMessage) {
+    // BUG-002 (review M3): resolve topic readiness BEFORE creating any approval
+    // state. This is safety-critical — the hook blocks up to 300s waiting for a
+    // response. If the topic is not ready we buffer the *request* (preserving its
+    // client_id metadata) and return WITHOUT creating an approval row, so a replay
+    // after the topic exists creates exactly one approval with a visible prompt.
+    // The previous order created an orphan approval row and recorded the client,
+    // then dropped the prompt — the user never saw it and the hook only fell back
+    // after timing out.
+    let thread_id = ctx.wait_for_topic(&msg.session_id).await;
+    if thread_id.is_none() && ctx.config.use_threads {
+        super::buffer_pending_message(ctx, msg).await;
+        return;
+    }
+
     let approval_id = {
         let sid = msg.session_id.clone();
         let content = msg.content.clone();
@@ -821,12 +852,6 @@ pub(super) async fn handle_approval_request(ctx: &HandlerContext, msg: &BridgeMe
             .write()
             .await
             .insert(approval_id.clone(), client_id.to_string());
-    }
-
-    let thread_id = ctx.wait_for_topic(&msg.session_id).await;
-    if thread_id.is_none() && ctx.config.use_threads {
-        tracing::warn!(session_id = %msg.session_id, "No topic — dropping approval_request");
-        return;
     }
 
     let keyboard = crate::bot::create_approval_keyboard(&approval_id);
@@ -852,7 +877,8 @@ pub(super) async fn handle_approval_request(ctx: &HandlerContext, msg: &BridgeMe
 pub(super) async fn handle_error(ctx: &HandlerContext, msg: &BridgeMessage) {
     let thread_id = ctx.wait_for_topic(&msg.session_id).await;
     if thread_id.is_none() && ctx.config.use_threads {
-        tracing::warn!(session_id = %msg.session_id, "No topic — dropping error");
+        // BUG-002: buffer instead of silently dropping; flushed once the topic exists.
+        super::buffer_pending_message(ctx, msg).await;
         return;
     }
     ctx.bot
@@ -907,6 +933,9 @@ pub(super) async fn handle_pre_compact(ctx: &HandlerContext, msg: &BridgeMessage
 
     let thread_id = ctx.wait_for_topic(&msg.session_id).await;
     if thread_id.is_none() && ctx.config.use_threads {
+        // BUG-002: intentionally NOT buffered. pre_compact is purely informational
+        // ("compacting…") and stale by the time a delayed topic appears; replaying it
+        // would post a misleading notice. Dropping (logged, not silent) is correct.
         tracing::warn!(session_id = %msg.session_id, "No topic — dropping pre_compact");
         return;
     }
@@ -1096,6 +1125,9 @@ fn store_back_action(lifecycle: QuestionLifecycle) -> StoreBackAction {
 pub(super) async fn handle_ask_user_question(ctx: &HandlerContext, msg: &BridgeMessage) {
     let thread_id = ctx.wait_for_topic(&msg.session_id).await;
     if thread_id.is_none() && ctx.config.use_threads {
+        // BUG-002: intentionally NOT buffered. The interactive widget is stateful and
+        // the CLI still renders it natively, so the user is not blocked; replaying a
+        // stale question into a late topic risks double-prompts. Drop (logged).
         tracing::warn!(session_id = %msg.session_id, "No topic — dropping ask_user_question (CLI widget still renders)");
         return;
     }

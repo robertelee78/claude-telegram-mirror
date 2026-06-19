@@ -14,6 +14,32 @@ fn make_mgr() -> (SessionManager, tempfile::TempDir) {
 }
 
 #[test]
+fn clear_positional_tmux_targets_migrates_only_positional() {
+    // ROUTING-002: startup migration clears positional (`session:window.pane`)
+    // targets but leaves stable `%N` pane ids and NULLs untouched.
+    let (mgr, _tmp) = make_mgr();
+    mgr.create_session("pane-id", 1, None, None, None, Some("%24"), None)
+        .unwrap();
+    mgr.create_session("positional", 2, None, None, None, Some("0:1.0"), None)
+        .unwrap();
+    mgr.create_session("no-target", 3, None, None, None, None, None)
+        .unwrap();
+
+    let cleared = mgr.clear_positional_tmux_targets().unwrap();
+    assert_eq!(cleared, 1, "only the positional row should be cleared");
+
+    // Pane id preserved.
+    assert_eq!(
+        mgr.get_tmux_info("pane-id").unwrap(),
+        Some(("%24".to_string(), None))
+    );
+    // Positional cleared to NULL (get_tmux_info maps NULL target -> None).
+    assert_eq!(mgr.get_tmux_info("positional").unwrap(), None);
+    // Never-set target untouched.
+    assert_eq!(mgr.get_tmux_info("no-target").unwrap(), None);
+}
+
+#[test]
 fn create_session_and_verify_exists() {
     let (mgr, _tmp) = make_mgr();
 

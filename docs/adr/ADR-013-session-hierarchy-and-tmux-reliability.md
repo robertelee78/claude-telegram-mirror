@@ -563,6 +563,57 @@ The cleanest fix: have `api_call` return `Ok(tg)` for 400 errors (just like it d
 
 Steps 9a and 9b can run in parallel. Step 9c depends on 9b. Step 9d depends on 9b.
 
+## Addendum — ROUTING-002: Stable pane-id routing (2026-06-18)
+
+**Status:** Implemented (2026-06-18). Supersedes the positional-target portions of
+Part A (F1, F6, F7) and the positional `tmux_target` assumption carried forward by
+ROUTING-001.
+
+### Problem (field report, multi-session drift)
+
+With several Claude sessions in one tmux server, every session's stored `tmux_target`
+collapsed onto whichever pane the user was *looking at*; Telegram→CLI replies then
+injected into the wrong session. Log signature:
+`Tmux target changed, auto-updating old=Some("0:1.0") new="0:0.0"`.
+
+### Root cause (proven, not inferred)
+
+`detect_tmux_session()` built a **positional** target `session:window.pane` from three
+bare `tmux display-message -p '#S'/'#I'/'#P'` calls. With no `-t`, tmux resolves those
+against the attached client's **active** pane, not the pane the hook ran in. Confirmed
+two ways: (1) live repro — a shell in pane `%0` running bare `display-message -p '#P'`
+returned `%1` (the active pane); (2) tmux(1): information is taken from `target-pane`
+if `-t` is given, "otherwise the active pane", and pane IDs are "unique and unchanged
+for the life of the … pane in the tmux server," passed to children via `$TMUX_PANE`.
+Positional ids are additionally unstable (reused on pane renumber/reorder). The hook
+ignored its own inherited `$TMUX_PANE`.
+
+### Decision
+
+1. **Route on the stable pane id.** `detect_tmux_session()` reads `$TMUX_PANE`
+   (e.g. `%24`) from the hook's inherited environment and stores it verbatim as the
+   target. `%N` is a first-class tmux `-t` target for send-keys / capture-pane /
+   list-panes / display-message, so no positional round-trip is needed and it is stable
+   for the pane's lifetime. tmux(1) explicitly recommends IDs over positional targets
+   "from a script."
+2. **Fallback only when `$TMUX_PANE` is unset** though `$TMUX` is set (not expected in
+   normal tmux): the legacy positional detection, behind a warning.
+3. **Migration:** on startup, `clear_positional_tmux_targets()` NULLs any active
+   session's non-`%` target left by an older build (it could misroute after a restart
+   and cannot be string-compared against new pane ids); the next hook re-establishes a
+   correct pane id. Warm-from-DB (F8) now warms only `%`-prefixed targets.
+4. **Uniqueness guard:** `check_and_update_tmux_target` now logs loudly if two active
+   sessions ever claim the same target (structurally impossible under pane ids), so the
+   condition is observable rather than silent; the most-recent hook stays authoritative.
+
+### Consequences
+
+- F1's `find_claude_code_session()` runtime fallback (already removed by ROUTING-001)
+  and F6/F7's positional live-detection are obsolete: the only trusted target source is
+  the hook's `$TMUX_PANE`.
+- `TmuxInfo.session`/`pane` positional fields are no longer meaningful for routing
+  (only `target`/`socket` are consumed downstream); `target` now carries the pane id.
+
 ## References
 
 - [Claude Code Hooks Reference](https://code.claude.com/docs/en/hooks)

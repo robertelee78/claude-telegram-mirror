@@ -386,55 +386,86 @@ impl InputInjector {
         PaneClaudeState::Unknown
     }
 
-    /// Detect current tmux session from environment
+    /// ROUTING-002: Build `TmuxInfo` from a stable tmux pane id (`$TMUX_PANE`).
+    ///
+    /// Pure and unit-testable: it neither reads process-global env nor spawns
+    /// tmux. Returns `None` when `tmux_pane` is absent/empty, signalling the
+    /// caller to fall back to positional detection. The pane id (e.g. `%24`) is
+    /// stored verbatim as the routing `target`; it is a first-class tmux target
+    /// accepted by send-keys/capture-pane/list-panes/display-message alike.
+    fn tmux_info_from_pane_id(socket: Option<String>, tmux_pane: Option<&str>) -> Option<TmuxInfo> {
+        let pane_id = tmux_pane?.trim();
+        if pane_id.is_empty() {
+            return None;
+        }
+        Some(TmuxInfo {
+            // The positional `session`/`pane` indices are not meaningful when we
+            // route by pane id; only `target`/`socket` are consumed downstream.
+            session: String::new(),
+            pane: pane_id.to_string(),
+            target: pane_id.to_string(),
+            socket,
+        })
+    }
+
+    /// Detect the current tmux pane from the environment.
+    ///
+    /// ROUTING-002: The pane is identified by its STABLE tmux pane id
+    /// (`$TMUX_PANE`, e.g. `%24`), read from the environment the hook process
+    /// inherited from its own pane. This is the only correct source:
+    ///
+    ///   - tmux sets `$TMUX_PANE` per-pane and it is inherited by every child
+    ///     process (Claude Code and the hooks it spawns), so it always names the
+    ///     pane the hook actually ran in. Pane ids are unique and unchanged for
+    ///     the life of the pane within the server (tmux(1)).
+    ///   - The previous implementation built a POSITIONAL target
+    ///     (`session:window.pane`) from bare `tmux display-message -p '#S'/'#I'/'#P'`
+    ///     calls. With no `-t`, tmux resolves those against the attached client's
+    ///     ACTIVE pane — NOT the calling pane (tmux(1): "otherwise the active
+    ///     pane"). With multiple Claude sessions in one server, every session's
+    ///     hook then recorded whichever pane the user was looking at, so all
+    ///     sessions' targets collapsed onto the active pane and Telegram→CLI
+    ///     replies misrouted. Positional ids are also unstable (reused on pane
+    ///     renumber/reorder). tmux(1) explicitly recommends pane/window/session
+    ///     IDs over positional targets "from a script".
+    ///
+    /// Falls back to the legacy positional detection only if `$TMUX_PANE` is
+    /// unset though `$TMUX` is set (not expected in normal tmux).
     pub fn detect_tmux_session() -> Option<TmuxInfo> {
         let tmux_env = std::env::var("TMUX").ok()?;
         let socket_path = tmux_env.split(',').next().map(|s| s.to_string());
 
-        let session = Command::new("tmux")
-            .arg("display-message")
-            .arg("-p")
-            .arg("#S")
-            .output()
-            .ok()
-            .and_then(|o| {
-                if o.status.success() {
-                    Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
-                } else {
-                    None
-                }
-            })?;
+        // Preferred path: the hook's own pane id, straight from the inherited env.
+        if let Some(info) = Self::tmux_info_from_pane_id(
+            socket_path.clone(),
+            std::env::var("TMUX_PANE").ok().as_deref(),
+        ) {
+            return Some(info);
+        }
 
-        let window = Command::new("tmux")
-            .arg("display-message")
-            .arg("-p")
-            .arg("#I")
-            .output()
-            .ok()
-            .and_then(|o| {
-                if o.status.success() {
-                    Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_else(|| "0".to_string());
-
-        let pane = Command::new("tmux")
-            .arg("display-message")
-            .arg("-p")
-            .arg("#P")
-            .output()
-            .ok()
-            .and_then(|o| {
-                if o.status.success() {
-                    Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_else(|| "0".to_string());
-
+        // Defensive fallback: $TMUX set but $TMUX_PANE unset. Derive a positional
+        // target from the active pane. This is the drift-prone legacy path, used
+        // only when the stable pane id is unavailable.
+        tracing::warn!(
+            "TMUX_PANE unset though TMUX is set; falling back to positional tmux \
+             target (may misroute with multiple concurrent sessions)"
+        );
+        let query = |fmt: &str| -> Option<String> {
+            Command::new("tmux")
+                .arg("display-message")
+                .arg("-p")
+                .arg(fmt)
+                .output()
+                .ok()
+                .and_then(|o| {
+                    o.status
+                        .success()
+                        .then(|| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                })
+        };
+        let session = query("#S")?;
+        let window = query("#I").unwrap_or_else(|| "0".to_string());
+        let pane = query("#P").unwrap_or_else(|| "0".to_string());
         let target = format!("{}:{}.{}", session, window, pane);
 
         Some(TmuxInfo {
@@ -534,6 +565,30 @@ mod tests {
         assert!(is_valid_slash_command("/rename My Feature"));
         assert!(!is_valid_slash_command("/clear;rm -rf /"));
         assert!(!is_valid_slash_command(""));
+    }
+
+    #[test]
+    fn test_tmux_info_from_pane_id() {
+        // ROUTING-002: the stable pane id is stored verbatim as the target, and
+        // the socket is threaded through untouched.
+        let info = InputInjector::tmux_info_from_pane_id(
+            Some("/tmp/tmux-1000/default".to_string()),
+            Some("%24"),
+        )
+        .expect("pane id present -> Some");
+        assert_eq!(info.target, "%24");
+        assert_eq!(info.pane, "%24");
+        assert_eq!(info.socket.as_deref(), Some("/tmp/tmux-1000/default"));
+
+        // Surrounding whitespace from `display-message`/env is trimmed.
+        let trimmed = InputInjector::tmux_info_from_pane_id(None, Some("  %7\n"))
+            .expect("trimmed pane id -> Some");
+        assert_eq!(trimmed.target, "%7");
+
+        // Absent or empty pane id -> None, so the caller uses the positional fallback.
+        assert!(InputInjector::tmux_info_from_pane_id(None, None).is_none());
+        assert!(InputInjector::tmux_info_from_pane_id(None, Some("")).is_none());
+        assert!(InputInjector::tmux_info_from_pane_id(None, Some("   ")).is_none());
     }
 
     #[test]

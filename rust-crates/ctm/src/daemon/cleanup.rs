@@ -302,6 +302,8 @@ pub(super) async fn handle_stale_session_cleanup(
     ctx.session_threads.write().await.remove(&session.id);
     ctx.session_tmux.write().await.remove(&session.id);
     ctx.custom_titles.write().await.remove(&session.id);
+    // BUG-002: drop any never-flushed buffered events so they cannot leak.
+    ctx.pending_topic_msgs.write().await.remove(&session.id);
 
     // Clean up transcript state file
     let state_file = get_config_dir().join(format!(".last_line_{}", session.id));
@@ -330,6 +332,7 @@ pub(super) async fn handle_stale_session_cleanup(
         ctx.session_threads.write().await.remove(&child.id);
         ctx.session_tmux.write().await.remove(&child.id);
         ctx.custom_titles.write().await.remove(&child.id);
+        ctx.pending_topic_msgs.write().await.remove(&child.id);
     }
 }
 

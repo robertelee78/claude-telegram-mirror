@@ -206,6 +206,17 @@ pub(super) struct DaemonState {
     // the specific socket client that submitted the approval_request, not
     // broadcast to all connected clients.
     pub(super) pending_approval_clients: Arc<RwLock<HashMap<String, String>>>,
+
+    // BUG-002 (no-silent-loss): content events that arrived before their
+    // session's topic existed, buffered per session and flushed once the topic
+    // is created (see `buffer_pending_message` / `flush_pending_for_session`).
+    pub(super) pending_topic_msgs: Arc<RwLock<HashMap<String, Vec<BridgeMessage>>>>,
+
+    // BUG-002 (review M1): flush-request channel. `flush_tx` is cloned into each
+    // HandlerContext; `flush_rx` is taken once by the event loop, which services
+    // requests by running `flush_pending_for_session`.
+    pub(super) flush_tx: tokio::sync::mpsc::UnboundedSender<String>,
+    pub(super) flush_rx: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<String>>>,
 }
 
 /// Bridge Daemon — orchestrates all components.
@@ -233,6 +244,8 @@ impl Daemon {
         let mirroring_enabled = Arc::new(std::sync::atomic::AtomicBool::new(
             crate::config::read_mirror_status(&config.config_dir),
         ));
+        // BUG-002 (review M1): flush-request channel (see DaemonState fields).
+        let (flush_tx, flush_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
         let state = Arc::new(DaemonState {
             bot,
@@ -252,6 +265,9 @@ impl Daemon {
             config: Arc::new(config),
             running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pending_approval_clients: Arc::new(RwLock::new(HashMap::new())),
+            pending_topic_msgs: Arc::new(RwLock::new(HashMap::new())),
+            flush_tx,
+            flush_rx: Mutex::new(Some(flush_rx)),
         });
 
         Ok(Self {
@@ -350,6 +366,22 @@ impl Daemon {
         // to be detected first (typically pane 0), which is exactly how a reply for
         // one session leaked into another's pane. Nothing to seed here anymore.
 
+        // ROUTING-002 migration: before warming, clear any POSITIONAL targets
+        // left by an older build. They can misroute after a restart and cannot be
+        // compared against the new stable `%N` pane ids; the next hook re-establishes
+        // a correct pane id. (Self-healing one-time step; no-op on a clean DB.)
+        {
+            let sessions = self.state.sessions.lock().await;
+            match sessions.clear_positional_tmux_targets() {
+                Ok(n) if n > 0 => tracing::info!(
+                    cleared = n,
+                    "ROUTING-002: cleared stale positional tmux targets on startup"
+                ),
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "ROUTING-002: failed clearing positional targets"),
+            }
+        }
+
         // ADR-013 F8: Warm session_tmux_targets cache from DB on startup.
         // After a daemon restart, the in-memory cache is empty. Populate it from
         // any active sessions that have stored tmux_target values in the DB.
@@ -362,6 +394,11 @@ impl Daemon {
             let mut warmed = 0u32;
             for session in &active_sessions {
                 if let Some(ref target) = session.tmux_target {
+                    // Only warm stable pane ids; positional targets were just cleared
+                    // in the DB above, so skip any that linger in this snapshot.
+                    if !target.starts_with('%') {
+                        continue;
+                    }
                     tmux_cache.insert(session.id.clone(), target.clone());
                     warmed += 1;
                 }
@@ -499,6 +536,12 @@ struct HandlerContext {
     socket_clients: SocketClients,
     /// S-2: Maps approval_id -> client_id for targeted approval response routing.
     pending_approval_clients: Arc<RwLock<HashMap<String, String>>>,
+    /// BUG-002 (no-silent-loss): per-session buffer of content events awaiting
+    /// topic creation. Flushed by `flush_pending_for_session`.
+    pending_topic_msgs: Arc<RwLock<HashMap<String, Vec<BridgeMessage>>>>,
+    /// BUG-002 (review M1): channel for posting a session-id flush request,
+    /// decoupling the lost-wakeup re-trigger from the handler call graph.
+    flush_tx: tokio::sync::mpsc::UnboundedSender<String>,
 }
 
 impl HandlerContext {
@@ -830,6 +873,31 @@ async fn check_and_update_tmux_target(ctx: &HandlerContext, msg: &BridgeMessage)
         "Tmux target changed, auto-updating"
     );
 
+    // ROUTING-002 uniqueness guard: under pane-id routing two live sessions can
+    // never share a target, so a collision here means another active session
+    // holds a now-stale mapping (e.g. a mixed old-positional / new-pane-id row
+    // during migration). Surface it loudly instead of letting it stay silent.
+    // We still claim the target for this session — the current hook is the most
+    // recent, authoritative proof of where this session lives.
+    {
+        let sid = msg.session_id.clone();
+        let target = new_target.to_string();
+        let collision = ctx
+            .db_op(move |sess| {
+                sess.is_tmux_target_owned_by_other(&target, &sid)
+                    .unwrap_or(false)
+            })
+            .await;
+        if collision {
+            tracing::warn!(
+                session_id = %msg.session_id,
+                target = new_target,
+                "ROUTING-002: tmux target already held by another active session — \
+                 claiming it for the most recent hook; the other mapping is stale"
+            );
+        }
+    }
+
     ctx.session_tmux
         .write()
         .await
@@ -950,7 +1018,11 @@ async fn ensure_session_exists(ctx: &HandlerContext, msg: &BridgeMessage) -> boo
                     .bytes()
                     .fold(0u32, |acc, b| acc.wrapping_add(b as u32)) as usize
                     % 6;
-            if let Ok(Some(tid)) = ctx.bot.create_forum_topic(&topic_name, color_index).await {
+            if let Ok(Some(tid)) = ctx
+                .bot
+                .create_forum_topic_resilient(&topic_name, color_index)
+                .await
+            {
                 let sid = msg.session_id.clone();
                 ctx.db_op(move |sess| {
                     if let Err(e) = sess.set_session_thread(&sid, tid) {
@@ -1035,6 +1107,10 @@ async fn ensure_session_exists(ctx: &HandlerContext, msg: &BridgeMessage) -> boo
             // Release topic creation lock
             lock.notify.notify_waiters();
             ctx.topic_locks.write().await.remove(&msg.session_id);
+
+            // BUG-002: a topic now exists for this session — flush any content
+            // events that arrived (and were buffered) before it did.
+            flush_pending_for_session(ctx, &msg.session_id).await;
         }
         return true;
     }
@@ -1061,6 +1137,100 @@ async fn ensure_session_exists(ctx: &HandlerContext, msg: &BridgeMessage) -> boo
     tracing::info!(session_id = %msg.session_id, "Creating session on-the-fly");
     socket_handlers::handle_session_start(ctx, msg).await;
     true
+}
+
+/// BUG-002 (no-silent-loss): cap on buffered content events per session. A burst
+/// while a topic is being (re)created is small; this only guards against a session
+/// whose topic creation never succeeds growing without bound.
+const MAX_PENDING_TOPIC_MSGS: usize = 200;
+
+/// BUG-002: Buffer a content event whose session topic is not ready yet, instead
+/// of silently dropping it. Flushed by [`flush_pending_for_session`] once the
+/// topic exists. Bounded per session — when full, the OLDEST buffered event is
+/// evicted (with a loud warning, so loss is visible, never silent).
+async fn buffer_pending_message(ctx: &HandlerContext, msg: &BridgeMessage) {
+    {
+        let mut pending = ctx.pending_topic_msgs.write().await;
+        let queue = pending.entry(msg.session_id.clone()).or_default();
+        if queue.len() >= MAX_PENDING_TOPIC_MSGS {
+            let dropped = queue.remove(0);
+            tracing::warn!(
+                session_id = %msg.session_id,
+                cap = MAX_PENDING_TOPIC_MSGS,
+                dropped_type = %dropped.msg_type,
+                "pending-topic buffer full — evicting oldest event to make room"
+            );
+        }
+        tracing::info!(
+            session_id = %msg.session_id,
+            msg_type = %msg.msg_type,
+            buffered = queue.len() + 1,
+            "Topic not ready — buffering event for flush once the topic exists"
+        );
+        queue.push(msg.clone());
+    }
+
+    // Review M1 (lost-wakeup race): a concurrent task may have created the topic
+    // and run its flush in the window between this handler's topic check and the
+    // insert above — draining an empty queue and leaving us buffered forever. Close
+    // it by re-checking after the insert: if the topic now exists, post a flush
+    // request. The request goes through a channel (not a direct call) to avoid an
+    // async-recursion cycle (buffer -> flush -> leaf handler -> buffer). It is safe
+    // if creation happens-before the insert (we self-trigger) and a no-op if it
+    // happens-after (the creator's own flush drains us).
+    if ctx.get_thread_id(&msg.session_id).await.is_some() {
+        let _ = ctx.flush_tx.send(msg.session_id.clone());
+    }
+}
+
+/// BUG-002: Flush buffered content events for a session once its topic exists.
+///
+/// Re-invokes the relevant LEAF content handler for each event (in arrival
+/// order). The topic now exists, so `wait_for_topic` inside each handler
+/// succeeds and the event is delivered. We dispatch to the leaf handlers — not
+/// back through `handle_socket_message` — deliberately: it avoids an async
+/// recursion cycle (`flush -> dispatch -> ensure_session_exists -> flush`), and
+/// the buffered events already passed the upstream gates (validation, mirroring
+/// toggle) before they were buffered. Only the mirror-only content types are
+/// ever buffered (see the buffering call sites); any other type is skipped.
+async fn flush_pending_for_session(ctx: &HandlerContext, session_id: &str) {
+    // Self-guard: only drain once the topic truly exists. A flush triggered after
+    // a creation that ultimately failed (e.g. chat is not a forum) must leave the
+    // buffer intact rather than re-invoke handlers that would just re-buffer.
+    if ctx.get_thread_id(session_id).await.is_none() {
+        return;
+    }
+    let msgs = {
+        let mut pending = ctx.pending_topic_msgs.write().await;
+        match pending.remove(session_id) {
+            Some(m) if !m.is_empty() => m,
+            _ => return,
+        }
+    };
+    tracing::info!(
+        session_id = %session_id,
+        count = msgs.len(),
+        "Flushing buffered events now that the topic exists"
+    );
+    for m in &msgs {
+        match &m.msg_type {
+            MessageType::AgentResponse => socket_handlers::handle_agent_response(ctx, m).await,
+            MessageType::UserInput => socket_handlers::handle_user_input(ctx, m).await,
+            MessageType::ToolStart => socket_handlers::handle_tool_start(ctx, m).await,
+            MessageType::ToolResult => socket_handlers::handle_tool_result(ctx, m).await,
+            MessageType::Error => socket_handlers::handle_error(ctx, m).await,
+            MessageType::ApprovalRequest => {
+                socket_handlers::handle_approval_request(ctx, m).await
+            }
+            other => {
+                tracing::warn!(
+                    session_id = %session_id,
+                    msg_type = %other,
+                    "Skipping flush of unexpected buffered message type"
+                );
+            }
+        }
+    }
 }
 
 /// Broadcast a `BridgeMessage` to all currently-connected socket clients.

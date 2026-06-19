@@ -980,6 +980,32 @@ impl SessionManager {
         Ok(out)
     }
 
+    /// ROUTING-002 migration: clear `tmux_target` for every active session whose
+    /// stored target is POSITIONAL (`session:window.pane`) rather than a stable
+    /// pane id (`%N`). Run once on daemon startup.
+    ///
+    /// After the routing fix, hooks report stable `%N` pane ids, but a DB written
+    /// by an older build holds positional targets that (a) may resolve to the
+    /// wrong pane after a restart and (b) cannot be string-compared against the
+    /// new pane ids for ownership/collision detection. Clearing them disables
+    /// injection for those sessions only until their next hook (which fires on
+    /// every turn) re-establishes a correct pane id — a brief, safe degradation
+    /// that is strictly better than misrouting a reply to the wrong pane.
+    ///
+    /// Returns the number of rows cleared.
+    pub fn clear_positional_tmux_targets(&self) -> Result<usize> {
+        // A pane id always begins with '%'; anything else is a positional target.
+        self.conn
+            .execute(
+                "UPDATE sessions SET tmux_target = NULL
+                 WHERE status = 'active'
+                   AND tmux_target IS NOT NULL
+                   AND substr(tmux_target, 1, 1) <> '%'",
+                [],
+            )
+            .map_err(|e| AppError::Database(e.to_string()))
+    }
+
     pub fn is_tmux_target_owned_by_other(
         &self,
         tmux_target: &str,

@@ -54,7 +54,18 @@ pub(super) async fn run_event_loop(
         config: Arc::clone(&state.config),
         socket_clients,
         pending_approval_clients: Arc::clone(&state.pending_approval_clients),
+        pending_topic_msgs: Arc::clone(&state.pending_topic_msgs),
+        flush_tx: state.flush_tx.clone(),
     };
+
+    // BUG-002 (review M1): take the flush-request receiver. If it was already
+    // taken (should not happen — single event loop), fall back to a dead channel.
+    let mut flush_rx = state
+        .flush_rx
+        .lock()
+        .await
+        .take()
+        .unwrap_or_else(|| tokio::sync::mpsc::unbounded_channel().1);
 
     // STALE-TOPICS: reconcile topics against live tmux/Claude state ONCE at startup,
     // before entering the loop. After a daemon restart or machine reboot the DB can hold
@@ -91,6 +102,17 @@ pub(super) async fn run_event_loop(
                         break;
                     }
                 }
+            }
+
+            // BUG-002 (review M1): service flush requests — a session whose topic
+            // just appeared after some of its events were buffered.
+            Some(session_id) = flush_rx.recv() => {
+                let ctx = base_ctx.clone();
+                let sem = handler_semaphore.clone();
+                tokio::spawn(async move {
+                    let _permit = sem.acquire().await.expect("semaphore closed");
+                    super::flush_pending_for_session(&ctx, &session_id).await;
+                });
             }
 
             // Telegram long-polling (poll every iteration)

@@ -922,6 +922,64 @@ The following issues from the audit are acknowledged but deferred:
 
 ---
 
+## Addendum — No-silent-loss for topic-not-ready content events (2026-06-18)
+
+**Status:** Implemented (2026-06-18). Extends the resilience theme of this ADR (the
+2026-03-17 silent-loss incident) to a second silent-loss path on the *outbound* side.
+
+### Incident
+
+During a bridge restart with several sessions starting at once, a session's first
+content events were silently lost. Log signature:
+
+```
+set_tmux_info: UPDATE affected 0 rows — session row does not exist yet
+Creating session on-the-fly
+No topic — dropping agent_response   ← lost
+No topic — dropping user_input       ← lost
+```
+
+### Root cause
+
+Before a content event can be posted, its session's Telegram forum topic must exist.
+The handlers called `wait_for_topic`; on `None` they logged "No topic — dropping" and
+returned — permanent loss. The dominant trigger is **topic-creation failure/timeout**:
+`api_call` retries Telegram 429s but returns `Err` immediately on network/5xx errors
+(common mid-restart), and the callers collapsed that `Err` into `None`. (A pure
+ordering race is NOT the cause — `ensure_session_exists` + the 45s `wait_for_topic`
+lock-wait already cover it.)
+
+### Decision
+
+1. **Retry topic creation on transient failure.** `create_forum_topic_resilient`
+   wraps `create_forum_topic` with bounded backoff (1s/2s/4s) on `Err` only; `Ok(None)`
+   (chat is genuinely not a forum — permanent) is returned immediately, never retried.
+   Both creation sites use it.
+2. **Buffer instead of drop.** Mirror-only content types (`agent_response`,
+   `user_input`, `tool_start`, `tool_result`, `error`, and `approval_request`) are
+   parked in a bounded (200/session) in-memory queue and flushed when the topic
+   appears, rather than dropped. `approval_request` resolves topic-readiness *before*
+   creating any approval row, so a replay creates exactly one approval with a visible
+   prompt (no orphan row, no duplicate).
+3. **Lost-wakeup race closed (review M1).** A creator can run its flush in the window
+   between a handler's topic check and its buffer insert. After inserting, the buffer
+   re-checks `get_thread_id` and posts a flush request over a dedicated channel
+   (decoupled to avoid an async-recursion cycle). Both interleavings are covered.
+4. **Bounded + self-cleaning.** Per-session cap evicts oldest (logged, never silent);
+   the buffer is purged on session end and cleanup so it cannot leak.
+
+### Intentionally NOT buffered
+
+`pre_compact` (informational and stale on replay) and `ask_user_question` (stateful;
+the CLI widget still renders natively, and replay risks double-prompts). Both still log
+on drop — non-silent.
+
+### Lightweight by design
+
+Per the single-node tokio context, this is an in-memory buffer + retry, not a durable
+SQLite outbox. The tradeoff: events buffered when a topic creation *never* succeeds are
+lost on daemon kill — accepted over the added complexity of a persistent outbox.
+
 ## References
 
 ### Telegram Bot API
