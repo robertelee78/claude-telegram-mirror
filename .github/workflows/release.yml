@@ -111,7 +111,7 @@ jobs:
           mkdir -p dist
           cp rust-crates/target/release/ctm dist/ctm-aarch64-apple-darwin
           chmod 755 dist/ctm-aarch64-apple-darwin
-          ( cd dist && (command -v sha256sum >/dev/null || sha256sum() { shasum -a 256 "$@"; }) && sha256sum ctm-aarch64-apple-darwin > ctm-aarch64-apple-darwin.sha256 )
+          ( cd dist && shasum -a 256 ctm-aarch64-apple-darwin > ctm-aarch64-apple-darwin.sha256 )
           VERSION=$(grep -m1 '^version' rust-crates/ctm/Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
           SIZE=$(stat -c %s dist/ctm-aarch64-apple-darwin 2>/dev/null || stat -f %z dist/ctm-aarch64-apple-darwin)
           SHA=$(cut -d' ' -f1 dist/ctm-aarch64-apple-darwin.sha256)
@@ -190,7 +190,7 @@ jobs:
           mkdir -p dist
           cp rust-crates/target/x86_64-apple-darwin/release/ctm dist/ctm-x86_64-apple-darwin
           chmod 755 dist/ctm-x86_64-apple-darwin
-          ( cd dist && (command -v sha256sum >/dev/null || sha256sum() { shasum -a 256 "$@"; }) && sha256sum ctm-x86_64-apple-darwin > ctm-x86_64-apple-darwin.sha256 )
+          ( cd dist && shasum -a 256 ctm-x86_64-apple-darwin > ctm-x86_64-apple-darwin.sha256 )
           VERSION=$(grep -m1 '^version' rust-crates/ctm/Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
           SIZE=$(stat -c %s dist/ctm-x86_64-apple-darwin 2>/dev/null || stat -f %z dist/ctm-x86_64-apple-darwin)
           SHA=$(cut -d' ' -f1 dist/ctm-x86_64-apple-darwin.sha256)

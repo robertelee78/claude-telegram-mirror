@@ -2,7 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
-## [0.2.29] - 2026-09-19
+## [0.2.30] - 2026-09-19
+
+### Added (automatic PATH + tab completion — ADR-017 amendment)
+- **`ctm shell-setup [--remove]`**, run by `install.sh` and after every `ctm update`: writes static completions for bash, zsh and fish to their per-user autoload dirs and maintains one idempotent, marker-delimited block at the *end* of your shell rc that puts `~/.local/bin` first on `PATH` (so it wins over fnm/nvm shims that prepend earlier) and, for zsh, wires the completion dir into `fpath`. Only the login shell's rc is created; other shells are touched only if their config exists. `--remove` restores the rc exactly. `CTM_NO_SHELL_SETUP=1` opts out.
+- **`ctm completions <shell>`** prints the completion script.
+- **Topic titles name the host** for OpenCode and Codex sessions (`OpenCode • host • project • id`), since all hosts share one forum. Claude Code topic names are unchanged.
+
+### Fixed
+- Release workflow: darwin-x64 packaging failed with `sha256sum: command not found` (a `shasum` shim defined in a nested subshell). macOS steps now call `shasum -a 256` directly. 0.2.29 therefore never published; 0.2.30 is the first release on the GitHub Releases channel.
+
+## [0.2.29] - 2026-09-19 (tagged; not published — see 0.2.30)
 
 ### Changed (distribution moved to GitHub Releases — ADR-017)
 - **npm is retired.** ctm is now one static binary per platform, published as GitHub Release assets and installed with `curl -fsSL https://raw.githubusercontent.com/robertelee78/claude-telegram-mirror/master/install.sh | sh`. The installer resolves the per-target release record (`stable-<target>.json`) through GitHub's `releases/latest/download/` redirect, downloads `ctm-<target>` from that exact release, verifies size and SHA-256, and installs atomically to `~/.local/bin` with a channel marker. No Node.js anywhere. The 0.2.28 npm publish had failed on an expired registry token after all four binaries built — the last time that failure mode can happen.

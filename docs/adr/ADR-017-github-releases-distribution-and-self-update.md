@@ -9,7 +9,7 @@
 > Just pure excellence, done the right way the entire time.
 > Chesterton's fence: always understand the current implementation fully before changing it.
 
-**Status:** Accepted (2026-09-19) — three spikes executed; implementation on `master` for 0.2.29
+**Status:** Implemented (2026-09-19) — first published release on this channel is 0.2.30 (0.2.29's darwin-x64 packaging step failed on a `sha256sum` shim scoped to the wrong subshell; fixed by using `shasum -a 256` on macOS). Amended the same day with §Shell integration.
 **Date:** 2026-09-19
 **Authors:** Robert, Claude
 **Tags:** distribution, install, update, github-releases, supersedes-npm
@@ -116,3 +116,31 @@ uses GitHub's `releases/latest/download/<fixed-name>` redirect instead.
 - `bump-version.sh` shrinks to one file; the six-file lockstep problem disappears.
 - The 0.2.28 tag stands (builds succeeded, feature is real) but has no
   user-installable artifact; 0.2.29 is the first release on this channel.
+
+## Shell integration (amendment, 2026-09-19)
+
+The operator's requirement: PATH and tab completion must be **automatic** — no
+printed `export PATH=…` line to paste. hf2q prints the line and provisions
+completions through clap's unstable dynamic completer with a ~1,100-line
+reconcile-on-every-startup subsystem; ctm gets the same user outcome with a smaller,
+deterministic mechanism (`src/shell.rs`):
+
+- **`ctm completions <bash|zsh|fish>`** prints a static clap completion script.
+- **`ctm shell-setup [--remove]`**, run by `install.sh` and after every `ctm update`
+  (by the *new* binary, so the recorded path is right):
+  1. writes the completion file to each shell's per-user autoload dir —
+     `~/.local/share/bash-completion/completions/ctm`,
+     `~/.local/share/zsh/site-functions/_ctm`, `~/.config/fish/completions/ctm.fish`;
+  2. maintains ONE idempotent, marker-delimited block (`# >>> ctm >>> … # <<< ctm <<<`)
+     **appended at the end** of the shell's rc — `~/.zshrc`; `~/.bashrc` and
+     `~/.bash_profile` when present; `~/.config/fish/conf.d/ctm.fish` — that prepends
+     the install dir to `PATH` and, for zsh, adds the completion dir to `fpath` and
+     runs `compinit` only if the user's config has not. Appending at the end is the
+     whole trick: version managers (fnm, nvm, …) prepend their shim dirs earlier in
+     the same file, so a block that runs last wins — verified in a fresh zsh whose
+     rc deliberately prepended a shim after `~/.local/bin`.
+  3. touches only the login shell's rc (creating it if missing) plus any other
+     supported shell whose config already exists; never litters. `--remove` deletes
+     the completion files and removes the block exactly (rc restored byte-for-byte
+     in the test). `CTM_NO_SHELL_SETUP=1` opts out.
+

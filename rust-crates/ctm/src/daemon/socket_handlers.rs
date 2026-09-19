@@ -263,8 +263,12 @@ pub(super) async fn handle_session_start(ctx: &HandlerContext, msg: &BridgeMessa
                 locks.insert(msg.session_id.clone(), state.clone());
                 drop(locks);
 
-                let topic_name =
-                    HandlerContext::format_topic_name(&msg.session_id, hostname, project_dir);
+                let topic_name = HandlerContext::format_topic_name(
+                    &msg.session_id,
+                    hostname,
+                    project_dir,
+                    msg.meta().host_kind(),
+                );
                 let color_index = msg
                     .session_id
                     .bytes()
@@ -1153,8 +1157,13 @@ pub(super) async fn handle_session_rename(
         )
     };
 
-    let suffix =
-        HandlerContext::format_topic_name(session_id, hostname.as_deref(), project_dir.as_deref());
+    let host = host_dispatch::session_host_kind(ctx, session_id).await;
+    let suffix = HandlerContext::format_topic_name(
+        session_id,
+        hostname.as_deref(),
+        project_dir.as_deref(),
+        host,
+    );
     let new_name = format!("{custom_title} | {suffix}");
     // U-2: Char-safe truncation — avoid panicking on multibyte UTF-8 characters.
     let new_name: String = new_name.chars().take(128).collect();

@@ -5,6 +5,7 @@
 //! module, e.g. `use ctm::session::SessionManager`.
 
 pub mod bot;
+pub mod cli;
 pub mod colors;
 pub mod config;
 pub mod daemon;
@@ -20,6 +21,7 @@ pub mod prune;
 pub mod service;
 pub mod session;
 pub mod setup;
+pub mod shell;
 pub mod socket;
 pub mod summarize;
 pub mod types;

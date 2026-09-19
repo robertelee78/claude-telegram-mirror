@@ -683,13 +683,19 @@ impl HandlerContext {
         None
     }
 
-    /// Format topic name for a session.
+    /// Format topic name for a session. ADR-016: non-Claude hosts are labelled
+    /// (`OpenCode • …`, `Codex • …`) because all hosts share one forum; Claude Code
+    /// sessions keep their existing unlabelled names.
     fn format_topic_name(
         session_id: &str,
         hostname: Option<&str>,
         project_dir: Option<&str>,
+        host: crate::types::HostKind,
     ) -> String {
         let mut parts = Vec::new();
+        if host.uses_native_api() {
+            parts.push(host.label().to_string());
+        }
         if let Some(h) = hostname {
             parts.push(h.to_string());
         }
@@ -1071,8 +1077,12 @@ async fn ensure_session_exists(ctx: &HandlerContext, msg: &BridgeMessage) -> boo
 
             let hostname = session.hostname.as_deref();
             let project_dir = session.project_dir.as_deref();
-            let topic_name =
-                HandlerContext::format_topic_name(&msg.session_id, hostname, project_dir);
+            let topic_name = HandlerContext::format_topic_name(
+                &msg.session_id,
+                hostname,
+                project_dir,
+                session.host_kind(),
+            );
             // Hash session_id to pick a color (6 valid Telegram topic colors)
             let color_index =
                 msg.session_id
@@ -1582,15 +1592,47 @@ mod tests {
             "session-abc12345def",
             Some("myhost"),
             Some("/opt/project"),
+            crate::types::HostKind::ClaudeCode,
         );
         assert!(name.contains("myhost"));
         assert!(name.contains("project"));
         assert!(name.contains("abc12345"));
+        assert!(
+            !name.contains("Claude"),
+            "Claude Code topics keep their pre-ADR-016 unlabelled names"
+        );
     }
 
     #[test]
     fn test_format_topic_name_no_hostname() {
-        let name = HandlerContext::format_topic_name("session-xyz", None, Some("/opt/project"));
+        let name = HandlerContext::format_topic_name(
+            "session-xyz",
+            None,
+            Some("/opt/project"),
+            crate::types::HostKind::ClaudeCode,
+        );
         assert!(name.contains("project"));
+    }
+
+    /// ADR-016: all hosts share one forum, so non-Claude sessions are labelled.
+    #[test]
+    fn test_format_topic_name_labels_native_hosts() {
+        let oc = HandlerContext::format_topic_name(
+            "ses_f44f3efa0ffeQKndY4KH1wmNdy",
+            Some("mac"),
+            Some("/w/proj"),
+            crate::types::HostKind::OpenCode,
+        );
+        assert!(
+            oc.starts_with("OpenCode \u{2022} mac \u{2022} proj"),
+            "{oc}"
+        );
+        let cx = HandlerContext::format_topic_name(
+            "01a0bb11-b097-7941-8e2f-ae17c2d6ae68",
+            None,
+            None,
+            crate::types::HostKind::Codex,
+        );
+        assert!(cx.starts_with("Codex \u{2022} 01a0bb11"), "{cx}");
     }
 }

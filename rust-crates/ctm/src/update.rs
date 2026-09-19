@@ -454,6 +454,7 @@ pub async fn run_update(check_only: bool, do_rollback: bool) -> anyhow::Result<(
             run_new(&new_bin, &["service", "install"]);
             run_new(&new_bin, &["service", "restart"]);
         }
+        run_new(&new_bin, &["shell-setup"]);
         println!();
         println!("migrated from the retired npm distribution:");
         println!("  old: {}", from.display());
@@ -467,6 +468,8 @@ pub async fn run_update(check_only: bool, do_rollback: bool) -> anyhow::Result<(
     }
 
     restart_service_if_installed(&new_bin);
+    // Completions may have gained subcommands; the rc block is idempotent.
+    run_new(&new_bin, &["shell-setup"]);
     println!("updated ctm {current} -> {installed}");
     println!("undo with: ctm update --rollback");
     Ok(())

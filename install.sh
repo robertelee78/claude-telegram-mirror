@@ -110,11 +110,14 @@ installed=$("$INSTALL_DIR/ctm" --version 2>/dev/null || true)
 [ -n "$installed" ] || fail "installed binary did not run (see: codesign -dv $INSTALL_DIR/ctm)"
 say "installed: $INSTALL_DIR/ctm ($installed)"
 
-# --- next steps ----------------------------------------------------------------
-case ":$PATH:" in
-  *":$INSTALL_DIR:"*) ;;
-  *) say ""; say "add to your shell profile:"; say "  export PATH=\"$INSTALL_DIR:\$PATH\"" ;;
-esac
+# --- shell integration (PATH first, tab completion) ------------------------------
+# Done by the installed binary so the rc block records the real install path. It
+# appends ONE marker-delimited block at the end of your shell's rc (so it wins over
+# version-manager shims that prepend earlier) and writes completion files.
+# Idempotent; `ctm shell-setup --remove` undoes it; CTM_NO_SHELL_SETUP=1 skips it.
+if [ -z "${CTM_NO_SHELL_SETUP:-}" ]; then
+  "$INSTALL_DIR/ctm" shell-setup </dev/null || say "warning: shell setup reported a problem (ctm itself is installed)"
+fi
 say ""
 if [ -f "$HOME/.config/claude-telegram-mirror/config.json" ]; then
   say "existing configuration found — reconcile the service and hooks to this binary:"

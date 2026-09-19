@@ -2,6 +2,7 @@
 use tokio::io::AsyncWriteExt;
 
 mod bot;
+mod cli;
 mod colors;
 mod config;
 mod daemon;
@@ -17,12 +18,14 @@ mod prune;
 mod service;
 mod session;
 mod setup;
+mod shell;
 mod socket;
 mod summarize;
 mod types;
 mod update;
 
-use clap::{Parser, Subcommand};
+use clap::Parser;
+use cli::{Cli, Commands};
 use std::fs;
 use tracing_subscriber::EnvFilter;
 
@@ -54,158 +57,7 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for ScrubWriter {
     }
 }
 
-#[derive(Parser)]
-#[command(
-    name = "ctm",
-    about = "Claude Telegram Mirror — Bidirectional Claude Code <-> Telegram bridge",
-    version
-)]
-struct Cli {
-    #[command(subcommand)]
-    command: Commands,
-}
-
-#[derive(Subcommand)]
-enum Commands {
-    /// Process hook events from stdin (called by Claude Code hooks)
-    Hook,
-
-    /// Start the bridge daemon
-    Start {
-        /// Enable verbose logging
-        #[arg(short, long)]
-        verbose: bool,
-        /// Run in foreground (accepted for script compatibility; daemon always runs in foreground)
-        #[arg(long)]
-        foreground: bool,
-    },
-
-    /// Stop the bridge daemon
-    Stop {
-        /// Force kill if graceful shutdown fails
-        #[arg(long)]
-        force: bool,
-    },
-
-    /// Restart the bridge daemon
-    Restart {
-        /// Enable verbose logging
-        #[arg(short, long)]
-        verbose: bool,
-    },
-
-    /// Show bridge daemon status
-    Status,
-
-    /// Show or modify configuration
-    Config {
-        /// Show current configuration
-        #[arg(long)]
-        show: bool,
-
-        /// Test Telegram connection
-        #[arg(long)]
-        test: bool,
-    },
-
-    /// Install Claude Code hooks for Telegram mirroring
-    InstallHooks {
-        /// Install to current project's .claude/settings.json
-        #[arg(short, long)]
-        project: bool,
-        /// Install even if a ctm hook already exists in another scope
-        /// (by default a project install is skipped to avoid double-firing).
-        #[arg(long)]
-        force: bool,
-    },
-
-    /// Remove Claude Code hooks
-    UninstallHooks {
-        /// Remove from the current project's settings.json + settings.local.json
-        /// instead of the global ~/.claude/settings.json.
-        #[arg(short, long)]
-        project: bool,
-    },
-
-    /// Show hook installation status
-    Hooks,
-
-    /// Interactive setup wizard
-    Setup,
-
-    /// Diagnose configuration and connectivity issues
-    Doctor {
-        /// Attempt to automatically fix detected issues
-        #[arg(long)]
-        fix: bool,
-    },
-
-    /// Update ctm to the latest GitHub release (ADR-017)
-    Update {
-        /// Only report whether an update is available; change nothing
-        #[arg(long)]
-        check: bool,
-        /// Restore the previously installed binary
-        #[arg(long)]
-        rollback: bool,
-    },
-
-    /// Manage systemd/launchd service
-    Service {
-        #[command(subcommand)]
-        action: ServiceAction,
-    },
-
-    /// Toggle Telegram mirroring on/off
-    Toggle {
-        /// Force mirroring ON
-        #[arg(long)]
-        on: bool,
-        /// Force mirroring OFF
-        #[arg(long)]
-        off: bool,
-    },
-
-    /// Prune stale Telegram forum topics (clear an accumulated backlog).
-    ///
-    /// Three modes:
-    ///   --ledger              delete every topic in the persistent ledger whose Claude
-    ///                         session is no longer alive (the surefire path for topics
-    ///                         this build created).
-    ///   --ids FILE            delete exactly the topic ids listed in FILE (one id per
-    ///                         line). Pair with scripts/list_topics.py, which enumerates
-    ///                         every existing topic via MTProto — the precise way to clear
-    ///                         legacy orphans the Bot API cannot list.
-    ///   --from N --to M       sweep a numeric topic-id range with deleteForumTopic — a
-    ///                         blunt fallback for legacy orphans when you have no id list.
-    ///                         Non-topic ids in the range are skipped harmlessly.
-    ///
-    /// All modes always skip the General topic (id 1) and any currently-active session's
-    /// topic.
-    PruneTopics {
-        /// Ledger mode: prune all recorded topics whose session is dead.
-        #[arg(long)]
-        ledger: bool,
-        /// Ids mode: file of topic ids to delete (one per line).
-        #[arg(long, value_name = "FILE")]
-        ids: Option<std::path::PathBuf>,
-        /// Range mode: first topic id (inclusive).
-        #[arg(long)]
-        from: Option<i64>,
-        /// Range mode: last topic id (inclusive).
-        #[arg(long)]
-        to: Option<i64>,
-        /// Show what would be deleted without deleting anything.
-        #[arg(long)]
-        dry_run: bool,
-        /// Skip the interactive confirmation prompt.
-        #[arg(long)]
-        yes: bool,
-    },
-}
-
 // ServiceAction is defined in service.rs for lib crate compatibility.
-use service::ServiceAction;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -270,6 +122,11 @@ async fn main() -> anyhow::Result<()> {
         Commands::Setup => setup::run_setup().await,
         Commands::Doctor { fix } => doctor::run_doctor(fix).await,
         Commands::Update { check, rollback } => update::run_update(check, rollback).await,
+        Commands::Completions { shell } => {
+            shell::print_completions(shell, &mut std::io::stdout())?;
+            Ok(())
+        }
+        Commands::ShellSetup { remove } => shell::run_shell_setup(remove),
         Commands::Service { action } => service::handle_service_command(&action),
         Commands::Toggle { on, off } => cmd_toggle(on, off).await,
         Commands::PruneTopics {
