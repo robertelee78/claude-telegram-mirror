@@ -439,6 +439,169 @@ async fn opencode_pipe_plugin_mirrors_a_process_with_no_port_and_no_password() {
     pipe_server.abort();
 }
 
+/// ADR-016 §Codex outbound: the hook path, end to end against the REAL codex binary
+/// and its REAL app-server — install the hook file into an isolated CODEX_HOME, have
+/// the app-server compute its hashes (`hooks/list`), trust them through Codex's own
+/// config RPC (`config/batchWrite`), then run `ctm codex-hook` exactly as Codex would
+/// and assert the messages reach the daemon socket on the same session id.
+#[tokio::test]
+#[ignore = "needs the `codex` binary; run with --ignored"]
+async fn codex_hooks_install_trust_and_forward_to_the_daemon() {
+    use ctm::host::{codex_hooks, codex_rpc};
+    if !have("codex") {
+        eprintln!("skip: codex not installed");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("bridge.sock");
+    let mut rx = fake_daemon(sock.clone()).await;
+
+    // 1. Install into an isolated CODEX_HOME so the operator's own hooks.json and
+    // config.toml are untouched. The daemon insists on finding the managed standalone
+    // install under CODEX_HOME, so link the real one in rather than copying 220 MB.
+    // The path is short on purpose: the app-server's control socket lives under CODEX_HOME and
+    // macOS temp dirs blow past the 104-byte sockaddr_un limit ("path must be shorter
+    // than SUN_LEN").
+    let codex_home = PathBuf::from(format!("/tmp/ctm-e2e-cx-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&codex_home);
+    std::fs::create_dir_all(&codex_home).unwrap();
+    struct HomeGuard(PathBuf);
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            let _ = Command::new("codex")
+                .args(["app-server", "daemon", "stop"])
+                .env("CODEX_HOME", &self.0)
+                .output();
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _home_guard = HomeGuard(codex_home.clone());
+    let real_home = std::env::var("CODEX_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(std::env::var("HOME").unwrap()).join(".codex"));
+    if !real_home.join("packages/standalone/current").exists() {
+        eprintln!("skip: no managed standalone codex install to link");
+        return;
+    }
+    std::os::unix::fs::symlink(real_home.join("packages"), codex_home.join("packages")).unwrap();
+    if real_home.join("auth.json").exists() {
+        let _ =
+            std::os::unix::fs::symlink(real_home.join("auth.json"), codex_home.join("auth.json"));
+    }
+    let hooks_file = codex_home.join("hooks.json");
+    let exe = env!("CARGO_BIN_EXE_ctm");
+    assert_eq!(
+        codex_hooks::ensure_at(&hooks_file, std::path::Path::new(exe)).unwrap(),
+        codex_hooks::HooksState::Installed
+    );
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&hooks_file).unwrap()).unwrap();
+    for event in codex_hooks::EVENTS {
+        assert!(doc["hooks"][*event].is_array(), "{event} written");
+    }
+
+    // 2. Codex itself validates the file and computes each hook's hash. Its daemon is
+    //    keyed by CODEX_HOME, so this one is separate from the operator's.
+    let start = Command::new("codex")
+        .args(["app-server", "daemon", "start"])
+        .env("CODEX_HOME", &codex_home)
+        .output()
+        .expect("codex app-server daemon start");
+    let started: serde_json::Value =
+        serde_json::from_slice(&start.stdout).unwrap_or(serde_json::Value::Null);
+    let socket_path = started["socketPath"]
+        .as_str()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            panic!(
+                "daemon reported no socketPath\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&start.stdout),
+                String::from_utf8_lossy(&start.stderr)
+            )
+        });
+    let mut rpc = codex_rpc::Rpc::connect(&socket_path).await.unwrap();
+    let listed = rpc.call("hooks/list", serde_json::json!({})).await.unwrap();
+    let ours = codex_hooks::ours_from_list(&listed, &hooks_file);
+    assert_eq!(
+        ours.len(),
+        codex_hooks::EVENTS.len(),
+        "codex parsed and listed every ctm hook: {listed}"
+    );
+    assert!(
+        ours.iter().all(|h| h.current_hash.starts_with("sha256:")),
+        "codex computed a hash for each"
+    );
+
+    // 3. Trust them through Codex's own config writer, then confirm Codex agrees.
+    let edits: Vec<serde_json::Value> = ours.iter().map(codex_hooks::trust_edit).collect();
+    rpc.call("config/batchWrite", serde_json::json!({ "edits": edits }))
+        .await
+        .unwrap();
+    let relisted = rpc.call("hooks/list", serde_json::json!({})).await.unwrap();
+    let after = codex_hooks::ours_from_list(&relisted, &hooks_file);
+    assert!(
+        after.iter().all(|h| h.trusted),
+        "every ctm hook is trusted after the config write: {relisted}"
+    );
+
+    // 4. Run the forwarder exactly as Codex runs it: payload on stdin, `{}` on stdout.
+    let session_id = "01a0bbe8-61f0-73a2-9617-ea9855a402cb";
+    let payloads = [
+        serde_json::json!({"session_id": session_id, "cwd": dir.path(), "hook_event_name": "SessionStart", "model": "gpt-6-astra", "permission_mode": "default", "source": "startup"}),
+        serde_json::json!({"session_id": session_id, "turn_id": "t1", "cwd": dir.path(), "hook_event_name": "Stop", "stop_hook_active": false, "last_assistant_message": "MIRRORED_OUT"}),
+    ];
+    for payload in &payloads {
+        let mut child = Command::new(exe)
+            .arg("codex-hook")
+            .env("TELEGRAM_BRIDGE_SOCKET", &sock)
+            .env("TELEGRAM_MIRROR", "true")
+            .env("TELEGRAM_BOT_TOKEN", "1:test")
+            .env("TELEGRAM_CHAT_ID", "-1001234567890")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn ctm codex-hook");
+        use std::io::Write;
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(payload.to_string().as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "hook exits 0");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "{}",
+            "hook returns a neutral decision"
+        );
+    }
+
+    let start_msg = wait_for(
+        &mut rx,
+        |m| m.msg_type == MessageType::SessionStart && m.session_id == session_id,
+        10,
+    )
+    .await
+    .expect("SessionStart reached the daemon");
+    assert_eq!(start_msg.meta().host_kind(), HostKind::Codex);
+    assert_eq!(start_msg.meta().host_session_id(), Some(session_id));
+    // The hook transport must not be registered as the injection observer.
+    assert_eq!(
+        start_msg.metadata.as_ref().unwrap()["hostTransport"],
+        "hook"
+    );
+
+    let reply = wait_for(
+        &mut rx,
+        |m| m.msg_type == MessageType::AgentResponse && m.session_id == session_id,
+        10,
+    )
+    .await
+    .expect("the agent's final message reached the daemon");
+    assert_eq!(reply.content, "MIRRORED_OUT");
+}
+
 #[tokio::test]
 #[ignore = "needs the `codex` binary; run with --ignored"]
 async fn codex_thread_lifecycle_mirrors_through_real_app_server() {

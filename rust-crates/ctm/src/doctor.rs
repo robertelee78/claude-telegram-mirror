@@ -680,7 +680,9 @@ fn check_pid_file(fix: bool) -> CheckResult {
 ///   joins one, so a missing control socket means every Codex session is invisible;
 ///   the npm `codex.js` shim needs `node`, which a service PATH may lack.
 async fn check_hosts(fix: bool) -> CheckResult {
-    use crate::host::{codex_daemon, detect, opencode_plugin, HostCaps, StructuredQuestions};
+    use crate::host::{
+        codex_daemon, codex_hooks, detect, opencode_plugin, HostCaps, StructuredQuestions,
+    };
 
     // Capability matrix (ADR-016), established by executed spikes.
     let caps_line = |kind: crate::types::HostKind| {
@@ -853,6 +855,43 @@ async fn check_hosts(fix: bool) -> CheckResult {
                         cx.socket_path.display()
                     ));
                     lines.push(caps_line(crate::types::HostKind::Codex));
+                    // Outbound needs Codex's own hooks: the app-server cannot observe a
+                    // thread a bare `codex` owns (ADR-016 amendment 2026-09-20).
+                    let exe = std::env::current_exe().unwrap_or_else(|_| bin.clone());
+                    let hooks_current = codex_hooks::ensure_is_current(&exe);
+                    let trusted = codex_hooks::untrusted_count(cx).await;
+                    match (hooks_current, trusted, fix) {
+                        (true, Ok(0), _) => lines.push(format!(
+                            "Codex: hooks installed and trusted at {} — agent replies and tool calls mirror out",
+                            codex_hooks::hooks_path().display()
+                        )),
+                        (_, _, true) => match codex_hooks::provision(cx, &exe).await {
+                            Ok((state, n)) => fixes.push(format!(
+                                "Codex hooks {state:?} at {} ({n} trusted)",
+                                codex_hooks::hooks_path().display()
+                            )),
+                            Err(e) => {
+                                escalate(CheckStatus::Fail, &mut worst);
+                                lines.push(format!("Codex: hooks could not be provisioned: {e}"));
+                            }
+                        },
+                        (false, _, false) => {
+                            escalate(CheckStatus::Warn, &mut worst);
+                            lines.push(format!(
+                                "Codex: hooks missing or outdated at {} — `ctm doctor --fix` writes them (the daemon also does)",
+                                codex_hooks::hooks_path().display()
+                            ));
+                        }
+                        (true, Ok(n), false) => {
+                            escalate(CheckStatus::Warn, &mut worst);
+                            lines.push(format!(
+                                "Codex: {n} ctm hook(s) not trusted yet — `ctm doctor --fix` trusts them with Codex's own hash"
+                            ));
+                        }
+                        (true, Err(e), false) => {
+                            lines.push(format!("Codex: hook trust not verifiable ({e})"));
+                        }
+                    }
                 } else if fix {
                     match codex_daemon::ensure_running(cx).await {
                         Ok(state) => fixes.push(format!(

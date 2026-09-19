@@ -21,6 +21,9 @@
 
 pub mod codex;
 pub mod codex_daemon;
+pub mod codex_hook_cmd;
+pub mod codex_hooks;
+pub mod codex_rpc;
 pub mod detect;
 pub mod link;
 pub mod opencode;

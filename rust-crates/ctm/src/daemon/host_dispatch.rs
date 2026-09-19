@@ -53,7 +53,12 @@ pub(super) async fn record_session_host(ctx: &HandlerContext, msg: &BridgeMessag
         .write()
         .await
         .insert(msg.session_id.clone(), kind);
-    if kind.uses_native_api() {
+    // ADR-016 §Codex outbound: hook-sourced messages come from a short-lived `ctm
+    // codex-hook` process that exits immediately. Registering it as the session's
+    // observer would point injection at a dead socket, so the app-server observer
+    // (which stays connected) keeps that role.
+    let via_hook = meta.host_transport() == Some("hook");
+    if kind.uses_native_api() && !via_hook {
         match meta.client_id() {
             Some(cid) => {
                 ctx.session_host_clients

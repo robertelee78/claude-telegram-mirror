@@ -105,6 +105,10 @@ pub enum Commands {
         remove: bool,
     },
 
+    /// Forward one Codex hook event to the daemon (ADR-016; run by Codex, not by you)
+    #[command(hide = true)]
+    CodexHook,
+
     /// Update ctm to the latest GitHub release (ADR-017)
     Update {
         /// Only report whether an update is available; change nothing

@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.34] - 2026-09-20
+
+### Added (Codex now mirrors OUT as well as in — ADR-016 §Codex outbound)
+- **A bare `codex` is fully mirrored.** ctm installs its own entries in `~/.codex/hooks.json` (honouring `CODEX_HOME`), so Codex's agent replies, tool calls, prompts and session start/end reach Telegram. Until now only injection worked: the app-server cannot observe a thread a bare `codex` owns, so nothing came back.
+- **No "Hooks need review" prompt, and no reverse-engineering.** ctm asks the app-server for its own hooks (`hooks/list` → `currentHash`) and persists that value through Codex's own config writer (`config/batchWrite`), then re-checks every 60 s — so `ctm update`, which changes the binary path and therefore the hash, re-trusts itself. Verified idempotent against Codex 0.155.1.
+- **Merging, not clobbering**: existing hooks in that file are preserved (ctm's entries are marked `ctm:<event>` and run first); `ctm uninstall-hooks` removes only ctm's.
+- `ctm doctor` 12/13 reports whether the hooks are installed and trusted, and `--fix` does both.
+
+### Known limitations (both by design, both reported by `ctm doctor`)
+- **Codex approvals stay terminal-only.** `PermissionRequest` carries no request id and an async hook cannot answer one later; a blocking hook that decided would suppress Codex's own prompt — the ADR-014 PR-E failure ctm exists to avoid. ctm registers no blocking hook.
+- **Codex assistant text arrives per turn, not streamed** — `Stop` carries the final message only. Tool activity still streams via `Pre/PostToolUse`.
+
 ## [0.2.33] - 2026-09-20
 
 ### Fixed (found by running 0.2.32 as a user)

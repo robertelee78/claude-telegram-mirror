@@ -425,3 +425,56 @@ and the payload keys are the ones `hook.rs` already speaks (`hook_event_name`,
 (`[hooks.state."<source>:<file>:<event>:<i>:<j>"] trusted_hash`), which ctm must write
 alongside the hook file. ADR-014's PR-E constraint still binds: observation hooks are
 non-blocking, and an approval hook must not pre-empt the TUI's own prompt.
+
+## Codex outbound via Codex's own hooks (amendment, 2026-09-20 — shipped in 0.2.34)
+
+The previous amendment established that the app-server cannot observe a thread a bare
+`codex` owns. This one closes the gap from the other side: Codex's **hooks** run *inside*
+that process, so ctm installs them the way it installs Claude Code's.
+
+### Spikes (executed against Codex 0.155.1)
+
+| # | Question | Result |
+|---|---|---|
+| 1 | Can a user install hooks without a plugin/marketplace? | **Yes** — `~/.codex/hooks.json` (honouring `CODEX_HOME`) is a first-class *user* source, independent of project trust. Same schema as a plugin's `codex-hooks.json`. |
+| 2 | Do hooks run in a bare TUI? | **Yes** — verified live; the operator's own screenshot showed Codex clamping a SessionEnd hook timeout in a plain `codex`. |
+| 3 | Does the payload identify the app-server thread? | **Yes** — `session_id` equalled the thread id in the TUI footer (`01a0bbe8-…`), which is what keeps hook-out and app-server-in on ONE Telegram topic. |
+| 4 | What does a hook actually see? | `SessionStart` (+`model`,`source`), `UserPromptSubmit` (+`prompt`), `Pre/PostToolUse` (+`tool_name`,`tool_use_id`,`tool_input`,`tool_response`), `Stop` (+`last_assistant_message` — the turn's FINAL message only, not a stream), `SessionEnd` (+`reason`). Captured verbatim. |
+| 5 | Can ctm avoid the "Hooks need review" prompt? | **Yes, without reimplementing Codex's hash.** `hooks/list` reports each hook's `key`, `currentHash` and `trustStatus`; `config/batchWrite` (`keyPath: hooks.state."<key>".trusted_hash`, `mergeStrategy: "replace"`) persists it through Codex's own config writer. Verified idempotent — a second write changed no bytes. The hash input itself was NOT reverse-engineered (24 candidate serialisations all missed; the binary hints `normalized hook identity should serialize to TOML`) and does not need to be. |
+| 6 | Is there a trust RPC? | **No** — `hooks/trust`, `hooks/setTrust`, … are all "unknown variant". `hooks/list` is read-only. |
+| 7 | Can approvals be mirrored? | **No.** `PermissionRequest` carries no request id, and an `async` hook cannot answer later; a *blocking* one that decided would suppress the TUI's own prompt — ADR-014's PR-E exactly. |
+
+Codex itself was consulted (`codex exec`, read-only sandbox) and reached the same
+conclusion independently, including "obtain Codex's hash rather than reimplementing its
+normalization" and "forward asynchronously and return neutral output".
+
+### Decision
+
+1. **`~/.codex/hooks.json` is written by ctm** (`host/codex_hooks.rs`), merging ctm's
+   entries into whatever is already there and preserving every entry ctm does not own.
+   ctm's entries run first within each event and are marked `id: "ctm:<event>"`.
+2. **Observation only, non-blocking**: `async: true` on every event Codex allows it
+   (`SessionEnd` is always synchronous and clamped to 3 s). ctm registers **no**
+   `PermissionRequest` and no blocking decision hook — the PR-E invariant in code.
+3. **`ctm codex-hook`** (`host/codex_hook_cmd.rs`, hidden subcommand) reads the payload,
+   writes `BridgeMessage`s to ctm's socket, prints `{}` and exits 0 — always, even with
+   no daemon, so a mirror can never change what Codex does.
+4. **Trust is taken from Codex**: `hooks/list` → `currentHash` → `config/batchWrite`
+   (`host/codex_rpc.rs`). The daemon's keeper re-checks every 60 s, so `ctm update`
+   (which changes the binary path, hence the hash) re-trusts without an operator step.
+5. **Hook messages carry `hostTransport: "hook"`** so `host_dispatch` never registers
+   the short-lived forwarder as the session's injection observer — that stays the
+   app-server connection, which is how one topic carries both directions.
+6. `ctm uninstall-hooks` removes ctm's Codex entries too.
+
+### Consequences
+
+- A bare `codex` now mirrors **both** ways: hooks out, app-server `turn/start` in.
+- **Assistant text is per-turn, not streamed**: `Stop` carries the final message only.
+  Tool activity comes from `Pre/PostToolUse`, so the topic still shows work in progress.
+- **Approvals remain terminal-only on Codex** and `HostCaps` keeps saying so. This is
+  honest degradation, not a silent gap: answering from Telegram would require a blocking
+  hook, and ADR-014 forbids it.
+- ctm now writes into `~/.codex/hooks.json` and, through Codex's own RPC, one
+  `hooks.state` key per hook in `config.toml`. Both are surfaced by `ctm doctor` and
+  documented; neither is silent.

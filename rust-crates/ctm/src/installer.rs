@@ -816,6 +816,23 @@ pub fn uninstall_hooks_scoped(project: bool) -> anyhow::Result<()> {
         }
     }
 
+    // ADR-016: Codex's hooks live in its own file, not Claude Code's settings; a global
+    // uninstall removes ctm's entries there too, leaving any of the operator's intact.
+    if !project {
+        let codex_hooks = crate::host::codex_hooks::hooks_path();
+        match crate::host::codex_hooks::remove_at(&codex_hooks) {
+            Ok(true) => {
+                any = true;
+                println!(
+                    "Removed ctm entries from Codex hooks ({})",
+                    codex_hooks.display()
+                );
+            }
+            Ok(false) => {}
+            Err(e) => eprintln!("warning: could not update {}: {e}", codex_hooks.display()),
+        }
+    }
+
     if !any {
         println!("No CTM hooks found to remove.");
     }

@@ -499,6 +499,10 @@ impl Daemon {
             let cx = hosts.codex.clone();
             tracing::info!(socket = %cx.socket_path.display(), "ADR-016: starting Codex observer");
             tokio::spawn(async move { crate::host::codex::run(cfg, cx).await });
+            // Outbound for a bare `codex` comes from Codex's own hooks: the app-server
+            // cannot observe a thread another process owns (ADR-016 amendment).
+            let cx = hosts.codex.clone();
+            tokio::spawn(async move { crate::host::codex_hooks::run_keeper(cx).await });
         } else {
             tracing::info!("Codex mirroring disabled by config");
         }

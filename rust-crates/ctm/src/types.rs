@@ -257,6 +257,12 @@ impl<'a> MessageMetadata<'a> {
         self.value_field("input")
     }
 
+    /// Which transport carried a native host's message (`"hostTransport"`): `"hook"`
+    /// for a one-shot hook forwarder, absent for a long-lived observer connection.
+    pub fn host_transport(&self) -> Option<&'a str> {
+        self.str_field("hostTransport")
+    }
+
     /// Tool use identifier (`"toolUseId"`).
     pub fn tool_use_id(&self) -> Option<&'a str> {
         self.str_field("toolUseId")
