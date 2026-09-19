@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.32] - 2026-09-19
+
+### Changed (OpenCode and Codex are on by default — ADR-016 amendment §Default enablement)
+- **Nothing to enable any more.** Install ctm and run `claude`, `codex` or `opencode`; all three are mirrored. `hosts.opencode` / `hosts.codex` in `config.json` are now opt-*out* (`"enabled": false`, or `CTM_OPENCODE_ENABLED=0` / `CTM_CODEX_ENABLED=0`).
+- **OpenCode: a plugin ctm provisions itself.** A bare `opencode` has no network listener at all (spike-verified), so the daemon now writes `~/.config/opencode/plugins/ctm.js` (honouring `XDG_CONFIG_HOME`) the way it writes hooks into Claude Code's `settings.json`. The plugin forwards OpenCode's event bus to the daemon over a local socket (`opencode.sock` next to `bridge.sock`) and executes the daemon's replies through OpenCode's in-process API — no `--port`, no password. The daemon writes the file at start and re-checks every minute, so `ctm update` rolls it forward and an OpenCode installed later is picked up; `ctm doctor --fix` writes it too. When an OpenCode process exits its topics are closed instead of ageing out. Verified end-to-end against OpenCode 1.18.31: `permission.asked` arrives through the pipe, the reply dismisses the TUI prompt, the command runs.
+- **Codex: ctm keeps the app-server daemon alive.** A bare `codex` started while `codex app-server daemon` runs joins it automatically (spike-verified), so the observer now runs `codex app-server daemon start` (idempotent) before each connect, through Codex's **native** binary — never the npm `codex.js` shim, which needs `node` that a launchd/systemd PATH does not reliably have. Not installed yet? Probed again every minute, quietly.
+- **HTTP observation of an external `opencode serve`** (`hosts.opencode.baseUrl` + password) remains as an opt-in addition; it is no longer the way OpenCode gets mirrored.
+- `ctm doctor` 12/13 "Hosts" now reports detection and wiring per host (plugin present/current, pipe socket, app-server socket, native binary) and `--fix` performs both wirings.
+
+### Fixed
+- **Tab completion in zsh when `compinit` already ran earlier in the rc** (oh-my-zsh, or another tool's block — the shipped 0.2.30/0.2.31 block skipped registration in that case, so `ctm <TAB>` completed file names). The block now registers `_ctm` directly with `compdef` when `compinit` has run, and no longer adds a duplicate `fpath` entry. Reproduced and verified in a clean-environment login zsh against a real rc. `ctm update` rewrites the block.
+- Stale statements that a plain `codex` "never joins" the app-server daemon (README, ADR-016, `codex.rs`, doctor) corrected in place; `install.sh` and ADR-017 no longer claim the installer never touches the shell profile.
+
 ## [0.2.31] - 2026-09-19
 
 ### Fixed (found by running the 0.2.30 migration as a user)
