@@ -711,13 +711,11 @@ async fn check_hosts() -> CheckResult {
         match kind {
             crate::types::HostKind::OpenCode => {
                 let oc = cfg.hosts.opencode.clone().unwrap_or_default();
-                let pw = std::env::var(&oc.password_env)
-                    .ok()
-                    .filter(|p| !p.is_empty());
+                let pw = oc.resolve_password();
                 if pw.is_none() {
                     escalate(CheckStatus::Fail, &mut worst);
                     lines.push(format!(
-                        "OpenCode: {} is not set — the server would be UNAUTHENTICATED while exposing /pty and /session/{{id}}/shell. Export it before starting `opencode --port N`.",
+                        "OpenCode: no server password — set `hosts.opencode.password` in config.json (or export {}). Without it the server is UNAUTHENTICATED while exposing /pty and /session/{{id}}/shell. Start OpenCode with the same value in OPENCODE_SERVER_PASSWORD.",
                         oc.password_env
                     ));
                 }

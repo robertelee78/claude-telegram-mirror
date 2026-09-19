@@ -289,28 +289,29 @@ native API, and the same Telegram UI — approvals, multiple-choice questions, r
 terminal, and answering at the terminal retires the Telegram keyboard (both verified
 live against each binary).
 
-Enable a host in `config.json`, or with an environment variable:
+Enable a host in `~/.config/claude-telegram-mirror/config.json`, then `ctm restart`
+and `ctm doctor` (check 12/12 "Hosts" verifies reachability and auth):
 
 ```json
 {
   "hosts": {
-    "opencode": { "baseUrl": "http://127.0.0.1:4096" },
+    "opencode": { "baseUrl": "http://127.0.0.1:4096", "password": "choose-a-secret" },
     "codex":    {}
   }
 }
 ```
 
-```bash
-CTM_OPENCODE_URL=http://127.0.0.1:4096  # enables the OpenCode observer
-CTM_CODEX_SOCKET=~/.codex/app-server-control/app-server-control.sock  # enables Codex (this is the default path)
-```
+The daemon runs under launchd/systemd and does not see your shell, which is why the
+OpenCode password lives in `config.json` (mode 0600, like the bot token). If
+`OPENCODE_SERVER_PASSWORD` *is* set in the daemon's environment it takes precedence.
+Environment-only enablement also works: `CTM_OPENCODE_URL=…` / `CTM_CODEX_SOCKET=…`.
 
-**OpenCode.** Start it with an explicit port and a server password — there is no port
+**OpenCode.** Start it with an explicit port and the same password — there is no port
 discovery, and without a password the server exposes `/pty` and shell endpoints to any
-local process (`ctm doctor` makes this a hard failure):
+local process (`ctm doctor` makes a missing password a hard failure):
 
 ```bash
-export OPENCODE_SERVER_PASSWORD='choose-a-secret'
+export OPENCODE_SERVER_PASSWORD='choose-a-secret'   # must match config.json
 opencode --port 4096        # full TUI; `--mini` does NOT render API-originated content
 ```
 

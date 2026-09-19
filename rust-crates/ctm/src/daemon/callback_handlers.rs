@@ -2581,6 +2581,27 @@ Ready to submit your answers?
         }
     }
 
+    /// ADR-016: the native-host delivery shape — labels, one array per question, in order.
+    #[test]
+    fn answers_to_labels_renders_single_multi_and_free_text_in_question_order() {
+        let questions = vec![
+            qdef("Single", 3, false),
+            qdef("Multi", 4, true),
+            qdef("Free", 2, false),
+        ];
+        let mut t: TMap<usize, TentativeAnswer> = TMap::new();
+        t.insert(0, TentativeAnswer::Option(2));
+        t.insert(1, TentativeAnswer::MultiOption(TSet::from([3, 0])));
+        t.insert(2, TentativeAnswer::FreeText("typed by hand".into()));
+        let collected = collect_and_validate_answers(&questions, &t).expect("valid");
+        let v = answers_to_labels(&questions, &collected);
+        assert_eq!(
+            v,
+            serde_json::json!([["opt2"], ["opt0", "opt3"], ["typed by hand"]]),
+            "labels not indices; multi sorted; free text verbatim; question order preserved"
+        );
+    }
+
     #[test]
     fn collect_validates_happy_path_mixed() {
         let questions = vec![qdef("Single", 3, false), qdef("Multi", 4, true)];

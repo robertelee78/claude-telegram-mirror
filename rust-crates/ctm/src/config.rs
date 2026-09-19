@@ -78,12 +78,29 @@ pub const APPROVAL_HOOK_TIMEOUT_BUFFER_SECS: u32 = 10;
 ///
 /// `base_url` MUST be an explicit loopback URL with the port the operator launched
 /// `opencode --port N` on — there is no port-discovery mechanism (spike-verified) and
-/// the default `--port 0` is random. The server password is read from the environment
-/// variable named by `password_env` at connect time and is never stored in config.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// the default `--port 0` is random.
+///
+/// The server password is resolved at connect time as: the environment variable named
+/// by `password_env` if set, else `password` from `config.json`. The file form exists
+/// because the daemon normally runs under launchd/systemd and does not inherit the
+/// operator's shell environment; `config.json` is mode 0600, the same posture as the
+/// bot token already stored there.
+#[derive(Clone, PartialEq, Eq)]
 pub struct OpenCodeHostConfig {
     pub base_url: String,
     pub password_env: String,
+    pub password: Option<String>,
+}
+
+impl OpenCodeHostConfig {
+    /// Effective server password: env var first, then config file. `None` means the
+    /// observer connects unauthenticated (doctor reports this as a hard failure).
+    pub fn resolve_password(&self) -> Option<String> {
+        std::env::var(&self.password_env)
+            .ok()
+            .filter(|p| !p.is_empty())
+            .or_else(|| self.password.clone().filter(|p| !p.is_empty()))
+    }
 }
 
 impl Default for OpenCodeHostConfig {
@@ -91,7 +108,19 @@ impl Default for OpenCodeHostConfig {
         Self {
             base_url: "http://127.0.0.1:4096".into(),
             password_env: "OPENCODE_SERVER_PASSWORD".into(),
+            password: None,
         }
+    }
+}
+
+// S-4 parity: never let the OpenCode password reach a log via {:?}.
+impl fmt::Debug for OpenCodeHostConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OpenCodeHostConfig")
+            .field("base_url", &self.base_url)
+            .field("password_env", &self.password_env)
+            .field("password", &self.password.as_ref().map(|_| "[REDACTED]"))
+            .finish()
     }
 }
 
@@ -262,6 +291,8 @@ struct OpenCodeHostFile {
     base_url: Option<String>,
     #[serde(alias = "passwordEnv", alias = "password_env")]
     password_env: Option<String>,
+    #[serde(alias = "password")]
+    password: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -512,6 +543,7 @@ pub fn load_config(require_auth: bool) -> Result<Config> {
             {
                 h.password_env = p;
             }
+            h.password = file.password;
             Some(h)
         }
     };

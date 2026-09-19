@@ -159,11 +159,12 @@ async fn opencode_session_lifecycle_mirrors_through_real_server() {
     }
     assert!(up, "opencode serve did not come up on {base}");
 
+    // Exercise the config-file password path (what a launchd-managed daemon uses).
     let oc = OpenCodeHostConfig {
         base_url: base.clone(),
-        password_env: "CTM_E2E_OC_PW".into(),
+        password_env: "CTM_E2E_OC_PW_UNSET".into(),
+        password: Some(password.into()),
     };
-    std::env::set_var("CTM_E2E_OC_PW", password);
     let cfg = Arc::new(base_config(
         sock.clone(),
         HostsConfig {

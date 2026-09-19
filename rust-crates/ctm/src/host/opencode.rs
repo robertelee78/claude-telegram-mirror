@@ -555,9 +555,7 @@ impl Http {
             .connect_timeout(std::time::Duration::from_secs(5))
             .build()
             .map_err(AppError::Reqwest)?;
-        let password = std::env::var(&oc.password_env)
-            .ok()
-            .filter(|p| !p.is_empty());
+        let password = oc.resolve_password();
         if password.is_none() {
             // Doctor makes this a hard failure; the observer only warns because the
             // operator may be running an explicitly unauthenticated dev server.

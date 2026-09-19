@@ -23,26 +23,35 @@ fi
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
+# Portable in-place sed: GNU sed takes `-i` with no argument, BSD/macOS sed requires a
+# backup suffix (a bare `-i` there consumes the script as the suffix and fails with
+# "undefined label"). Detect once and route every edit through this helper.
+if sed --version >/dev/null 2>&1; then
+  sedi() { sed -i "$@"; }
+else
+  sedi() { sed -i '' "$@"; }
+fi
+
 echo "Bumping version to $VERSION in all package files..."
 
 # 1. Root package.json — "version" field
-sed -i "s/\"version\": \"[^\"]*\"/\"version\": \"$VERSION\"/" "$REPO_ROOT/package.json"
+sedi "s/\"version\": \"[^\"]*\"/\"version\": \"$VERSION\"/" "$REPO_ROOT/package.json"
 echo "  Updated package.json"
 
 # 1b. Root package.json — optionalDependencies versions
-sed -i "s/\"@agidreams\/ctm-linux-x64\": \"[^\"]*\"/\"@agidreams\/ctm-linux-x64\": \"$VERSION\"/" "$REPO_ROOT/package.json"
-sed -i "s/\"@agidreams\/ctm-linux-arm64\": \"[^\"]*\"/\"@agidreams\/ctm-linux-arm64\": \"$VERSION\"/" "$REPO_ROOT/package.json"
-sed -i "s/\"@agidreams\/ctm-darwin-arm64\": \"[^\"]*\"/\"@agidreams\/ctm-darwin-arm64\": \"$VERSION\"/" "$REPO_ROOT/package.json"
-sed -i "s/\"@agidreams\/ctm-darwin-x64\": \"[^\"]*\"/\"@agidreams\/ctm-darwin-x64\": \"$VERSION\"/" "$REPO_ROOT/package.json"
+sedi "s/\"@agidreams\/ctm-linux-x64\": \"[^\"]*\"/\"@agidreams\/ctm-linux-x64\": \"$VERSION\"/" "$REPO_ROOT/package.json"
+sedi "s/\"@agidreams\/ctm-linux-arm64\": \"[^\"]*\"/\"@agidreams\/ctm-linux-arm64\": \"$VERSION\"/" "$REPO_ROOT/package.json"
+sedi "s/\"@agidreams\/ctm-darwin-arm64\": \"[^\"]*\"/\"@agidreams\/ctm-darwin-arm64\": \"$VERSION\"/" "$REPO_ROOT/package.json"
+sedi "s/\"@agidreams\/ctm-darwin-x64\": \"[^\"]*\"/\"@agidreams\/ctm-darwin-x64\": \"$VERSION\"/" "$REPO_ROOT/package.json"
 echo "  Updated optionalDependencies in package.json"
 
 # 2. Cargo.toml
-sed -i "s/^version = \"[^\"]*\"/version = \"$VERSION\"/" "$REPO_ROOT/rust-crates/ctm/Cargo.toml"
+sedi "s/^version = \"[^\"]*\"/version = \"$VERSION\"/" "$REPO_ROOT/rust-crates/ctm/Cargo.toml"
 echo "  Updated rust-crates/ctm/Cargo.toml"
 
 # 3-6. Platform npm packages
 for pkg in ctm-linux-x64 ctm-linux-arm64 ctm-darwin-arm64 ctm-darwin-x64; do
-  sed -i "s/\"version\": \"[^\"]*\"/\"version\": \"$VERSION\"/" "$REPO_ROOT/npm-packages/$pkg/package.json"
+  sedi "s/\"version\": \"[^\"]*\"/\"version\": \"$VERSION\"/" "$REPO_ROOT/npm-packages/$pkg/package.json"
   echo "  Updated npm-packages/$pkg/package.json"
 done
 
