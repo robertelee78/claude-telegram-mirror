@@ -832,6 +832,137 @@ async fn check_hosts() -> CheckResult {
     }
 }
 
+/// ADR-017: how this binary was installed, whether a newer release exists, and whether
+/// the service unit or the Claude Code hooks still point at a *different* binary (the
+/// state an npm→standalone migration or a hand-moved binary leaves behind). `--fix`
+/// re-registers the hooks and the service to the running executable.
+async fn check_update(fix: bool) -> CheckResult {
+    let exe = match std::env::current_exe().and_then(fs::canonicalize) {
+        Ok(e) => e,
+        Err(e) => return CheckResult::warn("Update", &format!("cannot resolve own path: {e}")),
+    };
+    let channel = crate::update::detect_channel(&exe);
+    let mut lines = Vec::new();
+    let mut worst = CheckStatus::Pass;
+    let escalate = |s: CheckStatus, worst: &mut CheckStatus| {
+        if matches!(s, CheckStatus::Fail)
+            || (matches!(s, CheckStatus::Warn) && matches!(*worst, CheckStatus::Pass))
+        {
+            *worst = s;
+        }
+    };
+
+    let channel_line = match &channel {
+        crate::update::Channel::Standalone { install_dir } => {
+            format!("standalone install at {}", install_dir.display())
+        }
+        crate::update::Channel::Npm { .. } => {
+            escalate(CheckStatus::Warn, &mut worst);
+            "retired npm install — run `ctm update` to migrate to the GitHub Releases channel"
+                .to_string()
+        }
+        crate::update::Channel::Source { .. } => {
+            "source build (cargo); `ctm update` will not overwrite it".to_string()
+        }
+        crate::update::Channel::Unmanaged { .. } => {
+            "unmanaged binary (not installed by ctm); `ctm update` will not overwrite it"
+                .to_string()
+        }
+    };
+    lines.push(channel_line);
+
+    let current = env!("CARGO_PKG_VERSION");
+    match crate::update::latest_version().await {
+        Some(latest) => {
+            let cur = semver::Version::parse(current).ok();
+            if cur.is_some_and(|c| latest > c) {
+                escalate(CheckStatus::Warn, &mut worst);
+                lines.push(format!(
+                    "update available: {current} -> {latest} (`ctm update`)"
+                ));
+            } else {
+                lines.push(format!("running {current}; latest release is {latest}"));
+            }
+        }
+        None => lines.push(format!(
+            "running {current}; could not reach GitHub to check for a newer release"
+        )),
+    }
+
+    // Drift: service unit and hooks should run THIS binary.
+    let mut drift = false;
+    if let Some(svc) = crate::service::service_binary_path() {
+        let same = fs::canonicalize(&svc).map(|p| p == exe).unwrap_or(false);
+        if !same {
+            drift = true;
+            lines.push(format!(
+                "service unit runs a different binary: {}",
+                svc.display()
+            ));
+        }
+    }
+    let hook_bins = crate::installer::registered_hook_binaries();
+    let stale: Vec<_> = hook_bins
+        .iter()
+        .filter(|b| fs::canonicalize(b).map(|p| p != exe).unwrap_or(true))
+        .collect();
+    if !stale.is_empty() {
+        drift = true;
+        for b in &stale {
+            lines.push(format!(
+                "Claude Code hooks run a different binary: {}",
+                b.display()
+            ));
+        }
+    }
+    if drift {
+        if fix {
+            match crate::installer::install_hooks(false) {
+                Ok(()) => lines.push("fixed: hooks re-registered to this binary".into()),
+                Err(e) => {
+                    escalate(CheckStatus::Fail, &mut worst);
+                    lines.push(format!("could not re-register hooks: {e}"));
+                }
+            }
+            if crate::service::is_service_installed() {
+                let r = crate::service::install_service();
+                if r.success {
+                    let rr = crate::service::restart_service();
+                    lines.push(format!(
+                        "fixed: service re-installed to this binary ({})",
+                        if rr.success {
+                            "restarted"
+                        } else {
+                            "restart failed — run `ctm service restart`"
+                        }
+                    ));
+                } else {
+                    escalate(CheckStatus::Fail, &mut worst);
+                    lines.push(format!("could not re-install service: {}", r.message));
+                }
+            }
+        } else {
+            escalate(CheckStatus::Warn, &mut worst);
+            lines.push(
+                "run `ctm doctor --fix` to point the service and hooks at this binary".into(),
+            );
+        }
+    }
+
+    let summary = match &channel {
+        crate::update::Channel::Standalone { .. } => format!("standalone, {current}"),
+        crate::update::Channel::Npm { .. } => format!("npm (retired), {current}"),
+        crate::update::Channel::Source { .. } => format!("source build, {current}"),
+        crate::update::Channel::Unmanaged { .. } => format!("unmanaged, {current}"),
+    };
+    let details = lines.join("\n");
+    match worst {
+        CheckStatus::Pass => CheckResult::pass("Update", &summary).with_details(&details),
+        CheckStatus::Warn => CheckResult::warn("Update", &summary).with_details(&details),
+        CheckStatus::Fail => CheckResult::fail("Update", &summary).with_details(&details),
+    }
+}
+
 /// STALE-TOPICS: reconcile Telegram forum topics against live tmux/Claude state.
 ///
 /// Mirrors the daemon's `daemon::reconcile` sweep but runs as a one-shot from the CLI,
@@ -1062,73 +1193,79 @@ pub async fn run_doctor(fix: bool) -> anyhow::Result<()> {
 
     // [1/9] Binary
     let c = check_binary_version();
-    print!("[1/12] ");
+    print!("[1/13] ");
     print_result(&c);
     checks.push(c);
 
     // [2/9] Config directory
     let c = check_config_dir(fix);
-    print!("[2/12] ");
+    print!("[2/13] ");
     print_result(&c);
     checks.push(c);
 
     // [3/9] Configuration (env vars / config file)
     let c = check_env_vars();
-    print!("[3/12] ");
+    print!("[3/13] ");
     print_result(&c);
     checks.push(c);
 
     // [4/9] Hooks
     let c = check_hooks(fix);
-    print!("[4/12] ");
+    print!("[4/13] ");
     print_result(&c);
     checks.push(c);
 
     // [5/9] PID file
     let c = check_pid_file(fix);
-    print!("[5/12] ");
+    print!("[5/13] ");
     print_result(&c);
     checks.push(c);
 
     // [6/9] Socket
     let c = check_socket(fix);
-    print!("[6/12] ");
+    print!("[6/13] ");
     print_result(&c);
     checks.push(c);
 
     // [7/11] Tmux
     let c = check_tmux();
-    print!("[7/12] ");
+    print!("[7/13] ");
     print_result(&c);
     checks.push(c);
 
     // [8/11] Service
     let c = check_service();
-    print!("[8/12] ");
+    print!("[8/13] ");
     print_result(&c);
     checks.push(c);
 
     // [9/11] Telegram API
     let c = check_telegram().await;
-    print!("[9/12] ");
+    print!("[9/13] ");
     print_result(&c);
     checks.push(c);
 
     // [10/11] Database
     let c = check_database();
-    print!("[10/12] ");
+    print!("[10/13] ");
     print_result(&c);
     checks.push(c);
 
     // [11/12] Stale topics (liveness-driven reconciliation)
     let c = check_stale_topics(fix).await;
-    print!("[11/12] ");
+    print!("[11/13] ");
     print_result(&c);
     checks.push(c);
 
-    // [12/12] ADR-016: non-Claude hosts (OpenCode / Codex observers)
+    // [12/13] ADR-016: non-Claude hosts (OpenCode / Codex observers)
     let c = check_hosts().await;
-    print!("[12/12] ");
+    print!("[12/13] ");
+    print_result(&c);
+    checks.push(c);
+
+    // [13/13] ADR-017: distribution channel, latest release, service/hook path drift
+    let c = check_update(fix).await;
+    print!("[13/13] ");
     print_result(&c);
     checks.push(c);
 

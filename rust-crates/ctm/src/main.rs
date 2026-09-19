@@ -20,6 +20,7 @@ mod setup;
 mod socket;
 mod summarize;
 mod types;
+mod update;
 
 use clap::{Parser, Subcommand};
 use std::fs;
@@ -137,6 +138,16 @@ enum Commands {
         /// Attempt to automatically fix detected issues
         #[arg(long)]
         fix: bool,
+    },
+
+    /// Update ctm to the latest GitHub release (ADR-017)
+    Update {
+        /// Only report whether an update is available; change nothing
+        #[arg(long)]
+        check: bool,
+        /// Restore the previously installed binary
+        #[arg(long)]
+        rollback: bool,
     },
 
     /// Manage systemd/launchd service
@@ -258,6 +269,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Hooks => installer::print_hook_status(),
         Commands::Setup => setup::run_setup().await,
         Commands::Doctor { fix } => doctor::run_doctor(fix).await,
+        Commands::Update { check, rollback } => update::run_update(check, rollback).await,
         Commands::Service { action } => service::handle_service_command(&action),
         Commands::Toggle { on, off } => cmd_toggle(on, off).await,
         Commands::PruneTopics {

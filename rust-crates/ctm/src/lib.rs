@@ -23,3 +23,4 @@ pub mod setup;
 pub mod socket;
 pub mod summarize;
 pub mod types;
+pub mod update;

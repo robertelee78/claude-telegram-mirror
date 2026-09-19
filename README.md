@@ -1,6 +1,5 @@
 # Claude Code Telegram Mirror
 
-[![npm version](https://img.shields.io/npm/v/claude-telegram-mirror.svg)](https://www.npmjs.com/package/claude-telegram-mirror)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 ![Rust](https://img.shields.io/badge/Built_with-Rust-dea584.svg)
 
@@ -11,11 +10,21 @@ Bidirectional communication between Claude Code CLI and Telegram. Control your C
 ## Installation
 
 ```bash
-npm install -g claude-telegram-mirror
+curl -fsSL https://raw.githubusercontent.com/robertelee78/claude-telegram-mirror/master/install.sh | sh
 ctm setup    # Interactive setup wizard
 ```
 
-This installs a native Rust binary (`ctm`) via platform-specific optional packages. No Node.js runtime is needed to run the binary itself — Node.js 18+ is only required as the npm distribution mechanism.
+One static binary, installed to `~/.local/bin/ctm` from the [GitHub Release](https://github.com/robertelee78/claude-telegram-mirror/releases/latest) for your platform (macOS arm64/x64, Linux x64/arm64), size- and SHA-256-verified against the release record before it is installed. No Node.js, no package manager.
+
+```bash
+ctm update            # upgrade to the latest release (restarts the service if installed)
+ctm update --check    # just report
+ctm update --rollback # put the previous binary back
+```
+
+Prefer to verify by hand? Every release ships `ctm-<target>`, `ctm-<target>.sha256`, and a `stable-<target>.json` record; `sha256sum -c ctm-<target>.sha256`.
+
+> Upgrading from the npm package (0.2.27 and earlier)? Run the install line above, then `ctm doctor --fix` — it re-points the service and the Claude Code hooks at the new binary — and finally `npm uninstall -g claude-telegram-mirror`. Your config, sessions and Telegram topics are untouched. `ctm update` from the old binary does the same migration in one step. (ADR-017)
 
 ## Features
 
@@ -40,8 +49,8 @@ This installs a native Rust binary (`ctm`) via platform-specific optional packag
 ## Quick Start
 
 ```bash
-# 1. Install globally
-npm install -g claude-telegram-mirror
+# 1. Install
+curl -fsSL https://raw.githubusercontent.com/robertelee78/claude-telegram-mirror/master/install.sh | sh
 
 # 2. Run interactive setup (creates bot, configures everything)
 ctm setup
@@ -201,7 +210,6 @@ When running Claude Code on multiple machines, each system needs its own bot to 
 
 ## Prerequisites
 
-- Node.js 18+ (for npm installation only)
 - Claude Code CLI
 - tmux (for bidirectional communication)
 - Telegram account

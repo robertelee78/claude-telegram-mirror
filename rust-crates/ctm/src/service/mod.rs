@@ -129,6 +129,27 @@ pub struct ServiceStatus {
 pub use env::parse_env_file;
 
 /// Check if the service is installed (service file / plist exists).
+/// ADR-017: the binary the installed service unit runs, if a unit exists.
+/// launchd: first `<string>` under `ProgramArguments`; systemd: `ExecStart=<bin> start`.
+pub fn service_binary_path() -> Option<PathBuf> {
+    if has_systemd() {
+        let text = std::fs::read_to_string(systemd_service_file()).ok()?;
+        let line = text
+            .lines()
+            .find(|l| l.trim_start().starts_with("ExecStart="))?;
+        let rest = line.trim_start().trim_start_matches("ExecStart=").trim();
+        return rest.split_whitespace().next().map(PathBuf::from);
+    }
+    if is_macos() {
+        let text = std::fs::read_to_string(launchd_plist()).ok()?;
+        let after = text.split("<key>ProgramArguments</key>").nth(1)?;
+        let start = after.find("<string>")? + "<string>".len();
+        let end = after[start..].find("</string>")? + start;
+        return Some(PathBuf::from(after[start..end].trim()));
+    }
+    None
+}
+
 pub fn is_service_installed() -> bool {
     if has_systemd() {
         systemd_service_file().exists()

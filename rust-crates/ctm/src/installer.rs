@@ -980,6 +980,55 @@ pub struct HookStatus {
     pub errors: Vec<String>,
 }
 
+/// ADR-017: the distinct binary paths that ctm's *global* hook commands point at.
+///
+/// Hook commands are `"<abs path>" hook` (see `ctm_hook_command`). After a migration
+/// from the npm channel, or a manual move of the binary, these can lag the running
+/// executable; `doctor` reports that as drift and `--fix` re-installs the hooks.
+pub fn registered_hook_binaries() -> Vec<PathBuf> {
+    let path = global_settings_path();
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let Ok(v) = serde_json::from_str::<Value>(&text) else {
+        return Vec::new();
+    };
+    let mut out: Vec<PathBuf> = Vec::new();
+    let Some(hooks) = v.get("hooks").and_then(Value::as_object) else {
+        return out;
+    };
+    for items in hooks.values().filter_map(Value::as_array) {
+        for item in items {
+            for h in item
+                .get("hooks")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let Some(cmd) = h.get("command").and_then(Value::as_str) else {
+                    continue;
+                };
+                if !is_ctm_command(cmd) {
+                    continue;
+                }
+                // `"path with spaces" hook` or `path hook`
+                let bin = if let Some(rest) = cmd.strip_prefix('"') {
+                    rest.split('"').next().unwrap_or("")
+                } else {
+                    cmd.split_whitespace().next().unwrap_or("")
+                };
+                if !bin.is_empty() && bin != "ctm" {
+                    let p = PathBuf::from(bin);
+                    if !out.contains(&p) {
+                        out.push(p);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Check hook installation status without printing anything (global scope).
 #[allow(dead_code)] // Library API / back-compat
 pub fn check_hook_status() -> HookStatus {

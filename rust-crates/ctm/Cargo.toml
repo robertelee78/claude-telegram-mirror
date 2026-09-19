@@ -35,6 +35,8 @@ time = { version = "0.3", features = ["macros"] }
 dialoguer = "0.11"
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
 futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
+sha2 = "0.10"
+semver = "1"
 
 [dev-dependencies]
 tempfile = "3"

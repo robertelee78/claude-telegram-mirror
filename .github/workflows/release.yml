@@ -22,26 +22,27 @@ jobs:
           strip target/release/ctm
           ls -lh target/release/ctm
 
-      - name: Package binary
+      - name: Package release asset
         run: |
-          cp rust-crates/target/release/ctm npm-packages/ctm-linux-x64/bin/ctm
-          chmod 755 npm-packages/ctm-linux-x64/bin/ctm
-          node -e "
-            const crypto = require('crypto');
-            const fs = require('fs');
-            const bin = fs.readFileSync('npm-packages/ctm-linux-x64/bin/ctm');
-            const checksums = { ctm: { sha256: crypto.createHash('sha256').update(bin).digest('hex'), size: bin.length } };
-            fs.writeFileSync('npm-packages/ctm-linux-x64/bin/checksums.json', JSON.stringify(checksums, null, 2) + '\n');
-          "
-          cd npm-packages/ctm-linux-x64
-          npm pack
-          mv *.tgz ../../
+          # ADR-017: one raw binary + one .sha256 + one release record per target.
+          # `ctm update` and install.sh read the record; the sha256 file is for humans.
+          mkdir -p dist
+          cp rust-crates/target/release/ctm dist/ctm-x86_64-unknown-linux-gnu
+          chmod 755 dist/ctm-x86_64-unknown-linux-gnu
+          ( cd dist && sha256sum ctm-x86_64-unknown-linux-gnu > ctm-x86_64-unknown-linux-gnu.sha256 )
+          VERSION=$(grep -m1 '^version' rust-crates/ctm/Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          SIZE=$(stat -c %s dist/ctm-x86_64-unknown-linux-gnu 2>/dev/null || stat -f %z dist/ctm-x86_64-unknown-linux-gnu)
+          SHA=$(cut -d' ' -f1 dist/ctm-x86_64-unknown-linux-gnu.sha256)
+          printf '{"kind":"ctm.standalone-release","schema_version":1,"package":"ctm","channel":"stable","target":"x86_64-unknown-linux-gnu","version":"%s","size":%s,"sha256":"%s"}\n' \
+            "$VERSION" "$SIZE" "$SHA" > dist/stable-x86_64-unknown-linux-gnu.json
+          cat dist/stable-x86_64-unknown-linux-gnu.json
+          ls -l dist
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ctm-linux-x64
-          path: '*.tgz'
+          name: x86_64-unknown-linux-gnu
+          path: dist/*
 
   build-darwin-arm64:
     runs-on: macos-latest
@@ -103,26 +104,27 @@ jobs:
           codesign -dvvv "$BIN" 2>&1 | grep -E 'Authority|TeamIdentifier' || true
           rm -f "$RUNNER_TEMP/cert.p12"
 
-      - name: Package binary
+      - name: Package release asset
         run: |
-          cp rust-crates/target/release/ctm npm-packages/ctm-darwin-arm64/bin/ctm
-          chmod 755 npm-packages/ctm-darwin-arm64/bin/ctm
-          node -e "
-            const crypto = require('crypto');
-            const fs = require('fs');
-            const bin = fs.readFileSync('npm-packages/ctm-darwin-arm64/bin/ctm');
-            const checksums = { ctm: { sha256: crypto.createHash('sha256').update(bin).digest('hex'), size: bin.length } };
-            fs.writeFileSync('npm-packages/ctm-darwin-arm64/bin/checksums.json', JSON.stringify(checksums, null, 2) + '\n');
-          "
-          cd npm-packages/ctm-darwin-arm64
-          npm pack
-          mv *.tgz ../../
+          # ADR-017: one raw binary + one .sha256 + one release record per target.
+          # `ctm update` and install.sh read the record; the sha256 file is for humans.
+          mkdir -p dist
+          cp rust-crates/target/release/ctm dist/ctm-aarch64-apple-darwin
+          chmod 755 dist/ctm-aarch64-apple-darwin
+          ( cd dist && (command -v sha256sum >/dev/null || sha256sum() { shasum -a 256 "$@"; }) && sha256sum ctm-aarch64-apple-darwin > ctm-aarch64-apple-darwin.sha256 )
+          VERSION=$(grep -m1 '^version' rust-crates/ctm/Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          SIZE=$(stat -c %s dist/ctm-aarch64-apple-darwin 2>/dev/null || stat -f %z dist/ctm-aarch64-apple-darwin)
+          SHA=$(cut -d' ' -f1 dist/ctm-aarch64-apple-darwin.sha256)
+          printf '{"kind":"ctm.standalone-release","schema_version":1,"package":"ctm","channel":"stable","target":"aarch64-apple-darwin","version":"%s","size":%s,"sha256":"%s"}\n' \
+            "$VERSION" "$SIZE" "$SHA" > dist/stable-aarch64-apple-darwin.json
+          cat dist/stable-aarch64-apple-darwin.json
+          ls -l dist
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ctm-darwin-arm64
-          path: '*.tgz'
+          name: aarch64-apple-darwin
+          path: dist/*
 
   build-darwin-x64:
     runs-on: macos-14
@@ -181,26 +183,27 @@ jobs:
           codesign -dvvv "$BIN" 2>&1 | grep -E 'Authority|TeamIdentifier' || true
           rm -f "$RUNNER_TEMP/cert.p12"
 
-      - name: Package binary
+      - name: Package release asset
         run: |
-          cp rust-crates/target/x86_64-apple-darwin/release/ctm npm-packages/ctm-darwin-x64/bin/ctm
-          chmod 755 npm-packages/ctm-darwin-x64/bin/ctm
-          node -e "
-            const crypto = require('crypto');
-            const fs = require('fs');
-            const bin = fs.readFileSync('npm-packages/ctm-darwin-x64/bin/ctm');
-            const checksums = { ctm: { sha256: crypto.createHash('sha256').update(bin).digest('hex'), size: bin.length } };
-            fs.writeFileSync('npm-packages/ctm-darwin-x64/bin/checksums.json', JSON.stringify(checksums, null, 2) + '\n');
-          "
-          cd npm-packages/ctm-darwin-x64
-          npm pack
-          mv *.tgz ../../
+          # ADR-017: one raw binary + one .sha256 + one release record per target.
+          # `ctm update` and install.sh read the record; the sha256 file is for humans.
+          mkdir -p dist
+          cp rust-crates/target/x86_64-apple-darwin/release/ctm dist/ctm-x86_64-apple-darwin
+          chmod 755 dist/ctm-x86_64-apple-darwin
+          ( cd dist && (command -v sha256sum >/dev/null || sha256sum() { shasum -a 256 "$@"; }) && sha256sum ctm-x86_64-apple-darwin > ctm-x86_64-apple-darwin.sha256 )
+          VERSION=$(grep -m1 '^version' rust-crates/ctm/Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          SIZE=$(stat -c %s dist/ctm-x86_64-apple-darwin 2>/dev/null || stat -f %z dist/ctm-x86_64-apple-darwin)
+          SHA=$(cut -d' ' -f1 dist/ctm-x86_64-apple-darwin.sha256)
+          printf '{"kind":"ctm.standalone-release","schema_version":1,"package":"ctm","channel":"stable","target":"x86_64-apple-darwin","version":"%s","size":%s,"sha256":"%s"}\n' \
+            "$VERSION" "$SIZE" "$SHA" > dist/stable-x86_64-apple-darwin.json
+          cat dist/stable-x86_64-apple-darwin.json
+          ls -l dist
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ctm-darwin-x64
-          path: '*.tgz'
+          name: x86_64-apple-darwin
+          path: dist/*
 
   build-linux-arm64:
     runs-on: ubuntu-latest
@@ -225,33 +228,33 @@ jobs:
           aarch64-linux-gnu-strip target/aarch64-unknown-linux-gnu/release/ctm
           ls -lh target/aarch64-unknown-linux-gnu/release/ctm
 
-      - name: Package binary
+      - name: Package release asset
         run: |
-          cp rust-crates/target/aarch64-unknown-linux-gnu/release/ctm npm-packages/ctm-linux-arm64/bin/ctm
-          chmod 755 npm-packages/ctm-linux-arm64/bin/ctm
-          node -e "
-            const crypto = require('crypto');
-            const fs = require('fs');
-            const bin = fs.readFileSync('npm-packages/ctm-linux-arm64/bin/ctm');
-            const checksums = { ctm: { sha256: crypto.createHash('sha256').update(bin).digest('hex'), size: bin.length } };
-            fs.writeFileSync('npm-packages/ctm-linux-arm64/bin/checksums.json', JSON.stringify(checksums, null, 2) + '\n');
-          "
-          cd npm-packages/ctm-linux-arm64
-          npm pack
-          mv *.tgz ../../
+          # ADR-017: one raw binary + one .sha256 + one release record per target.
+          # `ctm update` and install.sh read the record; the sha256 file is for humans.
+          mkdir -p dist
+          cp rust-crates/target/aarch64-unknown-linux-gnu/release/ctm dist/ctm-aarch64-unknown-linux-gnu
+          chmod 755 dist/ctm-aarch64-unknown-linux-gnu
+          ( cd dist && sha256sum ctm-aarch64-unknown-linux-gnu > ctm-aarch64-unknown-linux-gnu.sha256 )
+          VERSION=$(grep -m1 '^version' rust-crates/ctm/Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          SIZE=$(stat -c %s dist/ctm-aarch64-unknown-linux-gnu 2>/dev/null || stat -f %z dist/ctm-aarch64-unknown-linux-gnu)
+          SHA=$(cut -d' ' -f1 dist/ctm-aarch64-unknown-linux-gnu.sha256)
+          printf '{"kind":"ctm.standalone-release","schema_version":1,"package":"ctm","channel":"stable","target":"aarch64-unknown-linux-gnu","version":"%s","size":%s,"sha256":"%s"}\n' \
+            "$VERSION" "$SIZE" "$SHA" > dist/stable-aarch64-unknown-linux-gnu.json
+          cat dist/stable-aarch64-unknown-linux-gnu.json
+          ls -l dist
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ctm-linux-arm64
-          path: '*.tgz'
+          name: aarch64-unknown-linux-gnu
+          path: dist/*
 
   publish:
     needs: [build-linux-x64, build-linux-arm64, build-darwin-arm64, build-darwin-x64]
     runs-on: ubuntu-latest
     permissions:
       contents: write
-      id-token: write
     steps:
       - uses: actions/checkout@v4
 
@@ -259,71 +262,29 @@ jobs:
         with:
           path: artifacts
 
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '20.x'
-          registry-url: 'https://registry.npmjs.org'
-
-      - name: Publish platform packages to npm
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Assemble release assets
         run: |
-          # pipefail so `npm publish ... | tee` reports npm's exit status, not tee's.
-          # Without it, a failed publish (e.g. EOTP/auth) is masked as success and only
-          # surfaces ~150s later as a misleading "packages not available on registry"
-          # timeout; this also makes the EPUBLISHCONFLICT skip-branch actually reachable.
-          set -o pipefail
-          # Publish platform packages first
-          for pkg in ctm-linux-x64 ctm-linux-arm64 ctm-darwin-arm64 ctm-darwin-x64; do
-            # -print -quit (not `| head -1`): emits the first match and stops with no
-            # pipe, so it can't SIGPIPE-fail (exit 141) under the set -o pipefail above.
-            tgz=$(find artifacts/$pkg -name "*.tgz" -print -quit)
-            if [ -n "$tgz" ]; then
-              echo "Publishing $pkg..."
-              if ! npm publish "$tgz" --access public --provenance 2>&1 | tee /tmp/npm-publish-$pkg.log; then
-                if grep -q 'EPUBLISHCONFLICT\|You cannot publish over the previously published versions' /tmp/npm-publish-$pkg.log; then
-                  echo "  $pkg already published at this version — skipping"
-                else
-                  echo "  ERROR: $pkg publish failed with unexpected error"
-                  cat /tmp/npm-publish-$pkg.log
-                  exit 1
-                fi
-              fi
-            fi
-          done
-
-          # Wait for npm registry propagation
-          VERSION=$(node -p "require('./package.json').version")
-          echo "Waiting for npm registry propagation (v${VERSION})..."
-          for i in $(seq 1 30); do
-            ALL_AVAILABLE=true
-            for pkg in ctm-linux-x64 ctm-linux-arm64 ctm-darwin-arm64 ctm-darwin-x64; do
-              if ! npm view @agidreams/${pkg}@${VERSION} version 2>/dev/null; then
-                ALL_AVAILABLE=false
-                break
-              fi
-            done
-            if [ "$ALL_AVAILABLE" = true ]; then
-              echo "All platform packages available on registry"
-              break
-            fi
-            echo "Attempt $i/30 — waiting 5s..."
-            sleep 5
-          done
-
-          # After the loop, verify all packages are available
-          if [ "$ALL_AVAILABLE" != "true" ]; then
-            echo "ERROR: Platform packages not available on npm registry after 150s timeout"
-            echo "Cannot publish main package without platform dependencies"
-            exit 1
+          # ADR-017: the GitHub Release IS the distribution. Per target: the binary,
+          # its .sha256, and the stable-<triple>.json record that `ctm update` and
+          # install.sh resolve through releases/latest/download/. Plus install.sh
+          # itself, so a pinned copy travels with every release.
+          mkdir -p release
+          cp artifacts/*/ctm-* artifacts/*/stable-*.json release/
+          cp install.sh release/install.sh
+          VERSION=$(grep -m1 '^version' rust-crates/ctm/Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          TAG="${GITHUB_REF_NAME}"
+          if [ "${TAG}" != "v${VERSION}" ]; then
+            echo "ERROR: tag ${TAG} does not match Cargo.toml version ${VERSION}"; exit 1
           fi
-
-          # Publish the main package
-          npm publish --access public --provenance
+          # Every record must carry this version, or `ctm update` would install the wrong tag's asset.
+          for r in release/stable-*.json; do
+            grep -q "\"version\":\"${VERSION}\"" "$r" || { echo "ERROR: $r is not for ${VERSION}"; cat "$r"; exit 1; }
+          done
+          ls -l release
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/')
         with:
-          files: artifacts/**/*.tgz
+          files: release/*
           generate_release_notes: true

@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.29] - 2026-09-19
+
+### Changed (distribution moved to GitHub Releases — ADR-017)
+- **npm is retired.** ctm is now one static binary per platform, published as GitHub Release assets and installed with `curl -fsSL https://raw.githubusercontent.com/robertelee78/claude-telegram-mirror/master/install.sh | sh`. The installer resolves the per-target release record (`stable-<target>.json`) through GitHub's `releases/latest/download/` redirect, downloads `ctm-<target>` from that exact release, verifies size and SHA-256, and installs atomically to `~/.local/bin` with a channel marker. No Node.js anywhere. The 0.2.28 npm publish had failed on an expired registry token after all four binaries built — the last time that failure mode can happen.
+- **`ctm update [--check] [--rollback]`** — self-update through the same record → verified download → atomic rename swap, keeping one `.ctm-previous` for rollback, refusing to overwrite a binary it did not install, restarting the service afterwards. Running it from an npm-installed binary performs the migration to the standalone channel and re-points the service and hooks.
+- **`ctm doctor` check 13/13 "Update"**: install channel, latest release vs running version, and drift (service unit or Claude Code hooks pointing at a different binary), fixable with `--fix`.
+- `npm-packages/`, `package.json`, the Node wrapper/postinstall shims and `.npmignore` are removed; `scripts/bump-version.sh` now updates only `Cargo.toml` + `Cargo.lock`. The release workflow uploads binaries, `.sha256` files, records and `install.sh` to the GitHub Release and no longer touches npm.
+
 ## [0.2.28] - 2026-09-19
 
 ### Added (OpenCode and Codex as agent hosts — ADR-016)

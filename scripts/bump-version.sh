@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# bump-version.sh — update the version string across all 6 package files.
+# bump-version.sh — update the crate version (Cargo.toml + Cargo.lock).
 #
 # Usage: ./scripts/bump-version.sh 0.3.0
 #
@@ -34,27 +34,12 @@ fi
 
 echo "Bumping version to $VERSION in all package files..."
 
-# 1. Root package.json — "version" field
-sedi "s/\"version\": \"[^\"]*\"/\"version\": \"$VERSION\"/" "$REPO_ROOT/package.json"
-echo "  Updated package.json"
-
-# 1b. Root package.json — optionalDependencies versions
-sedi "s/\"@agidreams\/ctm-linux-x64\": \"[^\"]*\"/\"@agidreams\/ctm-linux-x64\": \"$VERSION\"/" "$REPO_ROOT/package.json"
-sedi "s/\"@agidreams\/ctm-linux-arm64\": \"[^\"]*\"/\"@agidreams\/ctm-linux-arm64\": \"$VERSION\"/" "$REPO_ROOT/package.json"
-sedi "s/\"@agidreams\/ctm-darwin-arm64\": \"[^\"]*\"/\"@agidreams\/ctm-darwin-arm64\": \"$VERSION\"/" "$REPO_ROOT/package.json"
-sedi "s/\"@agidreams\/ctm-darwin-x64\": \"[^\"]*\"/\"@agidreams\/ctm-darwin-x64\": \"$VERSION\"/" "$REPO_ROOT/package.json"
-echo "  Updated optionalDependencies in package.json"
-
-# 2. Cargo.toml
+# ADR-017: Cargo.toml is the single source of truth for the version. The release
+# workflow reads it to name the tag-pinned assets and to write each release record.
 sedi "s/^version = \"[^\"]*\"/version = \"$VERSION\"/" "$REPO_ROOT/rust-crates/ctm/Cargo.toml"
 echo "  Updated rust-crates/ctm/Cargo.toml"
-
-# 3-6. Platform npm packages
-for pkg in ctm-linux-x64 ctm-linux-arm64 ctm-darwin-arm64 ctm-darwin-x64; do
-  sedi "s/\"version\": \"[^\"]*\"/\"version\": \"$VERSION\"/" "$REPO_ROOT/npm-packages/$pkg/package.json"
-  echo "  Updated npm-packages/$pkg/package.json"
-done
+( cd "$REPO_ROOT/rust-crates" && cargo update -p ctm --offline >/dev/null 2>&1 || cargo update -p ctm >/dev/null 2>&1 ) && echo "  Updated rust-crates/Cargo.lock"
 
 echo ""
-echo "Version bumped to $VERSION in all 6 files."
+echo "Version bumped to $VERSION."
 echo "Don't forget to commit and tag: git tag v$VERSION"
