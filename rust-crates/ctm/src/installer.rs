@@ -543,10 +543,23 @@ fn array_without_ctm(existing: Option<&Value>) -> Vec<Value> {
 /// Resolve the (scope, settings-path) list for a project `base`, broadest first.
 /// Production entry point; tests build their own list with isolated paths.
 pub(crate) fn resolve_scopes(base: &Path) -> Vec<(HookScope, PathBuf)> {
-    [HookScope::Global, HookScope::Project, HookScope::Local]
-        .into_iter()
-        .map(|s| (s, scope_settings_path(s, base)))
-        .collect()
+    // When the project base IS the home directory (running from `~`), the project
+    // scope resolves to the global file. Counting one file under two scopes produced
+    // phantom "duplicate hooks" warnings from `ctm doctor` (found live 2026-09-19), so
+    // any scope whose path repeats an earlier scope's path is dropped.
+    let mut out: Vec<(HookScope, PathBuf)> = Vec::new();
+    for s in [HookScope::Global, HookScope::Project, HookScope::Local] {
+        let p = scope_settings_path(s, base);
+        let dup = out.iter().any(|(_, q)| {
+            q == &p
+                || (std::fs::canonicalize(q).ok().is_some()
+                    && std::fs::canonicalize(q).ok() == std::fs::canonicalize(&p).ok())
+        });
+        if !dup {
+            out.push((s, p));
+        }
+    }
+    out
 }
 
 fn other_scopes_with_ctm(
@@ -1416,6 +1429,26 @@ mod tests {
             "hooks": [{ "type": "command", "command": "ctm hook" }]
         });
         assert!(strip_ctm_from_item(&all_ctm).is_none());
+    }
+
+    /// Running from `~` makes the project scope resolve to the global file; that must
+    /// count as ONE scope or doctor reports phantom duplicates.
+    #[test]
+    fn resolve_scopes_drops_scopes_that_alias_the_same_file() {
+        let home = crate::config::home_dir();
+        let scopes = resolve_scopes(&home);
+        let paths: Vec<_> = scopes.iter().map(|(_, p)| p.clone()).collect();
+        let mut dedup = paths.clone();
+        dedup.dedup();
+        assert_eq!(paths, dedup, "no repeated paths: {paths:?}");
+        assert!(scopes.iter().any(|(s, _)| *s == HookScope::Global));
+        assert!(
+            !scopes.iter().any(|(s, _)| *s == HookScope::Project),
+            "project scope aliases global when base == HOME"
+        );
+        // A real project dir keeps all three.
+        let d = tempfile::tempdir().unwrap();
+        assert_eq!(resolve_scopes(d.path()).len(), 3);
     }
 
     #[test]

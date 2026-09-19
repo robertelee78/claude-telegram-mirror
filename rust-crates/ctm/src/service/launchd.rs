@@ -206,15 +206,49 @@ pub(super) fn start_launchd_service() -> ServiceResult {
 /// kickstart is unavailable or fails.
 pub(super) fn restart_launchd_service() -> ServiceResult {
     let plist = launchd_plist();
-    // Ensure the job is bootstrapped (no-op if already loaded).
+    let uid = nix::unistd::getuid().as_raw();
+    let target = format!("gui/{uid}/com.claude.{SERVICE_NAME}");
+
+    // ADR-017: `kickstart -k` restarts launchd's LOADED job definition and never
+    // re-reads the plist. When the plist on disk names a different program than the
+    // loaded job (binary moved: npm -> standalone migration, reinstall elsewhere), the
+    // job must be booted out and bootstrapped again or the old binary keeps running
+    // while `ctm status` truthfully reports "running". Found live on 2026-09-19.
+    if let (Some(loaded), Some(on_disk)) = (loaded_program(&target), plist_program(&plist)) {
+        let same = std::fs::canonicalize(&loaded).ok() == std::fs::canonicalize(&on_disk).ok()
+            || loaded == on_disk;
+        if !same {
+            let _ = Command::new("launchctl")
+                .args(["bootout", &target])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+            // bootout is asynchronous for the process; wait for it to be gone.
+            for _ in 0..40 {
+                if launchd_pid().is_none() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+        }
+    }
+
+    // Ensure the job is bootstrapped from the plist ON DISK (no-op if already loaded).
+    let _ = Command::new("launchctl")
+        .args([
+            "bootstrap",
+            &format!("gui/{uid}"),
+            &plist.display().to_string(),
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
     let _ = Command::new("launchctl")
         .args(["load", &plist.display().to_string()])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();
 
-    let uid = nix::unistd::getuid().as_raw();
-    let target = format!("gui/{uid}/com.claude.{SERVICE_NAME}");
     let kicked = Command::new("launchctl")
         .args(["kickstart", "-k", &target])
         .status();
@@ -235,6 +269,31 @@ pub(super) fn restart_launchd_service() -> ServiceResult {
         sleep(Duration::from_millis(250));
     }
     start_launchd_service()
+}
+
+/// The `program` launchd currently has loaded for the job, if any.
+fn loaded_program(target: &str) -> Option<PathBuf> {
+    let out = Command::new("launchctl")
+        .args(["print", target])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.lines()
+        .map(str::trim)
+        .find_map(|l| l.strip_prefix("program = "))
+        .map(|p| PathBuf::from(p.trim()))
+}
+
+/// The first `ProgramArguments` entry in the plist on disk.
+fn plist_program(plist: &std::path::Path) -> Option<PathBuf> {
+    let text = fs::read_to_string(plist).ok()?;
+    let after = text.split("<key>ProgramArguments</key>").nth(1)?;
+    let start = after.find("<string>")? + "<string>".len();
+    let end = after[start..].find("</string>")? + start;
+    Some(PathBuf::from(after[start..end].trim()))
 }
 
 /// Wait for the service to actually come up and stay up after a start/restart

@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.31] - 2026-09-19
+
+### Fixed (found by running the 0.2.30 migration as a user)
+- **`ctm service restart` now reloads the job when the binary path changed.** `launchctl kickstart -k` restarts launchd's *loaded* definition and never re-reads the plist, so after an npm→standalone migration `ctm doctor --fix` rewrote the plist, reported "restarted", and the old npm binary kept running. The restart path now compares the loaded `program` with the plist's `ProgramArguments` and, on mismatch, boots the job out and bootstraps it from disk. Verified live: loaded program flipped to `~/.local/bin/ctm`.
+- **`ctm doctor` no longer reports phantom duplicate hooks when run from `$HOME`.** With the current directory equal to the home directory, the "project" scope resolves to the same `~/.claude/settings.json` as the global scope, and one file was counted under two scopes. Scopes that alias the same file are now collapsed.
+
 ## [0.2.30] - 2026-09-19
 
 ### Added (automatic PATH + tab completion — ADR-017 amendment)
