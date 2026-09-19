@@ -119,11 +119,37 @@ say "installed: $INSTALL_DIR/ctm ($installed)"
 if [ -z "${CTM_NO_SHELL_SETUP:-}" ]; then
   "$INSTALL_DIR/ctm" shell-setup </dev/null || say "warning: shell setup reported a problem (ctm itself is installed)"
 fi
+# --- retire a previous npm install -----------------------------------------------
+# ctm used to ship as the npm package `claude-telegram-mirror` with a Node shim. If one
+# is still installed, its shim can shadow this binary on PATH and the service and hooks
+# may still point at it, so remove it here rather than leaving the user two ctms.
+npm_removed=""
+if command -v npm >/dev/null 2>&1; then
+  if npm ls -g --depth=0 claude-telegram-mirror >/dev/null 2>&1; then
+    say ""
+    say "removing the old npm package (claude-telegram-mirror) …"
+    if npm uninstall -g claude-telegram-mirror >/dev/null 2>&1; then
+      npm_removed=1
+      say "removed: npm claude-telegram-mirror"
+    else
+      say "warning: could not remove it automatically — run: npm uninstall -g claude-telegram-mirror"
+    fi
+  fi
+fi
+
 say ""
 if [ -f "$HOME/.config/claude-telegram-mirror/config.json" ]; then
-  say "existing configuration found — reconcile the service and hooks to this binary:"
-  say "  ctm doctor --fix"
+  # Existing install: the service unit and the Claude Code hooks hold an absolute path,
+  # which is stale after a migration (and always after removing the npm copy). `doctor
+  # --fix` re-points them, reloads the service, and wires the OpenCode/Codex hosts.
+  say "existing configuration found — reconciling the service, hooks and hosts …"
+  if "$INSTALL_DIR/ctm" doctor --fix </dev/null; then
+    :
+  else
+    say "warning: some checks still need attention — run: ctm doctor"
+  fi
 else
   say "next:"
   say "  ctm setup"
 fi
+[ -n "$npm_removed" ] && say "" && say "the old npm binary is gone; open a new shell so PATH finds $INSTALL_DIR/ctm"

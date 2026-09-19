@@ -320,9 +320,17 @@ pub(super) async fn handle_session_start(ctx: &HandlerContext, msg: &BridgeMessa
         None
     };
 
-    // ADR-013 D3: Build session info with tmux status indicator.
+    // ADR-013 D3: Build session info with the reply-channel indicator. ADR-016: native
+    // hosts are replied to over their API, so tmux is irrelevant to them — saying
+    // "replies disabled" there would be false (it was, in 0.2.32's first user test).
     let mut session_info = format_session_start(&msg.session_id, project_dir, hostname);
-    if let Some(target) = tmux_target {
+    let host_kind = meta.host_kind();
+    if host_kind.uses_native_api() {
+        session_info.push_str(&format!(
+            "\n\u{1F7E2} {}: connected \u{2014} replies go through its API",
+            host_kind.label()
+        ));
+    } else if let Some(target) = tmux_target {
         session_info.push_str(&format!("\n\u{1F7E2} tmux: connected (`{target}`)"));
     } else {
         session_info.push_str("\n\u{1F534} tmux: not detected \u{2014} replies disabled");

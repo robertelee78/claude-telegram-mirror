@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.33] - 2026-09-20
+
+### Fixed (found by running 0.2.32 as a user)
+- **Codex topics never closed.** `thread/closed` (and the `notLoaded` status that precedes it) were not handled at all, so a Telegram topic stayed open after the Codex session exited and auto-delete never fired. Both are now translated to `SessionEnd`; both are broadcast to every app-server client, subscribed or not (verified against 0.155.1).
+- **The "Session Started" card said "tmux: not detected — replies disabled" for OpenCode and Codex sessions.** Replies to those hosts go over their API and never needed tmux, so the card was false — it now names the host and its channel.
+- **`install.sh` removes a previous npm install.** If the retired `claude-telegram-mirror` npm package is still present, the installer uninstalls it (its Node shim could otherwise shadow the new binary on `PATH`) and, when an existing configuration is found, runs `ctm doctor --fix` itself to re-point the service and the Claude Code hooks and wire the hosts — instead of printing that as a step for the user.
+- README: no npm/Node references, and no suggestion to run `ctm completions` by hand (installs and updates do it).
+
+### Known limitation (Codex, app-server 0.155.1)
+- **A bare `codex` mirrors *into* Telegram but not *out* of it yet.** Injection works (verified: Telegram replies render in the Codex TUI and it answers), and session start/rename/end are mirrored. Agent messages, tool calls and approvals are not, because a second app-server client cannot subscribe to a thread another process owns: `thread/resume` answers `no rollout found` for the whole life of the thread (56 retries over 95 s, rollout file present on disk), `thread/items/list` is "not supported yet", and `thread/read` succeeds but opens no stream. `codex --remote unix://<socket>` sessions are unaffected. The fix is Codex's own hook system (same event vocabulary as Claude Code's), which ctm can install itself — tracked in ADR-016.
+
 ## [0.2.32] - 2026-09-19
 
 ### Changed (OpenCode and Codex are on by default — ADR-016 amendment §Default enablement)

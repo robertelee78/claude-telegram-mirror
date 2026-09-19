@@ -383,3 +383,45 @@ the wiring on the user. This amendment moves it into ctm.
 - No port, no password, no `--remote`. The bare-TUI path carries no network listener at
   all, which is strictly safer than the previous documented setup.
 - `HostsConfig::enabled()` now means "not opted out", not "configured".
+
+## Codex live observation is one-way on app-server 0.155.1 (amendment, 2026-09-20)
+
+Running 0.2.32 as a user exposed a claim in §Default enablement that does not hold on
+the current Codex: *"a bare `codex` started while the daemon runs auto-joins it"* is
+true for **registration and injection**, and false for **observation**.
+
+### What a second app-server client actually gets for a thread a bare `codex` owns
+
+| Call / event | 0.155.1 result |
+|---|---|
+| `thread/started`, `thread/name/updated`, `thread/status/changed`, `thread/closed` | **Delivered** to every client, subscribed or not |
+| `turn/*`, `item/*`, `serverRequest/*` | **Never delivered** unless subscribed |
+| `thread/resume {threadId}` | **`no rollout found`, permanently** — 56 retries over 95 s with the rollout file present on disk the whole time |
+| `thread/items/list` | `not supported yet` |
+| `thread/read` | Succeeds, returns the thread record, **opens no stream** |
+| `thread/current` | Not a method |
+| `turn/start` (injection) | **Works** — the user's Telegram messages rendered in the TUI and Codex answered |
+
+So ADR-016's retry-on-`turn/started` mitigation is unreachable by construction: the
+retry trigger is itself a subscribed-only notification. `codex --remote unix://…`
+sessions are unaffected — they are app-server-owned and fully observable, which is what
+the original spikes measured.
+
+### Consequence, and the path
+
+0.2.33 fixes what this makes possible today: `thread/closed` / `notLoaded` now end the
+session (topics were never closing), and the session card no longer claims tmux is
+needed. Codex sessions therefore mirror **in** (injection, start, rename, end) but not
+**out** (agent messages, tool calls, approvals).
+
+The mechanism for out is Codex's **own hook system**, which is ctm-installable and
+therefore keeps the zero-configuration promise: `hooks.json` has the same shape as
+Claude Code's hook block, the event vocabulary is a superset of Claude Code's
+(`PreToolUse`, `PermissionRequest`, `PostToolUse`, `SessionStart`, `SessionEnd`,
+`UserPromptSubmit`, `Stop`, `Interrupt`, `SubagentStart/Stop`, `PreCompact`/`PostCompact`),
+and the payload keys are the ones `hook.rs` already speaks (`hook_event_name`,
+`tool_name`, `tool_input`, `tool_use_id`, `permission_mode`, `last_assistant_message`,
+`prompt`). Each hook entry is trust-gated by a `sha256` recorded in `config.toml`
+(`[hooks.state."<source>:<file>:<event>:<i>:<j>"] trusted_hash`), which ctm must write
+alongside the hook file. ADR-014's PR-E constraint still binds: observation hooks are
+non-blocking, and an approval hook must not pre-empt the TUI's own prompt.

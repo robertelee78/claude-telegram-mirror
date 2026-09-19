@@ -196,6 +196,23 @@ impl Translator {
             || thread.get("threadSource").and_then(Value::as_str) == Some("system")
     }
 
+    /// End an announced thread exactly once and forget its state.
+    fn end_thread(&mut self, thread_id: &str, reason: &str) -> Vec<Out> {
+        let Some(ctx) = self.threads.remove(thread_id) else {
+            return vec![];
+        };
+        self.pending.clear(thread_id);
+        if !ctx.announced {
+            return vec![];
+        }
+        vec![Out::Bridge(self.msg(
+            MessageType::SessionEnd,
+            thread_id,
+            reason,
+            Map::new(),
+        ))]
+    }
+
     fn announce(&mut self, thread: &Value) -> Vec<Out> {
         let Some(tid) = thread.get("id").and_then(Value::as_str) else {
             return vec![];
@@ -447,12 +464,33 @@ impl Translator {
             }
             "thread/status/changed" => {
                 if let Some(tid) = tid {
-                    let active = p
+                    let status = p
                         .get("status")
                         .and_then(|s| s.get("type"))
-                        .and_then(Value::as_str)
-                        == Some("active");
-                    self.threads.entry(tid).or_default().running = active;
+                        .and_then(Value::as_str);
+                    // `notLoaded` is the app-server dropping the thread (the owning
+                    // process exited). Spike-verified: it is broadcast to every client,
+                    // subscribed or not, immediately before `thread/closed`.
+                    if status == Some("notLoaded") {
+                        out.extend(self.end_thread(&tid, "closed"));
+                    } else {
+                        self.threads.entry(tid).or_default().running = status == Some("active");
+                    }
+                }
+            }
+            // The owning process exited. Without this the Telegram topic stayed open
+            // forever (reported after 0.2.32: "the topic didn't self delete when I
+            // exited the codex session"). Delivered to unsubscribed clients too.
+            "thread/closed" | "thread/deleted" | "thread/archived" => {
+                if let Some(tid) = tid {
+                    let reason = if method == "thread/closed" {
+                        "closed"
+                    } else if method == "thread/deleted" {
+                        "deleted"
+                    } else {
+                        "archived"
+                    };
+                    out.extend(self.end_thread(&tid, reason));
                 }
             }
             "item/started" | "item/completed" => {
@@ -1015,6 +1053,11 @@ mod tests {
     // Verbatim samples captured from Codex 0.155.1 / app-server 0.153.2 (ADR-016 spike).
     const T: &str = "01a0bb11-b097-7941-8e2f-ae17c2d6ae68";
     const THREAD_STARTED_GHOST: &str = r#"{"method":"thread/started","params":{"thread":{"id":"01a0bb0d-5c00-7b33-ad6d-189ef1855afb","ephemeral":true,"threadSource":"system","source":"vscode","cwd":"/tmp","status":{"type":"idle"}}}}"#;
+    // Verbatim from the 0.155.1 spike: broadcast to EVERY client, subscribed or not,
+    // when the owning process exits (`listen.jsonl`, 22:22:58).
+    const THREAD_NOT_LOADED: &str = r#"{"method":"thread/status/changed","params":{"threadId":"01a0bb11-b097-7941-8e2f-ae17c2d6ae68","status":{"type":"notLoaded"}}}"#;
+    const THREAD_CLOSED: &str = r#"{"method":"thread/closed","params":{"threadId":"01a0bb11-b097-7941-8e2f-ae17c2d6ae68"}}"#;
+    const THREAD_STATUS_ACTIVE: &str = r#"{"method":"thread/status/changed","params":{"threadId":"01a0bb11-b097-7941-8e2f-ae17c2d6ae68","status":{"type":"active"}}}"#;
     const RESUME_OK: &str = r#"{"id":1000,"result":{"thread":{"id":"01a0bb11-b097-7941-8e2f-ae17c2d6ae68","parentThreadId":null,"ephemeral":false,"status":{"type":"idle"},"cwd":"/private/var/tmp/ctm-codex-spike","canAcceptDirectInput":true,"threadSource":"cli","name":null}}}"#;
     const TURN_STARTED: &str = r#"{"method":"turn/started","params":{"threadId":"01a0bb11-b097-7941-8e2f-ae17c2d6ae68","turn":{"id":"01a0bb12-01bf-77e1-88e8-53892ba8f83a","status":"inProgress"}}}"#;
     const APPROVAL_REQ: &str = r#"{"method":"item/commandExecution/requestApproval","id":2,"params":{"kind":"command","threadId":"01a0bb11-b097-7941-8e2f-ae17c2d6ae68","turnId":"01a0bb12-01bf-77e1-88e8-53892ba8f83a","itemId":"exec-f721","reason":"Allow this exact touch command outside the read-only sandbox?","command":"/bin/zsh -lc 'touch /tmp/probe3.txt'","cwd":"/tmp","commandActions":[{"type":"unknown","command":"touch /tmp/probe3.txt"}],"availableDecisions":["accept",{"acceptWithExecpolicyAmendment":{"execpolicy_amendment":["touch","/tmp/probe3.txt"]}},"cancel"]}}"#;
@@ -1112,6 +1155,44 @@ mod tests {
             out.is_empty(),
             "ephemeral system thread must not become a session"
         );
+    }
+
+    #[test]
+    fn thread_closed_ends_an_announced_session_once() {
+        let mut t = subscribed();
+        // `thread/closed` and the `notLoaded` status both mean the owning process is
+        // gone; both are broadcast to unsubscribed clients (spike-verified 0.155.1).
+        let ends: Vec<_> = t
+            .on_rpc(&v(THREAD_CLOSED))
+            .into_iter()
+            .filter_map(|o| match o {
+                Out::Bridge(m) => Some(m),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ends.len(), 1);
+        assert_eq!(ends[0].msg_type, MessageType::SessionEnd);
+        assert_eq!(ends[0].content, "closed");
+        assert_eq!(ends[0].session_id, "01a0bb11-b097-7941-8e2f-ae17c2d6ae68");
+        // Idempotent: a following notLoaded/closed for the same thread emits nothing.
+        assert!(t.on_rpc(&v(THREAD_CLOSED)).is_empty());
+        assert!(t.on_rpc(&v(THREAD_NOT_LOADED)).is_empty());
+    }
+
+    #[test]
+    fn not_loaded_status_ends_the_session_but_active_only_tracks_running() {
+        let mut t = subscribed();
+        assert!(t.on_rpc(&v(THREAD_STATUS_ACTIVE)).is_empty());
+        let ends: Vec<_> = t
+            .on_rpc(&v(THREAD_NOT_LOADED))
+            .into_iter()
+            .filter_map(|o| match o {
+                Out::Bridge(m) => Some(m),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ends.len(), 1);
+        assert_eq!(ends[0].msg_type, MessageType::SessionEnd);
     }
 
     #[test]

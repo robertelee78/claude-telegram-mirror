@@ -14,18 +14,16 @@ curl -fsSL https://raw.githubusercontent.com/robertelee78/claude-telegram-mirror
 ctm setup    # Interactive setup wizard
 ```
 
-One static binary, installed to `~/.local/bin/ctm` from the [GitHub Release](https://github.com/robertelee78/claude-telegram-mirror/releases/latest) for your platform (macOS arm64/x64, Linux x64/arm64), size- and SHA-256-verified against the release record before it is installed. No Node.js, no package manager. The installer also puts `~/.local/bin` first on your `PATH` and installs tab completion for bash, zsh and fish — one marker-delimited block at the end of your shell rc, removable with `ctm shell-setup --remove` (set `CTM_NO_SHELL_SETUP=1` to skip). Open a new shell afterwards.
+One static binary, installed to `~/.local/bin/ctm` from the [GitHub Release](https://github.com/robertelee78/claude-telegram-mirror/releases/latest) for your platform (macOS arm64/x64, Linux x64/arm64), size- and SHA-256-verified against the release record before it is installed. The installer also puts `~/.local/bin` first on your `PATH` and installs tab completion for bash, zsh and fish — one marker-delimited block at the end of your shell rc, removable with `ctm shell-setup --remove` (set `CTM_NO_SHELL_SETUP=1` to skip). Open a new shell afterwards.
 
 ```bash
 ctm update            # upgrade to the latest release (restarts the service if installed)
 ctm update --check    # just report
 ctm update --rollback # put the previous binary back
-ctm completions zsh   # print a completion script yourself, if you prefer
 ```
 
 Prefer to verify by hand? Every release ships `ctm-<target>`, `ctm-<target>.sha256`, and a `stable-<target>.json` record; `sha256sum -c ctm-<target>.sha256`.
 
-> Upgrading from the npm package (0.2.27 and earlier)? Run the install line above, then `ctm doctor --fix` — it re-points the service and the Claude Code hooks at the new binary — and finally `npm uninstall -g claude-telegram-mirror`. Your config, sessions and Telegram topics are untouched. `ctm update` from the old binary does the same migration in one step. (ADR-017)
 
 ## Features
 
