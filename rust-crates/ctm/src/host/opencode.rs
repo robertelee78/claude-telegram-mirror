@@ -19,7 +19,12 @@
 //!
 //! Structure: [`Translator`] is a pure state machine (host event → `BridgeMessage`s,
 //! daemon message → [`HostCall`]s) with no I/O, unit-tested against the captured
-//! samples. [`run`] is the thin network shell: SSE in, HTTP out, `ObserverLink` up.
+//! samples. Two transports drive it:
+//! - [`run`] here — SSE in, HTTP out — for an external server named by
+//!   `hosts.opencode.baseUrl` (opt-in);
+//! - `opencode_pipe` — the default — where the plugin ctm provisions inside every
+//!   OpenCode process pipes the same events up a Unix socket and executes the same
+//!   [`wire`]d calls through OpenCode's in-process client. No port, no password.
 
 use crate::config::{Config, OpenCodeHostConfig};
 use crate::error::{AppError, Result};
@@ -105,11 +110,41 @@ pub struct Translator {
     /// misreported as "answered at terminal".
     replied_by_us: HashSet<String>,
     pub pending: ApprovalFifo<PendingPermission>,
+    /// `projectDir` for sessions announced without an `info.directory` (a session that
+    /// predates this connection). The pipe plugin knows the process's directory.
+    default_directory: String,
 }
 
 impl Translator {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn set_default_directory(&mut self, dir: impl Into<String>) {
+        self.default_directory = dir.into();
+    }
+
+    /// Sessions this translator has announced to the daemon (for end-of-connection
+    /// cleanup when the host process goes away).
+    pub fn announced_sessions(&self) -> Vec<String> {
+        self.sessions
+            .iter()
+            .filter(|(_, s)| s.announced)
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    /// `SessionEnd` for every announced session; used when the host process exits.
+    pub fn end_all(&mut self, reason: &str) -> Vec<BridgeMessage> {
+        let ids = self.announced_sessions();
+        ids.iter()
+            .map(|sid| {
+                self.sessions.remove(sid);
+                self.assistant_text.remove(sid);
+                self.pending.clear(sid);
+                self.msg(MessageType::SessionEnd, sid, reason, Map::new())
+            })
+            .collect()
     }
 
     fn msg(
@@ -127,6 +162,7 @@ impl Translator {
     /// session announces it, so pre-existing idle sessions on the server do not each
     /// spawn a Telegram topic at observer start.
     fn ensure_announced(&mut self, session_id: &str, info: Option<&Value>) -> Vec<BridgeMessage> {
+        let default_directory = self.default_directory.clone();
         let entry = self.sessions.entry(session_id.to_string()).or_default();
         if let Some(info) = info {
             if let Some(d) = info.get("directory").and_then(Value::as_str) {
@@ -137,6 +173,9 @@ impl Translator {
             return vec![];
         }
         entry.announced = true;
+        if entry.directory.is_empty() {
+            entry.directory = default_directory;
+        }
         let mut meta = Map::new();
         if !entry.directory.is_empty() {
             meta.insert("projectDir".into(), Value::String(entry.directory.clone()));
@@ -551,6 +590,11 @@ struct Http {
 
 impl Http {
     fn new(oc: &OpenCodeHostConfig) -> Result<Self> {
+        let Some(base) = oc.base_url.as_deref() else {
+            return Err(AppError::Config(
+                "OpenCode HTTP observer needs hosts.opencode.baseUrl".into(),
+            ));
+        };
         let client = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(5))
             .build()
@@ -566,7 +610,7 @@ impl Http {
         }
         Ok(Self {
             client,
-            base: oc.base_url.trim_end_matches('/').to_string(),
+            base: base.trim_end_matches('/').to_string(),
             password,
         })
     }
@@ -582,93 +626,113 @@ impl Http {
     }
 
     async fn call(&self, c: &HostCall) -> Result<()> {
-        let (method, path, body, dir): (reqwest::Method, String, Value, Option<&str>) = match c {
-            HostCall::Prompt {
-                session_id,
-                directory,
-                text,
-            } => (
-                reqwest::Method::POST,
-                format!("/session/{session_id}/prompt_async"),
-                json!({ "parts": [{ "type": "text", "text": text }] }),
-                Some(directory),
-            ),
-            HostCall::Abort {
-                session_id,
-                directory,
-            } => (
-                reqwest::Method::POST,
-                format!("/session/{session_id}/abort"),
-                json!({}),
-                Some(directory),
-            ),
-            HostCall::Rename {
-                session_id,
-                directory,
-                title,
-            } => (
-                reqwest::Method::PATCH,
-                format!("/session/{session_id}"),
-                json!({ "title": title }),
-                Some(directory),
-            ),
-            HostCall::PermissionReply {
-                request_id,
-                directory,
-                reply,
-            } => (
-                reqwest::Method::POST,
-                format!("/permission/{request_id}/reply"),
-                json!({ "reply": reply }),
-                Some(directory),
-            ),
-            HostCall::QuestionReply {
-                request_id,
-                directory,
-                answers,
-            } => (
-                reqwest::Method::POST,
-                format!("/question/{request_id}/reply"),
-                json!({ "answers": answers }),
-                Some(directory),
-            ),
-            HostCall::Toast { message, variant } => (
-                reqwest::Method::POST,
-                "/tui/show-toast".into(),
-                json!({ "message": message, "variant": variant }),
-                None,
-            ),
-        };
+        let (method, path, body, dir) = wire(c);
         let mut rb = self.req(method, &path).json(&body);
-        if let Some(d) = dir.filter(|d| !d.is_empty()) {
+        if let Some(d) = dir {
             rb = rb.query(&[("directory", d)]);
         }
         let resp = rb.send().await.map_err(AppError::Reqwest)?;
-        let status = resp.status();
-        if status.is_success() {
-            return Ok(());
-        }
-        let text = resp.text().await.unwrap_or_default();
-        if matches!(c, HostCall::Toast { .. }) {
-            // No TUI attached (or headless server): purely cosmetic, never an error.
-            tracing::debug!(status = %status, "OpenCode: toast not shown");
-            return Ok(());
-        }
-        // 404 on a reply = the operator answered first (exactly-once, spike-verified).
-        if status == reqwest::StatusCode::NOT_FOUND
-            && matches!(
-                c,
-                HostCall::PermissionReply { .. } | HostCall::QuestionReply { .. }
-            )
-        {
-            tracing::info!(body = %text, "OpenCode: reply lost the race — already answered at terminal");
-            return Ok(());
-        }
-        Err(AppError::Telegram(format!(
-            "OpenCode {path} -> {status}: {}",
-            crate::formatting::truncate(&text, 300)
-        )))
+        let status = resp.status().as_u16();
+        let text = if resp.status().is_success() {
+            String::new()
+        } else {
+            resp.text().await.unwrap_or_default()
+        };
+        classify(c, status, &text)
     }
+}
+
+/// Endpoint mapping for one [`HostCall`]: `(method, path, JSON body, ?directory=)`.
+/// Pure, shared by the HTTP observer and the pipe plugin transport so both hit exactly
+/// the same OpenCode routes.
+pub fn wire(c: &HostCall) -> (reqwest::Method, String, Value, Option<&str>) {
+    fn dir(d: &str) -> Option<&str> {
+        (!d.is_empty()).then_some(d)
+    }
+    match c {
+        HostCall::Prompt {
+            session_id,
+            directory,
+            text,
+        } => (
+            reqwest::Method::POST,
+            format!("/session/{session_id}/prompt_async"),
+            json!({ "parts": [{ "type": "text", "text": text }] }),
+            dir(directory),
+        ),
+        HostCall::Abort {
+            session_id,
+            directory,
+        } => (
+            reqwest::Method::POST,
+            format!("/session/{session_id}/abort"),
+            json!({}),
+            dir(directory),
+        ),
+        HostCall::Rename {
+            session_id,
+            directory,
+            title,
+        } => (
+            reqwest::Method::PATCH,
+            format!("/session/{session_id}"),
+            json!({ "title": title }),
+            dir(directory),
+        ),
+        HostCall::PermissionReply {
+            request_id,
+            directory,
+            reply,
+        } => (
+            reqwest::Method::POST,
+            format!("/permission/{request_id}/reply"),
+            json!({ "reply": reply }),
+            dir(directory),
+        ),
+        HostCall::QuestionReply {
+            request_id,
+            directory,
+            answers,
+        } => (
+            reqwest::Method::POST,
+            format!("/question/{request_id}/reply"),
+            json!({ "answers": answers }),
+            dir(directory),
+        ),
+        HostCall::Toast { message, variant } => (
+            reqwest::Method::POST,
+            "/tui/show-toast".into(),
+            json!({ "message": message, "variant": variant }),
+            None,
+        ),
+    }
+}
+
+/// Interpret an HTTP status for a [`HostCall`], whichever transport carried it.
+pub fn classify(c: &HostCall, status: u16, body: &str) -> Result<()> {
+    if (200..300).contains(&status) {
+        return Ok(());
+    }
+    if matches!(c, HostCall::Toast { .. }) {
+        // No TUI attached (or headless server): purely cosmetic, never an error.
+        tracing::debug!(status, "OpenCode: toast not shown");
+        return Ok(());
+    }
+    // 404 on a reply = the operator answered first (exactly-once, spike-verified).
+    if status == 404
+        && matches!(
+            c,
+            HostCall::PermissionReply { .. } | HostCall::QuestionReply { .. }
+        )
+    {
+        tracing::info!(body = %body, "OpenCode: reply lost the race — already answered at terminal");
+        return Ok(());
+    }
+    let (_, path, _, _) = wire(c);
+    Err(AppError::Telegram(format!(
+        "OpenCode {path} -> {status}: {}",
+        crate::formatting::truncate(body, 300)
+    )))
 }
 
 /// Run the OpenCode observer forever, reconnecting both legs with backoff.
@@ -702,10 +766,10 @@ pub async fn run_once(config: &Config, oc: &OpenCodeHostConfig) -> Result<()> {
         return Err(AppError::Telegram(format!(
             "OpenCode /event -> {} (check {} and the server password)",
             resp.status(),
-            oc.base_url
+            http.base
         )));
     }
-    tracing::info!(base = %oc.base_url, "OpenCode observer connected");
+    tracing::info!(base = %http.base, "OpenCode observer connected");
     let mut resp = resp;
     let mut buf = String::new();
 
@@ -1003,6 +1067,40 @@ mod tests {
         assert!(
             matches!(&t.on_daemon(&mk("slash", "/clear"))[0], HostCall::Prompt { text, .. } if text == "/clear")
         );
+    }
+
+    #[test]
+    fn default_directory_applies_only_when_the_host_gave_none() {
+        // A pipe connection knows its process directory; a session that predates the
+        // connection is announced from a non-`session.*` event with no `info`.
+        let mut t = Translator::new();
+        t.set_default_directory("/from/pipe");
+        let out = t.on_event(&ev(IDLE));
+        let start = out
+            .iter()
+            .find(|m| m.msg_type == MessageType::SessionStart)
+            .expect("idle for an unknown session announces it first");
+        assert_eq!(start.meta().project_dir(), Some("/from/pipe"));
+        // With info.directory present, the host's value wins.
+        let mut t = Translator::new();
+        t.set_default_directory("/from/pipe");
+        let out = t.on_event(&ev(SESSION_CREATED));
+        assert_eq!(out[0].meta().project_dir(), Some("/tmp/proj"));
+    }
+
+    #[test]
+    fn end_all_ends_every_announced_session_once() {
+        let mut t = Translator::new();
+        t.on_event(&ev(SESSION_CREATED));
+        t.on_event(&ev(PERM_ASKED));
+        assert_eq!(t.pending.pending("ses_f44f3efa0ffeQKndY4KH1wmNdy"), 1);
+        let ends = t.end_all("opencode exited");
+        assert_eq!(ends.len(), 1);
+        assert_eq!(ends[0].msg_type, MessageType::SessionEnd);
+        assert_eq!(ends[0].content, "opencode exited");
+        assert_eq!(ends[0].session_id, "ses_f44f3efa0ffeQKndY4KH1wmNdy");
+        assert!(t.end_all("again").is_empty());
+        assert_eq!(t.pending.pending("ses_f44f3efa0ffeQKndY4KH1wmNdy"), 0);
     }
 
     #[test]

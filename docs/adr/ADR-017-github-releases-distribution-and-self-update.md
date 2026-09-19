@@ -65,8 +65,9 @@ uses GitHub's `releases/latest/download/<fixed-name>` redirect instead.
    `latest/download` redirect, downloads `ctm-<triple>` from the same release,
    verifies size and sha256, installs to `~/.local/bin/ctm` (mode 0755) with a
    `.ctm-channel` marker, and prints the next step (`ctm setup` for new installs;
-   `ctm doctor --fix` for existing ones, which reconciles service and hook paths).
-   It never touches `PATH` silently — it prints the export line if needed.
+   `ctm doctor --fix` for existing ones, which reconciles service and hook paths),
+   then runs `ctm shell-setup` so `PATH` and completions work in the next shell
+   (§Shell integration).
 
 2. **`ctm update [--check] [--rollback]`** (`src/update.rs`) implements the
    hf2q model natively:
@@ -135,10 +136,14 @@ deterministic mechanism (`src/shell.rs`):
      **appended at the end** of the shell's rc — `~/.zshrc`; `~/.bashrc` and
      `~/.bash_profile` when present; `~/.config/fish/conf.d/ctm.fish` — that prepends
      the install dir to `PATH` and, for zsh, adds the completion dir to `fpath` and
-     runs `compinit` only if the user's config has not. Appending at the end is the
-     whole trick: version managers (fnm, nvm, …) prepend their shim dirs earlier in
-     the same file, so a block that runs last wins — verified in a fresh zsh whose
-     rc deliberately prepended a shim after `~/.local/bin`.
+     either runs `compinit` (if the rc has not) or registers `_ctm` directly with
+     `compdef` (if it has: an already-initialised compinit never sees a later `fpath`
+     change — this was the 0.2.30/0.2.31 "tab completion not working" bug, reproduced
+     and fixed in a clean-env login zsh against the operator's real rc, where another
+     tool's block ran `compinit` first). Appending at the end is the whole trick:
+     version managers (fnm, nvm, …) prepend their shim dirs earlier in the same file,
+     so a block that runs last wins — verified in a fresh zsh whose rc deliberately
+     prepended a shim after `~/.local/bin`.
   3. touches only the login shell's rc (creating it if missing) plus any other
      supported shell whose config already exists; never litters. `--remove` deletes
      the completion files and removes the block exactly (rc restored byte-for-byte

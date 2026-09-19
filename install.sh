@@ -6,8 +6,9 @@
 # Installs the latest ctm release for this machine into ~/.local/bin (override with
 # CTM_INSTALL_DIR). Fetches the per-target release record via GitHub's
 # releases/latest/download redirect, downloads the matching binary from the same
-# release, verifies size and SHA-256, then installs it atomically. Never edits your
-# shell profile; prints the PATH line if ~/.local/bin is not already on PATH.
+# release, verifies size and SHA-256, then installs it atomically, then runs
+# `ctm shell-setup` so PATH and tab completion work in your next shell (one
+# marker-delimited block at the end of your rc; CTM_NO_SHELL_SETUP=1 skips it).
 #
 # POSIX sh only (no bashisms) so it runs under dash, macOS sh, and busybox.
 set -eu

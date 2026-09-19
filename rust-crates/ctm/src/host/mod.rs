@@ -20,8 +20,12 @@
 //! reporting.
 
 pub mod codex;
+pub mod codex_daemon;
+pub mod detect;
 pub mod link;
 pub mod opencode;
+pub mod opencode_pipe;
+pub mod opencode_plugin;
 
 use crate::types::HostKind;
 

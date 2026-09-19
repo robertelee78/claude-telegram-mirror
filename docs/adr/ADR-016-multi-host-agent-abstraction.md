@@ -9,7 +9,7 @@
 > Just pure excellence, done the right way the entire time.
 > Chesterton's fence: always understand the current implementation fully before changing it.
 
-**Status:** Implemented (2026-09-19) on `feat/adr-016-multi-host` — both host observers built, unit-tested against captured wire samples, and end-to-end tested against the real binaries; see Implementation log
+**Status:** Implemented (2026-09-19) on `feat/adr-016-multi-host` — both host observers built, unit-tested against captured wire samples, and end-to-end tested against the real binaries; see Implementation log. Amended the same day with §Default enablement (0.2.32): both hosts are on by default with nothing to configure.
 **Date:** 2026-09-19
 **Authors:** Robert, Claude
 **Tags:** multi-host, codex, opencode, host-abstraction, app-server, acp, supersedes-part-of-adr-004
@@ -65,7 +65,7 @@ Coupled to Claude Code specifically, and therefore per-host:
 | API-injected message renders in the attached interactive TUI | Codex | **High** — `thread/queue/add` from a separate process rendered as a user message; agent replied visibly; **a pre-existing unsent composer draft survived untouched** |
 | API-injected message renders in the attached full TUI | OpenCode | **High** — verified under PTY: `/session/{id}/message`, `/tui/append-prompt`, `/tui/show-toast` all rendered |
 | `attach --mini` renders none of the above | OpenCode | **High** — full TUI is mandatory |
-| A plain `codex` TUI never joins the app-server daemon | Codex | **High** — live session absent from `thread/loaded/list`; no socket until `daemon start`. A `codex --remote unix://…` TUI *does* register |
+| A `codex` started with **no** app-server daemon runs in-process and is invisible | Codex | **High** — live session absent from `thread/loaded/list`; no socket until `daemon start`. A `codex --remote unix://…` TUI registers, and — later spike, §Default enablement — so does a **bare `codex` started while the daemon is running** |
 | Structured multiple-choice exists as typed JSON | both | **High** — Codex `item/tool/requestUserInput`; OpenCode `question` tool (confirmed in `/experimental/tool/ids`) |
 | `permissionDecision: "ask"` is rejected by Codex | Codex | **High** — binary: `PreToolUse hook returned unsupported permissionDecision:ask` |
 | Multi-client resolution is a first-class protocol message | Codex | **High** (schema) — `ServerRequestResolvedNotification {requestId, threadId}` |
@@ -135,8 +135,9 @@ operating rules the schema never revealed. These are the reformulation:
   `thread/status/changed {activeFlags:["waitingOnApproval"]}` — no request, no
   `requestId`, nothing answerable. **`thread/resume {threadId}` is the subscribe
   call.** After it, both surfaces render the same prompt simultaneously.
-- A plain `codex` TUI never joins the daemon; only `codex --remote unix://…`
-  sessions do. Native observation requires the operator to run under the daemon.
+- A `codex` started with no app-server daemon never joins one; a bare `codex`
+  started while the daemon runs auto-joins it (§Default enablement). Native
+  observation therefore requires the daemon to be up first — which ctm ensures.
 - `item/tool/requestUserInput` fires **only in plan collaboration mode**
   (`default_mode_request_user_input` is an under-development flag). Codex's
   `HostCaps.structured_questions` is therefore *native, plan-mode only*.
@@ -292,8 +293,10 @@ Shared seam:
 - `daemon/*`: dispatch on `host_kind` at the text-inject, file-inject, `/rename`,
   `/abort`, abort-callback and Submit-All sites; `handle_approval_resolved_elsewhere`
   retires the Telegram keyboard when the operator answers at the terminal.
-- `config.rs`: `hosts: {opencode: {baseUrl, passwordEnv}, codex: {socketPath}}`, with
-  `CTM_OPENCODE_URL` / `CTM_CODEX_SOCKET` env enablement.
+- `config.rs`: `hosts: {opencode: {enabled, baseUrl?, passwordEnv, password?}, codex:
+  {enabled, socketPath, binary?}}` — both `enabled` by default (§Default enablement);
+  `CTM_OPENCODE_URL` opts an external server into HTTP observation, `CTM_CODEX_SOCKET`
+  overrides the control socket, `CTM_*_ENABLED=0` opts out.
 - `doctor.rs`: check 12/12 "Hosts" — reachability, auth (hard failure when the OpenCode
   password is unset), socket presence/mode, and `HostCaps` reported per host.
 
@@ -321,6 +324,62 @@ Deferred, deliberately (each is a follow-up, none blocks the invariant):
 - An "Allow always" button (both hosts support it; ctm's keyboard has approve/reject/abort).
 - Per-session permission ruleset as an opt-in product feature on OpenCode
   (`PATCH /session/{id}` `permission`), reverted on detach.
-- `setup.rs` wizard step for host selection (config is file/env only for now).
+- `setup.rs` wizard step for host selection — made moot by §Default enablement.
 - The two pre-existing `clippy --all-targets` nits (`queue.rs:575`, `env.rs:125`) are
   untouched — out of scope.
+
+## Default enablement (amendment, 2026-09-19 — shipped in 0.2.32)
+
+The operator's requirement, verbatim: *"A user does not have to manually ctm enable
+codex or opencode — they should be enabled by default. The only part that has to be
+figured out is the configuration."* The first cut of this ADR made both hosts opt-in
+(`hosts.opencode.baseUrl` + a password, `hosts.codex` + `codex --remote …`). That put
+the wiring on the user. This amendment moves it into ctm.
+
+### Spikes (executed against OpenCode 1.18.31 and Codex 0.155.1)
+
+| # | Question | Result |
+|---|---|---|
+| 1 | Does a bare `opencode` (no `--port`) expose anything? | **No listener at all.** `--port` is the only way to get one; `server.port` in `opencode.json` applies to `serve`/`web` only. The HTTP observer alone can never see a bare TUI. |
+| 2 | Do plugins load in the bare TUI, and can they reach the API? | **Yes.** `~/.config/opencode/plugins/*.js` (honouring `XDG_CONFIG_HOME`) loads in every process; the plugin receives an in-process `client` whose generic `_client.request({method,url,query,body})` works with no listener — but only after init returns (`setTimeout(…, 0)`); awaiting it inside init deadlocks the TUI. |
+| 3 | Which event feed carries `permission.asked`/`question.asked` in-process? | The plugin **`event` hook** — the full bus superset, identical wire shapes to legacy `/event`. `client.event.subscribe()` yields nothing in-process. |
+| 4 | Does a reply through the in-process client dismiss the TUI prompt? | **Yes** — `POST /permission/{id}/reply {reply:"once"}` via the pipe: prompt cleared, `permission.replied` broadcast, command ran. Same exactly-once semantics as HTTP. |
+| 5 | `opencode --port` loads the plugin twice — duplicate events? | Twice in one pid, but **only one instance receives events** (137 vs 0); the other pipe idles. Per-connection routing makes this harmless. |
+| 6 | Any startup blind spot? | **The first API request an instance serves is invisible to plugin hooks**, whatever it is and whenever it comes. A TUI issues many before the user's first prompt, and a used session announces lazily on its next event; the e2e test warms the instance with a list call. |
+| 7 | Does a bare `codex` join a running app-server daemon? | **Yes** — its thread appeared in `thread/started` on ctm's connection with no flags. Keeping the daemon alive *is* enabling Codex. |
+| 8 | Is `codex app-server daemon start` safe to run repeatedly, from a service? | Idempotent (`{"status":"alreadyRunning"}`, exit 0) and reports `socketPath`. The npm `codex` is a `codex.js` shim needing `node`, which launchd's PATH lacks; both `~/.codex/packages/standalone/current/bin/codex` and the npm package's `vendor/<triple>/bin/codex` are native and run without it. |
+
+### Decision
+
+1. **Both hosts are on by default.** `hosts.opencode.enabled` / `hosts.codex.enabled`
+   default `true`; `false` (or `CTM_OPENCODE_ENABLED=0` / `CTM_CODEX_ENABLED=0`) is the
+   only opt-out. There is no `ctm enable` command.
+2. **OpenCode is wired by a plugin ctm provisions itself** (`host/opencode_plugin.js`,
+   rendered with the pipe socket path into `<opencode config>/plugins/ctm.js`). It is a
+   dumb pipe: the `event` hook forwards every bus event up a Unix socket next to the
+   bridge socket (`opencode.sock`, 0600 in the 0700 config dir); the daemon sends
+   `{type:"call",id,method,url,query,body}` down and the plugin executes it through the
+   in-process client. The daemon end (`host/opencode_pipe.rs`) drives the unchanged pure
+   `Translator`; each connection owns its own `ObserverLink`, so `host_dispatch`
+   routing is untouched and several OpenCode processes coexist. When the process
+   exits, its announced sessions get `SessionEnd`. The daemon writes the plugin at start
+   and re-checks every 60 s (`run_keeper`), so `ctm update` rolls it forward and an
+   OpenCode installed later is picked up; `ctm doctor --fix` writes it too.
+3. **Codex is wired by keeping its daemon alive** (`host/codex_daemon.rs`): before each
+   connect attempt the observer runs `codex app-server daemon start` through a native
+   binary (`host/detect::codex_binary`: override → managed standalone → npm-bundled
+   native → any other `codex`; the `.js` shim is never executed). Not installed → probe
+   again in 60 s, silently.
+4. **HTTP observation stays, opt-in**, for an external `opencode serve` the plugin cannot
+   reach (`hosts.opencode.baseUrl` + password) — unchanged code, no longer the default.
+5. **`ctm doctor` 12/13** reports detection and wiring per host and fixes both.
+
+### Consequences
+
+- The user story is: install ctm, run `claude`, `codex` or `opencode`. Nothing else.
+- ctm now writes a file into OpenCode's config dir, exactly as it writes hooks into
+  Claude Code's `settings.json`. The file is marked generated and is regenerated, not
+  merged; a hand edit is overwritten within a minute while the daemon runs.
+- No port, no password, no `--remote`. The bare-TUI path carries no network listener at
+  all, which is strictly safer than the previous documented setup.
+- `HostsConfig::enabled()` now means "not opted out", not "configured".

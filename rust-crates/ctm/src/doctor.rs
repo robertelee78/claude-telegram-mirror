@@ -666,32 +666,42 @@ fn check_pid_file(fix: bool) -> CheckResult {
     }
 }
 
-/// ADR-016: verify each configured non-Claude host is reachable and safely set up.
+/// ADR-016 §Default enablement: OpenCode and Codex are mirrored unless turned off.
+///
+/// Reports what was detected and what is wired; `--fix` provisions the OpenCode plugin
+/// and starts Codex's app-server daemon — the same two things the daemon does itself.
 ///
 /// Every condition below is one an executed spike showed to be a silent failure mode:
-/// - OpenCode: no port discovery exists, so an unreachable `base_url` means the
-///   observer connects to nothing; an unset server password leaves `/pty` and
-///   `/session/{id}/shell` open to any local process (hard failure); `--mini` renders
-///   nothing (cannot be probed remotely — surfaced as guidance).
-/// - Codex: a plain `codex` TUI never joins the app-server daemon, so a missing control
-///   socket means every Codex session is invisible to ctm.
-async fn check_hosts() -> CheckResult {
+/// - OpenCode: the plugin file missing/outdated means a bare `opencode` is invisible;
+///   for an opt-in external server (`baseUrl`) there is no port discovery, so an
+///   unreachable URL means the HTTP observer connects to nothing, and an unset server
+///   password leaves `/pty` and `/session/{id}/shell` open to any local process.
+/// - Codex: a `codex` started with no app-server daemon runs in-process and never
+///   joins one, so a missing control socket means every Codex session is invisible;
+///   the npm `codex.js` shim needs `node`, which a service PATH may lack.
+async fn check_hosts(fix: bool) -> CheckResult {
+    use crate::host::{codex_daemon, detect, opencode_plugin, HostCaps, StructuredQuestions};
+
+    // Capability matrix (ADR-016), established by executed spikes.
+    let caps_line = |kind: crate::types::HostKind| {
+        let c = HostCaps::for_host(kind);
+        let q = match c.structured_questions {
+            StructuredQuestions::Native => "native",
+            StructuredQuestions::NativePlanModeOnly => "native (plan mode only)",
+            StructuredQuestions::ViaTuiScrape => "via TUI",
+        };
+        format!(
+            "  capabilities: questions {q}; steer {}; always-allow {}; image injection {}",
+            c.steer, c.always_decision, c.inject_images
+        )
+    };
+
     let cfg = match crate::config::load_config(false) {
         Ok(c) => c,
         Err(e) => return CheckResult::warn("Hosts", &format!("Config not loadable: {e}")),
     };
-    let enabled = cfg.hosts.enabled();
-    if enabled.is_empty() {
-        return CheckResult::pass(
-            "Hosts",
-            "Claude Code only (no OpenCode/Codex observers configured)",
-        )
-        .with_details(
-            "Enable with `hosts` in config.json, or CTM_OPENCODE_URL / CTM_CODEX_SOCKET",
-        );
-    }
-
     let mut lines = Vec::new();
+    let mut fixes = Vec::new();
     let mut worst = CheckStatus::Pass;
     let escalate = |s: CheckStatus, worst: &mut CheckStatus| {
         if matches!(s, CheckStatus::Fail)
@@ -700,142 +710,205 @@ async fn check_hosts() -> CheckResult {
             *worst = s;
         }
     };
+    let daemon_up = crate::socket::check_socket_status(&cfg.socket_path) == "active";
 
-    for kind in &enabled {
-        let caps = crate::host::HostCaps::for_host(*kind);
-        let q = match caps.structured_questions {
-            crate::host::StructuredQuestions::Native => "native",
-            crate::host::StructuredQuestions::NativePlanModeOnly => "native (plan mode only)",
-            crate::host::StructuredQuestions::ViaTuiScrape => "via TUI",
-        };
-        match kind {
-            crate::types::HostKind::OpenCode => {
-                let oc = cfg.hosts.opencode.clone().unwrap_or_default();
-                let pw = oc.resolve_password();
-                if pw.is_none() {
+    // ---------------------------------------------------------------- OpenCode
+    let oc = &cfg.hosts.opencode;
+    if !oc.enabled {
+        lines.push("OpenCode: off (hosts.opencode.enabled = false)".to_string());
+    } else if !detect::opencode_present() {
+        lines.push(
+            "OpenCode: not installed — nothing to wire (re-checked every minute by the daemon)"
+                .to_string(),
+        );
+    } else {
+        let pipe = opencode_plugin::pipe_socket_path(&cfg.socket_path);
+        let plugin = opencode_plugin::plugin_path();
+        let installed = detect::opencode_binary()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "binary not on PATH; config dir present".into());
+        if opencode_plugin::is_current(&pipe) {
+            lines.push(format!(
+                "OpenCode: {installed}; plugin current at {} — bare `opencode` is mirrored",
+                plugin.display()
+            ));
+            lines.push(caps_line(crate::types::HostKind::OpenCode));
+        } else if fix {
+            match opencode_plugin::ensure(&pipe) {
+                Ok(state) => fixes.push(format!(
+                    "wrote OpenCode plugin ({state:?}) at {}",
+                    plugin.display()
+                )),
+                Err(e) => {
+                    escalate(CheckStatus::Fail, &mut worst);
+                    lines.push(format!("OpenCode: plugin could not be written: {e}"));
+                }
+            }
+        } else {
+            escalate(CheckStatus::Warn, &mut worst);
+            let what = if plugin.exists() {
+                "outdated"
+            } else {
+                "missing"
+            };
+            lines.push(format!(
+                "OpenCode: plugin {what} at {} — `ctm doctor --fix` writes it (the daemon also does at start)",
+                plugin.display()
+            ));
+        }
+        if daemon_up && !pipe.exists() {
+            escalate(CheckStatus::Warn, &mut worst);
+            lines.push(format!(
+                "OpenCode: daemon is running but pipe socket {} is absent (daemon older than the plugin? restart it)",
+                pipe.display()
+            ));
+        }
+        if let Some(url) = &oc.base_url {
+            // Opt-in HTTP observer against an external `opencode serve`.
+            let pw = oc.resolve_password();
+            if pw.is_none() {
+                escalate(CheckStatus::Fail, &mut worst);
+                lines.push(format!(
+                    "OpenCode server {url}: no password — set `hosts.opencode.password` in config.json (or export {}); without it the server is UNAUTHENTICATED while exposing /pty",
+                    oc.password_env
+                ));
+            }
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(4))
+                .build();
+            let reach = match client {
+                Ok(c) => {
+                    let mut rb = c.get(format!("{}/global/health", url.trim_end_matches('/')));
+                    if let Some(p) = &pw {
+                        rb = rb.basic_auth("opencode", Some(p));
+                    }
+                    rb.send().await
+                }
+                Err(e) => Err(e),
+            };
+            match reach {
+                Ok(r) if r.status().is_success() => {
+                    let version = r
+                        .json::<serde_json::Value>()
+                        .await
+                        .ok()
+                        .and_then(|v| v.get("version").and_then(|x| x.as_str()).map(String::from))
+                        .unwrap_or_else(|| "unknown".into());
+                    lines.push(format!(
+                        "OpenCode server {url}: reachable (server {version})"
+                    ));
+                }
+                Ok(r) if r.status() == reqwest::StatusCode::UNAUTHORIZED => {
                     escalate(CheckStatus::Fail, &mut worst);
                     lines.push(format!(
-                        "OpenCode: no server password — set `hosts.opencode.password` in config.json (or export {}). Without it the server is UNAUTHENTICATED while exposing /pty and /session/{{id}}/shell. Start OpenCode with the same value in OPENCODE_SERVER_PASSWORD.",
+                        "OpenCode server {url}: rejected the password (401) — check {}",
                         oc.password_env
                     ));
                 }
-                let client = reqwest::Client::builder()
-                    .timeout(std::time::Duration::from_secs(4))
-                    .build();
-                let reach = match client {
-                    Ok(c) => {
-                        let mut rb = c.get(format!(
-                            "{}/global/health",
-                            oc.base_url.trim_end_matches('/')
-                        ));
-                        if let Some(p) = &pw {
-                            rb = rb.basic_auth("opencode", Some(p));
-                        }
-                        rb.send().await
-                    }
-                    Err(e) => Err(e),
-                };
-                match reach {
-                    Ok(r) if r.status().is_success() => {
-                        let version = r
-                            .json::<serde_json::Value>()
-                            .await
-                            .ok()
-                            .and_then(|v| {
-                                v.get("version").and_then(|x| x.as_str()).map(String::from)
-                            })
-                            .unwrap_or_else(|| "unknown".into());
-                        lines.push(format!(
-                            "OpenCode: reachable at {} (server {version}); questions {q}; steer {}; always-allow {}. Use the FULL TUI — `attach --mini` renders nothing from the API.",
-                            oc.base_url,
-                            caps.steer,
-                            caps.always_decision
-                        ));
-                    }
-                    Ok(r) if r.status() == reqwest::StatusCode::UNAUTHORIZED => {
-                        escalate(CheckStatus::Fail, &mut worst);
-                        lines.push(format!(
-                            "OpenCode: {} rejected the password (401) — check {}",
-                            oc.base_url, oc.password_env
-                        ));
-                    }
-                    Ok(r) => {
-                        escalate(CheckStatus::Warn, &mut worst);
-                        lines.push(format!(
-                            "OpenCode: {} answered {} to /global/health",
-                            oc.base_url,
-                            r.status()
-                        ));
-                    }
-                    Err(e) => {
-                        escalate(CheckStatus::Fail, &mut worst);
-                        lines.push(format!(
-                            "OpenCode: {} unreachable ({e}). There is no port discovery — start `opencode --port <N>` with the port from config.",
-                            oc.base_url
-                        ));
-                    }
+                Ok(r) => {
+                    escalate(CheckStatus::Warn, &mut worst);
+                    lines.push(format!(
+                        "OpenCode server {url}: answered {} to /global/health",
+                        r.status()
+                    ));
+                }
+                Err(e) => {
+                    escalate(CheckStatus::Fail, &mut worst);
+                    lines.push(format!("OpenCode server {url}: unreachable ({e}) — start `opencode serve --port <N>` with that port"));
                 }
             }
-            crate::types::HostKind::Codex => {
-                let cx = cfg.hosts.codex.clone().unwrap_or_default();
-                match std::fs::symlink_metadata(&cx.socket_path) {
-                    Ok(m) if std::os::unix::fs::FileTypeExt::is_socket(&m.file_type()) => {
-                        let mode =
-                            std::os::unix::fs::PermissionsExt::mode(&m.permissions()) & 0o777;
-                        if mode & 0o077 != 0 {
-                            escalate(CheckStatus::Warn, &mut worst);
-                            lines.push(format!(
-                                "Codex: control socket is mode {mode:o}; expected 0600"
-                            ));
-                        }
-                        lines.push(format!(
-                            "Codex: app-server socket present at {}; questions {q}; steer {}; image injection {}. Sessions must run as `codex --remote unix://<socket>` — a plain `codex` TUI never joins the daemon.",
-                            cx.socket_path.display(),
-                            caps.steer,
-                            caps.inject_images
-                        ));
-                    }
-                    Ok(_) => {
-                        escalate(CheckStatus::Fail, &mut worst);
-                        lines.push(format!(
-                            "Codex: {} exists but is not a socket",
-                            cx.socket_path.display()
-                        ));
-                    }
-                    Err(_) => {
-                        escalate(CheckStatus::Fail, &mut worst);
-                        lines.push(format!(
-                            "Codex: no app-server socket at {} — run `codex app-server daemon start`, then start sessions with `codex --remote unix://{}`",
-                            cx.socket_path.display(),
-                            cx.socket_path.display()
-                        ));
-                    }
-                }
-            }
-            crate::types::HostKind::ClaudeCode => {}
         }
     }
 
-    let summary = format!(
-        "{} configured",
-        enabled
-            .iter()
-            .map(|k| k.label())
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
+    // ------------------------------------------------------------------- Codex
+    let cx = &cfg.hosts.codex;
+    if !cx.enabled {
+        lines.push("Codex: off (hosts.codex.enabled = false)".to_string());
+    } else {
+        match detect::codex_binary(cx.binary.as_deref()) {
+            None if !detect::codex_present(cx.binary.as_deref()) => {
+                lines.push("Codex: not installed — nothing to wire (re-checked every minute by the daemon)".to_string());
+            }
+            None => {
+                escalate(CheckStatus::Warn, &mut worst);
+                lines.push("Codex: ~/.codex exists but no native `codex` binary was found (the npm `codex.js` shim needs node and is not used) — set hosts.codex.binary".to_string());
+            }
+            Some(bin) => {
+                let sock_ok = tokio::net::UnixStream::connect(&cx.socket_path)
+                    .await
+                    .is_ok();
+                if sock_ok {
+                    let mode = std::fs::symlink_metadata(&cx.socket_path)
+                        .map(|m| std::os::unix::fs::PermissionsExt::mode(&m.permissions()) & 0o777)
+                        .unwrap_or(0);
+                    if mode & 0o077 != 0 {
+                        escalate(CheckStatus::Warn, &mut worst);
+                        lines.push(format!(
+                            "Codex: control socket is mode {mode:o}; expected 0600"
+                        ));
+                    }
+                    lines.push(format!(
+                        "Codex: {}; app-server daemon running at {} — bare `codex` is mirrored",
+                        bin.display(),
+                        cx.socket_path.display()
+                    ));
+                    lines.push(caps_line(crate::types::HostKind::Codex));
+                } else if fix {
+                    match codex_daemon::ensure_running(cx).await {
+                        Ok(state) => fixes.push(format!(
+                            "started Codex app-server daemon ({state:?}) via {}",
+                            bin.display()
+                        )),
+                        Err(e) => {
+                            escalate(CheckStatus::Fail, &mut worst);
+                            lines.push(format!(
+                                "Codex: app-server daemon could not be started: {e}"
+                            ));
+                        }
+                    }
+                } else {
+                    escalate(
+                        if daemon_up {
+                            CheckStatus::Warn
+                        } else {
+                            CheckStatus::Pass
+                        },
+                        &mut worst,
+                    );
+                    lines.push(format!(
+                        "Codex: {}; app-server daemon not running (no socket at {}) — the ctm daemon starts it; `ctm doctor --fix` does too",
+                        bin.display(),
+                        cx.socket_path.display()
+                    ));
+                }
+            }
+        }
+    }
+
+    let summary = match cfg.hosts.enabled().as_slice() {
+        [] => "OpenCode and Codex off".to_string(),
+        kinds => format!(
+            "{} on by default",
+            kinds
+                .iter()
+                .map(|k| k.label())
+                .collect::<Vec<_>>()
+                .join(" + ")
+        ),
+    };
     let details = lines.join("\n");
-    match worst {
+    let result = match worst {
         CheckStatus::Pass => CheckResult::pass("Hosts", &summary).with_details(&details),
         CheckStatus::Warn => CheckResult::warn("Hosts", &summary).with_details(&details),
         CheckStatus::Fail => CheckResult::fail("Hosts", &summary).with_details(&details),
+    };
+    if fixes.is_empty() {
+        result
+    } else {
+        result.into_fixed(&fixes.join("; "))
     }
 }
 
-/// ADR-017: how this binary was installed, whether a newer release exists, and whether
-/// the service unit or the Claude Code hooks still point at a *different* binary (the
-/// state an npm→standalone migration or a hand-moved binary leaves behind). `--fix`
-/// re-registers the hooks and the service to the running executable.
 async fn check_update(fix: bool) -> CheckResult {
     let exe = match std::env::current_exe().and_then(fs::canonicalize) {
         Ok(e) => e,
@@ -1257,8 +1330,8 @@ pub async fn run_doctor(fix: bool) -> anyhow::Result<()> {
     print_result(&c);
     checks.push(c);
 
-    // [12/13] ADR-016: non-Claude hosts (OpenCode / Codex observers)
-    let c = check_hosts().await;
+    // [12/13] ADR-016: non-Claude hosts, on by default (OpenCode plugin / Codex daemon)
+    let c = check_hosts(fix).await;
     print!("[12/13] ");
     print_result(&c);
     checks.push(c);

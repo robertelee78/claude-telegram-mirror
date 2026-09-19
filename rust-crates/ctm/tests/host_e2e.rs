@@ -161,15 +161,19 @@ async fn opencode_session_lifecycle_mirrors_through_real_server() {
 
     // Exercise the config-file password path (what a launchd-managed daemon uses).
     let oc = OpenCodeHostConfig {
-        base_url: base.clone(),
+        enabled: true,
+        base_url: Some(base.clone()),
         password_env: "CTM_E2E_OC_PW_UNSET".into(),
         password: Some(password.into()),
     };
     let cfg = Arc::new(base_config(
         sock.clone(),
         HostsConfig {
-            opencode: Some(oc.clone()),
-            codex: None,
+            opencode: oc.clone(),
+            codex: CodexHostConfig {
+                enabled: false,
+                ..Default::default()
+            },
         },
     ));
     let cfg2 = Arc::clone(&cfg);
@@ -234,6 +238,207 @@ async fn opencode_session_lifecycle_mirrors_through_real_server() {
     // `_server` (ServerGuard) kills the server on drop.
 }
 
+/// Like `fake_daemon`, but also lets the test write daemon→observer messages down the
+/// most recent observer connection (what `host_dispatch::send_to_host_observer` does).
+async fn fake_daemon_rw(
+    path: PathBuf,
+) -> (
+    mpsc::UnboundedReceiver<BridgeMessage>,
+    mpsc::UnboundedSender<BridgeMessage>,
+) {
+    use tokio::io::AsyncWriteExt;
+    let listener = UnixListener::bind(&path).unwrap();
+    let (up_tx, up_rx) = mpsc::unbounded_channel();
+    let (down_tx, mut down_rx) = mpsc::unbounded_channel::<BridgeMessage>();
+    let writers: Arc<tokio::sync::Mutex<Vec<tokio::net::unix::OwnedWriteHalf>>> =
+        Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let w2 = Arc::clone(&writers);
+    tokio::spawn(async move {
+        while let Some(m) = down_rx.recv().await {
+            let line = format!("{}\n", serde_json::to_string(&m).unwrap());
+            if let Some(w) = w2.lock().await.last_mut() {
+                let _ = w.write_all(line.as_bytes()).await;
+            }
+        }
+    });
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            let (r, w) = stream.into_split();
+            writers.lock().await.push(w);
+            let tx = up_tx.clone();
+            tokio::spawn(async move {
+                let mut lines = BufReader::new(r).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    if let Ok(m) = serde_json::from_str::<BridgeMessage>(&line) {
+                        let _ = tx.send(m);
+                    }
+                }
+            });
+        }
+    });
+    (up_rx, down_tx)
+}
+
+/// ADR-016 §Default enablement: the pipe plugin ctm provisions makes an OpenCode
+/// process mirror itself with NO port configured for ctm and NO password. `serve` is
+/// used only because a TUI needs a terminal; the plugin loads identically in both
+/// (spike-verified), and the HTTP port here is the *test's* handle on the process,
+/// not ctm's.
+#[tokio::test]
+#[ignore = "needs the `opencode` binary; run with --ignored"]
+async fn opencode_pipe_plugin_mirrors_a_process_with_no_port_and_no_password() {
+    use ctm::host::opencode_plugin;
+    if !have("opencode") {
+        eprintln!("skip: opencode not installed");
+        return;
+    }
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_test_writer()
+        .try_init();
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("bridge.sock");
+    let (mut rx, down) = fake_daemon_rw(sock.clone()).await;
+
+    // What the daemon's keeper writes — into an isolated XDG_CONFIG_HOME here.
+    let xdg = dir.path().join("xdg");
+    let plugin = xdg
+        .join("opencode/plugins")
+        .join(opencode_plugin::PLUGIN_FILE);
+    let pipe_sock = opencode_plugin::pipe_socket_path(&sock);
+    assert_eq!(
+        opencode_plugin::ensure_at(&plugin, &pipe_sock).unwrap(),
+        opencode_plugin::PluginState::Installed
+    );
+
+    let cfg = Arc::new(base_config(sock.clone(), HostsConfig::default()));
+    let cfg2 = Arc::clone(&cfg);
+    let pipe_server = tokio::spawn(async move { ctm::host::opencode_pipe::serve(cfg2).await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(pipe_sock.exists(), "pipe socket bound");
+
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let proj = dir.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let server = Command::new("opencode")
+        .args([
+            "serve",
+            "--port",
+            &port.to_string(),
+            "--hostname",
+            "127.0.0.1",
+        ])
+        .env("XDG_CONFIG_HOME", &xdg)
+        .env_remove("OPENCODE_SERVER_PASSWORD")
+        .current_dir(&proj)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn opencode serve");
+    let _server = ServerGuard(server);
+    let base = format!("http://127.0.0.1:{port}");
+    let http = reqwest::Client::new();
+    let mut up = false;
+    for _ in 0..80 {
+        if let Ok(r) = http.get(format!("{base}/global/health")).send().await {
+            if r.status().is_success() {
+                up = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert!(up, "opencode serve did not come up on {base}");
+
+    // Spike-established (opencode 1.18.31): the FIRST API request to an instance is
+    // invisible to plugin hooks — whatever it is. A TUI issues many before the user's
+    // first prompt, so this only shows up in a headless test; warm the instance up the
+    // same way.
+    let projq = proj.to_string_lossy().to_string();
+    let _ = http
+        .get(format!("{base}/session"))
+        .query(&[("directory", projq.as_str())])
+        .send()
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // 1. Event leg: session.created arrives through the plugin → SessionStart.
+    let created: serde_json::Value = http
+        .post(format!("{base}/session"))
+        .query(&[("directory", projq.as_str())])
+        .json(&serde_json::json!({"title": "ctm-pipe-e2e"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let sid = created["id"].as_str().unwrap().to_string();
+    let start = wait_for(
+        &mut rx,
+        |m| m.msg_type == MessageType::SessionStart && m.session_id == sid,
+        15,
+    )
+    .await
+    .expect("SessionStart via the pipe");
+    assert_eq!(start.meta().host_kind(), HostKind::OpenCode);
+    assert_eq!(start.meta().host_session_id(), Some(sid.as_str()));
+
+    // 2. Call leg: a daemon→observer HostInject `/rename` becomes a PATCH executed by
+    //    OpenCode's in-process client. Observable through the server's own API.
+    let mut meta = serde_json::Map::new();
+    meta.insert("action".into(), serde_json::Value::String("slash".into()));
+    down.send(BridgeMessage {
+        msg_type: MessageType::HostInject,
+        session_id: sid.clone(),
+        timestamp: String::new(),
+        content: "/rename Renamed By Pipe".into(),
+        metadata: Some(meta),
+    })
+    .unwrap();
+    let mut renamed = false;
+    for _ in 0..40 {
+        let info: serde_json::Value = http
+            .get(format!("{base}/session/{sid}"))
+            .query(&[("directory", projq.as_str())])
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if info["title"] == "Renamed By Pipe" {
+            renamed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert!(
+        renamed,
+        "rename delivered through the pipe and executed in-process"
+    );
+
+    // 3. Process exit: the pipe closes → every announced session is ended.
+    drop(_server);
+    let end = wait_for(
+        &mut rx,
+        |m| m.msg_type == MessageType::SessionEnd && m.session_id == sid,
+        15,
+    )
+    .await
+    .expect("SessionEnd when the OpenCode process goes away");
+    assert_eq!(end.content, "opencode exited");
+
+    pipe_server.abort();
+}
+
 #[tokio::test]
 #[ignore = "needs the `codex` binary; run with --ignored"]
 async fn codex_thread_lifecycle_mirrors_through_real_app_server() {
@@ -264,13 +469,18 @@ async fn codex_thread_lifecycle_mirrors_through_real_app_server() {
     );
 
     let cx = CodexHostConfig {
+        enabled: true,
         socket_path: socket_path.clone(),
+        binary: None,
     };
     let cfg = Arc::new(base_config(
         sock.clone(),
         HostsConfig {
-            opencode: None,
-            codex: Some(cx.clone()),
+            opencode: OpenCodeHostConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            codex: cx.clone(),
         },
     ));
     let cfg2 = Arc::clone(&cfg);

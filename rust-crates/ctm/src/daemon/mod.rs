@@ -471,33 +471,36 @@ impl Daemon {
             .running
             .store(true, std::sync::atomic::Ordering::Relaxed);
 
-        // ADR-016: spawn one observer task per configured non-Claude host. Each is a
-        // client of the socket we just bound, so it must start AFTER `listen` above.
-        // Observers own their own reconnect loops; a host being down never affects the
-        // Claude Code path or the Telegram loop.
-        for kind in self.state.config.hosts.enabled() {
+        // ADR-016 §Default enablement: non-Claude hosts are on unless the operator
+        // turned one off. Every task below is a client of the socket bound above, so
+        // this must run AFTER `listen`. Each owns its own reconnect loop; a host being
+        // absent or down never affects the Claude Code path or the Telegram loop.
+        let hosts = &self.state.config.hosts;
+        if hosts.opencode.enabled {
+            // Pipe: the plugin ctm provisions inside every OpenCode process connects
+            // here. Listen unconditionally (cheap) so an OpenCode installed later —
+            // which the keeper then provisions within a minute — just works.
             let cfg = Arc::clone(&self.state.config);
-            match kind {
-                crate::types::HostKind::OpenCode => {
-                    let oc = cfg
-                        .hosts
-                        .opencode
-                        .clone()
-                        .expect("enabled() only lists configured hosts");
-                    tracing::info!(base_url = %oc.base_url, "ADR-016: starting OpenCode observer");
-                    tokio::spawn(async move { crate::host::opencode::run(cfg, oc).await });
-                }
-                crate::types::HostKind::Codex => {
-                    let cx = cfg
-                        .hosts
-                        .codex
-                        .clone()
-                        .expect("enabled() only lists configured hosts");
-                    tracing::info!(socket = %cx.socket_path.display(), "ADR-016: starting Codex observer");
-                    tokio::spawn(async move { crate::host::codex::run(cfg, cx).await });
-                }
-                crate::types::HostKind::ClaudeCode => {} // served by hooks, never listed
+            tokio::spawn(async move { crate::host::opencode_pipe::serve(cfg).await });
+            let cfg = Arc::clone(&self.state.config);
+            tokio::spawn(async move { crate::host::opencode_plugin::run_keeper(cfg).await });
+            if let Some(url) = &hosts.opencode.base_url {
+                // Opt-in: additionally observe an external `opencode serve` over HTTP.
+                let cfg = Arc::clone(&self.state.config);
+                let oc = hosts.opencode.clone();
+                tracing::info!(base_url = %url, "ADR-016: starting OpenCode HTTP observer");
+                tokio::spawn(async move { crate::host::opencode::run(cfg, oc).await });
             }
+        } else {
+            tracing::info!("OpenCode mirroring disabled by config");
+        }
+        if hosts.codex.enabled {
+            let cfg = Arc::clone(&self.state.config);
+            let cx = hosts.codex.clone();
+            tracing::info!(socket = %cx.socket_path.display(), "ADR-016: starting Codex observer");
+            tokio::spawn(async move { crate::host::codex::run(cfg, cx).await });
+        } else {
+            tracing::info!("Codex mirroring disabled by config");
         }
 
         tracing::info!("Bridge daemon started");

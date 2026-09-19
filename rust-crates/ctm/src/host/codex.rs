@@ -6,7 +6,10 @@
 //!
 //! - Transport is JSON-RPC 2.0 over **WebSocket over the Unix control socket** created
 //!   by `codex app-server daemon start` (`~/.codex/app-server-control/…sock`, 0600).
-//!   A plain `codex` TUI never joins the daemon; `codex --remote unix://…` does.
+//!   A bare `codex` started while that daemon is running **auto-joins it** (spike:
+//!   its thread appeared in `thread/started` on ctm's connection with no flags); one
+//!   started with no daemon runs in-process and is invisible. So ctm keeps the daemon
+//!   alive itself (`codex_daemon.rs`) — that is the whole of "enabling" Codex.
 //! - `initialize` first. `turn/start` and `turn/steer` are **ungated**; only
 //!   `thread/queue/*` needs `experimentalApi`, so ctm never declares it.
 //! - **A client is blind and mute until it calls `thread/resume {threadId}`** — without
@@ -895,7 +898,31 @@ impl Translator {
 /// Run the Codex observer forever, reconnecting with backoff.
 pub async fn run(config: Arc<Config>, cx: CodexHostConfig) {
     let mut backoff = Backoff::new();
+    let mut announced_absent = false;
     loop {
+        // ADR-016 §Default enablement: Codex may not be installed (yet). Probe quietly
+        // and keep the app-server daemon alive once it is.
+        match super::codex_daemon::ensure_running(&cx).await {
+            Ok(super::codex_daemon::Ensured::NotInstalled) => {
+                if !announced_absent {
+                    tracing::info!("Codex not installed — will watch for it");
+                    announced_absent = true;
+                }
+                tokio::time::sleep(super::codex_daemon::ABSENT_POLL).await;
+                continue;
+            }
+            Ok(state) => {
+                announced_absent = false;
+                if state != super::codex_daemon::Ensured::AlreadyRunning {
+                    tracing::info!(?state, "Codex app-server daemon ready");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Codex app-server daemon could not be started; will retry");
+                tokio::time::sleep(backoff.delay()).await;
+                continue;
+            }
+        }
         match run_once(&config, &cx).await {
             Ok(()) => backoff.reset(),
             Err(e) => tracing::warn!(error = %e, "Codex observer stopped; will reconnect"),

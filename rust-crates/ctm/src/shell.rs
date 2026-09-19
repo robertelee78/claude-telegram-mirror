@@ -7,7 +7,9 @@
 //!    startup file that puts the install directory first on `PATH` (appending at the
 //!    end is what makes it win over version managers like fnm/nvm that prepend their
 //!    shim dirs earlier in the same file) and, for zsh, adds the completion dir to
-//!    `fpath` and initialises `compinit` if the user's config has not.
+//!    `fpath` and either initialises `compinit` (if the rc has not) or registers
+//!    `_ctm` directly with `compdef` (if it has — a later fpath change is invisible to
+//!    an already-initialised compinit; this was the "tab completion not working" bug).
 //!
 //! Rules that keep this from being a nuisance: the block is rewritten in place (never
 //! duplicated) and removed exactly by `ctm shell-setup --remove`; only the login
@@ -106,14 +108,21 @@ fn rc_files(home: &Path, shell: Shell) -> Vec<PathBuf> {
 fn block_body(shell: Shell, install_dir: &Path, completion_dir: &Path) -> String {
     let dir = install_dir.display();
     match shell {
+        // Two cases, both verified in a clean-env login zsh against a real rc:
+        // - compinit has NOT run yet: run it; it scans fpath and registers `_ctm` from
+        //   the file's `#compdef ctm` header.
+        // - compinit HAS run (oh-my-zsh, or another tool's block earlier in the same
+        //   rc): its table is already built and a later fpath change is invisible to
+        //   it, so register the function directly. `autoload` alone is not enough —
+        //   `compdef` is what maps the command to it.
         Shell::Zsh => format!(
             "{BEGIN}\n\
              # managed by `ctm shell-setup`; edits here are overwritten, remove with `ctm shell-setup --remove`\n\
              export PATH=\"{dir}:$PATH\"\n\
-             fpath=(\"{}\" $fpath)\n\
-             (( $+functions[compdef] )) || {{ autoload -Uz compinit && compinit -i; }}\n\
+             (( ${{fpath[(Ie){cd}]}} )) || fpath=(\"{cd}\" $fpath)\n\
+             if (( $+functions[compdef] )); then autoload -Uz _ctm && compdef _ctm ctm; else autoload -Uz compinit && compinit -i; fi\n\
              {END}\n",
-            completion_dir.display()
+            cd = completion_dir.display()
         ),
         Shell::Bash => format!(
             "{BEGIN}\n\
@@ -443,10 +452,15 @@ mod tests {
     }
 
     #[test]
-    fn zsh_block_wires_fpath_and_compinit_guard() {
+    fn zsh_block_wires_fpath_and_registers_for_both_compinit_orders() {
         let b = block_body(Shell::Zsh, Path::new("/x/bin"), Path::new("/x/sf"));
-        assert!(b.contains("fpath=(\"/x/sf\" $fpath)"));
-        assert!(b.contains("compinit"));
+        assert!(b.contains("(( ${fpath[(Ie)/x/sf]} )) || fpath=(\"/x/sf\" $fpath)"));
+        // compinit already ran earlier in the rc → direct registration.
+        assert!(b.contains(
+            "if (( $+functions[compdef] )); then autoload -Uz _ctm && compdef _ctm ctm;"
+        ));
+        // compinit not yet run → run it (scans fpath, honours `#compdef ctm`).
+        assert!(b.contains("else autoload -Uz compinit && compinit -i; fi"));
         let f = block_body(Shell::Fish, Path::new("/x/bin"), Path::new("/x/c"));
         assert!(f.contains("fish_add_path --global --move \"/x/bin\""));
     }
