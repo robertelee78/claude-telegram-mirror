@@ -45,6 +45,20 @@ pub struct Session {
     /// daemon restart recovers the session name even though the in-memory
     /// `custom_titles` cache is empty.
     pub custom_title: Option<String>,
+    /// ADR-016: which agent host owns this session. `None` on rows predating the
+    /// column means Claude Code; use [`Session::host_kind`] rather than reading this
+    /// directly.
+    pub host_kind: Option<String>,
+}
+
+impl Session {
+    /// ADR-016: typed host kind, defaulting to Claude Code for legacy rows.
+    pub fn host_kind(&self) -> crate::types::HostKind {
+        self.host_kind
+            .as_deref()
+            .and_then(|s| crate::types::HostKind::try_from(s).ok())
+            .unwrap_or_default()
+    }
 }
 
 /// A pending tool-approval request.
@@ -164,7 +178,8 @@ impl SessionManager {
                 parent_session_id TEXT,
                 agent_id          TEXT,
                 agent_type        TEXT,
-                custom_title      TEXT
+                custom_title      TEXT,
+                host_kind         TEXT
             );
 
             CREATE TABLE IF NOT EXISTS pending_approvals (
@@ -203,6 +218,38 @@ impl SessionManager {
         self.migrate_add_tmux_columns()?;
         self.migrate_add_parent_columns()?;
         self.migrate_add_custom_title_column()?;
+        self.migrate_add_host_kind_column()?;
+        Ok(())
+    }
+
+    /// ADR-016 Migration: add `host_kind` if upgrading from a pre-multi-host DB.
+    ///
+    /// Rows left NULL are Claude Code sessions (see [`Session::host_kind`]), so no
+    /// backfill is needed and routing for existing sessions is unchanged.
+    fn migrate_add_host_kind_column(&self) -> Result<()> {
+        let mut stmt = self
+            .conn
+            .prepare("PRAGMA table_info(sessions)")
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        let columns: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|e| AppError::Database(e.to_string()))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        if !columns.iter().any(|c| c == "host_kind") {
+            match self
+                .conn
+                .execute_batch("ALTER TABLE sessions ADD COLUMN host_kind TEXT")
+            {
+                Ok(()) => {}
+                Err(e) if e.to_string().contains("duplicate column name") => {
+                    // Another connection already added this column concurrently — safe to ignore.
+                }
+                Err(e) => return Err(AppError::Database(e.to_string())),
+            }
+        }
         Ok(())
     }
 
@@ -766,6 +813,38 @@ impl SessionManager {
 
     /// ADR-013: Store parent_session_id, agent_id, and agent_type for a child (sub-agent) session.
     #[allow(dead_code)] // Library API — used by daemon routing (ADR-013)
+    /// ADR-016: record which agent host owns a session. Called in the same `db_op`
+    /// closure as `create_session` from the `SessionStart` handler, so the value is
+    /// set at insert time from observer-supplied metadata — never inferred later.
+    ///
+    /// `host_session_id` (the host's own `ses_…` / thread UUID) is persisted in the
+    /// `metadata` JSON column as `{"hostSessionId": …}` so the daemon can address the
+    /// host session after a restart without the observer having to re-announce it.
+    pub fn set_host_kind(
+        &self,
+        session_id: &str,
+        kind: crate::types::HostKind,
+        host_session_id: Option<&str>,
+    ) -> Result<()> {
+        let metadata =
+            host_session_id.map(|h| serde_json::json!({ "hostSessionId": h }).to_string());
+        let rows_changed = self
+            .conn
+            .execute(
+                "UPDATE sessions SET host_kind = ?1, metadata = COALESCE(?2, metadata) WHERE id = ?3",
+                params![kind.as_str(), metadata, session_id],
+            )
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        if rows_changed == 0 {
+            tracing::warn!(
+                session_id = %session_id,
+                host_kind = %kind,
+                "set_host_kind: UPDATE affected 0 rows — session row does not exist"
+            );
+        }
+        Ok(())
+    }
+
     pub fn set_parent_info(
         &self,
         session_id: &str,
@@ -1125,6 +1204,7 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
         // ADR-014 A5: custom_title is a migrated column; tolerate a NULL/absent
         // value defensively (older rows have no title set).
         custom_title: row.get::<_, Option<String>>("custom_title").unwrap_or(None),
+        host_kind: row.get::<_, Option<String>>("host_kind").unwrap_or(None),
     })
 }
 

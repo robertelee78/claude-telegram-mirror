@@ -9,8 +9,17 @@
 > Just pure excellence, done the right way the entire time.
 > Chesterton's fence: always understand the current implementation fully before changing it.
 
-**Status:** Proposed
+**Status:** Implemented — Sprint-1 fixes shipped; status reconciled 2026-09-19
 **Date:** 2026-03-17
+**Updated:** 2026-09-19 — reconciled from "Proposed", which contradicted the
+shipped code. Verified in source: separate API vs long-poll HTTP clients
+(`bot/client.rs:77`, 15s/45s at `:114`/`:125`), AIMD adaptive rate control
+(`bot/client.rs:11`), the 3-tier priority queue (`bot/queue.rs`), and bounded task
+spawning via `Semaphore::new(50)` (`daemon/event_loop.rs:36`). The items this ADR
+explicitly defers remain open: circuit breaker, socket-client backpressure
+propagation, a persistent deletion queue, formal lock-order enforcement, and the
+swallowed-error sweep. Long-polling over webhooks also remains a logged,
+accepted debt.
 **Authors:** Robert E. Lee, with BMAD multi-agent analysis
 **Supersedes:** None
 **Related:** ADR-006 (Rust Migration Gap Audit), ADR-010 (Deep Release Readiness Evaluation)
@@ -806,7 +815,8 @@ change beyond the scope of this resilience ADR.
 
 **File:** `doctor.rs:601`
 **Severity:** Low (diagnostic only — does not affect runtime behavior)
-**Status:** Fix applied locally, pending build + test + release
+**Status:** Implemented (verified 2026-09-19) — `doctor.rs` reads `sessions.db`
+(`doctor.rs:687`, `:810`)
 
 The `check_database()` function looked for `bridge.db` but the actual database file
 created by `session.rs:107` is `sessions.db`. This caused `ctm doctor` to always report

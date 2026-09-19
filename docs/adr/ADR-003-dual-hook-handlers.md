@@ -1,7 +1,13 @@
 # ADR-003: Dual Hook Handlers
 
-**Status:** Accepted
+**Status:** Superseded (2026-09-19) — retained for historical context
 **Date:** 2026-03-16
+**Updated:** 2026-09-19 — the dual bash + Node.js handler pair described below no
+longer exists. ADR-002's Rust migration collapsed both into the single `ctm hook`
+binary (`main.rs:69`), where tokio makes "finish in <5ms" and "block up to 5
+minutes for approval" the same process rather than competing requirements. The
+decision recorded here is historical; ADR-006's "Intentional Differences" table
+documents the divergence.
 
 ## Context
 

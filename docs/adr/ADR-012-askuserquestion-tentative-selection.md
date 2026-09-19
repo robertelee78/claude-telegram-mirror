@@ -9,8 +9,16 @@
 > Just pure excellence, done the right way the entire time.
 > Chesterton's fence: always understand the current implementation fully before changing it.
 
-**Status:** Proposed
+**Status:** Implemented — UI shipped and load-bearing; status reconciled 2026-09-19
 **Date:** 2026-03-17
+**Updated:** 2026-09-19 — reconciled from "Proposed", which contradicted both the
+code and ADR-014/015's treatment of this UI as already shipped. Verified in
+source: `TentativeAnswer` (`daemon/mod.rs:70`) and `PendingQuestion.tentative`
+(`:108`). Note the *delivery mechanism* underneath this UI changed twice — ADR-014
+PR-E replaced keystroke injection with structured `updatedInput`, and ADR-015
+reverted that — while the tentative-select + Submit-All UI decided here survived
+both swaps unchanged. The no-persistence and no-timeout consequences recorded
+below still hold.
 **Authors:** Robert E. Lee
 **Supersedes:** None
 **Related:** ADR-002 (Phased Rust Migration), ADR-011 (Resilience Architecture)

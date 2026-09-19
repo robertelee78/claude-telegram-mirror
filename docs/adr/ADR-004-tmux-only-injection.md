@@ -1,7 +1,15 @@
 # ADR-004: Tmux-Only Input Injection
 
-**Status:** Accepted
+**Status:** Accepted — amended by ADR-016 (2026-09-19)
 **Date:** 2026-03-16
+**Updated:** 2026-09-19 — **tmux `send-keys` is the sole injection method for Claude
+Code sessions only.** ADR-016 adds OpenCode and Codex as hosts whose sessions are
+driven over their native APIs by a host observer (`src/host/`), with the daemon
+dispatching on `sessions.host_kind` at exactly three points (`daemon/host_dispatch.rs`).
+The reasoning below — PTY and FIFO rejected, tmux chosen because there is no other IPC
+surface into an *interactive Ink TUI* — remains correct and remains the decision for
+Claude Code. It never applied to hosts that expose a bus the TUI is itself a client of.
+The implementation path is now `src/injector.rs` (Rust), not `src/bridge/injector.ts`.
 
 ## Context
 

@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added (OpenCode and Codex as agent hosts — ADR-016)
+- **ctm now mirrors OpenCode and Codex sessions, not only Claude Code.** Each non-Claude host gets an in-daemon *observer* — a long-lived client of ctm's own Unix socket speaking the existing `BridgeMessage` protocol — so the daemon's approval routing, priority queue, topic buffering and the whole Telegram question UI are reused unchanged. Neither host needs tmux: OpenCode is driven over its HTTP/SSE API (`/event`, `/permission/{id}/reply`, `/question/{id}/reply`, `/session/{id}/prompt_async`) and Codex over its app-server JSON-RPC (WebSocket on the `codex app-server daemon` control socket: `thread/resume`, `turn/start`, `turn/steer`, approval and `requestUserInput` responses). The daemon dispatches on a new `sessions.host_kind` column at exactly three points (`daemon/host_dispatch.rs`); `callback_handlers.rs`' TUI scraper stays Claude-only.
+- **Both surfaces, either answers — verified live on both hosts.** Answering an approval or multiple-choice question from Telegram clears the prompt in the attached terminal; answering at the terminal retires the Telegram keyboard (`permission.replied` / `serverRequest/resolved` → new `handle_approval_resolved_elsewhere`). Race resolution is exactly-once on both hosts; ctm finalizes on the host's own resolution signal, never on its own send.
+- **Config**: `"hosts": {"opencode": {"baseUrl", "passwordEnv"}, "codex": {"socketPath"}}` in `config.json`, or `CTM_OPENCODE_URL` / `CTM_CODEX_SOCKET`. Defaults: `http://127.0.0.1:4096`, `OPENCODE_SERVER_PASSWORD`, `~/.codex/app-server-control/app-server-control.sock`.
+- **`ctm doctor` check 12/12 "Hosts"**: reachability, auth (hard failure if the OpenCode password is unset — the server is otherwise unauthenticated while exposing `/pty`), Codex control-socket presence and mode, and each host's capabilities (structured questions, steer, always-allow, image injection).
+- **`tests/host_e2e.rs`** (`cargo test --test host_e2e -- --ignored`): end-to-end against the real `opencode` and `codex` binaries, zero model spend.
+
+### Changed
+- ADR-004's "tmux is the sole injection method" now applies to Claude Code sessions only (amended, not reversed). ADR-003/005/011/012/013/015 status headers reconciled to what shipped.
+- New dependencies: `tokio-tungstenite` (handshake only, no TLS) and `futures-util` for the Codex WebSocket transport.
+
 ## [0.2.27] - 2026-06-19
 
 ### Fixed (replies misrouted across concurrent sessions; first events lost on restart)

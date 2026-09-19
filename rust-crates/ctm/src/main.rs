@@ -9,6 +9,7 @@ mod doctor;
 mod error;
 mod formatting;
 mod hook;
+mod host;
 mod injector;
 mod installer;
 mod liveness;
