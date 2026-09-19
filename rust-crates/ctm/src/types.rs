@@ -165,6 +165,15 @@ pub enum MessageType {
     PreCompact,
     SessionRename,
     SendImage,
+    /// ADR-016: daemon -> host observer. Carries the operator's Submit-All answers for
+    /// a structured question on a non-Claude host. Metadata: `questionId`,
+    /// `hostSessionId`, `answers` (array of arrays of strings, one per question).
+    /// Never emitted for Claude Code sessions, which answer via tmux (ADR-015).
+    QuestionResponse,
+    /// ADR-016: daemon -> host observer. Deliver user text (or a control action) into a
+    /// non-Claude host session. Metadata: `hostSessionId`, `action` (`"text"`,
+    /// `"interrupt"`, `"abort"`).
+    HostInject,
     /// Forward-compatible catch-all for unknown message types. ADR-015: stray
     /// `question_request` / `question_response` wire values from an older hook/daemon
     /// deserialize here harmlessly (the structured question path was removed).
@@ -189,6 +198,8 @@ impl std::fmt::Display for MessageType {
             Self::PreCompact => write!(f, "pre_compact"),
             Self::SessionRename => write!(f, "session_rename"),
             Self::SendImage => write!(f, "send_image"),
+            Self::QuestionResponse => write!(f, "question_response"),
+            Self::HostInject => write!(f, "host_inject"),
             Self::Unknown => write!(f, "unknown"),
         }
     }
@@ -312,6 +323,37 @@ impl<'a> MessageMetadata<'a> {
         self.str_field("approvalId")
     }
 
+    /// ADR-016: which agent host produced this session (`"hostKind"`). Absent means
+    /// Claude Code, for backward compatibility with hook binaries that predate the field.
+    pub fn host_kind(&self) -> HostKind {
+        self.str_field("hostKind")
+            .and_then(|s| HostKind::try_from(s).ok())
+            .unwrap_or(HostKind::ClaudeCode)
+    }
+
+    /// ADR-016: the host's own session/thread identifier (`"hostSessionId"`), e.g. an
+    /// OpenCode `ses_…` id or a Codex thread UUID. Distinct from `session_id`, which
+    /// is ctm's routing key.
+    pub fn host_session_id(&self) -> Option<&'a str> {
+        self.str_field("hostSessionId")
+    }
+
+    /// ADR-016: host-side question/request identifier (`"questionId"`).
+    pub fn question_id(&self) -> Option<&'a str> {
+        self.str_field("questionId")
+    }
+
+    /// ADR-016: Submit-All answers (`"answers"`): one array of selected labels per
+    /// question, in question order.
+    pub fn answers(&self) -> Option<&'a serde_json::Value> {
+        self.value_field("answers")
+    }
+
+    /// ADR-016: `HostInject` action (`"action"`): `"text"`, `"interrupt"`, `"abort"`.
+    pub fn action(&self) -> Option<&'a str> {
+        self.str_field("action")
+    }
+
     /// CLAUDE_CODE_ENTRYPOINT value (e.g. "cli", "sdk-cli", "sdk-ts").
     /// Non-"cli" values indicate non-interactive sessions (pipe mode, SDK, CI).
     pub fn entrypoint(&self) -> Option<&'a str> {
@@ -404,6 +446,67 @@ pub fn is_valid_session_status(s: &str) -> bool {
 #[allow(dead_code)] // Backward-compat public API
 pub fn is_valid_approval_status(s: &str) -> bool {
     VALID_APPROVAL_STATUSES.contains(&s)
+}
+
+/// ADR-016: which agent CLI a session belongs to.
+///
+/// Stored as TEXT in the `sessions.host_kind` column and carried as `hostKind` in
+/// `BridgeMessage` metadata. Absent on the wire means `ClaudeCode` so that hook
+/// binaries and DB rows predating ADR-016 keep routing exactly as before.
+///
+/// The daemon dispatches on this at exactly three points — user-text injection,
+/// Submit-All delivery, and session insert — and nowhere else (ADR-016 Decision).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum HostKind {
+    #[default]
+    ClaudeCode,
+    OpenCode,
+    Codex,
+}
+
+impl HostKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "claude_code",
+            Self::OpenCode => "opencode",
+            Self::Codex => "codex",
+        }
+    }
+
+    /// Human-readable label for topic titles and status output.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "Claude Code",
+            Self::OpenCode => "OpenCode",
+            Self::Codex => "Codex",
+        }
+    }
+
+    /// True for hosts whose injection and question answering go over a native API via
+    /// a host observer, rather than tmux keystrokes (ADR-004 amended by ADR-016).
+    pub fn uses_native_api(&self) -> bool {
+        !matches!(self, Self::ClaudeCode)
+    }
+}
+
+impl std::fmt::Display for HostKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+impl TryFrom<&str> for HostKind {
+    type Error = String;
+
+    fn try_from(s: &str) -> std::result::Result<Self, Self::Error> {
+        match s {
+            "claude_code" | "claude" => Ok(Self::ClaudeCode),
+            "opencode" => Ok(Self::OpenCode),
+            "codex" => Ok(Self::Codex),
+            other => Err(format!("invalid host kind: {other}")),
+        }
+    }
 }
 
 /// Typed session status for compile-time safety.

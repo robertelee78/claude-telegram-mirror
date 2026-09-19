@@ -85,6 +85,13 @@ async fn handle_telegram_text(ctx: &HandlerContext, msg: &TgMessage, text: &str)
         None => return,
     };
 
+    // ADR-016: native-API hosts never have a tmux target. Dispatch to the observer path
+    // BEFORE the tmux lookup so the "tmux not detected" warning below cannot fire for them.
+    if session.host_kind().uses_native_api() {
+        host_dispatch::handle_native_host_text(ctx, &session, text, thread_id).await;
+        return;
+    }
+
     // Get tmux info. ROUTING-001: resolve the per-session pane target and socket
     // into locals and pass them explicitly to every injector call below. The
     // injector is stateless, so there is no shared `set_target` that a concurrent
@@ -406,6 +413,24 @@ async fn inject_to_session(
     thread_id: i64,
     what: &str,
 ) {
+    // ADR-016: native-API hosts receive the file reference as plain text over the observer.
+    if session.host_kind().uses_native_api() {
+        let label = session.host_kind().label();
+        if host_dispatch::host_inject(ctx, &session.id, "text", text).await {
+            ctx.bot
+                .send_message(&format!("{what} sent to {label}"), None, Some(thread_id))
+                .await;
+        } else {
+            ctx.bot
+                .send_message(
+                    &format!("\u{26A0}\u{FE0F} {what} not delivered \u{2014} the {label} observer is not connected."),
+                    None,
+                    Some(thread_id),
+                )
+                .await;
+        }
+        return;
+    }
     let tmux_target = get_tmux_target(ctx, &session.id, session.tmux_socket.as_deref()).await;
 
     if let Some(target) = tmux_target {
@@ -613,6 +638,23 @@ async fn handle_bot_command(ctx: &HandlerContext, msg: &TgMessage, text: &str) {
                 .await;
 
             if let Some(session) = session {
+                // ADR-016: native hosts rename via the observer (`slash` action).
+                if session.host_kind().uses_native_api() {
+                    let command = format!("/rename {args}");
+                    if host_dispatch::host_inject(ctx, &session.id, "slash", &command).await {
+                        ctx.bot
+                            .send_message(
+                                &format!(
+                                    "Sending rename to {}: *{args}*",
+                                    session.host_kind().label()
+                                ),
+                                Some(&opts),
+                                Some(thread_id),
+                            )
+                            .await;
+                    }
+                    return;
+                }
                 let tmux_target =
                     get_tmux_target(ctx, &session.id, session.tmux_socket.as_deref()).await;
                 if let Some(target) = tmux_target {
@@ -823,6 +865,14 @@ async fn handle_bot_command(ctx: &HandlerContext, msg: &TgMessage, text: &str) {
                     };
 
                     if aborted {
+                        // ADR-016: native-API hosts get an interrupt over the observer.
+                        if host_dispatch::session_host_kind(ctx, &session_id)
+                            .await
+                            .uses_native_api()
+                        {
+                            let _ =
+                                host_dispatch::host_inject(ctx, &session_id, "interrupt", "").await;
+                        }
                         // Send Escape key via tmux to gracefully interrupt
                         let tmux_target = ctx.session_tmux.read().await.get(&session_id).cloned();
                         if let Some(target) = tmux_target {

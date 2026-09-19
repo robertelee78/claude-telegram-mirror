@@ -12,6 +12,7 @@ pub mod doctor;
 pub mod error;
 pub mod formatting;
 pub mod hook;
+pub mod host;
 pub mod injector;
 pub mod installer;
 pub mod liveness;

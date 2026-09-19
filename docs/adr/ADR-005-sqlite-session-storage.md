@@ -2,6 +2,14 @@
 
 **Status:** Accepted
 **Date:** 2026-03-16
+**Updated:** 2026-09-19 — decision unchanged: SQLite remains the session store.
+Implementation moved from `better-sqlite3` to `rusqlite` with the `bundled`
+feature (`rust-crates/ctm/Cargo.toml:25`) during ADR-002's Rust migration, so the
+"Node.js hook handler" named in the Context below is now the `ctm hook` binary
+(see ADR-003, superseded). ADR-016 (2026-09-19) adds a nullable `sessions.host_kind`
+column (migration `migrate_add_host_kind_column`, mirroring `custom_title`), set at
+insert time from observer metadata and NULL for Claude Code rows, plus a
+`{"hostSessionId": …}` entry in the previously unused `metadata` column.
 
 ## Context
 

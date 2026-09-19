@@ -19,6 +19,7 @@ This installs a native Rust binary (`ctm`) via platform-specific optional packag
 
 ## Features
 
+- **Three hosts, one bridge**: Claude Code (via hooks + tmux), **OpenCode** and **Codex** (via their native APIs — no tmux needed). See [Other agent hosts](#other-agent-hosts-opencode-codex)
 - **CLI to Telegram**: Mirror Claude's responses, tool usage, and notifications
 - **Telegram to CLI**: Send prompts from Telegram directly to Claude Code
 - **Tool Summarizer**: Human-readable summaries for 30+ command patterns ("Running tests" instead of "Running: Bash")
@@ -276,8 +277,54 @@ Environment variables take precedence over config file values.
 
 ```bash
 ctm doctor
-# Checks: config, hooks, socket, tmux, systemd/launchd, Telegram API
+# Checks: config, hooks, socket, tmux, systemd/launchd, Telegram API, hosts
 ```
+
+## Other agent hosts (OpenCode, Codex)
+
+ctm can mirror **OpenCode** and **Codex** sessions alongside Claude Code (ADR-016).
+Neither needs tmux: the daemon runs a small *observer* per host that speaks the host's
+native API, and the same Telegram UI — approvals, multiple-choice questions, replies,
+`stop`/`kill` — works unchanged. Answering from Telegram dismisses the prompt in the
+terminal, and answering at the terminal retires the Telegram keyboard (both verified
+live against each binary).
+
+Enable a host in `config.json`, or with an environment variable:
+
+```json
+{
+  "hosts": {
+    "opencode": { "baseUrl": "http://127.0.0.1:4096" },
+    "codex":    {}
+  }
+}
+```
+
+```bash
+CTM_OPENCODE_URL=http://127.0.0.1:4096  # enables the OpenCode observer
+CTM_CODEX_SOCKET=~/.codex/app-server-control/app-server-control.sock  # enables Codex (this is the default path)
+```
+
+**OpenCode.** Start it with an explicit port and a server password — there is no port
+discovery, and without a password the server exposes `/pty` and shell endpoints to any
+local process (`ctm doctor` makes this a hard failure):
+
+```bash
+export OPENCODE_SERVER_PASSWORD='choose-a-secret'
+opencode --port 4096        # full TUI; `--mini` does NOT render API-originated content
+```
+
+**Codex.** Sessions must run under the app-server daemon; a plain `codex` is invisible
+to it:
+
+```bash
+codex app-server daemon start
+codex --remote unix://$HOME/.codex/app-server-control/app-server-control.sock
+```
+
+Multiple-choice questions on Codex only exist in plan mode (`/plan`), a Codex limit.
+Neither host prints "answered from Telegram" in its own TUI after a remote decision —
+the prompt simply clears; ctm shows a toast on OpenCode and documents it on Codex.
 
 ## Project-Level Hooks
 

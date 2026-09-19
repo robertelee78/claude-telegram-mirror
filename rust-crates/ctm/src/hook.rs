@@ -658,7 +658,10 @@ async fn get_hook_output(
 /// to the Telegram display prompt. The full, untruncated tool input is always
 /// available in the `approval_request` message's `metadata.input` field, so no
 /// data is lost for programmatic consumers.
-fn format_tool_approval_prompt(tool_name: &str, tool_input: &serde_json::Value) -> String {
+pub(crate) fn format_tool_approval_prompt(
+    tool_name: &str,
+    tool_input: &serde_json::Value,
+) -> String {
     let mut desc = format!("\u{1F527} **Tool:** `{tool_name}`\n\n");
     match tool_name {
         "Write" => {
@@ -980,6 +983,7 @@ mod tests {
             config_dir: std::path::PathBuf::from("/tmp"),
             config_path: std::path::PathBuf::from("/tmp/config.json"),
             forum_enabled: false,
+            hosts: Default::default(),
         }
     }
 

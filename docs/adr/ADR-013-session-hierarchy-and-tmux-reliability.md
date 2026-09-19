@@ -1,6 +1,6 @@
 # ADR-013: Session Hierarchy and tmux Reliability
 
-**Status:** Phase 9 in progress — GAP-8/9/10 identified via deep investigation (2026-03-18)
+**Status:** Implemented (2026-06-18; status reconciled 2026-09-19) — Phase 9 complete. Superseded in part by this document's own ROUTING-002 addendum.
 **Date:** 2026-03-18
 **Authors:** Robert, Claude
 

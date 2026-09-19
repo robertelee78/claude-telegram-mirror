@@ -17,6 +17,7 @@ mod callback_handlers;
 mod cleanup;
 mod event_loop;
 mod files;
+mod host_dispatch;
 mod reconcile;
 mod socket_handlers;
 mod telegram_handlers;
@@ -116,6 +117,13 @@ pub(super) struct PendingQuestion {
     summary_message_id: Option<i64>,
     /// ADR-015 (Codex B3): ownership arbiter between the Submit All and resolve paths.
     lifecycle: QuestionLifecycle,
+    /// ADR-016: the host-side request id (OpenCode `que_…`, Codex JSON-RPC request id)
+    /// the observer needs to deliver a Submit-All answer. `None` for Claude Code, whose
+    /// answers go over tmux.
+    host_question_id: Option<String>,
+    /// ADR-016: the host's own session/thread id, carried alongside the question id so the
+    /// observer never has to reverse-map ctm's `session_id`.
+    host_session_id: Option<String>,
 }
 
 #[derive(Clone)]
@@ -207,6 +215,15 @@ pub(super) struct DaemonState {
     // broadcast to all connected clients.
     pub(super) pending_approval_clients: Arc<RwLock<HashMap<String, String>>>,
 
+    // ADR-016: session_id -> HostKind cache, populated at SessionStart from observer
+    // metadata (never inferred). Avoids a DB round-trip on every dispatch decision.
+    pub(super) session_hosts: Arc<RwLock<HashMap<String, crate::types::HostKind>>>,
+
+    // ADR-016: session_id -> socket client_id of the host OBSERVER that owns the
+    // session, for daemon->observer delivery (`HostInject`, `QuestionResponse`).
+    // Mirrors `pending_approval_clients`; only populated for native-API hosts.
+    pub(super) session_host_clients: Arc<RwLock<HashMap<String, String>>>,
+
     // BUG-002 (no-silent-loss): content events that arrived before their
     // session's topic existed, buffered per session and flushed once the topic
     // is created (see `buffer_pending_message` / `flush_pending_for_session`).
@@ -265,6 +282,8 @@ impl Daemon {
             config: Arc::new(config),
             running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pending_approval_clients: Arc::new(RwLock::new(HashMap::new())),
+            session_hosts: Arc::new(RwLock::new(HashMap::new())),
+            session_host_clients: Arc::new(RwLock::new(HashMap::new())),
             pending_topic_msgs: Arc::new(RwLock::new(HashMap::new())),
             flush_tx,
             flush_rx: Mutex::new(Some(flush_rx)),
@@ -451,6 +470,36 @@ impl Daemon {
         self.state
             .running
             .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        // ADR-016: spawn one observer task per configured non-Claude host. Each is a
+        // client of the socket we just bound, so it must start AFTER `listen` above.
+        // Observers own their own reconnect loops; a host being down never affects the
+        // Claude Code path or the Telegram loop.
+        for kind in self.state.config.hosts.enabled() {
+            let cfg = Arc::clone(&self.state.config);
+            match kind {
+                crate::types::HostKind::OpenCode => {
+                    let oc = cfg
+                        .hosts
+                        .opencode
+                        .clone()
+                        .expect("enabled() only lists configured hosts");
+                    tracing::info!(base_url = %oc.base_url, "ADR-016: starting OpenCode observer");
+                    tokio::spawn(async move { crate::host::opencode::run(cfg, oc).await });
+                }
+                crate::types::HostKind::Codex => {
+                    let cx = cfg
+                        .hosts
+                        .codex
+                        .clone()
+                        .expect("enabled() only lists configured hosts");
+                    tracing::info!(socket = %cx.socket_path.display(), "ADR-016: starting Codex observer");
+                    tokio::spawn(async move { crate::host::codex::run(cfg, cx).await });
+                }
+                crate::types::HostKind::ClaudeCode => {} // served by hooks, never listed
+            }
+        }
+
         tracing::info!("Bridge daemon started");
         Ok(())
     }
@@ -497,7 +546,8 @@ type SocketClients = Arc<Mutex<HashMap<String, Arc<Mutex<tokio::net::unix::Owned
 // 3. session_tmux (RwLock<HashMap>)
 // 4. All other RwLocks in HandlerContext field declaration order:
 //    recent_inputs, tool_cache, compacting, pending_del,
-//    custom_titles, pending_q, topic_locks, bot_sessions
+//    custom_titles, pending_q, topic_locks, bot_sessions,
+//    session_hosts, session_host_clients (ADR-016; never held across an await)
 // 5. injector (Mutex<InputInjector>)
 // 6. socket_clients (SocketClients)
 //
@@ -538,6 +588,10 @@ struct HandlerContext {
     socket_clients: SocketClients,
     /// S-2: Maps approval_id -> client_id for targeted approval response routing.
     pending_approval_clients: Arc<RwLock<HashMap<String, String>>>,
+    /// ADR-016: session_id -> HostKind (see `DaemonState::session_hosts`).
+    session_hosts: Arc<RwLock<HashMap<String, crate::types::HostKind>>>,
+    /// ADR-016: session_id -> observer client_id (see `DaemonState::session_host_clients`).
+    session_host_clients: Arc<RwLock<HashMap<String, String>>>,
     /// BUG-002 (no-silent-loss): per-session buffer of content events awaiting
     /// topic creation. Flushed by `flush_pending_for_session`.
     pending_topic_msgs: Arc<RwLock<HashMap<String, Vec<BridgeMessage>>>>,
@@ -806,6 +860,11 @@ async fn handle_socket_message(ctx: HandlerContext, msg: BridgeMessage) {
             if ensure_session_exists(&ctx, &msg).await {
                 socket_handlers::handle_send_image(&ctx, &msg).await;
             }
+        }
+        // ADR-016: an INBOUND approval_response (observer -> daemon) means the operator
+        // answered the prompt at the terminal on a native-API host. Inform Telegram.
+        MessageType::ApprovalResponse => {
+            socket_handlers::handle_approval_resolved_elsewhere(&ctx, &msg).await;
         }
         _ => {
             tracing::debug!(msg_type = %msg.msg_type, "Unknown message type");
@@ -1247,7 +1306,7 @@ async fn broadcast_to_clients(clients: &SocketClients, message: &BridgeMessage) 
     };
     let line = format!("{json}\n");
     let guard = clients.lock().await;
-    for (_id, writer) in guard.iter() {
+    for writer in guard.values() {
         let mut w = writer.lock().await;
         let _ = w.write_all(line.as_bytes()).await;
     }

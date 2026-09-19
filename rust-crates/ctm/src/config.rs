@@ -74,6 +74,67 @@ pub const DEFAULT_APPROVAL_WAIT_SECS: u32 = 300;
 /// hook timeout, so Claude Code does not cancel the hook before its own wait completes.
 pub const APPROVAL_HOOK_TIMEOUT_BUFFER_SECS: u32 = 10;
 
+/// ADR-016: OpenCode host settings.
+///
+/// `base_url` MUST be an explicit loopback URL with the port the operator launched
+/// `opencode --port N` on — there is no port-discovery mechanism (spike-verified) and
+/// the default `--port 0` is random. The server password is read from the environment
+/// variable named by `password_env` at connect time and is never stored in config.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenCodeHostConfig {
+    pub base_url: String,
+    pub password_env: String,
+}
+
+impl Default for OpenCodeHostConfig {
+    fn default() -> Self {
+        Self {
+            base_url: "http://127.0.0.1:4096".into(),
+            password_env: "OPENCODE_SERVER_PASSWORD".into(),
+        }
+    }
+}
+
+/// ADR-016: Codex host settings. The app-server control socket is created by
+/// `codex app-server daemon start` (mode 0600); a plain `codex` TUI never joins it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodexHostConfig {
+    pub socket_path: PathBuf,
+}
+
+impl Default for CodexHostConfig {
+    fn default() -> Self {
+        Self {
+            socket_path: home_dir()
+                .join(".codex")
+                .join("app-server-control")
+                .join("app-server-control.sock"),
+        }
+    }
+}
+
+/// ADR-016: which non-Claude hosts the daemon should run observers for. Claude Code
+/// needs no entry — it is served by hooks, not an observer.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HostsConfig {
+    pub opencode: Option<OpenCodeHostConfig>,
+    pub codex: Option<CodexHostConfig>,
+}
+
+impl HostsConfig {
+    /// Hosts with an observer to spawn, in a stable order.
+    pub fn enabled(&self) -> Vec<crate::types::HostKind> {
+        let mut v = Vec::new();
+        if self.opencode.is_some() {
+            v.push(crate::types::HostKind::OpenCode);
+        }
+        if self.codex.is_some() {
+            v.push(crate::types::HostKind::Codex);
+        }
+        v
+    }
+}
+
 /// CTM configuration loaded from env vars > config file > defaults
 #[derive(Clone)]
 pub struct Config {
@@ -101,6 +162,8 @@ pub struct Config {
     /// Whether forum (topics) mode is enabled (default: false)
     #[allow(dead_code)] // Library API
     pub forum_enabled: bool,
+    /// ADR-016: non-Claude hosts to observe.
+    pub hosts: HostsConfig,
 }
 
 /// S-4: Manual Debug impl that redacts bot_token to prevent accidental log exposure.
@@ -133,6 +196,7 @@ impl fmt::Debug for Config {
             .field("config_dir", &self.config_dir)
             .field("config_path", &self.config_path)
             .field("forum_enabled", &self.forum_enabled)
+            .field("hosts", &self.hosts)
             .finish()
     }
 }
@@ -176,6 +240,33 @@ struct ConfigFile {
         alias = "inactivity_delete_threshold_minutes"
     )]
     inactivity_delete_threshold_minutes: Option<u32>,
+    #[serde(alias = "socketPath", alias = "socket_path")]
+    socket_path: Option<String>,
+    /// ADR-016: `"hosts": {"opencode": {"baseUrl": ..}, "codex": {"socketPath": ..}}`.
+    /// An empty object `{}` enables a host with defaults.
+    #[serde(alias = "hosts")]
+    hosts: Option<HostsFile>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+struct HostsFile {
+    opencode: Option<OpenCodeHostFile>,
+    codex: Option<CodexHostFile>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+struct OpenCodeHostFile {
+    #[serde(alias = "baseUrl", alias = "base_url")]
+    base_url: Option<String>,
+    #[serde(alias = "passwordEnv", alias = "password_env")]
+    password_env: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+struct CodexHostFile {
     #[serde(alias = "socketPath", alias = "socket_path")]
     socket_path: Option<String>,
 }
@@ -402,6 +493,41 @@ pub fn load_config(require_auth: bool) -> Result<Config> {
         }
     }
 
+    // ADR-016: hosts. Env vars enable/override each host independently:
+    //   CTM_OPENCODE_URL=http://127.0.0.1:4096   (presence enables the OpenCode observer)
+    //   CTM_CODEX_SOCKET=/path/to/app-server-control.sock (presence enables Codex)
+    // The config-file form is `"hosts": {"opencode": {...}, "codex": {...}}`.
+    let hosts_file = file_config.hosts.unwrap_or_default();
+    let opencode = match (std::env::var("CTM_OPENCODE_URL").ok(), hosts_file.opencode) {
+        (None, None) => None,
+        (env_url, file) => {
+            let file = file.unwrap_or_default();
+            let mut h = OpenCodeHostConfig::default();
+            if let Some(u) = env_url.or(file.base_url) {
+                h.base_url = u.trim_end_matches('/').to_string();
+            }
+            if let Some(p) = std::env::var("CTM_OPENCODE_PASSWORD_ENV")
+                .ok()
+                .or(file.password_env)
+            {
+                h.password_env = p;
+            }
+            Some(h)
+        }
+    };
+    let codex = match (std::env::var("CTM_CODEX_SOCKET").ok(), hosts_file.codex) {
+        (None, None) => None,
+        (env_sock, file) => {
+            let file = file.unwrap_or_default();
+            let mut h = CodexHostConfig::default();
+            if let Some(s) = env_sock.or(file.socket_path) {
+                h.socket_path = PathBuf::from(s);
+            }
+            Some(h)
+        }
+    };
+    let hosts = HostsConfig { opencode, codex };
+
     Ok(Config {
         bot_token,
         chat_id,
@@ -420,6 +546,7 @@ pub fn load_config(require_auth: bool) -> Result<Config> {
         config_dir,
         config_path,
         forum_enabled: false,
+        hosts,
     })
 }
 

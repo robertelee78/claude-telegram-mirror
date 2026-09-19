@@ -1090,6 +1090,7 @@ mod tests {
             config_dir: PathBuf::from("/tmp"),
             config_path: PathBuf::from("/tmp/config.json"),
             forum_enabled: false,
+            hosts: Default::default(),
         }
     }
 

@@ -36,6 +36,10 @@ pub(super) async fn handle_session_start(ctx: &HandlerContext, msg: &BridgeMessa
         let pd = project_dir.map(|s| s.to_string());
         let tt = tmux_target.map(|s| s.to_string());
         let ts = tmux_socket.map(|s| s.to_string());
+        // ADR-016: host kind + host session id ride in the same closure as the insert,
+        // so they are set at insert time on the same connection — never inferred later.
+        let host_kind = meta.host_kind();
+        let hsid = meta.host_session_id().map(|s| s.to_string());
         ctx.db_op(move |sess| {
             let _ = sess.create_session(
                 &sid,
@@ -46,9 +50,15 @@ pub(super) async fn handle_session_start(ctx: &HandlerContext, msg: &BridgeMessa
                 tt.as_deref(),
                 ts.as_deref(),
             );
+            if host_kind.uses_native_api() {
+                let _ = sess.set_host_kind(&sid, host_kind, hsid.as_deref());
+            }
         })
         .await;
     }
+
+    // ADR-016: cache the host kind and remember the observer client for delivery.
+    host_dispatch::record_session_host(ctx, msg).await;
 
     // Cache tmux target
     if let Some(target) = tmux_target {
@@ -387,6 +397,10 @@ pub(super) async fn handle_session_end(ctx: &HandlerContext, msg: &BridgeMessage
         return;
     }
 
+    // ADR-016: drop the host-kind cache and observer binding for this session. A resumed
+    // session re-announces both on its next `session_start`.
+    host_dispatch::forget_session_host(ctx, &msg.session_id).await;
+
     let sid = msg.session_id.clone();
     let session_opt = ctx
         .db_op(move |sess| sess.get_session(&sid).ok().flatten())
@@ -595,7 +609,7 @@ pub(super) async fn handle_agent_response(ctx: &HandlerContext, msg: &BridgeMess
     } else {
         // ADR-013 GAP-3: Prefix child session messages with agent label
         let content = if let Some(prefix) = get_child_prefix(ctx, &msg.session_id).await {
-            format!("{}{}", prefix, &msg.content)
+            format!("{}{}", prefix, msg.content)
         } else {
             msg.content.clone()
         };
@@ -714,6 +728,77 @@ pub(super) async fn handle_tool_start(ctx: &HandlerContext, msg: &BridgeMessage)
             )
             .await;
     }
+}
+
+/// ADR-016: the operator answered an approval at the terminal of a native-API host
+/// (OpenCode `permission.replied`, Codex `serverRequest/resolved`), and the observer
+/// relayed it. This is the "other surface is informed" half of the both-surfaces
+/// invariant: resolve the oldest pending approval for the session and rewrite its
+/// Telegram message into the same static audit line the Telegram-tap path produces
+/// (ADR-014 B3), so no live keyboard is left pointing at a decided request.
+///
+/// Oldest-first matches the observer's own FIFO (`host::link::ApprovalFifo`); both
+/// native hosts block on one approval at a time per session, so FIFO order is host
+/// order. `content` carries the host's reply word (`once`/`always`/`reject`/…) for the
+/// audit line; it is display-only and never re-sent to the host.
+pub(super) async fn handle_approval_resolved_elsewhere(ctx: &HandlerContext, msg: &BridgeMessage) {
+    let sid = msg.session_id.clone();
+    // get_pending_approvals is ordered created_at DESC — oldest is last.
+    let oldest = ctx
+        .db_op(move |sess| {
+            sess.get_pending_approvals(&sid)
+                .ok()
+                .and_then(|v| v.into_iter().last())
+        })
+        .await;
+    let Some(approval) = oldest else {
+        tracing::info!(
+            session_id = %msg.session_id,
+            "ADR-016: terminal-resolved approval had no pending Telegram counterpart (already handled)"
+        );
+        return;
+    };
+
+    let reply = msg.content.trim().to_string();
+    let rejected = matches!(
+        reply.as_str(),
+        "reject" | "rejected" | "deny" | "denied" | "cancel"
+    );
+    let status = if rejected {
+        crate::types::ApprovalStatus::Rejected
+    } else {
+        crate::types::ApprovalStatus::Approved
+    };
+    let changed = {
+        let aid = approval.id.clone();
+        ctx.db_op(move |sess| sess.resolve_approval(&aid, status).unwrap_or(false))
+            .await
+    };
+    ctx.pending_approval_clients
+        .write()
+        .await
+        .remove(&approval.id);
+    if !changed {
+        return; // a Telegram tap won the race and already resolved + edited it
+    }
+
+    if let Some(mid) = approval.message_id {
+        let icon = if rejected { "\u{274C}" } else { "\u{2705}" };
+        let time = chrono::Local::now().format("%H:%M");
+        let what = if reply.is_empty() {
+            String::new()
+        } else {
+            format!(" ({reply})")
+        };
+        let line = format!("{icon} Answered at terminal{what} \u{00B7} {time}");
+        let _ = ctx.bot.edit_message_text_no_markup(mid, &line).await;
+    }
+    tracing::info!(
+        session_id = %msg.session_id,
+        approval_id = %approval.id,
+        reply,
+        "ADR-016: approval resolved at terminal — Telegram keyboard retired"
+    );
 }
 
 /// Handler 5: tool_result
@@ -1209,6 +1294,8 @@ pub(super) async fn handle_ask_user_question(ctx: &HandlerContext, msg: &BridgeM
         question_message_ids: Vec::new(),
         summary_message_id: None,
         lifecycle: QuestionLifecycle::Active,
+        host_question_id: msg.meta().question_id().map(str::to_string),
+        host_session_id: msg.meta().host_session_id().map(str::to_string),
     }));
     let old_entry = {
         let mut pq = ctx.pending_q.write().await;

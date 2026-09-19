@@ -1,6 +1,6 @@
 # ADR-015: Restore AskUserQuestion to the Bidirectional Mirror (Supersede ADR-014 PR-E)
 
-**Status:** accepted — empirical spike (2026-05-31) resolved the two load-bearing unknowns; single-user invariant simplifies the race handling. Implementation in progress on `master`.
+**Status:** Implemented — shipped 0.2.20 → 0.2.22 (2026-05-31 → 2026-06-01), current as of 0.2.27; status reconciled 2026-09-19 (was "implementation in progress"). The empirical spike (2026-05-31) resolved the two load-bearing unknowns, and the single-user invariant simplified race handling. Verified in source: `parse_widget` (`daemon/callback_handlers.rs:133`) and `capture_pane` readiness polling (`:2036`) replaced the blind 2000ms sleep.
 **Date:** 2026-05-31
 **Authors:** Robert, Claude
 **Tags:** askuserquestion, tmux-injection, bidirectional-mirror, regression, supersedes-adr-014-pr-e

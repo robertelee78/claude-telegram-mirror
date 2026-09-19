@@ -666,6 +666,174 @@ fn check_pid_file(fix: bool) -> CheckResult {
     }
 }
 
+/// ADR-016: verify each configured non-Claude host is reachable and safely set up.
+///
+/// Every condition below is one an executed spike showed to be a silent failure mode:
+/// - OpenCode: no port discovery exists, so an unreachable `base_url` means the
+///   observer connects to nothing; an unset server password leaves `/pty` and
+///   `/session/{id}/shell` open to any local process (hard failure); `--mini` renders
+///   nothing (cannot be probed remotely — surfaced as guidance).
+/// - Codex: a plain `codex` TUI never joins the app-server daemon, so a missing control
+///   socket means every Codex session is invisible to ctm.
+async fn check_hosts() -> CheckResult {
+    let cfg = match crate::config::load_config(false) {
+        Ok(c) => c,
+        Err(e) => return CheckResult::warn("Hosts", &format!("Config not loadable: {e}")),
+    };
+    let enabled = cfg.hosts.enabled();
+    if enabled.is_empty() {
+        return CheckResult::pass(
+            "Hosts",
+            "Claude Code only (no OpenCode/Codex observers configured)",
+        )
+        .with_details(
+            "Enable with `hosts` in config.json, or CTM_OPENCODE_URL / CTM_CODEX_SOCKET",
+        );
+    }
+
+    let mut lines = Vec::new();
+    let mut worst = CheckStatus::Pass;
+    let escalate = |s: CheckStatus, worst: &mut CheckStatus| {
+        if matches!(s, CheckStatus::Fail)
+            || (matches!(s, CheckStatus::Warn) && matches!(*worst, CheckStatus::Pass))
+        {
+            *worst = s;
+        }
+    };
+
+    for kind in &enabled {
+        let caps = crate::host::HostCaps::for_host(*kind);
+        let q = match caps.structured_questions {
+            crate::host::StructuredQuestions::Native => "native",
+            crate::host::StructuredQuestions::NativePlanModeOnly => "native (plan mode only)",
+            crate::host::StructuredQuestions::ViaTuiScrape => "via TUI",
+        };
+        match kind {
+            crate::types::HostKind::OpenCode => {
+                let oc = cfg.hosts.opencode.clone().unwrap_or_default();
+                let pw = std::env::var(&oc.password_env)
+                    .ok()
+                    .filter(|p| !p.is_empty());
+                if pw.is_none() {
+                    escalate(CheckStatus::Fail, &mut worst);
+                    lines.push(format!(
+                        "OpenCode: {} is not set — the server would be UNAUTHENTICATED while exposing /pty and /session/{{id}}/shell. Export it before starting `opencode --port N`.",
+                        oc.password_env
+                    ));
+                }
+                let client = reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(4))
+                    .build();
+                let reach = match client {
+                    Ok(c) => {
+                        let mut rb = c.get(format!(
+                            "{}/global/health",
+                            oc.base_url.trim_end_matches('/')
+                        ));
+                        if let Some(p) = &pw {
+                            rb = rb.basic_auth("opencode", Some(p));
+                        }
+                        rb.send().await
+                    }
+                    Err(e) => Err(e),
+                };
+                match reach {
+                    Ok(r) if r.status().is_success() => {
+                        let version = r
+                            .json::<serde_json::Value>()
+                            .await
+                            .ok()
+                            .and_then(|v| {
+                                v.get("version").and_then(|x| x.as_str()).map(String::from)
+                            })
+                            .unwrap_or_else(|| "unknown".into());
+                        lines.push(format!(
+                            "OpenCode: reachable at {} (server {version}); questions {q}; steer {}; always-allow {}. Use the FULL TUI — `attach --mini` renders nothing from the API.",
+                            oc.base_url,
+                            caps.steer,
+                            caps.always_decision
+                        ));
+                    }
+                    Ok(r) if r.status() == reqwest::StatusCode::UNAUTHORIZED => {
+                        escalate(CheckStatus::Fail, &mut worst);
+                        lines.push(format!(
+                            "OpenCode: {} rejected the password (401) — check {}",
+                            oc.base_url, oc.password_env
+                        ));
+                    }
+                    Ok(r) => {
+                        escalate(CheckStatus::Warn, &mut worst);
+                        lines.push(format!(
+                            "OpenCode: {} answered {} to /global/health",
+                            oc.base_url,
+                            r.status()
+                        ));
+                    }
+                    Err(e) => {
+                        escalate(CheckStatus::Fail, &mut worst);
+                        lines.push(format!(
+                            "OpenCode: {} unreachable ({e}). There is no port discovery — start `opencode --port <N>` with the port from config.",
+                            oc.base_url
+                        ));
+                    }
+                }
+            }
+            crate::types::HostKind::Codex => {
+                let cx = cfg.hosts.codex.clone().unwrap_or_default();
+                match std::fs::symlink_metadata(&cx.socket_path) {
+                    Ok(m) if std::os::unix::fs::FileTypeExt::is_socket(&m.file_type()) => {
+                        let mode =
+                            std::os::unix::fs::PermissionsExt::mode(&m.permissions()) & 0o777;
+                        if mode & 0o077 != 0 {
+                            escalate(CheckStatus::Warn, &mut worst);
+                            lines.push(format!(
+                                "Codex: control socket is mode {mode:o}; expected 0600"
+                            ));
+                        }
+                        lines.push(format!(
+                            "Codex: app-server socket present at {}; questions {q}; steer {}; image injection {}. Sessions must run as `codex --remote unix://<socket>` — a plain `codex` TUI never joins the daemon.",
+                            cx.socket_path.display(),
+                            caps.steer,
+                            caps.inject_images
+                        ));
+                    }
+                    Ok(_) => {
+                        escalate(CheckStatus::Fail, &mut worst);
+                        lines.push(format!(
+                            "Codex: {} exists but is not a socket",
+                            cx.socket_path.display()
+                        ));
+                    }
+                    Err(_) => {
+                        escalate(CheckStatus::Fail, &mut worst);
+                        lines.push(format!(
+                            "Codex: no app-server socket at {} — run `codex app-server daemon start`, then start sessions with `codex --remote unix://{}`",
+                            cx.socket_path.display(),
+                            cx.socket_path.display()
+                        ));
+                    }
+                }
+            }
+            crate::types::HostKind::ClaudeCode => {}
+        }
+    }
+
+    let summary = format!(
+        "{} configured",
+        enabled
+            .iter()
+            .map(|k| k.label())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let details = lines.join("\n");
+    match worst {
+        CheckStatus::Pass => CheckResult::pass("Hosts", &summary).with_details(&details),
+        CheckStatus::Warn => CheckResult::warn("Hosts", &summary).with_details(&details),
+        CheckStatus::Fail => CheckResult::fail("Hosts", &summary).with_details(&details),
+    }
+}
+
 /// STALE-TOPICS: reconcile Telegram forum topics against live tmux/Claude state.
 ///
 /// Mirrors the daemon's `daemon::reconcile` sweep but runs as a one-shot from the CLI,
@@ -896,67 +1064,73 @@ pub async fn run_doctor(fix: bool) -> anyhow::Result<()> {
 
     // [1/9] Binary
     let c = check_binary_version();
-    print!("[1/11] ");
+    print!("[1/12] ");
     print_result(&c);
     checks.push(c);
 
     // [2/9] Config directory
     let c = check_config_dir(fix);
-    print!("[2/11] ");
+    print!("[2/12] ");
     print_result(&c);
     checks.push(c);
 
     // [3/9] Configuration (env vars / config file)
     let c = check_env_vars();
-    print!("[3/11] ");
+    print!("[3/12] ");
     print_result(&c);
     checks.push(c);
 
     // [4/9] Hooks
     let c = check_hooks(fix);
-    print!("[4/11] ");
+    print!("[4/12] ");
     print_result(&c);
     checks.push(c);
 
     // [5/9] PID file
     let c = check_pid_file(fix);
-    print!("[5/11] ");
+    print!("[5/12] ");
     print_result(&c);
     checks.push(c);
 
     // [6/9] Socket
     let c = check_socket(fix);
-    print!("[6/11] ");
+    print!("[6/12] ");
     print_result(&c);
     checks.push(c);
 
     // [7/11] Tmux
     let c = check_tmux();
-    print!("[7/11] ");
+    print!("[7/12] ");
     print_result(&c);
     checks.push(c);
 
     // [8/11] Service
     let c = check_service();
-    print!("[8/11] ");
+    print!("[8/12] ");
     print_result(&c);
     checks.push(c);
 
     // [9/11] Telegram API
     let c = check_telegram().await;
-    print!("[9/11] ");
+    print!("[9/12] ");
     print_result(&c);
     checks.push(c);
 
     // [10/11] Database
     let c = check_database();
-    print!("[10/11] ");
+    print!("[10/12] ");
     print_result(&c);
     checks.push(c);
 
-    // [11/11] Stale topics (liveness-driven reconciliation)
+    // [11/12] Stale topics (liveness-driven reconciliation)
     let c = check_stale_topics(fix).await;
-    print!("[11/11] ");
+    print!("[11/12] ");
+    print_result(&c);
+    checks.push(c);
+
+    // [12/12] ADR-016: non-Claude hosts (OpenCode / Codex observers)
+    let c = check_hosts().await;
+    print!("[12/12] ");
     print_result(&c);
     checks.push(c);
 

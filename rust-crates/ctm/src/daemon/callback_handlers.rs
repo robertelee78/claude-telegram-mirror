@@ -266,6 +266,13 @@ async fn handle_confirm_abort_callback(ctx: &HandlerContext, session_id: &str, c
     };
 
     if aborted {
+        // ADR-016: native-API hosts get an abort over the observer instead of Ctrl-C.
+        if host_dispatch::session_host_kind(ctx, session_id)
+            .await
+            .uses_native_api()
+        {
+            let _ = host_dispatch::host_inject(ctx, session_id, "abort", "").await;
+        }
         // Send Ctrl-C via tmux to interrupt the running process
         let tmux_target = ctx.session_tmux.read().await.get(session_id).cloned();
         if let Some(target) = tmux_target {
@@ -1459,6 +1466,10 @@ async fn handle_submitall_callback(ctx: &HandlerContext, data: &str, cb: &Callba
     // missing target never strands a half-finalized entry. (Lock ordering: session_tmux
     // is acquired before the per-entry pending_q mutex.)
     let tmux_target = ctx.session_tmux.read().await.get(&full_key).cloned();
+    // ADR-016: native-API hosts have no tmux target; their answers go to the observer.
+    let native_host = host_dispatch::session_host_kind(ctx, &full_key)
+        .await
+        .uses_native_api();
 
     // Phase 2: under the per-entry mutex, arbitrate ownership (Codex B3) and extract the
     // answers. We transition Active→Submitting ONLY when delivery can actually proceed
@@ -1482,6 +1493,9 @@ async fn handle_submitall_callback(ctx: &HandlerContext, data: &str, cb: &Callba
             session_id: String,
             question_message_ids: Vec<i64>,
             summary_message_id: Option<i64>,
+            /// ADR-016: `(host_question_id, host_session_id, answers-as-labels)` when the
+            /// session belongs to a native-API host; `None` for Claude Code (tmux path).
+            native: Option<(String, Option<String>, serde_json::Value)>,
         },
     }
     let outcome = {
@@ -1491,8 +1505,13 @@ async fn handle_submitall_callback(ctx: &HandlerContext, data: &str, cb: &Callba
             SubmitAllOutcome::AlreadySubmitting
         } else if pending.lifecycle == QuestionLifecycle::Resolved {
             SubmitAllOutcome::AlreadyResolved
-        } else if tmux_target.is_none() {
+        } else if tmux_target.is_none() && !native_host {
             // Codex B1: leave the entry Active (do NOT finalize / set Submitting / remove).
+            SubmitAllOutcome::NoTmux
+        } else if native_host && pending.host_question_id.is_none() {
+            // ADR-016: a native host question without a host request id cannot be
+            // delivered anywhere — treat exactly like a missing tmux target (stay Active).
+            tracing::warn!(session_id = %full_key, "ADR-016: native host question has no host_question_id");
             SubmitAllOutcome::NoTmux
         } else {
             // ADR-015 v4: collect + VALIDATE all answers BEFORE claiming ownership. On any
@@ -1506,11 +1525,24 @@ async fn handle_submitall_callback(ctx: &HandlerContext, data: &str, cb: &Callba
                     // Submitting).
                     pending.lifecycle = QuestionLifecycle::Submitting;
 
+                    let native = if native_host {
+                        pending.host_question_id.as_ref().map(|qid| {
+                            (
+                                qid.clone(),
+                                pending.host_session_id.clone(),
+                                answers_to_labels(&pending.questions, &answers),
+                            )
+                        })
+                    } else {
+                        None
+                    };
+
                     SubmitAllOutcome::Proceed {
                         answers,
                         session_id: pending.session_id.clone(),
                         question_message_ids: pending.question_message_ids.clone(),
                         summary_message_id: pending.summary_message_id,
+                        native,
                     }
                 }
             }
@@ -1518,7 +1550,7 @@ async fn handle_submitall_callback(ctx: &HandlerContext, data: &str, cb: &Callba
         // per-entry Mutex drops here
     };
 
-    let (answers, session_id, question_message_ids, summary_message_id) = match outcome {
+    let (answers, session_id, question_message_ids, summary_message_id, native) = match outcome {
         SubmitAllOutcome::AlreadySubmitting => {
             let _ = ctx
                 .bot
@@ -1564,36 +1596,57 @@ async fn handle_submitall_callback(ctx: &HandlerContext, data: &str, cb: &Callba
             session_id,
             question_message_ids,
             summary_message_id,
+            native,
         } => (
             answers,
             session_id,
             question_message_ids,
             summary_message_id,
+            native,
         ),
     };
-    let target = tmux_target.expect("tmux_target checked present under the entry mutex");
-
     let _ = ctx
         .bot
         .answer_callback_query(&cb.id, Some("Submitting..."), false)
         .await;
 
-    let sid = session_id.clone();
-    let socket = ctx
-        .db_op(move |sess| {
-            sess.get_session(&sid)
-                .ok()
-                .flatten()
-                .and_then(|s| s.tmux_socket)
-        })
-        .await;
+    let outcome = if let Some((qid, hsid, label_answers)) = native {
+        // ADR-016: native-API host. Deliver the labels to the observer and treat the write
+        // as the whole delivery. There is no `FailedDirty` on this path — a single POST/RPC
+        // either reached the observer or it did not, and a late duplicate is harmless on
+        // both hosts (silently dropped / 404, verified by spike).
+        if host_dispatch::host_answer_question(
+            ctx,
+            &session_id,
+            &qid,
+            hsid.as_deref(),
+            label_answers,
+        )
+        .await
+        {
+            InjectOutcome::Success
+        } else {
+            InjectOutcome::FailedClean
+        }
+    } else {
+        let target = tmux_target.expect("tmux_target checked present under the entry mutex");
+        let sid = session_id.clone();
+        let socket = ctx
+            .db_op(move |sess| {
+                sess.get_session(&sid)
+                    .ok()
+                    .flatten()
+                    .and_then(|s| s.tmux_socket)
+            })
+            .await;
 
-    // ADR-015 v4: drive the answers into Claude's native CLI widget via tmux. The typed
-    // outcome decides recovery: only `Success` finalizes ("Submitted", remove entry);
-    // `FailedClean` (nothing landed) safely restores Active for retry; `FailedDirty`
-    // (≥1 keystroke landed → live widget partially advanced) terminalizes WITHOUT retry —
-    // a blind re-drive from Q0 would corrupt the half-advanced widget.
-    let outcome = inject_answers(ctx, &target, socket.as_deref(), &answers).await;
+        // ADR-015 v4: drive the answers into Claude's native CLI widget via tmux. The typed
+        // outcome decides recovery: only `Success` finalizes ("Submitted", remove entry);
+        // `FailedClean` (nothing landed) safely restores Active for retry; `FailedDirty`
+        // (≥1 keystroke landed → live widget partially advanced) terminalizes WITHOUT retry —
+        // a blind re-drive from Q0 would corrupt the half-advanced widget.
+        inject_answers(ctx, &target, socket.as_deref(), &answers).await
+    };
 
     match outcome {
         InjectOutcome::FailedClean => {
@@ -1916,6 +1969,35 @@ struct InjItem {
     /// auto-advances on commit; multi-select must navigate to the `Next`/`Submit` row).
     multi_select: bool,
     answer: CollectedAnswer,
+}
+
+/// ADR-016: render collected answers as option LABELS (or free text), one array per
+/// question in question order — the shape both native hosts accept. Indices are already
+/// bounds-checked by `collect_and_validate_answers`, so `get` cannot fail here; the
+/// `unwrap_or_default` is defensive, not a silent-drop path.
+fn answers_to_labels(questions: &[QuestionDef], answers: &[InjItem]) -> serde_json::Value {
+    let per_q: Vec<serde_json::Value> = answers
+        .iter()
+        .map(|it| {
+            let opts = questions
+                .get(it.q_idx)
+                .map(|q| q.options.as_slice())
+                .unwrap_or(&[]);
+            let labels: Vec<String> = match &it.answer {
+                CollectedAnswer::Single(i) => opts
+                    .get(*i)
+                    .map(|o| vec![o.label.clone()])
+                    .unwrap_or_default(),
+                CollectedAnswer::Multi(is) => is
+                    .iter()
+                    .filter_map(|i| opts.get(*i).map(|o| o.label.clone()))
+                    .collect(),
+                CollectedAnswer::FreeText(s) => vec![s.clone()],
+            };
+            serde_json::Value::Array(labels.into_iter().map(serde_json::Value::String).collect())
+        })
+        .collect();
+    serde_json::Value::Array(per_q)
 }
 
 /// ADR-015 v4: collect + validate the tentative answers for ALL questions into injection
