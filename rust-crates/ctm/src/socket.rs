@@ -241,7 +241,7 @@ impl SocketServer {
         let json = serde_json::to_string(message)?;
         let line = format!("{json}\n");
         let clients = self.clients.lock().await;
-        for (_id, writer) in clients.iter() {
+        for writer in clients.values() {
             let mut w = writer.lock().await;
             let _ = w.write_all(line.as_bytes()).await;
         }

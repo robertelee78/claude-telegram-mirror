@@ -334,37 +334,37 @@ impl Translator {
                             out.push(self.msg(MessageType::ToolStart, sid, "", meta));
                         }
                     }
-                    "completed" | "error" => {
-                        if self.tool_finished.insert(call_id.into()) {
-                            // A tool can complete without ctm ever seeing `running`
-                            // (reconnect mid-call); emit the start so Telegram has context.
-                            if self.tool_started.insert(call_id.into()) {
-                                let mut meta = Map::new();
-                                meta.insert("tool".into(), Value::String(tool.clone()));
-                                meta.insert("input".into(), input.clone());
-                                meta.insert("toolUseId".into(), Value::String(call_id.into()));
-                                out.push(self.msg(MessageType::ToolStart, sid, "", meta));
-                            }
-                            let content = if status == "error" {
-                                format!(
-                                    "error: {}",
-                                    state.get("error").and_then(Value::as_str).unwrap_or("")
-                                )
-                            } else {
-                                state
-                                    .get("output")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("")
-                                    .to_string()
-                            };
+                    // Guard-side insert(): runs only when the pattern matches, so a repeated
+                    // completed/error update for the same callID is deduped exactly once.
+                    "completed" | "error" if self.tool_finished.insert(call_id.into()) => {
+                        // A tool can complete without ctm ever seeing `running`
+                        // (reconnect mid-call); emit the start so Telegram has context.
+                        if self.tool_started.insert(call_id.into()) {
                             let mut meta = Map::new();
-                            meta.insert("tool".into(), Value::String(tool));
-                            meta.insert("input".into(), input);
+                            meta.insert("tool".into(), Value::String(tool.clone()));
+                            meta.insert("input".into(), input.clone());
                             meta.insert("toolUseId".into(), Value::String(call_id.into()));
-                            out.push(self.msg(MessageType::ToolResult, sid, content, meta));
+                            out.push(self.msg(MessageType::ToolStart, sid, "", meta));
                         }
+                        let content = if status == "error" {
+                            format!(
+                                "error: {}",
+                                state.get("error").and_then(Value::as_str).unwrap_or("")
+                            )
+                        } else {
+                            state
+                                .get("output")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string()
+                        };
+                        let mut meta = Map::new();
+                        meta.insert("tool".into(), Value::String(tool));
+                        meta.insert("input".into(), input);
+                        meta.insert("toolUseId".into(), Value::String(call_id.into()));
+                        out.push(self.msg(MessageType::ToolResult, sid, content, meta));
                     }
-                    _ => {} // pending: input not yet known
+                    _ => {} // pending: input not yet known; or an already-finished callID
                 }
             }
             _ => {} // step-start / step-finish / patch / reasoning: not mirrored

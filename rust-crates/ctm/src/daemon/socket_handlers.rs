@@ -609,7 +609,7 @@ pub(super) async fn handle_agent_response(ctx: &HandlerContext, msg: &BridgeMess
     } else {
         // ADR-013 GAP-3: Prefix child session messages with agent label
         let content = if let Some(prefix) = get_child_prefix(ctx, &msg.session_id).await {
-            format!("{}{}", prefix, &msg.content)
+            format!("{}{}", prefix, msg.content)
         } else {
             msg.content.clone()
         };

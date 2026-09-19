@@ -1306,7 +1306,7 @@ async fn broadcast_to_clients(clients: &SocketClients, message: &BridgeMessage) 
     };
     let line = format!("{json}\n");
     let guard = clients.lock().await;
-    for (_id, writer) in guard.iter() {
+    for writer in guard.values() {
         let mut w = writer.lock().await;
         let _ = w.write_all(line.as_bytes()).await;
     }

@@ -456,9 +456,10 @@ pub fn is_valid_approval_status(s: &str) -> bool {
 ///
 /// The daemon dispatches on this at exactly three points — user-text injection,
 /// Submit-All delivery, and session insert — and nowhere else (ADR-016 Decision).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum HostKind {
+    #[default]
     ClaudeCode,
     OpenCode,
     Codex,
@@ -486,12 +487,6 @@ impl HostKind {
     /// a host observer, rather than tmux keystrokes (ADR-004 amended by ADR-016).
     pub fn uses_native_api(&self) -> bool {
         !matches!(self, Self::ClaudeCode)
-    }
-}
-
-impl Default for HostKind {
-    fn default() -> Self {
-        Self::ClaudeCode
     }
 }
 
