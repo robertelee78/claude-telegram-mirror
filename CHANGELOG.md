@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.41] - 2026-09-20
+
+### Fixed (a machine reported "is current" minutes after a new release was published)
+- **`ctm update` can no longer be answered from a cache.** The `releases/latest/download/…` record URL is a redirect whose target moves with every release, so an intermediary that caches it serves the previous version indefinitely. GitHub marks that redirect `no-cache` and ctm already sent `Cache-Control: no-cache`, but a proxy is free to ignore both; the URL now carries a unique timestamp (which GitHub ignores) so it is uncacheable by construction, and the request also sends `no-store` and `Pragma`.
+- **"is current" now names what it compared against** — `ctm 0.2.41 is current (newest published release: 0.2.41)`. Previously an up-to-date install and a stale lookup printed the same sentence.
+
 ## [0.2.40] - 2026-09-20
 
 ### Fixed (reported from a Linux box: "Reply failed — the Codex observer is not connected")

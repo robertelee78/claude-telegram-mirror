@@ -176,7 +176,19 @@ fn sha256_file(path: &Path) -> Result<([u8; 32], u64)> {
 // ---------------------------------------------------------------------------- network
 
 fn record_url(target: &str) -> String {
-    format!("https://github.com/{REPO}/releases/latest/download/stable-{target}.json")
+    // The `latest/download` path is a redirect whose target moves with each release, so
+    // a cache that keeps it serves an old version forever. GitHub marks the redirect
+    // `no-cache`, but an intermediary that ignores that header has been seen to answer
+    // with the previous release ("ctm 0.2.39 is current" the same minute 0.2.40 was
+    // published, on a machine whose network differed only in its proxy). A unique query
+    // string makes the URL uncacheable by construction; GitHub ignores the parameter.
+    format!(
+        "https://github.com/{REPO}/releases/latest/download/stable-{target}.json?ts={}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    )
 }
 
 fn asset_url(version: &str, target: &str) -> String {
@@ -201,7 +213,8 @@ async fn fetch_record(target: &str) -> Result<(Version, ReleaseRecord, Expectati
     let resp = client
         .get(record_url(target))
         .header("Accept-Encoding", "identity")
-        .header("Cache-Control", "no-cache")
+        .header("Cache-Control", "no-cache, no-store, max-age=0")
+        .header("Pragma", "no-cache")
         .send()
         .await?;
     if !allowed_origin(resp.url()) {
@@ -421,7 +434,9 @@ pub async fn run_update(check_only: bool, do_rollback: bool) -> anyhow::Result<(
     };
 
     if migrating_from.is_none() && latest <= current {
-        println!("ctm {current} is current");
+        // Name what was compared against: "is current" used to be indistinguishable
+        // from "the lookup returned something stale".
+        println!("ctm {current} is current (newest published release: {latest})");
         return Ok(());
     }
     if check_only {
@@ -625,9 +640,22 @@ mod tests {
     }
 
     #[test]
+    fn the_record_url_is_uncacheable() {
+        // A cached `latest/download` redirect serves the previous release forever,
+        // which is how one machine reported "is current" minutes after a new release.
+        let a = record_url("x86_64-unknown-linux-gnu");
+        assert!(a.contains("?ts="), "{a}");
+        let ts: u64 = a.split("?ts=").nth(1).unwrap().parse().unwrap();
+        assert!(ts > 1_700_000_000, "a real epoch timestamp: {ts}");
+    }
+
+    #[test]
     fn urls_and_origins() {
         assert_eq!(
-            record_url("aarch64-apple-darwin"),
+            record_url("aarch64-apple-darwin")
+                .split_once("?ts=")
+                .map(|(base, _)| base)
+                .expect("the record URL carries a cache-busting timestamp"),
             "https://github.com/robertelee78/claude-telegram-mirror/releases/latest/download/stable-aarch64-apple-darwin.json"
         );
         assert_eq!(
