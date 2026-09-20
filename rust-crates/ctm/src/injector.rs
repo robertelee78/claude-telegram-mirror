@@ -2,6 +2,48 @@ use crate::error::Result;
 use crate::types::{is_valid_slash_command, ALLOWED_TMUX_KEYS};
 use std::process::Command;
 
+/// How long to wait for typed text to appear in the composer before submitting.
+const SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
+/// How long to wait for the composer to empty after Enter.
+const SUBMIT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
+const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+/// Extra Enters to try when the first one did not submit.
+const SUBMIT_RETRIES: u32 = 2;
+/// How many lines at the bottom of the pane count as "the composer".
+const COMPOSER_LINES: usize = 14;
+
+/// A short, distinctive tail of the injected text, used to recognise it on screen.
+///
+/// The tail rather than the head because a long message scrolls: its end is what sits
+/// by the cursor. Whitespace is dropped so the TUI's own wrapping cannot break the
+/// comparison, and control characters are ignored for the same reason.
+pub(crate) fn submit_marker(text: &str) -> String {
+    let squashed: String = text
+        .chars()
+        .filter(|c| !c.is_whitespace() && !c.is_control())
+        .collect();
+    let n = squashed.chars().count();
+    squashed.chars().skip(n.saturating_sub(24)).collect()
+}
+
+/// Is `marker` visible in the composer region (the bottom of the pane)?
+///
+/// Only the bottom matters: after a submit the same text is still on screen, just moved
+/// up into the transcript, so searching the whole pane would never see it leave.
+pub(crate) fn composer_contains(pane: &str, marker: &str) -> bool {
+    if marker.is_empty() {
+        return false;
+    }
+    let lines: Vec<&str> = pane.lines().collect();
+    let start = lines.len().saturating_sub(COMPOSER_LINES);
+    let tail: String = lines[start..]
+        .join("")
+        .chars()
+        .filter(|c| !c.is_whitespace() && !c.is_control())
+        .collect();
+    tail.contains(marker)
+}
+
 /// Input injector for sending user input from Telegram to Claude Code CLI via tmux.
 ///
 /// Security: ALL tmux commands use Command::arg() — NO shell interpolation.
@@ -104,16 +146,29 @@ impl InputInjector {
 
     /// Inject text input into the given tmux pane (literal text + trailing Enter).
     /// Uses Command::arg() — no shell interpolation possible.
+    /// Type `text` into the pane and submit it.
+    ///
+    /// The naive form of this — send the text, immediately send Enter — races the TUI's
+    /// input handling: for a long message the Enter can arrive while the pane is still
+    /// ingesting, and it is swallowed. The operator then finds their message sitting in
+    /// the composer, unsent, and has to press Enter at the console (reported for a
+    /// Claude Code session; the message was long).
+    ///
+    /// So this does what ADR-015 established for the question widget: read the pane and
+    /// act on what is actually there. Type, wait until the text appears in the composer,
+    /// press Enter, then confirm the composer emptied — retrying Enter a couple of times
+    /// if it did not. When the pane cannot be read at all it falls back to the old
+    /// behaviour, which is never worse than before.
     pub fn inject(&self, target: &str, socket: Option<&str>, text: &str) -> Result<bool> {
         if let Err(reason) = Self::validate_target(target, socket) {
             tracing::warn!(%reason, "Target validation failed");
             return Ok(false);
         }
-        let socket = Self::sanitized_socket(socket);
+        let socket_owned = Self::sanitized_socket(socket);
 
         // Send text with -l (literal mode)
         let mut send_cmd = Command::new("tmux");
-        for arg in Self::socket_args(&socket) {
+        for arg in Self::socket_args(&socket_owned) {
             send_cmd.arg(arg);
         }
         send_cmd
@@ -132,28 +187,83 @@ impl InputInjector {
             return Ok(false);
         }
 
-        // Send Enter key separately
-        let mut enter_cmd = Command::new("tmux");
-        for arg in Self::socket_args(&socket) {
-            enter_cmd.arg(arg);
-        }
-        enter_cmd
-            .arg("send-keys")
-            .arg("-t")
-            .arg(target)
-            .arg("Enter");
+        let marker = submit_marker(text);
 
-        let output = enter_cmd.output()?;
-        if !output.status.success() {
-            tracing::error!(
-                stderr = %String::from_utf8_lossy(&output.stderr),
-                "tmux send-keys Enter failed"
-            );
-            return Ok(false);
+        // Wait for the typed text to land in the composer before pressing Enter.
+        if !marker.is_empty() {
+            self.wait_until(target, socket, SETTLE_TIMEOUT, |pane| {
+                composer_contains(pane, &marker)
+            });
+        }
+
+        for attempt in 0..=SUBMIT_RETRIES {
+            let mut enter_cmd = Command::new("tmux");
+            for arg in Self::socket_args(&socket_owned) {
+                enter_cmd.arg(arg);
+            }
+            enter_cmd
+                .arg("send-keys")
+                .arg("-t")
+                .arg(target)
+                .arg("Enter");
+            let output = enter_cmd.output()?;
+            if !output.status.success() {
+                tracing::error!(
+                    stderr = %String::from_utf8_lossy(&output.stderr),
+                    "tmux send-keys Enter failed"
+                );
+                return Ok(false);
+            }
+
+            // Nothing to verify against (empty or unreadable pane): keep the old
+            // fire-and-forget behaviour.
+            if marker.is_empty() {
+                break;
+            }
+            let submitted = self.wait_until(target, socket, SUBMIT_TIMEOUT, |pane| {
+                !composer_contains(pane, &marker)
+            });
+            if submitted {
+                if attempt > 0 {
+                    tracing::info!(%target, attempt, "Submit needed a repeated Enter");
+                }
+                break;
+            }
+            if attempt == SUBMIT_RETRIES {
+                tracing::warn!(
+                    %target,
+                    "Text is in the composer but would not submit after {} attempts",
+                    SUBMIT_RETRIES + 1
+                );
+                return Ok(false);
+            }
         }
 
         tracing::debug!(%target, text_len = text.len(), "Injected text via tmux");
         Ok(true)
+    }
+
+    /// Poll the pane until `pred` holds, or the budget runs out. `false` when the pane
+    /// cannot be read (the caller then proceeds without verification).
+    fn wait_until(
+        &self,
+        target: &str,
+        socket: Option<&str>,
+        budget: std::time::Duration,
+        pred: impl Fn(&str) -> bool,
+    ) -> bool {
+        let deadline = std::time::Instant::now() + budget;
+        loop {
+            match self.capture_pane(target, socket) {
+                Some(pane) if pred(&pane) => return true,
+                Some(_) => {}
+                None => return false,
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(POLL_INTERVAL);
+        }
     }
 
     /// ADR-015: Inject LITERAL text into the tmux pane WITHOUT a trailing Enter.
@@ -522,6 +632,50 @@ pub struct TmuxInfo {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_marker_is_the_tail_and_survives_the_tuis_wrapping() {
+        // The composer wraps and indents; the comparison must not care.
+        let text = "1) explain this part better. 7) what do you suggest? Again I want this to be simple ux for a user, like a tor hidden service.";
+        let m = submit_marker(text);
+        assert!(!m.is_empty());
+        assert!(text.replace(' ', "").ends_with(&m), "it is the tail: {m}");
+
+        let wrapped = format!(
+            "some earlier output\n│ > 1) explain this part better. 7) what do you\n│   suggest? Again I want this to be simple ux for a\n│   user, like a tor hidden service.\n"
+        );
+        assert!(
+            composer_contains(&wrapped, &m),
+            "wrapped across lines still matches"
+        );
+    }
+
+    #[test]
+    fn only_the_composer_counts_not_the_transcript() {
+        // After a submit the text is still on screen — it moved up into the transcript.
+        // Searching the whole pane would conclude it never submitted.
+        let m = submit_marker("please run the tests and report back");
+        let mut pane = String::from("> please run the tests and report back\n");
+        pane.push_str("• Sure, running them now.\n");
+        for _ in 0..COMPOSER_LINES {
+            pane.push_str("output line\n");
+        }
+        pane.push_str("│ > \n");
+        assert!(
+            !composer_contains(&pane, &m),
+            "submitted: the composer is empty even though the text is visible above"
+        );
+
+        // Still sitting unsent in the composer is the failing case the operator hit.
+        let unsent = "• earlier output\n│ > please run the tests and report back\n";
+        assert!(composer_contains(unsent, &m));
+    }
+
+    #[test]
+    fn an_empty_or_whitespace_message_has_no_marker_and_never_blocks() {
+        assert_eq!(submit_marker("   \n\t "), "");
+        assert!(!composer_contains("anything at all", ""));
+    }
     use super::*;
     use crate::types::is_valid_slash_command;
 

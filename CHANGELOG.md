@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.44] - 2026-09-20
+
+### Fixed (reported: a Telegram reply sat in Claude's composer, unsent)
+- **Injected text is now confirmed submitted, not fired and forgotten.** `inject` typed the message and pressed Enter in the same breath, racing the TUI's input handling — for a long message the Enter was swallowed, leaving the text in the composer for the operator to submit by hand at the console. It now does what ADR-015 established for the question widget: type, wait for the text to appear in the composer, press Enter, then confirm the composer emptied, retrying Enter twice if it did not. When the pane cannot be read it falls back to the previous behaviour, so it is never worse than before.
+- Verified against a real Claude Code TUI, whose composer sits above its status block rather than on the last line: before Enter the text is in the composer region, after Enter it has moved into the transcript — the distinction the check depends on.
+
+### Added
+- `tests/injector_tmux.rs`: the injection path against a real tmux pane (no model spend) — a short message submits, a long one submits, and a dead target reports failure rather than claiming delivery. An `--ignored` test drives a real Claude Code pane when one is supplied via `CTM_TEST_TMUX_SOCKET`/`CTM_TEST_TMUX_TARGET`.
+
 ## [0.2.43] - 2026-09-20
 
 ### Fixed (reported from a phone)
