@@ -578,7 +578,10 @@ mod tests {
         let unresolved = link.join("hooks.json");
         std::fs::write(&unresolved, "{}").unwrap();
         let resolved = std::fs::canonicalize(&unresolved).unwrap();
-        assert_ne!(resolved, unresolved, "the symlinked path differs by construction");
+        assert_ne!(
+            resolved, unresolved,
+            "the symlinked path differs by construction"
+        );
 
         let listed = json!({"data":[{"hooks":[{
             "key": "k:stop:0:0",
