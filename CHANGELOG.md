@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.36] - 2026-09-20
+
+### Fixed (found by running 0.2.35 as a user — the approval buttons never appeared)
+- **The Codex observer gave up on subscribing one second after a session started.** 0.2.35 retried a deferred `thread/resume` on a timer, but measured the retry window from when the *observer connected* rather than per thread. A daemon that had been up for minutes — the normal case — treated the very first retry as already expired and abandoned the thread before its rollout could exist. The window is now per thread, from the first deferral, so a session started at any time gets subscribed and its approvals arrive in Telegram with buttons. The log line that fired in that case also claimed the session was a bare `codex`, which was wrong and is now only said after a genuine per-thread expiry.
+- A thread awaiting subscription is tracked by the resume attempt itself rather than by whether it had been announced, so a thread discovered through `thread/loaded/list` is retried too.
+
 ## [0.2.35] - 2026-09-20
 
 ### Added (Codex approvals can be answered from Telegram — ADR-016 §Codex approvals)

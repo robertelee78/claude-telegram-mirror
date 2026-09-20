@@ -114,6 +114,11 @@ enum ServerReq {
 #[derive(Debug, Default, Clone)]
 struct ThreadCtx {
     subscribed: bool,
+    /// A `thread/resume` has been sent for this thread and has not succeeded yet.
+    /// Tracked explicitly because a thread can be awaiting subscription before it is
+    /// announced (it was listed by `thread/loaded/list`, or its resume was deferred
+    /// before `thread/started` arrived).
+    resume_pending: bool,
     running: bool,
     current_turn: Option<String>,
     announced: bool,
@@ -181,6 +186,10 @@ impl Translator {
     }
 
     fn subscribe(&mut self, thread_id: &str) -> Out {
+        self.threads
+            .entry(thread_id.to_string())
+            .or_default()
+            .resume_pending = true;
         // `excludeTurns: true` — full-history hydration is deprecated (deprecationNotice
         // observed live) and ctm only needs the thread record + live stream.
         self.request(
@@ -204,14 +213,17 @@ impl Translator {
     /// still unsubscribed. `turn/started` cannot be the retry trigger — it is only
     /// delivered to *subscribed* clients, so a deferred subscription could never
     /// recover from it. The runner retries these on a timer instead.
-    pub fn resume_retries(&mut self) -> Vec<Out> {
-        let pending: Vec<String> = self
-            .threads
+    pub fn pending_subscriptions(&self) -> Vec<String> {
+        self.threads
             .iter()
-            .filter(|(_, c)| c.announced && !c.subscribed)
+            .filter(|(_, c)| c.resume_pending && !c.subscribed)
             .map(|(id, _)| id.clone())
-            .collect();
-        pending.iter().map(|id| self.subscribe(id)).collect()
+            .collect()
+    }
+
+    /// A `thread/resume` for one thread (the retry the runner schedules).
+    pub fn resume_request(&mut self, thread_id: &str) -> Out {
+        self.subscribe(thread_id)
     }
 
     /// End an announced thread exactly once and forget its state.
@@ -338,7 +350,9 @@ impl Translator {
                     }
                     out.extend(self.announce(thread));
                 }
-                self.threads.entry(tid).or_default().subscribed = true;
+                let ctx = self.threads.entry(tid).or_default();
+                ctx.subscribed = true;
+                ctx.resume_pending = false;
                 out
             }
             Ours::TurnStart(tid) => {
@@ -1022,26 +1036,27 @@ pub async fn run_once(config: &Config, cx: &CodexHostConfig) -> Result<()> {
     // so retries are bounded and the outcome is reported once instead of churning.
     let mut resume_tick = tokio::time::interval(RESUME_RETRY_INTERVAL);
     resume_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let started = tokio::time::Instant::now();
-    let mut gave_up = false;
+    let mut first_deferred: HashMap<String, tokio::time::Instant> = HashMap::new();
+    let mut abandoned: HashSet<String> = HashSet::new();
 
     loop {
         tokio::select! {
             _ = resume_tick.tick() => {
-                if !gave_up {
-                    let retries = tr.resume_retries();
-                    if !retries.is_empty() {
-                        if started.elapsed() > RESUME_RETRY_WINDOW {
-                            gave_up = true;
-                            tracing::info!(
-                                threads = retries.len(),
-                                "Codex: these threads cannot be subscribed to — they are bare `codex` sessions, which own their own thread. They mirror out through ctm's Codex hooks; approvals need `codex --remote` (ctm's shell integration does this)."
-                            );
-                        } else {
-                            for o in retries {
-                                dispatch(o, &mut tx, &link).await?;
-                            }
-                        }
+                // The window is measured per THREAD, from the first time that thread
+                // was seen unsubscribed — not from when this connection opened. Getting
+                // that wrong made a long-lived observer give up one second after a new
+                // thread appeared, before its rollout could exist (observed live).
+                let now = tokio::time::Instant::now();
+                for id in tr.pending_subscriptions() {
+                    let first = *first_deferred.entry(id.clone()).or_insert(now);
+                    if now.duration_since(first) <= RESUME_RETRY_WINDOW {
+                        let out = tr.resume_request(&id);
+                        dispatch(out, &mut tx, &link).await?;
+                    } else if abandoned.insert(id.clone()) {
+                        tracing::info!(
+                            thread_id = %id,
+                            "Codex: cannot subscribe to this thread — a bare `codex` owns its own thread. It mirrors out through ctm's hooks, but its approvals can only be answered at the terminal; start it in a shell with ctm's integration so it joins the app-server."
+                        );
                     }
                 }
             }
@@ -1200,6 +1215,60 @@ mod tests {
         assert!(
             out.is_empty(),
             "ephemeral system thread must not become a session"
+        );
+    }
+
+    #[test]
+    fn a_deferred_subscription_stays_pending_until_it_succeeds() {
+        // Regression (0.2.35, seen live): the retry window was measured from when the
+        // OBSERVER connected, so a thread that appeared minutes later was abandoned on
+        // its very first retry tick — one second after `thread/resume` was deferred,
+        // long before the rollout could exist. The translator must keep reporting such
+        // a thread as pending until a resume actually succeeds.
+        let mut t = Translator::new();
+        let init = t.on_connect();
+        let Rpc::Request { id, .. } = rpcs(&init)[0].clone() else {
+            panic!()
+        };
+        let out = t.on_rpc(&json!({"id": id, "result": {"userAgent": "codex-tui/0.155.1"}}));
+        let Rpc::Request { id: list_id, .. } = rpcs(&out)[0].clone() else {
+            panic!()
+        };
+        // A fresh thread appears; its first resume is refused (no rollout yet).
+        t.on_rpc(&json!({"id": list_id, "result": {"data": [T], "nextCursor": null}}));
+        t.on_rpc(&json!({
+            "id": 2,
+            "error": {"code": -32000, "message": format!("no rollout found for thread id {T}")}
+        }));
+        assert_eq!(
+            t.pending_subscriptions(),
+            vec![T.to_string()],
+            "announced but unsubscribed"
+        );
+
+        // Retries keep failing while the turn has not persisted: still pending.
+        for _ in 0..5 {
+            let Out::Rpc(Rpc::Request { id, method, .. }) = t.resume_request(T) else {
+                panic!("expected a request")
+            };
+            assert_eq!(method, "thread/resume");
+            t.on_rpc(&json!({
+                "id": id,
+                "error": {"code": -32000, "message": format!("no rollout found for thread id {T}")}
+            }));
+            assert_eq!(t.pending_subscriptions(), vec![T.to_string()]);
+        }
+
+        // Once the rollout exists the retry succeeds and it stops being retried.
+        let Out::Rpc(Rpc::Request { id, .. }) = t.resume_request(T) else {
+            panic!("expected a request")
+        };
+        let mut ok = v(RESUME_OK);
+        ok["id"] = json!(id);
+        t.on_rpc(&ok);
+        assert!(
+            t.pending_subscriptions().is_empty(),
+            "a subscribed thread is never retried again"
         );
     }
 

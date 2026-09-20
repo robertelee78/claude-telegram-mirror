@@ -484,7 +484,12 @@ async fn codex_remote_session_delivers_an_answerable_approval() {
     ));
     let cfg2 = Arc::clone(&cfg);
     let observer = tokio::spawn(async move { ctm::host::codex::run_once(&cfg2, &cx).await });
-    tokio::time::sleep(Duration::from_millis(800)).await;
+    // Deliberately let the observer age before the session starts. The 0.2.35 bug
+    // measured the resume-retry window from when the OBSERVER connected, so a thread
+    // created after that window had elapsed was abandoned one second after its first
+    // deferral — and its approvals never arrived. A long-lived daemon is the normal
+    // case, so the test reproduces it.
+    tokio::time::sleep(Duration::from_secs(6)).await;
 
     // A real TUI, in app-server mode — exactly what ctm's shell integration produces.
     let work = PathBuf::from(format!("/tmp/ctm-e2e-approve-{}", std::process::id()));
