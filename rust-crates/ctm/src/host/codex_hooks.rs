@@ -564,13 +564,22 @@ mod tests {
 
     #[test]
     fn a_resolved_source_path_still_matches_our_unresolved_one() {
-        // macOS reports /private/tmp/... for a file ctm knows as /tmp/... .
-        let dir = std::path::PathBuf::from(format!("/tmp/ctm-hooks-canon-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let unresolved = dir.join("hooks.json");
+        // The app-server reports a resolved path while ctm holds an unresolved one
+        // (macOS turns /tmp into /private/tmp; a symlinked HOME does the same). Build
+        // the symlink rather than assuming the platform provides one — asserting that
+        // `/tmp` is a symlink passes on macOS and fails on Linux, which is how this
+        // test broke CI.
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let unresolved = link.join("hooks.json");
         std::fs::write(&unresolved, "{}").unwrap();
         let resolved = std::fs::canonicalize(&unresolved).unwrap();
-        assert_ne!(resolved, unresolved, "precondition: /tmp is a symlink here");
+        assert_ne!(resolved, unresolved, "the symlinked path differs by construction");
+
         let listed = json!({"data":[{"hooks":[{
             "key": "k:stop:0:0",
             "command": "/x/ctm codex-hook",
@@ -578,8 +587,11 @@ mod tests {
             "currentHash": "sha256:zzz",
             "trustStatus": "untrusted"
         }]}]});
-        assert_eq!(ours_from_list(&listed, &unresolved).len(), 1);
-        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            ours_from_list(&listed, &unresolved).len(),
+            1,
+            "the same file reached by two paths is one hook"
+        );
     }
 
     #[test]
