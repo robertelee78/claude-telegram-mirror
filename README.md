@@ -3,7 +3,10 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 ![Rust](https://img.shields.io/badge/Built_with-Rust-dea584.svg)
 
-Bidirectional communication between Claude Code CLI and Telegram. Control your Claude Code sessions from your phone.
+Run your coding agents from your phone. ctm mirrors **Claude Code**, **OpenCode** and
+**Codex** sessions into Telegram — each session gets its own topic, you see what the agent
+is doing, and you can reply, answer its questions and approve its tool calls from either
+side. Install it and all three are mirrored; there is nothing to enable per host.
 
 **Supported platforms:** Linux x64, Linux arm64, macOS ARM64, macOS Intel x64
 
@@ -27,23 +30,31 @@ Prefer to verify by hand? Every release ships `ctm-<target>`, `ctm-<target>.sha2
 
 ## Features
 
-- **Three hosts, one bridge, zero setup**: Claude Code (via hooks + tmux), **OpenCode** and **Codex** (via their native APIs — no tmux, no port, no password; on by default). See [Other agent hosts](#other-agent-hosts-opencode-codex)
-- **CLI to Telegram**: Mirror Claude's responses, tool usage, and notifications
-- **Telegram to CLI**: Send prompts from Telegram directly to Claude Code
-- **Tool Summarizer**: Human-readable summaries for 30+ command patterns ("Running tests" instead of "Running: Bash")
-- **AskUserQuestion (both surfaces)**: Claude's interactive multiple-choice question renders natively in the CLI *and* as inline buttons on Telegram — answer from either side. Telegram answers drive the live CLI widget via `tmux send-keys`, with `capture-pane` readiness pacing on multi-select so the confirming Enter only fires once Claude's review screen is on-screen (ADR-015)
-- **Photo & Document Upload**: Send images/files from Telegram, path injected into Claude
-- **Stop/Interrupt**: Type `stop` to send Escape, `kill` to send Ctrl-C
-- **Session Threading**: Each Claude session gets its own Forum Topic
-- **Session Rename**: `/rename` syncs with Claude Code's session title
-- **Multi-System Support**: Run separate daemons on multiple machines
-- **Compaction Notifications**: Get notified when Claude summarizes context
-- **Governor Rate Limiting**: MessageQueue with retry and exponential backoff
-- **Doctor Auto-Fix**: `ctm doctor --fix` auto-remediates common issues
-- **Token Scrubbing**: Global regex-based scrubbing prevents bot tokens from leaking to logs
-- **Atomic PID Locking**: `flock(2)` prevents duplicate daemon instances
-- **Path Traversal Protection**: Transcript paths validated and canonicalized before file access
-- **Char-Boundary Safe**: Unicode-safe message chunking and string truncation throughout
+- **Three hosts, one bridge, nothing to enable** — Claude Code (hooks + tmux), **OpenCode**
+  (a plugin ctm installs) and **Codex** (its app-server, plus hooks ctm installs). See
+  [Other agent hosts](#other-agent-hosts-opencode-codex).
+- **A topic per session** — including sub-agents, which report into their parent's topic
+  instead of opening one of their own.
+- **Both directions** — the agent's replies, tool calls and questions go out; your text,
+  photos and files go in.
+- **Approvals from either surface** — tool-permission prompts appear as inline buttons in
+  Telegram *and* stay answerable at the terminal. Whichever answers first wins; the other
+  side is retired.
+- **Multiple-choice questions on both surfaces** — Claude's `AskUserQuestion` renders
+  natively in the CLI *and* as buttons in Telegram. A Telegram answer drives that live
+  widget, paced against `capture-pane` so a keystroke only fires once the expected screen
+  has rendered (ADR-015).
+- **Confirmed delivery** — an injected message is verified to have left the composer, and
+  the Enter is retried if the TUI swallowed it.
+- **Human-readable tool summaries** — "Running tests" rather than "Bash", for 30+ command
+  shapes, with a **Details** button that still works days later.
+- **Stop/interrupt** — `stop` sends Escape, `kill` sends Ctrl-C, `/abort` ends the session.
+- **Self-updating** — `ctm update` swaps the binary atomically and restarts the service;
+  `ctm doctor --fix` reconciles hooks, service and hosts.
+- **Multi-machine** — one daemon and one bot per host, all posting into one supergroup.
+- **Built to fail visibly** — bot tokens scrubbed from logs, `flock(2)` against duplicate
+  daemons, canonicalized transcript paths, Unicode-safe chunking, and a doctor that reports
+  what it cannot verify rather than assuming.
 
 ## Quick Start
 
@@ -51,16 +62,22 @@ Prefer to verify by hand? Every release ships `ctm-<target>`, `ctm-<target>.sha2
 # 1. Install
 curl -fsSL https://raw.githubusercontent.com/robertelee78/claude-telegram-mirror/master/install.sh | sh
 
-# 2. Run interactive setup (creates bot, configures everything)
+# 2. Create the bot and configure everything (interactive)
 ctm setup
 
-# 3. Start the daemon
+# 3. Start the daemon (or `ctm service install` to run it at login)
 ctm start
-
-# 4. Run Claude in tmux
-tmux new -s claude
-claude
 ```
+
+Then use your agents exactly as you already do:
+
+```bash
+tmux new -s claude && claude   # Claude Code needs tmux, so replies can reach its pane
+codex                          # mirrored as-is
+opencode                       # mirrored as-is
+```
+
+`ctm doctor` reports what is wired, per host.
 
 ## Trust Model (read before adding anyone)
 
@@ -101,10 +118,21 @@ ctm hooks              # Show hook status
 # OS service management (optional, for auto-start on boot)
 ctm service install    # Install as systemd/launchd service
 ctm service uninstall  # Remove system service
-ctm service start      # Start via service manager
+ctm service start      # Start via service manager (installs the unit if missing)
 ctm service stop       # Stop via service manager
 ctm service restart    # Restart via service manager
 ctm service status     # Show service status
+
+# Updates and shell integration
+ctm update             # Update to the latest release, then restart the service
+ctm update --check     # Report the newest release without changing anything
+ctm update --rollback  # Put the previous binary back
+ctm shell-setup        # (Re)install PATH + completions; --remove undoes it
+ctm completions zsh    # Print a completion script (bash, zsh, fish)
+
+# Housekeeping
+ctm prune-topics --ledger --dry-run   # Show topics whose session is over
+ctm prune-topics --ledger             # ...and delete them
 ```
 
 **Note:** `ctm stop` and `ctm restart` auto-detect whether the daemon is running directly or via a system service and use the appropriate method.
@@ -113,13 +141,13 @@ ctm service status     # Show service status
 
 | Command | Action |
 |---------|--------|
-| Any text | Sends to Claude as input |
-| `stop` | Sends Escape to pause Claude |
-| `kill` | Sends Ctrl-C to exit Claude entirely |
-| `cc <cmd>` | Sends `/<cmd>` as a slash command to Claude |
+| Any text | Sent to the agent as input |
+| `stop` | Interrupt the current turn (Escape on Claude Code, the host's own interrupt elsewhere) |
+| `kill` | Abort harder (Ctrl-C on Claude Code, the host's abort elsewhere) |
+| `cc <cmd>` | Send `/<cmd>` to the agent as a slash command |
 | `/status` | Show active sessions and mirroring state |
 | `/sessions` | List active sessions with age and project dir |
-| `/rename <name>` | Rename session (syncs with Claude Code) |
+| `/rename <name>` | Rename the session and its topic |
 | `/attach <id>` | Attach to a session for updates |
 | `/detach` | Detach from current session |
 | `/mute` / `/unmute` | Suppress/resume agent response notifications |
@@ -132,63 +160,86 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for additional details and comm
 
 ### Tool Approval Buttons
 
-When Claude requests to use a tool that requires permission (Write, Edit, Bash with non-safe commands), you'll see approval buttons in Telegram:
+When an agent asks permission to run something, the request appears in Telegram with
+buttons — and stays answerable at the terminal. Whichever surface answers first wins, and
+the other is retired.
 
 | Button | Action |
 |--------|--------|
-| **Approve** | Allow the tool to execute |
-| **Reject** | Deny this specific tool execution |
-| **Abort** | Stop the entire Claude session |
-| **Details** | View full tool input parameters |
+| **Approve** | Allow this tool call |
+| **Reject** | Deny this tool call |
+| **Abort** | Stop the session |
+| **Details** | Show the full tool input |
 
-Approval buttons only appear in normal mode, not with `--dangerously-skip-permissions`. If you don't respond within 5 minutes, Claude falls back to CLI approval.
+**Details** is recorded in the database and answerable for seven days, so it still works
+when you open Telegram later, or after the daemon has restarted.
+
+Per host:
+
+- **Claude Code** — the `PreToolUse` hook waits up to five minutes for a Telegram answer,
+  then falls back to the CLI prompt. Nothing appears under
+  `--dangerously-skip-permissions`, because nothing asks.
+- **Codex** — approvals arrive over its app-server as requests carrying ids, so a Telegram
+  tap resolves exactly that request. ctm's shell integration is what puts a session there
+  (see [Other agent hosts](#other-agent-hosts-opencode-codex)).
+- **OpenCode** — answered through its API; a reply from either side dismisses the other.
 
 ## Architecture
 
+One binary in three modes: the **daemon**, the **hook** the agents invoke (`ctm hook`,
+`ctm codex-hook`), and the **CLI** you type. Everything downstream of a `BridgeMessage` is
+host-neutral — the hosts differ only in how events get out and how your replies get in.
+
 ```
-OUTBOUND  (CLI → Telegram) — Claude Code mirrors all activity out:
-
-  ┌─────────────┐  fires   ┌──────────┐  NDJSON over  ┌──────────────┐  Bot API   ┌──────────────┐
-  │ Claude Code │  hook    │ ctm hook │  Unix socket  │  ctm daemon  │  sendMsg   │  Telegram    │
-  │ CLI (tmux)  │ ───────▶ │ (binary) │ ────────────▶ │ (event loop) │ ─────────▶ │ forum topic  │
-  └─────────────┘          └──────────┘               └──────────────┘            └──────────────┘
-
-INBOUND  (Telegram → CLI) — daemon injects into the live pane:
-
-  ┌─────────────┐  tmux send-keys  ┌──────────────┐  getUpdates long poll    ┌──────────────┐
-  │ Claude Code │ ◀─────────────── │  ctm daemon  │ ◀─────────────────────── │  Telegram    │
-  │ CLI (tmux)  │  -t <pane>       │ InputInjector│  text & button callbacks │  forum topic │
-  └─────────────┘                  └──────────────┘                          └──────────────┘
-
-  Approvals (PreToolUse): the hook blocks on the Unix socket for an approval_response;
-  the daemon shows inline buttons in Telegram and writes the verdict back to the hook.
-
-  ctm daemon = tokio event loop · Unix SocketServer · SessionManager (SQLite) + per-session tmux cache
-               · TelegramBot (Bot API) · InputInjector (tmux) · pending approval / question state
+                          ┌──────────────┐   Bot API    ┌──────────────┐
+                          │  ctm daemon  │ ◀──────────▶ │   Telegram   │
+                          │ (tokio loop) │  long poll   │ forum topics │
+                          └──────┬───────┘              └──────────────┘
+                                 │
+                   events up ▲   │   ▼ replies, approvals, answers
+                             │   │
+                 ┌───────────┴───┴────────────┐
+                 │   NDJSON over Unix socket  │
+                 └───┬──────────┬─────────┬───┘
+                     │          │         │
+        ┌────────────┴──┐ ┌─────┴──────┐ ┌┴─────────────┐
+        │  Claude Code  │ │  OpenCode  │ │    Codex     │
+        ├───────────────┤ ├────────────┤ ├──────────────┤
+        │ out: hooks    │ │ out + in:  │ │ out: hooks   │
+        │ in:  tmux     │ │ the plugin │ │ in+approval: │
+        │   send-keys,  │ │ ctm writes │ │  app-server  │
+        │   verified    │ │ (bus up,   │ │  (requests   │
+        │   submitted   │ │  API in)   │ │   carry ids) │
+        └───────────────┘ └────────────┘ └──────────────┘
 ```
 
-> The `ctm hook` and the daemon are the **same binary** in different modes. Outbound rides
-> hook → Unix socket → daemon → Bot API; inbound rides daemon long-poll → `InputInjector`
-> (`tmux send-keys`) into the live CLI pane. The daemon resolves a session's tmux pane from
-> its cache then SQLite, and **fails closed** if that session never reported one (ROUTING-001) —
-> it never guesses a pane, to avoid misrouting keystrokes into another session.
+**What ctm installs, and keeps current:**
 
-**Flow:**
-1. Claude Code hooks invoke `ctm hook`, which reads the event from stdin
-2. PreToolUse: for tool approvals, sends an approval request via socket and blocks for the Telegram response. **AskUserQuestion is *not* intercepted here** — the hook returns fast so Claude renders its native widget in the CLI; the daemon mirrors the question to Telegram from the standard `tool_start` event (ADR-015)
-3. Other hooks: sends JSON to daemon via socket and exits immediately
-4. Daemon forwards messages to Telegram Forum Topic with summarized tool actions
-5. Telegram replies are injected into the live CLI via `tmux send-keys` — including AskUserQuestion option/multi-select answers, which drive the native widget directly. **Multi-select uses `tmux capture-pane` readiness pacing** so each keystroke and the confirming Enter only fire once the expected screen has rendered — no blind sleeps (ADR-015). The question shows in **both** the CLI (native) and Telegram, answerable from either
-6. Stop/kill commands send Escape or Ctrl-C to interrupt Claude
+| Host | Outbound | Inbound & approvals | ctm writes |
+|---|---|---|---|
+| Claude Code | `PreToolUse` / `PostToolUse` / `Stop` / … hooks | `tmux send-keys` into the live pane | hooks in `~/.claude/settings.json` |
+| OpenCode | the plugin's event hook, piped up a Unix socket | the same plugin, through OpenCode's in-process API | `~/.config/opencode/plugins/ctm.js` |
+| Codex | Codex's own hooks | its app-server (`turn/start`, `turn/steer`, approval requests) | `~/.codex/hooks.json`, plus a `codex` shell function |
+
+The daemon keeps all of that in repair: it rewrites the OpenCode plugin and the Codex
+hooks when they are missing or stale (so `ctm update` rolls them forward), trusts the
+Codex hooks with the hash Codex itself reports, and starts Codex's app-server if it is not
+already running.
+
+> **Failing closed beats guessing.** The daemon resolves a Claude session's tmux pane from
+> its cache, then SQLite, and gives up rather than picking one (ROUTING-001) — a guessed
+> pane means keystrokes in someone else's session. The same instinct governs the rest: a
+> Codex approval is answered by its request id, never by typing at a screen ctm cannot
+> verify.
 
 ## Multi-System Architecture
 
-When running Claude Code on multiple machines, each system needs its own bot to avoid Telegram API conflicts (error 409: only one polling connection per bot token is allowed).
+When you run agents on more than one machine, each machine needs its own bot: Telegram allows only one polling connection per bot token (error 409).
 
 **The model:**
 - **One daemon per host** - Each machine runs its own bridge daemon
 - **One bot per daemon** - Each daemon uses a unique Telegram bot
-- **Multiple sessions per host** - One daemon handles all Claude sessions on that machine
+- **Multiple sessions per host** - One daemon handles every session on that machine, across all three agents
 - **Shared supergroup** - All bots post to the same Telegram supergroup
 
 ### Setup for Multiple Systems
@@ -205,13 +256,15 @@ When running Claude Code on multiple machines, each system needs its own bot to 
    export TELEGRAM_BOT_TOKEN="token-for-system-b-bot"
    export TELEGRAM_CHAT_ID="-100shared-group-id"  # Same group!
    ```
-4. **Each daemon creates topics for its sessions** - Messages route correctly because each daemon only processes topics it created.
+4. **Each daemon creates topics for its own sessions** - Replies route correctly because a daemon only processes the topics it created.
 
 ## Prerequisites
 
-- Claude Code CLI
-- tmux (for bidirectional communication)
-- Telegram account
+- A Telegram account and a supergroup with Topics enabled — `ctm setup` walks you through
+  creating the bot and finding the chat id
+- At least one agent: Claude Code, OpenCode or Codex
+- **tmux**, for Claude Code only: its replies are typed into the pane. OpenCode and Codex
+  are driven through their own APIs and need no tmux.
 
 ## Telegram Setup
 
@@ -257,6 +310,11 @@ export TELEGRAM_MIRROR=true
 # export TELEGRAM_MIRROR_VERBOSE=true
 # export TELEGRAM_BRIDGE_SOCKET=~/.config/claude-telegram-mirror/bridge.sock
 # export TELEGRAM_STALE_SESSION_TIMEOUT_HOURS=72  # Auto-cleanup dead sessions (default: 72)
+
+# Hosts are on by default; these turn pieces off:
+# export CTM_CODEX_ENABLED=0       # do not mirror Codex
+# export CTM_OPENCODE_ENABLED=0    # do not mirror OpenCode
+# export CTM_CODEX_REMOTE=0        # keep `codex` plain (loses Telegram approvals)
 ```
 
 Source in your shell profile (`~/.bashrc` or `~/.zshrc`):
@@ -279,6 +337,18 @@ The `ctm setup` wizard creates `~/.config/claude-telegram-mirror/config.json`:
 ```
 
 Environment variables take precedence over config file values.
+
+Hosts need no configuration — they are on when the agent is installed. To turn one off, or
+to point ctm at an OpenCode server it could not otherwise reach:
+
+```json
+{
+  "hosts": {
+    "codex":    { "enabled": false },
+    "opencode": { "enabled": true, "baseUrl": "http://127.0.0.1:4096", "password": "…" }
+  }
+}
+```
 
 ### Test Connection
 
@@ -306,27 +376,23 @@ How the daemon wires each host, automatically, at start and re-checked every min
   daemon's replies through OpenCode's own in-process API. A bare `opencode` therefore
   opens no network listener at all. The file is generated and regenerated by ctm
   (`ctm update` rolls it forward; `ctm doctor --fix` rewrites it) — don't edit it.
-- **Codex** — three parts, all automatic. ctm's shell block defines a `codex` function
-  that adds `--remote unix://<socket> -C "$PWD"` so your session lives in Codex's
-  app-server, where approvals carry a request id ctm can answer from Telegram. It passes
-  through every subcommand and any explicit `--remote`/`-C`, does nothing while the
-  daemon is down, and `CTM_CODEX_REMOTE=0` turns it off. Outbound: ctm adds its own entries to
-  `~/.codex/hooks.json` (merging with any hooks you already have) and trusts them using
-  the hash Codex itself reports, so there is no "Hooks need review" prompt to answer.
-  Inbound: ctm keeps Codex's app-server daemon running (`codex app-server daemon start`,
-  idempotent) via Codex's native binary, and a bare `codex` started while it runs joins
-  it automatically, which is how your Telegram replies get in.
+- **Codex** — three pieces, all automatic:
+  - *Outbound*: ctm adds its own entries to `~/.codex/hooks.json`, merging with any hooks
+    you already have, and trusts them using the hash Codex itself reports — so there is no
+    "Hooks need review" prompt for you to answer.
+  - *Inbound*: ctm keeps Codex's app-server running (`codex app-server daemon start`,
+    idempotent) using Codex's native binary, and a `codex` started while it runs joins it.
+  - *Approvals*: ctm's shell block defines a `codex` function adding
+    `--remote unix://<socket> -C "$PWD"`, which puts your session in that app-server —
+    where each approval is a request with an id ctm can resolve from Telegram. It passes
+    through every subcommand and any explicit `--remote`/`-C`, does nothing while the
+    daemon is down, and `CTM_CODEX_REMOTE=0` turns it off. Run `type codex` to see it.
 
 `ctm doctor` check 12/13 "Hosts" shows what was detected and whether it is wired; a
 host that is not installed is simply reported as such and watched for.
 
-Turning a host off, if you ever want to (`~/.config/claude-telegram-mirror/config.json`):
-
-```json
-{ "hosts": { "opencode": { "enabled": false }, "codex": { "enabled": false } } }
-```
-
-or `CTM_OPENCODE_ENABLED=0` / `CTM_CODEX_ENABLED=0` in the daemon's environment.
+Turning a host off is a one-line config change or an environment variable — see
+[Configuration](#config-file-alternative).
 
 <details>
 <summary>Also mirroring an <em>external</em> <code>opencode serve</code> over HTTP (optional)</summary>
@@ -379,27 +445,33 @@ ctm install-hooks --project
 |-----------|-------|---------|
 | CLI -> Telegram | User types | User (cli): ... |
 | CLI -> Telegram | Tool starts | Running tests (summarized) |
-| CLI -> Telegram | Claude responds | Claude: ... |
+| CLI -> Telegram | The agent responds | Claude / Codex / OpenCode: ... |
 | CLI -> Telegram | Session starts | New Forum Topic created |
-| CLI -> Telegram | Context compacting | Notification sent |
-| CLI <-> Telegram | AskUserQuestion | Inline buttons; answers returned structurally (no keystrokes) |
-| Telegram -> CLI | User sends message | Injected via tmux |
+| CLI -> Telegram | Context compacting | Notification sent (Claude Code) |
+| CLI <-> Telegram | AskUserQuestion | Buttons in Telegram, native widget in the CLI; a Telegram answer drives that widget with paced keystrokes (ADR-015) |
+| Telegram -> CLI | User sends message | Typed into the pane (Claude Code) or sent over the host API (OpenCode, Codex), and confirmed delivered |
 | Telegram -> CLI | User sends photo | Downloaded, path injected |
-| Telegram -> CLI | User types "stop" | Sends Escape interrupt |
+| Telegram -> CLI | User types "stop" | Escape (Claude Code) or an interrupt over the host API |
+| Host -> Telegram | Sub-agent activity | Shown inside the parent session's topic, tagged with the agent |
 
 ## Technical Details
 
-- **Binary**: Single native Rust executable (`ctm`), ~10 MB
-- **Session storage**: SQLite at `~/.config/claude-telegram-mirror/sessions.db`
-- **Socket path**: `~/.config/claude-telegram-mirror/bridge.sock`
-- **PID file**: `~/.config/claude-telegram-mirror/bridge.pid` (flock-guarded)
-- **Downloads**: `~/.config/claude-telegram-mirror/downloads/` (0700 permissions)
-- **Response extraction**: Reads Claude's transcript `.jsonl` on Stop event
-- **Deduplication**: Telegram-originated messages tracked to prevent echo
-- **Topic routing**: Each daemon only processes topics it created (multi-bot safe)
-- **Rate limiting**: Governor-based with exponential backoff retry queue
-- **Token scrubbing**: All log output filtered through regex to strip bot tokens
-- **Test suite**: 470+ Rust tests (unit + 11 integration test files)
+- **Binary**: one native Rust executable (`ctm`), ~10 MB, no runtime dependencies
+- **State**: SQLite at `~/.config/claude-telegram-mirror/sessions.db` — sessions, the topic
+  ledger, pending approvals, and the tool details behind the **Details** button (kept 7 days)
+- **Sockets**: `bridge.sock` (hooks and host observers) and `opencode.sock` (the OpenCode
+  plugin), both 0600 inside a 0700 directory
+- **PID file**: `bridge.pid`, `flock`-guarded so two daemons cannot race
+- **Downloads**: `~/.config/claude-telegram-mirror/downloads/` (0700)
+- **Agent output**: Claude's transcript `.jsonl` on Stop; OpenCode and Codex report their
+  own text over their APIs
+- **Topic routing**: each daemon only handles the topics it created, so several machines
+  can share one supergroup
+- **Rate limiting**: Governor-based, with a retry queue and exponential backoff
+- **Token scrubbing**: every log line is filtered so a bot token cannot leak
+- **Tests**: 878 passing across 48 source files and 13 integration test files. Nine more
+  run only on request (`cargo test -- --ignored`) because they drive the real `codex`,
+  `opencode` and Claude Code binaries end to end.
 
 ## Troubleshooting
 
@@ -427,17 +499,38 @@ ctm doctor --fix   # Auto-fix common issues
 - Check daemon logs for errors
 - Run `ctm status` to verify daemon is running
 
-**tmux injection not working?**
-- Verify tmux session: `tmux list-sessions`
+**tmux injection not working? (Claude Code)**
+- Verify the session: `tmux list-sessions`
 - Check daemon logs for "Session tmux target stored"
+- A reply that lands in the composer but is never submitted was fixed in 0.2.44 — ctm now
+  confirms the submit and retries the Enter
+
+**Codex: replies do not arrive, or approvals have no buttons?**
+- `ctm doctor` (check 12/13) reports whether Codex's app-server is reachable and whether
+  ctm's hooks are installed and trusted; `ctm doctor --fix` does both
+- Approvals require the session to live in the app-server, which ctm's shell block arranges
+  by adding `--remote` to a plain `codex`. Open a new shell after installing or updating,
+  and check with `type codex`. `CTM_CODEX_REMOTE=0` turns it off
+- A session started while the daemon was down still mirrors out, but cannot be replied to
+
+**OpenCode: nothing mirrored?**
+- ctm installs `~/.config/opencode/plugins/ctm.js`; `ctm doctor --fix` rewrites it
+- Plugins load at startup, so restart `opencode` after installing ctm
+
+**Too many topics?**
+- Sub-agents stopped getting their own topics in 0.2.42 — update first
+- Clear a backlog: `ctm prune-topics --ledger --dry-run`, then without `--dry-run`
 
 **Messages going to wrong topic?**
 - Clear session DB: `rm ~/.config/claude-telegram-mirror/sessions.db`
 
 **Service not starting (Linux)?**
+- `ctm service start` installs the unit first if it is missing
 - Check status: `systemctl --user status claude-telegram-mirror`
 - View logs: `journalctl --user -u claude-telegram-mirror -f`
-- Enable linger: `loginctl enable-linger $USER`
+- `Failed to connect to bus`? A plain SSH login has no systemd user manager. Run
+  `sudo loginctl enable-linger $USER` and log in again — that is also what keeps the
+  daemon alive after you log out.
 
 **Service not starting (macOS)?**
 - Check status: `launchctl list | grep claude`
@@ -457,42 +550,57 @@ cd claude-telegram-mirror/rust-crates
 cargo build --release
 # Binary at: rust-crates/target/release/ctm
 
-# 2. Run tests
+# 2. Run tests (878 of them)
 cargo test
+
+# ...and the end-to-end ones, which drive real codex/opencode/tmux binaries
+cargo test -- --ignored
 
 # 3. Use the binary directly
 ./target/release/ctm setup
 ./target/release/ctm start
 ```
 
-### Project Structure (33 source files)
+### Project Structure (48 source files)
 
 ```
 rust-crates/ctm/src/
-  main.rs           # CLI entry point (clap)
-  lib.rs            # Library re-exports
-  hook.rs           # Hook event processing
-  config.rs         # Configuration loading (env > file > defaults)
-  error.rs          # Centralized error types (thiserror)
-  types.rs          # Shared types, validation, security constants
-  session.rs        # SQLite session management
-  socket.rs         # Unix socket server/client (flock, NDJSON)
-  injector.rs       # tmux input injection
-  formatting.rs     # Message formatting, chunking, ANSI stripping
-  summarize.rs      # Tool action summarizer (30+ patterns)
-  liveness.rs       # tmux pane liveness checks for topic reconciliation
-  prune.rs          # prune-topics subcommand (bulk stale-topic cleanup)
-  colors.rs         # ANSI color helpers for terminal output
-  doctor.rs         # Diagnostic checks with --fix
-  installer.rs      # Hook installer
-  setup.rs          # Interactive setup wizard
-  bot/              # Telegram API client (mod.rs, client.rs, queue.rs, types.rs)
-  daemon/           # Bridge daemon (mod.rs, event_loop.rs, socket_handlers.rs,
-                    #   telegram_handlers.rs, callback_handlers.rs, cleanup.rs,
-                    #   reconcile.rs, files.rs)
-  service/          # OS service management (mod.rs, systemd.rs, launchd.rs, env.rs)
+  main.rs · cli.rs    # CLI entry point and command definitions (clap)
+  lib.rs              # Library re-exports
+  hook.rs             # Claude Code hook event processing
+  config.rs           # Configuration (env > file > defaults), including hosts
+  error.rs · types.rs # Error types; wire types, validation, security constants
+  session.rs          # SQLite: sessions, topic ledger, approvals, tool details
+  socket.rs           # Unix socket server/client (flock, NDJSON)
+  injector.rs         # tmux injection, with submit verification
+  formatting.rs       # Formatting, chunking, ANSI stripping
+  summarize.rs        # Tool action summarizer (30+ patterns)
+  liveness.rs         # Pane/host liveness policy for topic reconciliation
+  prune.rs            # prune-topics (host-aware liveness)
+  update.rs           # Self-update: release record, verified download, atomic swap
+  shell.rs            # PATH, completions, and the `codex` remote-mode function
+  doctor.rs           # Diagnostics with --fix
+  installer.rs        # Claude Code hook installer
+  setup.rs            # Interactive setup wizard
+  colors.rs           # ANSI helpers
+  bot/                # Telegram API client (client, queue, types)
+  daemon/             # Event loop; socket/telegram/callback handlers; cleanup;
+                      #   reconcile; files; host_dispatch — the only host-aware seam
+  host/               # ADR-016 hosts:
+                      #   link            observer <-> daemon socket link
+                      #   opencode        translator + HTTP observer
+                      #   opencode_pipe   plugin transport (a bare `opencode`)
+                      #   opencode_plugin the plugin ctm provisions
+                      #   codex           app-server observer (JSON-RPC over WebSocket)
+                      #   codex_rpc       one-shot RPC client (hooks/list, config write)
+                      #   codex_hooks     the hooks ctm installs and trusts
+                      #   codex_hook_cmd  `ctm codex-hook`, the forwarder
+                      #   codex_daemon    keeps Codex's app-server alive
+                      #   detect          finds host installs from a service PATH
+  service/            # systemd, launchd, env file
 
-rust-crates/ctm/tests/   # 11 integration test files
+rust-crates/ctm/tests/   # 13 integration test files, including host_e2e.rs (real
+                         # codex/opencode) and injector_tmux.rs (real tmux)
 ```
 
 </details>
@@ -503,4 +611,4 @@ MIT
 
 ## Credits
 
-Built for remote Claude Code interaction from mobile devices.
+Built so a coding agent — Claude Code, OpenCode or Codex — can be watched and driven from a phone.
