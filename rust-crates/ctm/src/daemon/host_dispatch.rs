@@ -361,3 +361,52 @@ pub(super) async fn handle_native_host_text(
             .await;
     }
 }
+
+/// ADR-016 §transport arbitration: should this message be mirrored, or is it the
+/// duplicate of one that came the other way?
+///
+/// A Codex session in app-server mode is reported by BOTH paths: ctm's hooks run inside
+/// the app-server process, and ctm's observer streams the same thread over the protocol.
+/// The protocol path is strictly richer (it carries approvals and per-item events), so
+/// once the observer is subscribed it claims the session (`hostTransport: "protocol"`)
+/// and hook-sourced *content* is dropped. Before that claim — a bare `codex`, or the
+/// first moments of a session — the hooks are the only source and must pass.
+///
+/// `SessionEnd` is never dropped: it is the signal that closes the topic, it is
+/// idempotent in the daemon, and losing it is worse than handling it twice.
+pub(super) async fn is_duplicate_transport(ctx: &HandlerContext, msg: &BridgeMessage) -> bool {
+    let meta = msg.meta();
+    match meta.host_transport() {
+        Some("protocol") => {
+            ctx.session_transports
+                .write()
+                .await
+                .insert(msg.session_id.clone(), ());
+            false
+        }
+        Some("hook") => {
+            if matches!(msg.msg_type, MessageType::SessionEnd) {
+                return false;
+            }
+            let claimed = ctx
+                .session_transports
+                .read()
+                .await
+                .contains_key(&msg.session_id);
+            if claimed {
+                tracing::debug!(
+                    session_id = %msg.session_id,
+                    msg_type = %msg.msg_type,
+                    "ADR-016: hook message dropped — this session is mirrored over the protocol"
+                );
+            }
+            claimed
+        }
+        _ => false,
+    }
+}
+
+/// Forget a session's transport claim (session end / cleanup).
+pub(super) async fn forget_transport(ctx: &HandlerContext, session_id: &str) {
+    ctx.session_transports.write().await.remove(session_id);
+}

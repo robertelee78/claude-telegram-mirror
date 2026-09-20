@@ -109,6 +109,14 @@ pub enum Commands {
     #[command(hide = true)]
     CodexHook,
 
+    /// Report that a Codex TUI exited (ADR-016; run by ctm's shell integration)
+    #[command(hide = true)]
+    CodexExited {
+        /// Working directory the session was started in
+        #[arg(long)]
+        cwd: String,
+    },
+
     /// Update ctm to the latest GitHub release (ADR-017)
     Update {
         /// Only report whether an update is available; change nothing

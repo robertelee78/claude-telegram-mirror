@@ -55,6 +55,7 @@ pub(super) async fn run_event_loop(
         socket_clients,
         pending_approval_clients: Arc::clone(&state.pending_approval_clients),
         session_hosts: Arc::clone(&state.session_hosts),
+        session_transports: Arc::clone(&state.session_transports),
         session_host_clients: Arc::clone(&state.session_host_clients),
         pending_topic_msgs: Arc::clone(&state.pending_topic_msgs),
         flush_tx: state.flush_tx.clone(),

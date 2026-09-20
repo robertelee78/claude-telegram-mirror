@@ -395,6 +395,49 @@ pub(super) async fn handle_session_start(ctx: &HandlerContext, msg: &BridgeMessa
 /// the Rust equivalent of the TypeScript `handleSessionEnd()`.  See also
 /// `ensure_session_exists` which handles the start (creation) side.
 pub(super) async fn handle_session_end(ctx: &HandlerContext, msg: &BridgeMessage) {
+    // ADR-016: `ctm codex-exited` reports "the TUI for this directory quit" without a
+    // session id, because a Codex TUI never learns its own thread id. Resolve it to the
+    // newest live Codex session for that directory and end that one.
+    if msg.session_id.is_empty() {
+        let Some(dir) = msg.meta().project_dir().map(str::to_string) else {
+            return;
+        };
+        let kind = msg.meta().host_kind();
+        let resolved = ctx
+            .db_op(move |sess| {
+                let mut found: Option<(String, String)> = None;
+                for s in sess.get_active_sessions().unwrap_or_default() {
+                    if s.host_kind() != kind {
+                        continue;
+                    }
+                    let same_dir = s.project_dir.as_deref().is_some_and(|p| {
+                        p == dir
+                            || std::fs::canonicalize(p).ok() == std::fs::canonicalize(&dir).ok()
+                    });
+                    if !same_dir {
+                        continue;
+                    }
+                    // Newest by last activity: several TUIs can share a directory.
+                    if found
+                        .as_ref()
+                        .is_none_or(|(_, seen)| s.last_activity > *seen)
+                    {
+                        found = Some((s.id.clone(), s.last_activity.clone()));
+                    }
+                }
+                found.map(|(id, _)| id)
+            })
+            .await;
+        let Some(session_id) = resolved else {
+            tracing::debug!(dir = %msg.meta().project_dir().unwrap_or(""), "ADR-016: codex-exited matched no live session");
+            return;
+        };
+        tracing::info!(session_id = %session_id, "ADR-016: Codex TUI exited — ending its session");
+        let mut resolved_msg = msg.clone();
+        resolved_msg.session_id = session_id;
+        return Box::pin(handle_session_end(ctx, &resolved_msg)).await;
+    }
+
     // ADR-014 A3: `session_exit_reason == "resume"` means the session is being
     // suspended and WILL come back. Tearing down here would wrongly destroy a
     // resuming session's topic, so skip teardown entirely. The reason is carried

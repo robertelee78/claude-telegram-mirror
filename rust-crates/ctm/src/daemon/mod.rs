@@ -219,6 +219,10 @@ pub(super) struct DaemonState {
     // metadata (never inferred). Avoids a DB round-trip on every dispatch decision.
     pub(super) session_hosts: Arc<RwLock<HashMap<String, crate::types::HostKind>>>,
 
+    // ADR-016 §transport arbitration: sessions claimed by the protocol observer, whose
+    // hook-sourced duplicates must be dropped (`host_dispatch::is_duplicate_transport`).
+    pub(super) session_transports: Arc<RwLock<HashMap<String, ()>>>,
+
     // ADR-016: session_id -> socket client_id of the host OBSERVER that owns the
     // session, for daemon->observer delivery (`HostInject`, `QuestionResponse`).
     // Mirrors `pending_approval_clients`; only populated for native-API hosts.
@@ -283,6 +287,7 @@ impl Daemon {
             running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pending_approval_clients: Arc::new(RwLock::new(HashMap::new())),
             session_hosts: Arc::new(RwLock::new(HashMap::new())),
+            session_transports: Arc::new(RwLock::new(HashMap::new())),
             session_host_clients: Arc::new(RwLock::new(HashMap::new())),
             pending_topic_msgs: Arc::new(RwLock::new(HashMap::new())),
             flush_tx,
@@ -597,6 +602,8 @@ struct HandlerContext {
     pending_approval_clients: Arc<RwLock<HashMap<String, String>>>,
     /// ADR-016: session_id -> HostKind (see `DaemonState::session_hosts`).
     session_hosts: Arc<RwLock<HashMap<String, crate::types::HostKind>>>,
+    /// ADR-016 §transport arbitration (see `DaemonState::session_transports`).
+    session_transports: Arc<RwLock<HashMap<String, ()>>>,
     /// ADR-016: session_id -> observer client_id (see `DaemonState::session_host_clients`).
     session_host_clients: Arc<RwLock<HashMap<String, String>>>,
     /// BUG-002 (no-silent-loss): per-session buffer of content events awaiting
@@ -773,6 +780,13 @@ async fn handle_socket_message(ctx: HandlerContext, msg: BridgeMessage) {
         return;
     }
 
+    // ADR-016 §transport arbitration: a Codex session in app-server mode is reported by
+    // both ctm's hooks and ctm's observer; the protocol path claims the session and the
+    // hook duplicates are dropped here.
+    if host_dispatch::is_duplicate_transport(&ctx, &msg).await {
+        return;
+    }
+
     match msg.msg_type {
         MessageType::SessionStart => {
             // Dedup: skip full handler if session already exists and is active.
@@ -821,7 +835,10 @@ async fn handle_socket_message(ctx: HandlerContext, msg: BridgeMessage) {
                 }
             }
         }
-        MessageType::SessionEnd => socket_handlers::handle_session_end(&ctx, &msg).await,
+        MessageType::SessionEnd => {
+            host_dispatch::forget_transport(&ctx, &msg.session_id).await;
+            socket_handlers::handle_session_end(&ctx, &msg).await
+        }
         MessageType::AgentResponse => {
             if ensure_session_exists(&ctx, &msg).await {
                 socket_handlers::handle_agent_response(&ctx, &msg).await;

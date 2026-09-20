@@ -46,6 +46,33 @@ pub async fn run() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `ctm codex-exited --cwd <dir>`: the TUI for this directory has quit.
+///
+/// A session running in Codex's app-server (`--remote`, which ctm's shell integration
+/// arranges) outlives its terminal: quitting the TUI detaches the client, the thread
+/// stays loaded, and NO event is emitted — not `thread/closed`, not a `SessionEnd` hook
+/// (the hooks run inside the app-server, whose session has not ended). Observed
+/// directly: after quitting, the daemon logged nothing at all, and the Telegram topic
+/// stayed open.
+///
+/// The shell function that launched `codex` is the one thing that knows, so it says so
+/// when `codex` returns. The daemon ends the newest live Codex session for that
+/// directory.
+pub async fn run_exited(cwd: &str) -> anyhow::Result<()> {
+    let Ok(cfg) = crate::config::load_config(false) else {
+        return Ok(());
+    };
+    let mut meta = Map::new();
+    meta.insert("hostTransport".into(), Value::String("hook".into()));
+    meta.insert("projectDir".into(), Value::String(cwd.to_string()));
+    meta.insert("action".into(), Value::String("client-exited".into()));
+    // An empty session id: the daemon resolves it from `projectDir` (the TUI never
+    // learns its own thread id).
+    let msg = stamped(KIND, MessageType::SessionEnd, "", "exited", meta);
+    let _ = send(&cfg.socket_path, &[msg]).await;
+    Ok(())
+}
+
 /// Translate one Codex hook payload into daemon messages. Pure; unit-tested.
 pub fn translate(p: &Value) -> Vec<BridgeMessage> {
     let s = |k: &str| p.get(k).and_then(Value::as_str).unwrap_or_default();
@@ -243,6 +270,15 @@ mod tests {
         let e = tr(SESSION_END);
         assert_eq!(e[0].msg_type, MessageType::SessionEnd);
         assert_eq!(e[0].content, "other");
+    }
+
+    #[test]
+    fn a_hook_session_end_still_carries_the_hook_transport() {
+        // SessionEnd is never dropped by transport arbitration — it closes the topic —
+        // but it must still be labelled so the rule is uniform.
+        let m = tr(SESSION_END);
+        assert_eq!(m[0].msg_type, MessageType::SessionEnd);
+        assert_eq!(m[0].meta().host_transport(), Some("hook"));
     }
 
     #[test]

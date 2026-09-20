@@ -157,6 +157,16 @@ impl Translator {
         mut meta: Map<String, Value>,
     ) -> BridgeMessage {
         meta.insert("hostSessionId".into(), Value::String(thread_id.into()));
+        // ADR-016 §transport arbitration: claim this session for the protocol path ONLY
+        // once the subscription actually succeeded. Both paths are live for an
+        // app-server session — the hooks run inside the app-server and the observer
+        // streams the same thread — so without a claim every message is mirrored twice
+        // (reported: "hi" and its reply each appearing twice). While unsubscribed the
+        // observer sees no content at all, so it must not claim and suppress the hooks
+        // that are covering a bare `codex`.
+        if self.threads.get(thread_id).is_some_and(|c| c.subscribed) {
+            meta.insert("hostTransport".into(), Value::String("protocol".into()));
+        }
         stamped(KIND, t, thread_id, content, meta)
     }
 
@@ -1265,6 +1275,53 @@ mod tests {
         assert!(
             t.pending_subscriptions().is_empty(),
             "a subscribed thread is never retried again"
+        );
+    }
+
+    #[test]
+    fn only_a_subscribed_observer_claims_the_session() {
+        // Both paths are live for an app-server session (hooks run inside the
+        // app-server, the observer streams the same thread), which is why every message
+        // appeared twice. The observer claims the session only once subscribed; while
+        // unsubscribed it sees no content and must leave the hooks alone.
+        let mut t = Translator::new();
+        let init = t.on_connect();
+        let Rpc::Request { id, .. } = rpcs(&init)[0].clone() else {
+            panic!()
+        };
+        let out = t.on_rpc(&json!({"id": id, "result": {"userAgent": "codex-tui/0.155.1"}}));
+        let Rpc::Request { id: list_id, .. } = rpcs(&out)[0].clone() else {
+            panic!()
+        };
+        // Announced from thread/started, not yet subscribed → NO claim.
+        let started = json!({"method": "thread/started", "params": {"thread": {
+            "id": T, "ephemeral": false, "threadSource": "cli",
+            "cwd": "/private/var/tmp/ctm-codex-spike", "status": {"type": "idle"}
+        }}});
+        let out = t.on_rpc(&started);
+        let announced = bridges(&out);
+        assert_eq!(announced.len(), 1);
+        assert_eq!(
+            announced[0].meta().host_transport(),
+            None,
+            "an unsubscribed observer must not suppress the hooks"
+        );
+
+        // Subscribe, then everything it emits carries the claim.
+        t.on_rpc(&json!({"id": list_id, "result": {"data": [T], "nextCursor": null}}));
+        let Out::Rpc(Rpc::Request { id, .. }) = t.resume_request(T) else {
+            panic!()
+        };
+        let mut ok = v(RESUME_OK);
+        ok["id"] = json!(id);
+        t.on_rpc(&ok);
+        let out = t.on_rpc(&v(CMD_STARTED));
+        let msgs = bridges(&out);
+        assert!(!msgs.is_empty(), "subscribed observer emits content");
+        assert_eq!(
+            msgs[0].meta().host_transport(),
+            Some("protocol"),
+            "the claim is what suppresses the duplicate hook message"
         );
     }
 

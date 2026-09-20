@@ -276,7 +276,7 @@ dependencies = [
 
 [[package]]
 name = "ctm"
-version = "0.2.38"
+version = "0.2.39"
 dependencies = [
  "anyhow",
  "chrono",

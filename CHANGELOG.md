@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.39] - 2026-09-20
+
+### Fixed (both reported from real use of a mirrored Codex session)
+- **Every message appeared twice.** A Codex session in app-server mode is reported by *both* of ctm's paths: the hooks run inside the app-server process and the observer streams the same thread. The observer now claims a session (`hostTransport: "protocol"`) once its subscription actually succeeds, and the daemon drops hook-sourced duplicates for claimed sessions. While unsubscribed — a bare `codex`, or the opening moments of a session — the observer sees no content and does not claim, so the hooks remain the only source and still work. `SessionEnd` is never dropped.
+- **Quitting Codex left the topic open.** A session that lives in the app-server outlives its terminal: quitting detaches the client, the thread stays loaded, and nothing is emitted — no `thread/closed`, and no `SessionEnd` hook, because the app-server's session has not ended. Verified directly: after quitting, the daemon logged nothing at all. ctm's shell function now reports the exit (`ctm codex-exited --cwd "$PWD"`, preserving codex's exit status), and the daemon ends the newest live Codex session for that directory.
+
 ## [0.2.38] - 2026-09-20
 
 ### Fixed (reported from a fresh Linux install)

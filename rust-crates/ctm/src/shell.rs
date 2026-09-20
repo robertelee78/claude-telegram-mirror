@@ -135,6 +135,9 @@ fn codex_wrapper(shell: Shell) -> String {
              \x20 case \" {PASSTHROUGH} \" in *\" ${{1:-}} \"*) command codex \"$@\"; return;; esac\n\
              \x20 for a in \"$@\"; do case \"$a\" in --remote|--remote=*|-C|--cd|--cd=*) command codex \"$@\"; return;; esac; done\n\
              \x20 command codex --remote \"unix://$sock\" -C \"$PWD\" \"$@\"\n\
+             \x20 local rc=$?\n\
+             \x20 command ctm codex-exited --cwd \"$PWD\" >/dev/null 2>&1 || true\n\
+             \x20 return $rc\n\
              }}\n"
         ),
         Shell::Fish => format!(
@@ -150,6 +153,9 @@ fn codex_wrapper(shell: Shell) -> String {
              \x20   command codex $argv; return\n\
              \x20 end\n\
              \x20 command codex --remote \"unix://$sock\" -C \"$PWD\" $argv\n\
+             \x20 set -l rc $status\n\
+             \x20 command ctm codex-exited --cwd \"$PWD\" >/dev/null 2>&1\n\
+             \x20 return $rc\n\
              end\n",
             PASSTHROUGH_FISH = PASSTHROUGH
         ),
@@ -543,6 +549,10 @@ mod tests {
         assert!(b.contains("--remote|--remote=*|-C|--cd|--cd=*"));
         // … nor anything when the daemon is down or the operator opted out.
         assert!(b.contains(r#"[ ! -S "$sock" ]"#));
+        // Quitting a --remote TUI emits no event of its own (the thread stays loaded in
+        // the app-server), so the wrapper is what tells ctm the session is over.
+        assert!(b.contains(r#"command ctm codex-exited --cwd "$PWD""#));
+        assert!(b.contains("return $rc"), "codex's exit status is preserved");
         assert!(b.contains(r#""${CTM_CODEX_REMOTE:-1}" = "0""#));
     }
 

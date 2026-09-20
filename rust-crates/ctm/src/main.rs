@@ -128,6 +128,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::ShellSetup { remove } => shell::run_shell_setup(remove),
         Commands::CodexHook => host::codex_hook_cmd::run().await,
+        Commands::CodexExited { cwd } => host::codex_hook_cmd::run_exited(&cwd).await,
         Commands::Service { action } => service::handle_service_command(&action),
         Commands::Toggle { on, off } => cmd_toggle(on, off).await,
         Commands::PruneTopics {
