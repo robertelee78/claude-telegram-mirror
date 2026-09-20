@@ -91,8 +91,34 @@ enum Ours {
     LoadedList,
     Resume(String),
     TurnStart(String),
+    /// A `turn/steer` we sent, with everything needed to recover from the two errors
+    /// the server answers with: a turn-id mismatch (it names the real one) and "no
+    /// active turn" (the turn ended in flight, so the text becomes a new turn).
+    Steer {
+        thread_id: String,
+        text: String,
+        retried: bool,
+    },
     Other,
 }
+
+/// `expected active turn id `X` but found `Y`` → `Y`.
+///
+/// `turn/steer` requires `expectedTurnId`, which is only learned from `turn/started` —
+/// a notification that reaches *subscribed* clients only. For a bare `codex`, which
+/// cannot be subscribed to, the id is therefore unknowable in advance; the server's own
+/// mismatch error is the one place it is published, so ctm asks with a sentinel and
+/// reads the answer. Verified live: injecting into a running bare session failed with
+/// `missing field expectedTurnId`, and a deliberate mismatch replied
+/// ``expected active turn id `000…` but found `01a0bdb5-…` ``.
+fn actual_turn_id(err: &str) -> Option<String> {
+    let after = err.split("but found").nth(1)?;
+    let inside = after.split('`').nth(1)?;
+    (!inside.trim().is_empty()).then(|| inside.trim().to_string())
+}
+
+/// A turn id that can never be a real one, used to ask the server which turn is live.
+const TURN_ID_PROBE: &str = "00000000-0000-0000-0000-000000000000";
 
 /// What a pending *server* request is, keyed by its JSON-RPC id.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -382,6 +408,38 @@ impl Translator {
                 ctx.subscribed = true;
                 ctx.resume_pending = false;
                 out
+            }
+            Ours::Steer {
+                thread_id,
+                text,
+                retried,
+            } => {
+                let Some(e) = err else {
+                    return vec![]; // steered successfully
+                };
+                // The server names the turn it expected: retry once with that id.
+                if let Some(actual) = actual_turn_id(e) {
+                    if !retried {
+                        self.threads
+                            .entry(thread_id.clone())
+                            .or_default()
+                            .current_turn = Some(actual.clone());
+                        return vec![self.steer(&thread_id, &text, &actual, true)];
+                    }
+                }
+                // The turn finished between our decision and the request: send the text
+                // as a new turn rather than losing it.
+                if e.contains("no active turn") {
+                    self.threads.entry(thread_id.clone()).or_default().running = false;
+                    return self.inject_text(&thread_id, &text);
+                }
+                tracing::warn!(thread_id = %thread_id, error = e, "Codex: turn/steer failed");
+                vec![Out::Bridge(self.msg(
+                    MessageType::Error,
+                    &thread_id,
+                    format!("Could not deliver message to Codex: {e}"),
+                    Map::new(),
+                ))]
             }
             Ours::TurnStart(tid) => {
                 if let Some(e) = err {
@@ -977,18 +1035,40 @@ impl Translator {
         }
     }
 
+    /// One `turn/steer` request, remembering what it carried so a mismatch can be retried.
+    fn steer(&mut self, tid: &str, text: &str, expected_turn: &str, retried: bool) -> Out {
+        let client_id = format!("{CLIENT_MSG_PREFIX}{}", uuid::Uuid::new_v4());
+        self.request(
+            Ours::Steer {
+                thread_id: tid.to_string(),
+                text: text.to_string(),
+                retried,
+            },
+            "turn/steer",
+            json!({
+                "threadId": tid,
+                "expectedTurnId": expected_turn,
+                "clientUserMessageId": client_id,
+                "input": [{"type": "text", "text": text}],
+            }),
+        )
+    }
+
     fn inject_text(&mut self, tid: &str, text: &str) -> Vec<Out> {
         let running = self.threads.get(tid).is_some_and(|c| c.running);
-        let client_id = format!("{CLIENT_MSG_PREFIX}{}", uuid::Uuid::new_v4());
-        let input = json!([{"type": "text", "text": text}]);
         if running {
-            // Steer the in-flight turn (ungated, spike-verified).
-            vec![self.request(
-                Ours::Other,
-                "turn/steer",
-                json!({"threadId": tid, "clientUserMessageId": client_id, "input": input}),
-            )]
+            // Steer the in-flight turn. `expectedTurnId` is mandatory; when ctm is not
+            // subscribed it has never seen `turn/started`, so it sends the probe id and
+            // recovers the real one from the server's mismatch error.
+            let expected = self
+                .threads
+                .get(tid)
+                .and_then(|c| c.current_turn.clone())
+                .unwrap_or_else(|| TURN_ID_PROBE.to_string());
+            vec![self.steer(tid, text, &expected, false)]
         } else {
+            let client_id = format!("{CLIENT_MSG_PREFIX}{}", uuid::Uuid::new_v4());
+            let input = json!([{"type": "text", "text": text}]);
             vec![self.request(
                 Ours::TurnStart(tid.into()),
                 "turn/start",
@@ -1158,6 +1238,19 @@ mod tests {
             .collect()
     }
     /// Bring a translator to "initialized + thread T subscribed" using captured shapes.
+    /// A `HostInject` as the daemon sends one.
+    fn host_inject(tid: &str, action: &str, content: &str) -> BridgeMessage {
+        let mut meta = Map::new();
+        meta.insert("action".into(), Value::String(action.into()));
+        BridgeMessage {
+            msg_type: MessageType::HostInject,
+            session_id: tid.into(),
+            timestamp: String::new(),
+            content: content.into(),
+            metadata: Some(meta),
+        }
+    }
+
     fn subscribed() -> Translator {
         let mut t = Translator::new();
         let init = t.on_connect();
@@ -1276,6 +1369,87 @@ mod tests {
             t.pending_subscriptions().is_empty(),
             "a subscribed thread is never retried again"
         );
+    }
+
+    #[test]
+    fn steering_supplies_the_expected_turn_id_and_recovers_from_a_mismatch() {
+        // Live failure this reproduces: a Telegram reply to a busy bare `codex` was
+        // delivered to the observer and then rejected by the app-server with
+        // "Invalid request: missing field `expectedTurnId`", so it never reached the
+        // session. ctm cannot know that id while unsubscribed, so it asks.
+        let mut t = subscribed();
+        t.threads.entry(T.into()).or_default().running = true;
+        t.threads.entry(T.into()).or_default().current_turn = None;
+
+        let out = t.on_daemon(&host_inject(T, "text", "from telegram"));
+        let Rpc::Request { id, method, params } = rpcs(&out)[0].clone() else {
+            panic!("expected a request")
+        };
+        assert_eq!(method, "turn/steer");
+        assert_eq!(
+            params["expectedTurnId"], TURN_ID_PROBE,
+            "the field is always present; unknown means probe"
+        );
+
+        // The server answers with the turn it actually has.
+        let out = t.on_rpc(&json!({
+            "id": id,
+            "error": {"code": -32600, "message":
+                "expected active turn id `00000000-0000-0000-0000-000000000000` but found `01a0bdb5-a811-7ce3-9284-22016901e5b1`"}
+        }));
+        let Rpc::Request { method, params, .. } = rpcs(&out)[0].clone() else {
+            panic!("expected the retry")
+        };
+        assert_eq!(method, "turn/steer");
+        assert_eq!(
+            params["expectedTurnId"],
+            "01a0bdb5-a811-7ce3-9284-22016901e5b1"
+        );
+        assert_eq!(
+            params["input"][0]["text"], "from telegram",
+            "same text, not lost"
+        );
+    }
+
+    #[test]
+    fn a_turn_that_ends_mid_flight_becomes_a_new_turn_instead_of_being_lost() {
+        let mut t = subscribed();
+        t.threads.entry(T.into()).or_default().running = true;
+        let out = t.on_daemon(&host_inject(T, "text", "late reply"));
+        let Rpc::Request { id, .. } = rpcs(&out)[0].clone() else {
+            panic!()
+        };
+        let out = t.on_rpc(&json!({
+            "id": id,
+            "error": {"code": -32600, "message": "no active turn to steer"}
+        }));
+        let Rpc::Request { method, params, .. } = rpcs(&out)[0].clone() else {
+            panic!("expected a turn/start")
+        };
+        assert_eq!(method, "turn/start");
+        assert_eq!(params["input"][0]["text"], "late reply");
+    }
+
+    #[test]
+    fn a_mismatch_is_retried_only_once() {
+        let mut t = subscribed();
+        t.threads.entry(T.into()).or_default().running = true;
+        let out = t.on_daemon(&host_inject(T, "text", "x"));
+        let Rpc::Request { id, .. } = rpcs(&out)[0].clone() else {
+            panic!()
+        };
+        let mismatch = |id: u64, found: &str| {
+            json!({"id": id, "error": {"code": -32600, "message":
+                format!("expected active turn id `p` but found `{found}`")}})
+        };
+        let out = t.on_rpc(&mismatch(id, "turn-a"));
+        let Rpc::Request { id: id2, .. } = rpcs(&out)[0].clone() else {
+            panic!()
+        };
+        // A second mismatch must not loop; it reports instead.
+        let out = t.on_rpc(&mismatch(id2, "turn-b"));
+        assert!(rpcs(&out).is_empty(), "no third attempt");
+        assert_eq!(bridges(&out)[0].msg_type, MessageType::Error);
     }
 
     #[test]

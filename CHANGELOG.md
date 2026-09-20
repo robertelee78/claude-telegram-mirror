@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.42] - 2026-09-20
+
+### Fixed (a Telegram reply never reached a busy Codex session)
+- **`turn/steer` was rejected by Codex with `missing field \`expectedTurnId\``,** so any message sent while Codex was mid-turn was delivered to ctm's observer and then dropped by the app-server — the daemon logged a successful delivery while nothing arrived in the session. `expectedTurnId` is only learned from `turn/started`, which reaches *subscribed* clients only, so for a bare `codex` (which cannot be subscribed to) it is unknowable in advance. ctm now always sends the field: the real turn id when it has one, otherwise a sentinel, and the server's own mismatch error (``expected active turn id `X` but found `Y` ``) supplies the correct id for a single retry. If the turn ended in flight (`no active turn to steer`) the text is sent as a new turn instead of being lost, and a second mismatch reports rather than looping.
+
 ## [0.2.41] - 2026-09-20
 
 ### Fixed (a machine reported "is current" minutes after a new release was published)
