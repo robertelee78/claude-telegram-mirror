@@ -21,10 +21,12 @@
 //!   which reports `key`, `currentHash`, `trustStatus`) and persists that value through
 //!   Codex's own config RPC (`config/batchWrite`, `mergeStrategy: "replace"`), so the
 //!   file stays Codex-owned and format-preserving. Verified idempotent.
-//! - **Approvals are NOT mirrored actionably.** `PermissionRequest` carries no request
-//!   id, and an `async` hook cannot answer one later; a *blocking* hook that decided
-//!   would suppress the TUI's own prompt — precisely ADR-014's PR-E failure. Approvals
-//!   are therefore surfaced read-only and `HostCaps` keeps reporting the truth.
+//! - **Approvals do NOT come through hooks.** `PermissionRequest` has no request id, so
+//!   a decision cannot be tied to the request it answers; answering by keystroke would
+//!   be blind injection into an unknown screen (ADR-014's own failure class — Codex's
+//!   review of the design made the same objection). Approvals instead come over the
+//!   app-server, which has request ids and atomic resolution — see `shell.rs`, which
+//!   makes a plain `codex` join it.
 
 use crate::config::CodexHostConfig;
 use crate::error::{AppError, Result};

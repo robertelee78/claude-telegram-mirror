@@ -50,6 +50,10 @@ const CLIENT_NAME: &str = "ctm";
 /// Marker prefix on `clientUserMessageId` so our own injected user messages are not
 /// re-mirrored as terminal input when they echo back as `item/started userMessage`.
 const CLIENT_MSG_PREFIX: &str = "ctm-";
+/// How often a deferred `thread/resume` is retried.
+const RESUME_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+/// How long to keep retrying before concluding the thread is not app-server-owned.
+const RESUME_RETRY_WINDOW: std::time::Duration = std::time::Duration::from_secs(90);
 
 /// Something the observer must send to the app-server: a request we originate, or a
 /// response to a server request.
@@ -194,6 +198,20 @@ impl Translator {
             .and_then(Value::as_bool)
             .unwrap_or(false)
             || thread.get("threadSource").and_then(Value::as_str) == Some("system")
+    }
+
+    /// ADR-016 (2026-09-20): threads whose `thread/resume` was deferred and that are
+    /// still unsubscribed. `turn/started` cannot be the retry trigger — it is only
+    /// delivered to *subscribed* clients, so a deferred subscription could never
+    /// recover from it. The runner retries these on a timer instead.
+    pub fn resume_retries(&mut self) -> Vec<Out> {
+        let pending: Vec<String> = self
+            .threads
+            .iter()
+            .filter(|(_, c)| c.announced && !c.subscribed)
+            .map(|(id, _)| id.clone())
+            .collect();
+        pending.iter().map(|id| self.subscribe(id)).collect()
     }
 
     /// End an announced thread exactly once and forget its state.
@@ -997,8 +1015,36 @@ pub async fn run_once(config: &Config, cx: &CodexHostConfig) -> Result<()> {
         dispatch(o, &mut tx, &link).await?;
     }
 
+    // A fresh thread has no rollout yet, so its first `thread/resume` is refused. For a
+    // session the app-server owns (`codex --remote …`, which ctm's shell integration
+    // makes the default) the rollout appears once the turn starts and a retry succeeds
+    // — spike-verified. For a bare `codex`, which owns its own thread, it never does,
+    // so retries are bounded and the outcome is reported once instead of churning.
+    let mut resume_tick = tokio::time::interval(RESUME_RETRY_INTERVAL);
+    resume_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let started = tokio::time::Instant::now();
+    let mut gave_up = false;
+
     loop {
         tokio::select! {
+            _ = resume_tick.tick() => {
+                if !gave_up {
+                    let retries = tr.resume_retries();
+                    if !retries.is_empty() {
+                        if started.elapsed() > RESUME_RETRY_WINDOW {
+                            gave_up = true;
+                            tracing::info!(
+                                threads = retries.len(),
+                                "Codex: these threads cannot be subscribed to — they are bare `codex` sessions, which own their own thread. They mirror out through ctm's Codex hooks; approvals need `codex --remote` (ctm's shell integration does this)."
+                            );
+                        } else {
+                            for o in retries {
+                                dispatch(o, &mut tx, &link).await?;
+                            }
+                        }
+                    }
+                }
+            }
             frame = rx.next() => {
                 let Some(frame) = frame else {
                     return Err(AppError::Socket("Codex WebSocket closed".into()));

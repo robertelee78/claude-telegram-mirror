@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.35] - 2026-09-20
+
+### Added (Codex approvals can be answered from Telegram — ADR-016 §Codex approvals)
+- **Approvals on Codex are no longer terminal-only.** ctm's shell integration now makes a plain `codex` join the app-server (`--remote unix://<socket> -C "$PWD"`), where each approval is a JSON-RPC request with an id that ctm answers atomically and `serverRequest/resolved` retires the other surface. You still just type `codex`; the block passes through every subcommand (`exec`, `app-server`, `resume`, …), any explicit `--remote`/`-C`, and every run while the ctm daemon is down. `CTM_CODEX_REMOTE=0` opts out.
+- `-C "$PWD"` is part of the rewrite because a remote session otherwise adopts the *daemon's* working directory — silently, which would have broken every project workflow.
+- **The Codex observer retries a deferred subscription on a timer** (every 2 s for 90 s). ADR-016 hung that retry on `turn/started`, which only *subscribed* clients receive — so a deferred subscription could never recover. That is why a mirrored Codex session showed a topic but no replies.
+
+### Changed
+- ADR-016's claim that Codex rejects `permissionDecision: "ask"` is reinstated with evidence: the schema accepts it, the binary rejects it at runtime. Claude Code's fallback does not port to Codex.
+
+### Not shipped, deliberately
+- An earlier design answered Codex's own terminal prompt with a tmux keystroke. Every mechanic worked, but there is **no atomic link between a Telegram tap and the approval it is answering** — screen-capture and key-send are separate operations, so a keystroke can approve the *next* request. Codex's own review of the design refused it on the same grounds, and it is ADR-014's blind-injection failure applied to command authorization. No keystroke authorization path exists in ctm.
+
 ## [0.2.34] - 2026-09-20
 
 ### Added (Codex now mirrors OUT as well as in — ADR-016 §Codex outbound)

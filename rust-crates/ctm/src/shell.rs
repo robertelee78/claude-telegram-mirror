@@ -105,6 +105,57 @@ fn rc_files(home: &Path, shell: Shell) -> Vec<PathBuf> {
     }
 }
 
+/// ADR-016 §Codex approvals: the shell function that makes a plain `codex` join the
+/// app-server, which is the only way an approval can be mirrored *correctly*.
+///
+/// A bare `codex` owns its thread, and a second client can neither observe it nor
+/// answer its approvals: `PermissionRequest` hooks carry no request id, so a remote
+/// decision cannot be bound to the request it answers, and driving the prompt by
+/// keystroke is blind injection into an unknown screen — the ADR-014 failure class.
+/// `codex --remote unix://<socket>` puts the session in the app-server instead, where
+/// every approval is a JSON-RPC request with an id that ctm answers atomically and
+/// `serverRequest/resolved` retires the other surface. That is ctm's invariant, kept.
+///
+/// The function is deliberately conservative:
+/// - it only touches a plain interactive run — any subcommand (`exec`, `app-server`,
+///   `resume`, `login`, …) and any explicit `--remote`/`-C` is passed through untouched;
+/// - it requires the control socket to exist, so with no ctm daemon `codex` is just
+///   `codex`;
+/// - `-C "$PWD"` preserves the working directory (without it the session would silently
+///   adopt the daemon's — verified);
+/// - `CTM_CODEX_REMOTE=0` turns it off.
+fn codex_wrapper(shell: Shell) -> String {
+    // Subcommands that must never be rewritten (`codex --help` prints this set).
+    const PASSTHROUGH: &str = "agents exec e review login logout mcp plugin app-server remote-control app completion update doctor sandbox debug apply resume queue archive delete migrate-rollouts unarchive help";
+    match shell {
+        Shell::Zsh | Shell::Bash => format!(
+            "codex() {{\n\
+             \x20 local sock=\"${{CODEX_HOME:-$HOME/.codex}}/app-server-control/app-server-control.sock\"\n\
+             \x20 if [ \"${{CTM_CODEX_REMOTE:-1}}\" = \"0\" ] || [ ! -S \"$sock\" ]; then command codex \"$@\"; return; fi\n\
+             \x20 case \" {PASSTHROUGH} \" in *\" ${{1:-}} \"*) command codex \"$@\"; return;; esac\n\
+             \x20 for a in \"$@\"; do case \"$a\" in --remote|--remote=*|-C|--cd|--cd=*) command codex \"$@\"; return;; esac; done\n\
+             \x20 command codex --remote \"unix://$sock\" -C \"$PWD\" \"$@\"\n\
+             }}\n"
+        ),
+        Shell::Fish => format!(
+            "function codex\n\
+             \x20 set -l sock (test -n \"$CODEX_HOME\"; and echo $CODEX_HOME; or echo $HOME/.codex)/app-server-control/app-server-control.sock\n\
+             \x20 if test \"$CTM_CODEX_REMOTE\" = 0 -o ! -S $sock\n\
+             \x20   command codex $argv; return\n\
+             \x20 end\n\
+             \x20 if contains -- \"$argv[1]\" {PASSTHROUGH_FISH}\n\
+             \x20   command codex $argv; return\n\
+             \x20 end\n\
+             \x20 if string match -q -- '--remote*' $argv; or string match -q -- '-C' $argv; or string match -q -- '--cd*' $argv\n\
+             \x20   command codex $argv; return\n\
+             \x20 end\n\
+             \x20 command codex --remote \"unix://$sock\" -C \"$PWD\" $argv\n\
+             end\n",
+            PASSTHROUGH_FISH = PASSTHROUGH
+        ),
+    }
+}
+
 fn block_body(shell: Shell, install_dir: &Path, completion_dir: &Path) -> String {
     let dir = install_dir.display();
     match shell {
@@ -121,17 +172,20 @@ fn block_body(shell: Shell, install_dir: &Path, completion_dir: &Path) -> String
              export PATH=\"{dir}:$PATH\"\n\
              (( ${{fpath[(Ie){cd}]}} )) || fpath=(\"{cd}\" $fpath)\n\
              if (( $+functions[compdef] )); then autoload -Uz _ctm && compdef _ctm ctm; else autoload -Uz compinit && compinit -i; fi\n\
+             {codex}\
              {END}\n",
-            cd = completion_dir.display()
+            cd = completion_dir.display(),
+            codex = codex_wrapper(shell)
         ),
         Shell::Bash => format!(
             "{BEGIN}\n\
              # managed by `ctm shell-setup`; edits here are overwritten, remove with `ctm shell-setup --remove`\n\
              export PATH=\"{dir}:$PATH\"\n\
-             [ -f \"{}\" ] && . \"{}\"\n\
+             [ -f \"{comp}\" ] && . \"{comp}\"\n\
+             {codex}\
              {END}\n",
-            completion_dir.join("ctm").display(),
-            completion_dir.join("ctm").display()
+            comp = completion_dir.join("ctm").display(),
+            codex = codex_wrapper(shell)
         ),
         // A whole file we own, so no markers needed — but keep them for symmetry
         // with --remove, which deletes the file.
@@ -139,7 +193,9 @@ fn block_body(shell: Shell, install_dir: &Path, completion_dir: &Path) -> String
             "{BEGIN}\n\
              # managed by `ctm shell-setup`; remove with `ctm shell-setup --remove`\n\
              fish_add_path --global --move \"{dir}\"\n\
-             {END}\n"
+             {codex}\
+             {END}\n",
+            codex = codex_wrapper(shell)
         ),
     }
 }
@@ -463,5 +519,43 @@ mod tests {
         assert!(b.contains("else autoload -Uz compinit && compinit -i; fi"));
         let f = block_body(Shell::Fish, Path::new("/x/bin"), Path::new("/x/c"));
         assert!(f.contains("fish_add_path --global --move \"/x/bin\""));
+    }
+
+    #[test]
+    fn codex_wrapper_only_rewrites_a_plain_interactive_run() {
+        let b = block_body(
+            Shell::Zsh,
+            Path::new("/home/u/.local/bin"),
+            Path::new("/home/u/.zsh"),
+        );
+        // The rewrite that makes approvals answerable: the session lives in the
+        // app-server, and -C keeps the working directory (without it the session
+        // silently adopts the daemon's — verified).
+        assert!(b.contains(r#"command codex --remote "unix://$sock" -C "$PWD" "$@""#));
+        // Never touch a subcommand …
+        for sub in ["exec", "app-server", "resume", "login", "mcp"] {
+            assert!(
+                b.contains(&format!(" {sub} ")),
+                "{sub} must be in the passthrough set"
+            );
+        }
+        // … nor an invocation that already chose its own endpoint or directory …
+        assert!(b.contains("--remote|--remote=*|-C|--cd|--cd=*"));
+        // … nor anything when the daemon is down or the operator opted out.
+        assert!(b.contains(r#"[ ! -S "$sock" ]"#));
+        assert!(b.contains(r#""${CTM_CODEX_REMOTE:-1}" = "0""#));
+    }
+
+    #[test]
+    fn codex_wrapper_is_written_for_every_shell() {
+        for shell in [Shell::Zsh, Shell::Bash, Shell::Fish] {
+            let b = block_body(
+                shell,
+                Path::new("/home/u/.local/bin"),
+                Path::new("/home/u/c"),
+            );
+            assert!(b.contains("codex"), "{shell:?} block defines the wrapper");
+            assert!(b.contains("CTM_CODEX_REMOTE"), "{shell:?} opt-out");
+        }
     }
 }

@@ -478,3 +478,69 @@ normalization" and "forward asynchronously and return neutral output".
 - ctm now writes into `~/.codex/hooks.json` and, through Codex's own RPC, one
   `hooks.state` key per hook in `config.toml`. Both are surfaced by `ctm doctor` and
   documented; neither is silent.
+
+## Codex approvals, answered correctly (amendment, 2026-09-20 — shipped in 0.2.35)
+
+The previous amendment shipped Codex outbound via hooks and recorded approvals as
+terminal-only. The operator rejected that ("unacceptable"), which was the right call —
+and the first design that followed was wrong in a way worth recording.
+
+### The design that was rejected, and why
+
+ctm's `PermissionRequest` hook would notify without deciding (returning `{}`, so Codex
+still rendered its own prompt), and a Telegram answer would be delivered as a keystroke
+into the pane — `y` to approve, `Escape` to reject. Every mechanic was spike-verified:
+returning `{}` renders the prompt; `y` approves and Codex prints `✔ You approved codex
+to run …`; `Escape` rejects; `TMUX_PANE` is visible to the hook; a digit only moves the
+selection ("Press enter to confirm"); a stray key lands in the composer as text.
+
+Codex itself reviewed the design and refused it, correctly:
+
+> **The tmux path lacks an atomic connection between a Telegram answer and its intended
+> approval.** … The dangerous case is approving request B using permission granted for
+> request A. A successful `tmux send-keys` only establishes delivery to tmux — not
+> acceptance by the intended Codex prompt. A ctm mutex, callback nonce, command hash,
+> screen capture, or debounce cannot eliminate this race.
+
+It is the ADR-014 failure class — blind injection into an unknown screen — applied to
+*command authorization*, where the cost of getting it wrong is executing something the
+operator never approved. Two further findings sealed it: `PermissionRequest` carries no
+request id at all, and other hooks may decide first (any deny wins, an allow suppresses
+the prompt), so ctm's `{}` never guaranteed a prompt existed to answer. The review also
+caught a stale claim in this ADR: `permissionDecision: "ask"` appears in the
+`pre-tool-use.command.output` schema but the binary still rejects it
+(`PreToolUse hook returned unsupported permissionDecision:ask`) — Claude's fallback does
+not port.
+
+**No keystroke authorization path was shipped.**
+
+### What shipped instead
+
+`codex --remote unix://<socket>` puts the session in the app-server, where an approval is
+a JSON-RPC **request with an id**: ctm answers by responding to that id, and
+`serverRequest/resolved` retires the other surface. That is the mechanism ADR-016 built
+originally — the only thing missing was that a plain `codex` did not use it.
+
+| # | Question | Result |
+|---|---|---|
+| 1 | Does a peer client get approvals for a `--remote` session? | **Yes** — `item/commandExecution/requestApproval` arrived with its request id after `thread/resume` succeeded. |
+| 2 | Does `thread/resume` work for an app-server-owned thread? | **Yes**, once the turn persists a rollout — unlike a bare session, where it never does. |
+| 3 | Does `--remote` change the working directory? | **Yes, silently** — the session adopts the *daemon's* cwd. `-C "$PWD"` restores it. |
+| 4 | Can the retry recover a deferred subscription? | Only on a timer. `turn/started` is delivered to **subscribed** clients only, so ADR-016's original retry trigger was unreachable; the observer now retries every 2 s for 90 s. |
+
+So ctm's shell integration (`shell.rs`, already writing one managed block) defines a
+`codex` function that adds `--remote unix://<socket> -C "$PWD"` — and nothing else. It
+passes through every subcommand (`exec`, `app-server`, `resume`, …), any explicit
+`--remote`/`-C`, any run while the control socket is absent, and `CTM_CODEX_REMOTE=0`.
+The operator still types `codex`.
+
+### Consequences
+
+- **Codex approvals are answerable from Telegram**, atomically, with both surfaces live
+  — ctm's invariant, kept the way ADR-014 requires rather than approximated.
+- A session started in app-server mode is also fully observable, so it mirrors out over
+  the protocol; the hooks remain for sessions that are not (an explicit `--remote`-less
+  run, or a shell without ctm's block).
+- ctm now defines a shell function named after another tool. That is intrusive by
+  nature, so it is inert without the daemon, opt-out in one variable, and reported by
+  `ctm doctor`.

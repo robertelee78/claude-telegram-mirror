@@ -439,6 +439,126 @@ async fn opencode_pipe_plugin_mirrors_a_process_with_no_port_and_no_password() {
     pipe_server.abort();
 }
 
+/// ADR-016 §Codex approvals: the reason ctm makes a plain `codex` join the app-server.
+///
+/// Launches a REAL `codex --remote` TUI against the REAL app-server, drives it to a
+/// command that needs approval, and asserts ctm's observer receives an
+/// `ApprovalRequest` it can answer — i.e. an approval carrying an id, resolvable
+/// atomically, rather than a prompt that could only be answered by blind keystrokes.
+/// Costs one small model turn.
+#[tokio::test]
+#[ignore = "needs the `codex` binary and spends a model turn; run with --ignored"]
+async fn codex_remote_session_delivers_an_answerable_approval() {
+    if !have("codex") || !have("tmux") {
+        eprintln!("skip: codex or tmux missing");
+        return;
+    }
+    let start = Command::new("codex")
+        .args(["app-server", "daemon", "start"])
+        .output()
+        .expect("codex app-server daemon start");
+    let started: serde_json::Value =
+        serde_json::from_slice(&start.stdout).unwrap_or(serde_json::Value::Null);
+    let Some(socket_path) = started["socketPath"].as_str().map(PathBuf::from) else {
+        eprintln!("skip: no app-server daemon available");
+        return;
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("bridge.sock");
+    let mut rx = fake_daemon(sock.clone()).await;
+    let cx = CodexHostConfig {
+        enabled: true,
+        socket_path: socket_path.clone(),
+        binary: None,
+    };
+    let cfg = Arc::new(base_config(
+        sock.clone(),
+        HostsConfig {
+            opencode: OpenCodeHostConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            codex: cx.clone(),
+        },
+    ));
+    let cfg2 = Arc::clone(&cfg);
+    let observer = tokio::spawn(async move { ctm::host::codex::run_once(&cfg2, &cx).await });
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    // A real TUI, in app-server mode — exactly what ctm's shell integration produces.
+    let work = PathBuf::from(format!("/tmp/ctm-e2e-approve-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&work);
+    std::fs::create_dir_all(&work).unwrap();
+    let tmux = format!("ctm-e2e-{}", std::process::id());
+    struct TmuxGuard(String, PathBuf);
+    impl Drop for TmuxGuard {
+        fn drop(&mut self) {
+            let _ = Command::new("tmux")
+                .args(["kill-session", "-t", &self.0])
+                .output();
+            let _ = std::fs::remove_dir_all(&self.1);
+        }
+    }
+    let _guard = TmuxGuard(tmux.clone(), work.clone());
+    let launch = format!(
+        "cd {w} && codex --remote unix://{s} -C {w} -c approval_policy='on-request' -c sandbox_mode='read-only'; sleep 30",
+        w = work.display(),
+        s = socket_path.display()
+    );
+    assert!(Command::new("tmux")
+        .args([
+            "new-session",
+            "-d",
+            "-s",
+            &tmux,
+            "-x",
+            "120",
+            "-y",
+            "40",
+            &launch
+        ])
+        .status()
+        .unwrap()
+        .success());
+    let keys = |k: &str| {
+        let _ = Command::new("tmux")
+            .args(["send-keys", "-t", &tmux, k])
+            .output();
+    };
+    tokio::time::sleep(Duration::from_secs(12)).await;
+    keys("Enter"); // trust-this-directory prompt
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    keys("run this exact shell command: touch needs-approval.txt");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    keys("Enter");
+
+    let approval = wait_for(&mut rx, |m| m.msg_type == MessageType::ApprovalRequest, 90)
+        .await
+        .expect("the approval reached ctm as an answerable request");
+    assert_eq!(approval.meta().host_kind(), HostKind::Codex);
+    assert!(
+        approval.content.contains("touch") || approval.content.contains("needs-approval"),
+        "the prompt names the command: {}",
+        approval.content
+    );
+    // It is answerable: ctm holds an id for it, so a Telegram tap resolves THIS request
+    // rather than whatever happens to be on screen later.
+    // `hostRequestId` is the JSON-RPC request id: answering is a response on that id,
+    // so a Telegram tap resolves THIS request and not whatever is on screen later.
+    assert!(
+        approval
+            .metadata
+            .as_ref()
+            .unwrap()
+            .contains_key("hostRequestId"),
+        "approval carries the app-server request id: {:?}",
+        approval.metadata
+    );
+
+    observer.abort();
+}
+
 /// ADR-016 §Codex outbound: the hook path, end to end against the REAL codex binary
 /// and its REAL app-server — install the hook file into an isolated CODEX_HOME, have
 /// the app-server compute its hashes (`hooks/list`), trust them through Codex's own
@@ -483,7 +603,14 @@ async fn codex_hooks_install_trust_and_forward_to_the_daemon() {
         eprintln!("skip: no managed standalone codex install to link");
         return;
     }
-    std::os::unix::fs::symlink(real_home.join("packages"), codex_home.join("packages")).unwrap();
+    // Link the RELEASE dir only, never `packages` itself: the daemon rewrites
+    // `packages/standalone/current` on start, and through a parent-level symlink that
+    // rewrite lands in the operator's real install and breaks it when this temp home is
+    // removed (observed once — the repair is `ln -sfn <release> current`).
+    let release = real_home.join("packages/standalone/current");
+    let release = std::fs::canonicalize(&release).unwrap_or(release);
+    std::fs::create_dir_all(codex_home.join("packages/standalone")).unwrap();
+    std::os::unix::fs::symlink(&release, codex_home.join("packages/standalone/current")).unwrap();
     if real_home.join("auth.json").exists() {
         let _ =
             std::os::unix::fs::symlink(real_home.join("auth.json"), codex_home.join("auth.json"));
