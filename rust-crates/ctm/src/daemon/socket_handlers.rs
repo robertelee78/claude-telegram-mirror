@@ -57,8 +57,8 @@ pub(super) async fn handle_session_start(ctx: &HandlerContext, msg: &BridgeMessa
         .await;
     }
 
-    // ADR-016: cache the host kind and remember the observer client for delivery.
-    host_dispatch::record_session_host(ctx, msg).await;
+    // ADR-016: the host binding is recorded by the dispatcher before this handler runs
+    // (it must happen even when the dedup path skips the handler), so nothing to do here.
 
     // Cache tmux target
     if let Some(target) = tmux_target {

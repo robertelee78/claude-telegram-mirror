@@ -789,6 +789,16 @@ async fn handle_socket_message(ctx: HandlerContext, msg: BridgeMessage) {
 
     match msg.msg_type {
         MessageType::SessionStart => {
+            // ADR-016: bind the session to its host observer BEFORE the dedup below.
+            // Both of ctm's paths announce a Codex session and either may arrive first;
+            // when the hook won that race the observer's own `session_start` was
+            // swallowed by the dedup and never registered, so a Telegram reply had
+            // nowhere to go ("the Codex observer is not connected" — seen on a Linux
+            // box where the hook consistently won). Registration is idempotent, so it
+            // is safe on every occurrence, and hook-transport messages are ignored by
+            // `record_session_host` itself.
+            host_dispatch::record_session_host(&ctx, &msg).await;
+
             // Dedup: skip full handler if session already exists and is active.
             // Activity and tmux target are already updated by check_and_update_tmux_target
             // (called unconditionally above), so an early return here is safe — we only

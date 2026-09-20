@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.40] - 2026-09-20
+
+### Fixed (reported from a Linux box: "Reply failed — the Codex observer is not connected")
+- **A Telegram reply could have nowhere to go, depending on which path announced the session first.** Both of ctm's paths announce a Codex session — the hooks and the app-server observer — and the `session_start` dispatcher deduplicated the second one *before* binding the session to its observer. When the hook won that race (consistently so on the reporting machine) the observer was never bound, so injection had no destination even though the observer was connected and working. The binding now happens on every `session_start`, before the dedup; it is idempotent, and the rule for what may be bound (a long-lived native observer, never a hook process, never Claude Code) is now one tested function shared by both call sites.
+
 ## [0.2.39] - 2026-09-20
 
 ### Fixed (both reported from real use of a mirrored Codex session)

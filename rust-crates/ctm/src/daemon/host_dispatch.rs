@@ -46,6 +46,22 @@ pub(super) async fn session_host_kind(ctx: &HandlerContext, session_id: &str) ->
 /// `_client_id` is injected into metadata by `socket.rs` on every inbound line, so an
 /// observer that reconnects under a new id is re-learned on its next `session_start`
 /// (which observers re-send on reconnect, mirroring how hooks resend it per invocation).
+/// Which socket client — if any — should be remembered as this session's observer, the
+/// connection a Telegram reply is delivered to.
+///
+/// Pure so the rule can be tested directly. Only a long-lived, native-API observer
+/// qualifies: a `ctm codex-hook` process has already exited by the time anything needs
+/// delivering, and Claude Code is injected through tmux, not a socket.
+pub(super) fn observer_binding<'a>(meta: &crate::types::MessageMetadata<'a>) -> Option<&'a str> {
+    if !meta.host_kind().uses_native_api() {
+        return None;
+    }
+    if meta.host_transport() == Some("hook") {
+        return None;
+    }
+    meta.client_id()
+}
+
 pub(super) async fn record_session_host(ctx: &HandlerContext, msg: &BridgeMessage) {
     let meta = msg.meta();
     let kind = meta.host_kind();
@@ -57,9 +73,8 @@ pub(super) async fn record_session_host(ctx: &HandlerContext, msg: &BridgeMessag
     // codex-hook` process that exits immediately. Registering it as the session's
     // observer would point injection at a dead socket, so the app-server observer
     // (which stays connected) keeps that role.
-    let via_hook = meta.host_transport() == Some("hook");
-    if kind.uses_native_api() && !via_hook {
-        match meta.client_id() {
+    if kind.uses_native_api() {
+        match observer_binding(&meta) {
             Some(cid) => {
                 ctx.session_host_clients
                     .write()
@@ -72,6 +87,9 @@ pub(super) async fn record_session_host(ctx: &HandlerContext, msg: &BridgeMessag
                     "ADR-016: host observer registered for session"
                 );
             }
+            // A hook-sourced announcement is the normal case here and binds nothing —
+            // the observer's own announcement does that, whichever arrives first.
+            None if meta.host_transport() == Some("hook") => {}
             None => {
                 // Only reachable if a message bypassed socket.rs's `_client_id` injection —
                 // e.g. a unit test constructing a BridgeMessage directly. Real observers
@@ -409,4 +427,48 @@ pub(super) async fn is_duplicate_transport(ctx: &HandlerContext, msg: &BridgeMes
 /// Forget a session's transport claim (session end / cleanup).
 pub(super) async fn forget_transport(ctx: &HandlerContext, session_id: &str) {
     ctx.session_transports.write().await.remove(session_id);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn meta_of(v: serde_json::Value) -> BridgeMessage {
+        BridgeMessage {
+            msg_type: MessageType::SessionStart,
+            session_id: "s".into(),
+            timestamp: String::new(),
+            content: String::new(),
+            metadata: v.as_object().cloned(),
+        }
+    }
+
+    #[test]
+    fn only_a_long_lived_native_observer_is_bound_for_delivery() {
+        // The app-server observer: this is the connection replies go to.
+        let m = meta_of(json!({"hostKind": "codex", "_client_id": "client-1"}));
+        assert_eq!(observer_binding(&m.meta()), Some("client-1"));
+
+        // A `ctm codex-hook` process has exited by the time anything needs delivering;
+        // binding it would point injection at a dead socket.
+        let m = meta_of(json!({
+            "hostKind": "codex", "_client_id": "client-2", "hostTransport": "hook"
+        }));
+        assert_eq!(observer_binding(&m.meta()), None);
+
+        // Claude Code is injected over tmux, never a socket.
+        let m = meta_of(json!({"hostKind": "claude_code", "_client_id": "client-3"}));
+        assert_eq!(observer_binding(&m.meta()), None);
+
+        // Native host, but the transport did not identify itself: nothing to bind.
+        let m = meta_of(json!({"hostKind": "opencode"}));
+        assert_eq!(observer_binding(&m.meta()), None);
+    }
+
+    #[test]
+    fn an_opencode_observer_is_bound_too() {
+        let m = meta_of(json!({"hostKind": "opencode", "_client_id": "client-9"}));
+        assert_eq!(observer_binding(&m.meta()), Some("client-9"));
+    }
 }
