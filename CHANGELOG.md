@@ -4,6 +4,9 @@ All notable changes to this project will be documented in this file.
 
 ## [0.2.42] - 2026-09-20
 
+### Fixed (one Codex session must mean one Telegram topic)
+- **Codex sub-agents no longer open topics of their own.** A session that spawned three sub-agents produced four topics for one conversation. `thread/started` does not carry `parentThreadId` (only `thread/read` does), so ctm saw each sub-agent as an independent session; it now reads the `threadSource: "subagent"` marker and the `source.subAgent.thread_spawn` record that names the parent, both of which *are* in the started event. A sub-agent's output is re-addressed to its parent's session and labelled with the agent that produced it (`🤖 [Anscombe]`), so the work stays visible in the one topic that owns it. A sub-agent whose parent ctm has never seen is left unannounced rather than given a stray topic.
+
 ### Fixed (a Telegram reply never reached a busy Codex session)
 - **`turn/steer` was rejected by Codex with `missing field \`expectedTurnId\``,** so any message sent while Codex was mid-turn was delivered to ctm's observer and then dropped by the app-server — the daemon logged a successful delivery while nothing arrived in the session. `expectedTurnId` is only learned from `turn/started`, which reaches *subscribed* clients only, so for a bare `codex` (which cannot be subscribed to) it is unknowable in advance. ctm now always sends the field: the real turn id when it has one, otherwise a sentinel, and the server's own mismatch error (``expected active turn id `X` but found `Y` ``) supplies the correct id for a single retry. If the turn ended in flight (`no active turn to steer`) the text is sent as a new turn instead of being lost, and a second mismatch reports rather than looping.
 

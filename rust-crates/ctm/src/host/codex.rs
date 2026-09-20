@@ -136,6 +136,10 @@ enum ServerReq {
 #[derive(Debug, Default, Clone)]
 struct ThreadCtx {
     subscribed: bool,
+    /// Set when this thread is a sub-agent: its messages belong to the parent session.
+    parent: Option<String>,
+    /// `(nickname, role)` used to label sub-agent output inside the parent's topic.
+    agent_label: Option<(String, String)>,
     /// A `thread/resume` has been sent for this thread and has not succeeded yet.
     /// Tracked explicitly because a thread can be awaiting subscription before it is
     /// announced (it was listed by `thread/loaded/list`, or its resume was deferred
@@ -182,6 +186,18 @@ impl Translator {
         content: impl Into<String>,
         mut meta: Map<String, Value>,
     ) -> BridgeMessage {
+        // Sub-agent output belongs in the parent's topic (one session, one topic).
+        let (thread_id, agent) = match self.threads.get(thread_id) {
+            Some(c) => match (&c.parent, &c.agent_label) {
+                (Some(p), label) => (p.as_str(), label.clone()),
+                (None, _) => (thread_id, None),
+            },
+            None => (thread_id, None),
+        };
+        if let Some((nickname, role)) = agent {
+            meta.insert("agentId".into(), Value::String(nickname));
+            meta.insert("agentType".into(), Value::String(role));
+        }
         meta.insert("hostSessionId".into(), Value::String(thread_id.into()));
         // ADR-016 §transport arbitration: claim this session for the protocol path ONLY
         // once the subscription actually succeeded. Both paths are live for an
@@ -252,6 +268,52 @@ impl Translator {
         vec![self.subscribe(thread_id)]
     }
 
+    /// The thread this one is a sub-agent of, if any.
+    ///
+    /// `thread/started` does NOT carry `parentThreadId` — only `thread/read` does
+    /// (verified against a live sub-agent thread) — but it does carry `threadSource`
+    /// and the `source.subAgent.thread_spawn` record, which names the parent. Reading
+    /// both is what keeps one Codex session mapped to exactly one Telegram topic:
+    /// without it, every sub-agent Codex spawned opened a topic of its own.
+    fn parent_of(thread: &Value) -> Option<String> {
+        if let Some(p) = thread.get("parentThreadId").and_then(Value::as_str) {
+            return Some(p.to_string());
+        }
+        thread
+            .get("source")?
+            .get("subAgent")?
+            .get("thread_spawn")?
+            .get("parent_thread_id")?
+            .as_str()
+            .map(str::to_string)
+    }
+
+    /// Is this a sub-agent thread rather than a session of its own?
+    fn is_subagent(thread: &Value) -> bool {
+        thread.get("threadSource").and_then(Value::as_str) == Some("subagent")
+            || Self::parent_of(thread).is_some()
+    }
+
+    /// How a sub-agent should be labelled in its parent's topic.
+    fn subagent_label(thread: &Value) -> Option<(String, String)> {
+        let spawn = thread.get("source")?.get("subAgent")?.get("thread_spawn")?;
+        let nickname = spawn
+            .get("agent_nickname")
+            .and_then(Value::as_str)
+            .unwrap_or("sub-agent");
+        let role = spawn
+            .get("agent_role")
+            .and_then(Value::as_str)
+            .or_else(|| {
+                spawn
+                    .get("agent_path")
+                    .and_then(Value::as_str)
+                    .and_then(|p| p.rsplit('/').next())
+            })
+            .unwrap_or(nickname);
+        Some((nickname.to_string(), role.to_string()))
+    }
+
     /// Ghost-thread filter (spike-verified): per-turn title-generation sub-threads are
     /// `ephemeral: true` with `threadSource: "system"`.
     fn is_ghost(thread: &Value) -> bool {
@@ -302,6 +364,26 @@ impl Translator {
             return vec![];
         };
         let tid = tid.to_string();
+
+        // A sub-agent is part of its parent's session, not a session of its own: ctm
+        // keeps one topic per Codex session, so its output is re-addressed to the
+        // parent (and labelled there). A sub-agent whose parent ctm has never seen is
+        // left alone rather than given a stray topic.
+        if Self::is_subagent(thread) {
+            let Some(parent) = Self::parent_of(thread) else {
+                tracing::info!(thread_id = %tid, "Codex: sub-agent thread with no identifiable parent — not announcing");
+                self.threads.entry(tid).or_default().announced = true;
+                return vec![];
+            };
+            let label = Self::subagent_label(thread);
+            let ctx = self.threads.entry(tid.clone()).or_default();
+            ctx.announced = true;
+            ctx.parent = Some(parent.clone());
+            ctx.agent_label = label;
+            tracing::info!(thread_id = %tid, parent = %parent, "Codex: sub-agent thread mapped onto its parent's session");
+            return vec![];
+        }
+
         let ctx = self.threads.entry(tid.clone()).or_default();
         if ctx.announced {
             return vec![];
@@ -1305,6 +1387,57 @@ mod tests {
             "turn/start+steer are ungated; never opt into experimentalApi"
         );
         subscribed();
+    }
+
+    // Verbatim from a live sub-agent thread the operator's session spawned (thread/read
+    // on 01a0bdb7-5d3c): `thread/started` carries threadSource and source.subAgent but
+    // NOT parentThreadId, which is why every sub-agent used to open its own topic.
+    const SUBAGENT_STARTED: &str = r#"{"method":"thread/started","params":{"thread":{"id":"01a0bdb7-5d3c-7531-bf43-678c09de5f4b","environments":[{"environmentId":"local","cwd":"/opt/repo-to-cve"}],"ephemeral":false,"threadSource":"subagent","source":{"subAgent":{"thread_spawn":{"parent_thread_id":"01a0bb11-b097-7941-8e2f-ae17c2d6ae68","depth":1,"agent_path":"/root/instruction_selection_integration","agent_nickname":"Anscombe","agent_role":null}}},"status":{"type":"idle"}}}}"#;
+
+    #[test]
+    fn a_subagent_thread_gets_no_topic_of_its_own() {
+        // One Codex session, one Telegram topic. A sub-agent is part of its parent's
+        // session — it must not be announced as a session in its own right.
+        let mut t = subscribed();
+        let out = t.on_rpc(&v(SUBAGENT_STARTED));
+        assert!(
+            bridges(&out).is_empty(),
+            "no SessionStart, so no second topic: {:?}",
+            bridges(&out)
+        );
+    }
+
+    #[test]
+    fn subagent_output_is_readdressed_to_the_parent_and_labelled() {
+        let mut t = subscribed();
+        t.on_rpc(&v(SUBAGENT_STARTED));
+        // An item on the sub-agent thread…
+        let sub_cmd = CMD_STARTED.replace(
+            "01a0bb11-b097-7941-8e2f-ae17c2d6ae68",
+            "01a0bdb7-5d3c-7531-bf43-678c09de5f4b",
+        );
+        let out = t.on_rpc(&v(&sub_cmd));
+        let msgs = bridges(&out);
+        assert_eq!(msgs.len(), 1);
+        // …arrives in the PARENT's session, tagged with the agent that produced it.
+        assert_eq!(msgs[0].session_id, T);
+        assert_eq!(msgs[0].meta().agent_id(), Some("Anscombe"));
+        assert_eq!(
+            msgs[0].meta().agent_type(),
+            Some("instruction_selection_integration")
+        );
+    }
+
+    #[test]
+    fn a_subagent_without_a_traceable_parent_is_not_announced() {
+        let mut t = subscribed();
+        let orphan = SUBAGENT_STARTED
+            .replace(r#""source":{"subAgent":{"thread_spawn":{"parent_thread_id":"01a0bb11-b097-7941-8e2f-ae17c2d6ae68","depth":1,"agent_path":"/root/instruction_selection_integration","agent_nickname":"Anscombe","agent_role":null}}},"#, "");
+        let out = t.on_rpc(&v(&orphan));
+        assert!(
+            bridges(&out).is_empty(),
+            "a stray topic is worse than silence here"
+        );
     }
 
     #[test]
