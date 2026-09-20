@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.43] - 2026-09-20
+
+### Fixed (reported from a phone)
+- **"Details expired (5 min cache)" on a message still on screen.** The Details button's payload lived only in an in-memory cache with a five-minute life, so a tap from a phone minutes later — or after any daemon restart, which empties it — had nothing to answer with. Tool inputs are now written to the database as well, kept for seven days and pruned by the existing sweep; the in-memory cache stays as the fast path. The message when nothing was ever recorded is now honest ("No details recorded for this tool call.") instead of blaming expiry.
+
+### Added
+- **An end-to-end Codex session lifecycle test** (`--ignored`, against the real binary): one session announces exactly one topic — no sub-agent, ghost or companion thread alongside it — a Telegram reply reaches the session *while a turn is in flight*, the agent's reply is mirrored back, and quitting the TUI ends the session. Every one of those assertions is a defect that reached the operator instead of CI this week. The daemon-side resolution behind the last one (a TUI reports only its directory, since it never learns its own thread id) is now a pure, unit-tested function rather than inline handler logic.
+
 ## [0.2.42] - 2026-09-20
 
 ### Fixed (one Codex session must mean one Telegram topic)

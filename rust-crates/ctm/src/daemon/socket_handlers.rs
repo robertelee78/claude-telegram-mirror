@@ -405,27 +405,19 @@ pub(super) async fn handle_session_end(ctx: &HandlerContext, msg: &BridgeMessage
         let kind = msg.meta().host_kind();
         let resolved = ctx
             .db_op(move |sess| {
-                let mut found: Option<(String, String)> = None;
-                for s in sess.get_active_sessions().unwrap_or_default() {
-                    if s.host_kind() != kind {
-                        continue;
-                    }
-                    let same_dir = s.project_dir.as_deref().is_some_and(|p| {
-                        p == dir
-                            || std::fs::canonicalize(p).ok() == std::fs::canonicalize(&dir).ok()
-                    });
-                    if !same_dir {
-                        continue;
-                    }
-                    // Newest by last activity: several TUIs can share a directory.
-                    if found
-                        .as_ref()
-                        .is_none_or(|(_, seen)| s.last_activity > *seen)
-                    {
-                        found = Some((s.id.clone(), s.last_activity.clone()));
-                    }
-                }
-                found.map(|(id, _)| id)
+                let rows = sess.get_active_sessions().unwrap_or_default();
+                host_dispatch::resolve_exited_session(
+                    rows.iter().map(|s| {
+                        (
+                            s.id.as_str(),
+                            s.host_kind(),
+                            s.project_dir.as_deref(),
+                            s.last_activity.as_str(),
+                        )
+                    }),
+                    kind,
+                    &dir,
+                )
             })
             .await;
         let Some(session_id) = resolved else {
@@ -734,6 +726,23 @@ pub(super) async fn handle_tool_start(ctx: &HandlerContext, msg: &BridgeMessage)
                 timestamp: std::time::Instant::now(),
             },
         );
+    }
+
+    // The memory cache is a fast path with a short life; the Details button is tapped
+    // from a phone, long after the message arrived and often after a daemon restart, so
+    // the payload is also written down. (Reported: "Details expired (5 min cache)" on a
+    // message still on screen.)
+    if !tool_input.is_null() {
+        let tuid = tool_use_id.clone();
+        let sid = msg.session_id.clone();
+        let tool = tool_name.to_string();
+        let input = tool_input.to_string();
+        ctx.db_op(move |sess| {
+            if let Err(e) = sess.record_tool_details(&tuid, &sid, &tool, &input) {
+                tracing::debug!(error = %e, "could not record tool details");
+            }
+        })
+        .await;
     }
 
     // Schedule cache expiry

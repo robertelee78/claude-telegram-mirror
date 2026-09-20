@@ -52,6 +52,37 @@ pub(super) async fn session_host_kind(ctx: &HandlerContext, session_id: &str) ->
 /// Pure so the rule can be tested directly. Only a long-lived, native-API observer
 /// qualifies: a `ctm codex-hook` process has already exited by the time anything needs
 /// delivering, and Claude Code is injected through tmux, not a socket.
+/// Which live session a "the TUI for this directory quit" report refers to.
+///
+/// A Codex TUI never learns its own thread id, so `ctm codex-exited` reports only a
+/// directory; the newest live session of that host in that directory is the one that
+/// just ended. Paths are compared canonically because a shell reports `$PWD` while the
+/// host recorded a resolved path (`/tmp` vs `/private/tmp`).
+///
+/// Pure, so the choice is testable without a daemon.
+pub(super) fn resolve_exited_session<'a>(
+    sessions: impl IntoIterator<Item = (&'a str, crate::types::HostKind, Option<&'a str>, &'a str)>,
+    kind: crate::types::HostKind,
+    dir: &str,
+) -> Option<String> {
+    let canon = |p: &str| std::fs::canonicalize(p).unwrap_or_else(|_| std::path::PathBuf::from(p));
+    let want = canon(dir);
+    let mut best: Option<(&str, &str)> = None;
+    for (id, host, project_dir, last_activity) in sessions {
+        if host != kind {
+            continue;
+        }
+        let Some(pd) = project_dir else { continue };
+        if pd != dir && canon(pd) != want {
+            continue;
+        }
+        if best.is_none_or(|(_, seen)| last_activity > seen) {
+            best = Some((id, last_activity));
+        }
+    }
+    best.map(|(id, _)| id.to_string())
+}
+
 pub(super) fn observer_binding<'a>(meta: &crate::types::MessageMetadata<'a>) -> Option<&'a str> {
     if !meta.host_kind().uses_native_api() {
         return None;
@@ -464,6 +495,71 @@ mod tests {
         // Native host, but the transport did not identify itself: nothing to bind.
         let m = meta_of(json!({"hostKind": "opencode"}));
         assert_eq!(observer_binding(&m.meta()), None);
+    }
+
+    #[test]
+    fn the_newest_live_session_in_that_directory_is_the_one_that_exited() {
+        use crate::types::HostKind::{ClaudeCode, Codex, OpenCode};
+        let rows = vec![
+            ("older", Codex, Some("/work/proj"), "2026-09-20T08:00:00Z"),
+            ("newest", Codex, Some("/work/proj"), "2026-09-20T09:30:00Z"),
+            (
+                "other-dir",
+                Codex,
+                Some("/work/else"),
+                "2026-09-20T10:00:00Z",
+            ),
+            (
+                "other-host",
+                OpenCode,
+                Some("/work/proj"),
+                "2026-09-20T11:00:00Z",
+            ),
+            (
+                "claude",
+                ClaudeCode,
+                Some("/work/proj"),
+                "2026-09-20T12:00:00Z",
+            ),
+            ("no-dir", Codex, None, "2026-09-20T13:00:00Z"),
+        ];
+        assert_eq!(
+            resolve_exited_session(rows.clone(), Codex, "/work/proj"),
+            Some("newest".into()),
+            "several TUIs can share a directory; the newest is the one that just quit"
+        );
+        assert_eq!(
+            resolve_exited_session(rows.clone(), Codex, "/nowhere"),
+            None
+        );
+        assert_eq!(
+            resolve_exited_session(rows, OpenCode, "/work/proj"),
+            Some("other-host".into()),
+            "hosts do not resolve each other's exits"
+        );
+    }
+
+    #[test]
+    fn a_reported_directory_matches_its_resolved_form() {
+        use crate::types::HostKind::Codex;
+        // The shell reports $PWD while the host recorded a resolved path (/tmp on macOS
+        // is /private/tmp). Build the symlink rather than assuming the platform has one.
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let resolved = std::fs::canonicalize(&link).unwrap();
+        let rows = vec![(
+            "s1",
+            Codex,
+            Some(resolved.to_str().unwrap()),
+            "2026-09-20T09:00:00Z",
+        )];
+        assert_eq!(
+            resolve_exited_session(rows, Codex, link.to_str().unwrap()),
+            Some("s1".into())
+        );
     }
 
     #[test]

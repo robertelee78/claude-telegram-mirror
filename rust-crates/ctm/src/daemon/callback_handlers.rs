@@ -555,6 +555,21 @@ async fn handle_tool_details_callback(ctx: &HandlerContext, tool_use_id: &str, c
             .get(tool_use_id)
             .map(|c| (c.tool.clone(), c.input.clone()))
     };
+    // Fall back to what was written down when the in-memory entry has aged out or the
+    // daemon has restarted since the message was sent.
+    let cached = match cached {
+        Some(hit) => Some(hit),
+        None => {
+            let tuid = tool_use_id.to_string();
+            ctx.db_op(move |sess| sess.get_tool_details(&tuid).ok().flatten())
+                .await
+                .map(|(tool, input)| {
+                    let parsed = serde_json::from_str(&input)
+                        .unwrap_or(serde_json::Value::String(input.clone()));
+                    (tool, parsed)
+                })
+        }
+    };
 
     match cached {
         Some((tool, input)) => {
@@ -593,7 +608,11 @@ async fn handle_tool_details_callback(ctx: &HandlerContext, tool_use_id: &str, c
         None => {
             let _ = ctx
                 .bot
-                .answer_callback_query(&cb.id, Some("Details expired (5 min cache)"), true)
+                .answer_callback_query(
+                    &cb.id,
+                    Some("No details recorded for this tool call."),
+                    true,
+                )
                 .await;
         }
     }

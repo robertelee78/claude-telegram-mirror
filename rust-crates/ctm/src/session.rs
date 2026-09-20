@@ -206,6 +206,20 @@ impl SessionManager {
                 created_at  TEXT NOT NULL
             );
 
+            -- ADR-016: the Details button payload. It used to live only in a 5-minute
+            -- in-memory cache, so a tap from a phone minutes later, or after any daemon
+            -- restart, answered that the details had expired -- not a useful thing for
+            -- a mirror to say about a message still on screen.
+            CREATE TABLE IF NOT EXISTS tool_details (
+                tool_use_id TEXT PRIMARY KEY,
+                session_id  TEXT,
+                tool        TEXT NOT NULL,
+                input       TEXT NOT NULL,
+                created_at  TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_tool_details_session ON tool_details(session_id);
+            CREATE INDEX IF NOT EXISTS idx_tool_details_created ON tool_details(created_at);
             CREATE INDEX IF NOT EXISTS idx_sessions_chat     ON sessions(chat_id);
             CREATE INDEX IF NOT EXISTS idx_sessions_status   ON sessions(status);
             CREATE INDEX IF NOT EXISTS idx_approvals_session ON pending_approvals(session_id);
@@ -220,6 +234,70 @@ impl SessionManager {
         self.migrate_add_custom_title_column()?;
         self.migrate_add_host_kind_column()?;
         Ok(())
+    }
+
+    /// Remember a tool call's input so the "Details" button can still answer later.
+    ///
+    /// Keyed by the host's own tool-use id. Re-recording the same id replaces it, which
+    /// is what a retried or re-rendered tool call should do.
+    pub fn record_tool_details(
+        &self,
+        tool_use_id: &str,
+        session_id: &str,
+        tool: &str,
+        input: &str,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO tool_details (tool_use_id, session_id, tool, input, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(tool_use_id) DO UPDATE SET
+                    session_id = excluded.session_id,
+                    tool       = excluded.tool,
+                    input      = excluded.input,
+                    created_at = excluded.created_at",
+                rusqlite::params![
+                    tool_use_id,
+                    session_id,
+                    tool,
+                    input,
+                    chrono::Utc::now().to_rfc3339()
+                ],
+            )
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// The `(tool, input)` recorded for a tool-use id, if it is still retained.
+    pub fn get_tool_details(&self, tool_use_id: &str) -> Result<Option<(String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT tool, input FROM tool_details WHERE tool_use_id = ?1")
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        let mut rows = stmt
+            .query(rusqlite::params![tool_use_id])
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        match rows.next().map_err(|e| AppError::Database(e.to_string()))? {
+            Some(r) => {
+                let tool: String = r.get(0).map_err(|e| AppError::Database(e.to_string()))?;
+                let input: String = r.get(1).map_err(|e| AppError::Database(e.to_string()))?;
+                Ok(Some((tool, input)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Drop tool details older than `days`, so the table cannot grow without bound.
+    pub fn prune_tool_details(&self, days: i64) -> Result<usize> {
+        let cutoff = (chrono::Utc::now() - chrono::Duration::days(days)).to_rfc3339();
+        let n = self
+            .conn
+            .execute(
+                "DELETE FROM tool_details WHERE created_at < ?1",
+                rusqlite::params![cutoff],
+            )
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        Ok(n)
     }
 
     /// ADR-016 Migration: add `host_kind` if upgrading from a pre-multi-host DB.

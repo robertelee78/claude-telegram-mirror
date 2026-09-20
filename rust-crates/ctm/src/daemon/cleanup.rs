@@ -6,6 +6,10 @@ use super::*;
 // Eviction kicks in during the cleanup cycle when these thresholds are exceeded.
 const MAX_SESSION_CACHE: usize = 200;
 const MAX_TOOL_CACHE: usize = 500;
+/// How long the Details button can still answer. A mirror is read on a phone, often
+/// well after the message arrived, so this is days rather than the in-memory cache's
+/// minutes.
+const TOOL_DETAILS_RETENTION_DAYS: i64 = 7;
 
 /// STALE-TOPICS: max topics the per-cycle reconcile sweep prunes in one pass. A large
 /// accumulated backlog drains in rate-limited batches across cycles rather than firing
@@ -76,6 +80,22 @@ pub(super) async fn run_cleanup(ctx: HandlerContext) {
     // Close topics for sessions inactive > topic_delete_delay_minutes (stage 1).
     // Delete topics for sessions inactive > INACTIVITY_DELETE_THRESHOLD_MINUTES (stage 2).
     cleanup_inactive_topics(&ctx).await;
+
+    // Tool details are kept long enough to be useful on a phone, then pruned.
+    {
+        let removed = ctx
+            .db_op(|sess| {
+                sess.prune_tool_details(TOOL_DETAILS_RETENTION_DAYS)
+                    .unwrap_or(0)
+            })
+            .await;
+        if removed > 0 {
+            tracing::info!(
+                removed,
+                "Pruned tool details older than {TOOL_DETAILS_RETENTION_DAYS}d"
+            );
+        }
+    }
 
     // Clean old downloads
     cleanup_old_downloads();

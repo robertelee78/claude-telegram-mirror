@@ -1299,3 +1299,58 @@ fn bridge_message_ndjson_compatible() {
         "Serialized JSON must not contain raw newlines"
     );
 }
+
+// ======================================================================
+// Tool details persistence (the "Details" button)
+// ======================================================================
+
+#[test]
+fn tool_details_survive_the_memory_cache_and_a_restart() {
+    // Reported from a phone: tapping Details on a message still on screen answered
+    // "Details expired (5 min cache)". The payload now outlives both the in-memory
+    // cache and the daemon process that sent the message.
+    let (mgr, tmp) = make_mgr();
+    mgr.record_tool_details(
+        "call_42",
+        "01a0aba7-cec2-76a1-8915-610dd6677c88",
+        "Bash",
+        r#"{"command":"sed -n '1682,1758p' src/scanners/codeql.rs"}"#,
+    )
+    .unwrap();
+
+    // A new manager over the same file is what a restarted daemon sees.
+    let reopened = SessionManager::new(tmp.path(), 5).unwrap();
+    let (tool, input) = reopened
+        .get_tool_details("call_42")
+        .unwrap()
+        .expect("details are still there after a restart");
+    assert_eq!(tool, "Bash");
+    assert!(input.contains("codeql.rs"), "{input}");
+
+    assert_eq!(reopened.get_tool_details("never-seen").unwrap(), None);
+}
+
+#[test]
+fn recording_the_same_tool_use_id_replaces_it() {
+    let (mgr, _tmp) = make_mgr();
+    mgr.record_tool_details("t1", "s1", "Bash", r#"{"command":"first"}"#)
+        .unwrap();
+    mgr.record_tool_details("t1", "s1", "Edit", r#"{"path":"second"}"#)
+        .unwrap();
+    let (tool, input) = mgr.get_tool_details("t1").unwrap().unwrap();
+    assert_eq!(tool, "Edit");
+    assert!(input.contains("second"));
+}
+
+#[test]
+fn pruning_keeps_recent_details_and_drops_old_ones() {
+    let (mgr, _tmp) = make_mgr();
+    mgr.record_tool_details("recent", "s1", "Bash", "{}")
+        .unwrap();
+    // Nothing is old yet, so a prune must not touch it.
+    assert_eq!(mgr.prune_tool_details(7).unwrap(), 0);
+    assert!(mgr.get_tool_details("recent").unwrap().is_some());
+    // A zero-day retention treats everything as expired.
+    assert_eq!(mgr.prune_tool_details(0).unwrap(), 1);
+    assert!(mgr.get_tool_details("recent").unwrap().is_none());
+}

@@ -14,7 +14,7 @@
 
 use ctm::config::{CodexHostConfig, Config, HostsConfig, OpenCodeHostConfig};
 use ctm::types::{BridgeMessage, HostKind, MessageType};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
@@ -446,6 +446,267 @@ async fn opencode_pipe_plugin_mirrors_a_process_with_no_port_and_no_password() {
 /// `ApprovalRequest` it can answer — i.e. an approval carrying an id, resolvable
 /// atomically, rather than a prompt that could only be answered by blind keystrokes.
 /// Costs one small model turn.
+/// A real Codex TUI in app-server mode, in an isolated `CODEX_HOME`.
+///
+/// Isolation is not tidiness: these tests create real Codex threads, and the operator's
+/// own ctm daemon is a client of the shared app-server, so running against that one
+/// makes their Telegram sprout a topic per test run (it did). The paths are short
+/// because the control socket lives under `CODEX_HOME` and macOS temp paths exceed
+/// `SUN_LEN`. Only `packages/standalone/current` is linked in — linking `packages`
+/// itself lets the daemon rewrite the operator's real install (it did that too).
+struct CodexTui {
+    home: PathBuf,
+    work: PathBuf,
+    tmux: String,
+    socket_path: PathBuf,
+}
+
+impl CodexTui {
+    /// `None` when the prerequisites are missing, so callers can skip cleanly.
+    fn start(tag: &str, bridge_socket: &Path, extra_config: &[&str]) -> Option<Self> {
+        if !have("codex") || !have("tmux") {
+            eprintln!("skip: codex or tmux missing");
+            return None;
+        }
+        let pid = std::process::id();
+        let home = PathBuf::from(format!("/tmp/ctm-e2e-{tag}-h{pid}"));
+        let work = PathBuf::from(format!("/tmp/ctm-e2e-{tag}-w{pid}"));
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&work);
+        std::fs::create_dir_all(&home).ok()?;
+        std::fs::create_dir_all(&work).ok()?;
+
+        let real_home = std::env::var("CODEX_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from(std::env::var("HOME").unwrap()).join(".codex"));
+        let release = std::fs::canonicalize(real_home.join("packages/standalone/current"))
+            .unwrap_or_else(|_| real_home.join("packages/standalone/current"));
+        if !release.exists() {
+            eprintln!("skip: no managed standalone codex install to link");
+            return None;
+        }
+        std::fs::create_dir_all(home.join("packages/standalone")).ok()?;
+        std::os::unix::fs::symlink(&release, home.join("packages/standalone/current")).ok()?;
+        for f in ["auth.json", "config.toml"] {
+            if real_home.join(f).exists() {
+                let _ = std::os::unix::fs::symlink(real_home.join(f), home.join(f));
+            }
+        }
+
+        let start = Command::new("codex")
+            .args(["app-server", "daemon", "start"])
+            .env("CODEX_HOME", &home)
+            .output()
+            .ok()?;
+        let started: serde_json::Value =
+            serde_json::from_slice(&start.stdout).unwrap_or(serde_json::Value::Null);
+        let socket_path = started["socketPath"].as_str().map(PathBuf::from)?;
+
+        let tmux = format!("ctm-e2e-{tag}-{pid}");
+        let cfg: String = extra_config.iter().map(|c| format!(" -c {c}")).collect();
+        // Exactly what ctm's shell integration runs: `--remote -C "$PWD"`, and then the
+        // exit report, because a thread owned by the app-server outlives its terminal
+        // and emits nothing of its own when the TUI quits.
+        let launch = format!(
+            "cd {w} && CODEX_HOME={h} codex --remote unix://{s} -C {w}{cfg}; \
+             TELEGRAM_BRIDGE_SOCKET={sock} TELEGRAM_MIRROR=true TELEGRAM_BOT_TOKEN=1:test \
+             TELEGRAM_CHAT_ID=-1001234567890 {ctm} codex-exited --cwd {w}; sleep 20",
+            w = work.display(),
+            h = home.display(),
+            s = socket_path.display(),
+            sock = bridge_socket.display(),
+            ctm = env!("CARGO_BIN_EXE_ctm"),
+        );
+        Command::new("tmux")
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                &tmux,
+                "-x",
+                "120",
+                "-y",
+                "40",
+                &launch,
+            ])
+            .status()
+            .ok()?;
+        Some(Self {
+            home,
+            work,
+            tmux,
+            socket_path,
+        })
+    }
+
+    fn keys(&self, k: &str) {
+        let _ = Command::new("tmux")
+            .args(["send-keys", "-t", &self.tmux, k])
+            .output();
+    }
+
+    fn screen(&self) -> String {
+        Command::new("tmux")
+            .args(["capture-pane", "-t", &self.tmux, "-p"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_default()
+    }
+
+    /// Poll the screen until it contains `needle`, or give up.
+    async fn wait_for_screen(&self, needle: &str, secs: u64) -> bool {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+        while tokio::time::Instant::now() < deadline {
+            if self.screen().contains(needle) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        false
+    }
+
+    /// Answer the trust-this-directory prompt and submit a prompt.
+    async fn submit(&self, prompt: &str) {
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        self.keys("Enter"); // trust prompt
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        self.keys(prompt);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        self.keys("Enter");
+    }
+}
+
+impl Drop for CodexTui {
+    fn drop(&mut self) {
+        let _ = Command::new("tmux")
+            .args(["kill-session", "-t", &self.tmux])
+            .output();
+        let _ = Command::new("codex")
+            .args(["app-server", "daemon", "stop"])
+            .env("CODEX_HOME", &self.home)
+            .output();
+        let _ = std::fs::remove_dir_all(&self.home);
+        let _ = std::fs::remove_dir_all(&self.work);
+    }
+}
+
+/// ADR-016: the whole life of one Codex session, against the real binary.
+///
+/// Every assertion here corresponds to a defect that reached the operator rather than
+/// CI, which is the point of having it:
+/// - **one session, one topic** — sub-agent and title threads opened topics of their own;
+/// - **inbound reaches a busy session** — `turn/steer` was rejected for a missing
+///   `expectedTurnId`, so replies vanished while the daemon logged success;
+/// - **the session ends when the TUI quits** — a thread in the app-server outlives its
+///   terminal, so nothing closed the topic.
+#[tokio::test]
+#[ignore = "needs the `codex` binary and spends a model turn; run with --ignored"]
+async fn codex_session_lifecycle_one_topic_two_way_and_a_clean_exit() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("bridge.sock");
+    let (mut rx, down) = fake_daemon_rw(sock.clone()).await;
+
+    let Some(tui) = CodexTui::start("life", &sock, &[]) else {
+        return;
+    };
+    let cx = CodexHostConfig {
+        enabled: true,
+        socket_path: tui.socket_path.clone(),
+        binary: None,
+    };
+    let cfg = Arc::new(base_config(
+        sock.clone(),
+        HostsConfig {
+            opencode: OpenCodeHostConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            codex: cx.clone(),
+        },
+    ));
+    let cfg2 = Arc::clone(&cfg);
+    let observer = tokio::spawn(async move { ctm::host::codex::run_once(&cfg2, &cx).await });
+    // A long-lived daemon is the normal case; a fresh one hid a retry bug for two
+    // releases.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    // 1. A session appears, exactly once.
+    tui.submit("say LIFECYCLE_OK and nothing else").await;
+    let start = wait_for(&mut rx, |m| m.msg_type == MessageType::SessionStart, 60)
+        .await
+        .expect("the session was announced");
+    let session_id = start.session_id.clone();
+    assert_eq!(start.meta().host_kind(), HostKind::Codex);
+
+    // 2. Inbound while the turn is in flight — the `expectedTurnId` path.
+    let mut meta = serde_json::Map::new();
+    meta.insert("action".into(), serde_json::Value::String("text".into()));
+    down.send(BridgeMessage {
+        msg_type: MessageType::HostInject,
+        session_id: session_id.clone(),
+        timestamp: String::new(),
+        content: "INBOUND_MARKER_42".into(),
+        metadata: Some(meta),
+    })
+    .unwrap();
+    assert!(
+        tui.wait_for_screen("INBOUND_MARKER_42", 60).await,
+        "a Telegram reply reached the session; screen was:\n{}",
+        tui.screen()
+    );
+
+    // 3. The agent's reply comes back out.
+    let reply = wait_for(
+        &mut rx,
+        |m| m.msg_type == MessageType::AgentResponse && m.session_id == session_id,
+        90,
+    )
+    .await
+    .expect("the agent's reply was mirrored");
+    assert!(!reply.content.trim().is_empty());
+
+    // 4. One session, one topic: no sub-agent, ghost or companion thread announced
+    //    itself alongside it.
+    let mut extra_sessions: Vec<String> = Vec::new();
+    while let Ok(m) = rx.try_recv() {
+        if m.msg_type == MessageType::SessionStart && m.session_id != session_id {
+            extra_sessions.push(m.session_id);
+        }
+    }
+    assert!(
+        extra_sessions.is_empty(),
+        "one Codex session must map to one topic, but these also announced: {extra_sessions:?}"
+    );
+
+    // 5. Quitting the TUI ends the session, so the topic can be closed.
+    tui.keys("C-c");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    tui.keys("C-c");
+    // Two shapes are both correct: the observer may report the thread closing, or —
+    // for an app-server session, which outlives its terminal and emits nothing — ctm's
+    // shell integration reports the exit by directory, and the daemon resolves that to
+    // the session (`host_dispatch::resolve_exited_session`, unit-tested).
+    let work_dir = tui.work.clone();
+    let ended = wait_for(
+        &mut rx,
+        move |m| {
+            m.msg_type == MessageType::SessionEnd
+                && (m.session_id == session_id
+                    || m.meta().project_dir().is_some_and(|d| {
+                        std::fs::canonicalize(d).ok() == std::fs::canonicalize(&work_dir).ok()
+                    }))
+        },
+        45,
+    )
+    .await;
+    assert!(
+        ended.is_some(),
+        "quitting must end the session (a thread in the app-server outlives its terminal)"
+    );
+
+    observer.abort();
+}
+
 #[tokio::test]
 #[ignore = "needs the `codex` binary and spends a model turn; run with --ignored"]
 async fn codex_remote_session_delivers_an_answerable_approval() {
