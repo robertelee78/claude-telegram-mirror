@@ -50,10 +50,6 @@ const CLIENT_NAME: &str = "ctm";
 /// Marker prefix on `clientUserMessageId` so our own injected user messages are not
 /// re-mirrored as terminal input when they echo back as `item/started userMessage`.
 const CLIENT_MSG_PREFIX: &str = "ctm-";
-/// How often a deferred `thread/resume` is retried.
-const RESUME_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
-/// How long to keep retrying before concluding the thread is not app-server-owned.
-const RESUME_RETRY_WINDOW: std::time::Duration = std::time::Duration::from_secs(90);
 
 /// Something the observer must send to the app-server: a request we originate, or a
 /// response to a server request.
@@ -199,6 +195,27 @@ impl Translator {
         )
     }
 
+    /// A `thread/resume` retry, emitted whenever the server says anything about a
+    /// thread ctm is not subscribed to.
+    ///
+    /// The first `thread/resume` for a fresh thread is refused (`no rollout found`)
+    /// because the rollout appears only once the turn is under way. The obvious retry
+    /// trigger, `turn/started`, is delivered to **subscribed** clients only — so a
+    /// deferred subscription could never recover from it. The events that DO reach an
+    /// unsubscribed client are `thread/status/changed`, `thread/name/updated` and
+    /// `thread/started` (spike-verified against 0.155.1), and a status change to
+    /// `active` is exactly the moment the rollout comes into existence. Retrying on
+    /// those is self-limiting: no wall-clock window to get wrong, no give-up state, and
+    /// a bare `codex` (whose thread is never resumable) simply retries a few times per
+    /// turn and stops when the thread closes.
+    fn retry_resume_if_unsubscribed(&mut self, thread_id: &str) -> Vec<Out> {
+        let ctx = self.threads.entry(thread_id.to_string()).or_default();
+        if ctx.subscribed || !ctx.resume_pending {
+            return vec![];
+        }
+        vec![self.subscribe(thread_id)]
+    }
+
     /// Ghost-thread filter (spike-verified): per-turn title-generation sub-threads are
     /// `ephemeral: true` with `threadSource: "system"`.
     fn is_ghost(thread: &Value) -> bool {
@@ -209,10 +226,10 @@ impl Translator {
             || thread.get("threadSource").and_then(Value::as_str) == Some("system")
     }
 
-    /// ADR-016 (2026-09-20): threads whose `thread/resume` was deferred and that are
-    /// still unsubscribed. `turn/started` cannot be the retry trigger — it is only
-    /// delivered to *subscribed* clients, so a deferred subscription could never
-    /// recover from it. The runner retries these on a timer instead.
+    /// Threads whose `thread/resume` was deferred and are still unsubscribed. The retry
+    /// itself is event-driven (`retry_resume_if_unsubscribed`), so this exists to let
+    /// the tests assert that state directly.
+    #[cfg(test)]
     pub fn pending_subscriptions(&self) -> Vec<String> {
         self.threads
             .iter()
@@ -221,7 +238,8 @@ impl Translator {
             .collect()
     }
 
-    /// A `thread/resume` for one thread (the retry the runner schedules).
+    /// A `thread/resume` for one thread, for tests that drive retries explicitly.
+    #[cfg(test)]
     pub fn resume_request(&mut self, thread_id: &str) -> Out {
         self.subscribe(thread_id)
     }
@@ -408,6 +426,9 @@ impl Translator {
                 }
             }
             "thread/name/updated" => {
+                if let Some(t) = tid.clone() {
+                    out.extend(self.retry_resume_if_unsubscribed(&t));
+                }
                 if let (Some(tid), Some(name)) = (tid, p.get("threadName").and_then(Value::as_str))
                 {
                     out.push(Out::Bridge(self.msg(
@@ -495,7 +516,7 @@ impl Translator {
                 }
             }
             "thread/status/changed" => {
-                if let Some(tid) = tid {
+                if let Some(tid) = tid.clone() {
                     let status = p
                         .get("status")
                         .and_then(|s| s.get("type"))
@@ -506,7 +527,11 @@ impl Translator {
                     if status == Some("notLoaded") {
                         out.extend(self.end_thread(&tid, "closed"));
                     } else {
-                        self.threads.entry(tid).or_default().running = status == Some("active");
+                        self.threads.entry(tid.clone()).or_default().running =
+                            status == Some("active");
+                        // `active` means a turn began, so the rollout now exists and a
+                        // deferred subscription can finally succeed.
+                        out.extend(self.retry_resume_if_unsubscribed(&tid));
                     }
                 }
             }
@@ -1029,37 +1054,8 @@ pub async fn run_once(config: &Config, cx: &CodexHostConfig) -> Result<()> {
         dispatch(o, &mut tx, &link).await?;
     }
 
-    // A fresh thread has no rollout yet, so its first `thread/resume` is refused. For a
-    // session the app-server owns (`codex --remote …`, which ctm's shell integration
-    // makes the default) the rollout appears once the turn starts and a retry succeeds
-    // — spike-verified. For a bare `codex`, which owns its own thread, it never does,
-    // so retries are bounded and the outcome is reported once instead of churning.
-    let mut resume_tick = tokio::time::interval(RESUME_RETRY_INTERVAL);
-    resume_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut first_deferred: HashMap<String, tokio::time::Instant> = HashMap::new();
-    let mut abandoned: HashSet<String> = HashSet::new();
-
     loop {
         tokio::select! {
-            _ = resume_tick.tick() => {
-                // The window is measured per THREAD, from the first time that thread
-                // was seen unsubscribed — not from when this connection opened. Getting
-                // that wrong made a long-lived observer give up one second after a new
-                // thread appeared, before its rollout could exist (observed live).
-                let now = tokio::time::Instant::now();
-                for id in tr.pending_subscriptions() {
-                    let first = *first_deferred.entry(id.clone()).or_insert(now);
-                    if now.duration_since(first) <= RESUME_RETRY_WINDOW {
-                        let out = tr.resume_request(&id);
-                        dispatch(out, &mut tx, &link).await?;
-                    } else if abandoned.insert(id.clone()) {
-                        tracing::info!(
-                            thread_id = %id,
-                            "Codex: cannot subscribe to this thread — a bare `codex` owns its own thread. It mirrors out through ctm's hooks, but its approvals can only be answered at the terminal; start it in a shell with ctm's integration so it joins the app-server."
-                        );
-                    }
-                }
-            }
             frame = rx.next() => {
                 let Some(frame) = frame else {
                     return Err(AppError::Socket("Codex WebSocket closed".into()));
@@ -1269,6 +1265,47 @@ mod tests {
         assert!(
             t.pending_subscriptions().is_empty(),
             "a subscribed thread is never retried again"
+        );
+    }
+
+    #[test]
+    fn a_status_change_retries_a_deferred_subscription() {
+        // The retry is driven by events an UNSUBSCRIBED client actually receives — no
+        // wall clock, so there is no window to mis-measure (the 0.2.35 bug) and no
+        // give-up state to get wrong.
+        let mut t = Translator::new();
+        let init = t.on_connect();
+        let Rpc::Request { id, .. } = rpcs(&init)[0].clone() else {
+            panic!()
+        };
+        let out = t.on_rpc(&json!({"id": id, "result": {"userAgent": "codex-tui/0.155.1"}}));
+        let Rpc::Request { id: list_id, .. } = rpcs(&out)[0].clone() else {
+            panic!()
+        };
+        t.on_rpc(&json!({"id": list_id, "result": {"data": [T], "nextCursor": null}}));
+        t.on_rpc(&json!({
+            "id": 2,
+            "error": {"code": -32000, "message": format!("no rollout found for thread id {T}")}
+        }));
+        assert_eq!(t.pending_subscriptions(), vec![T.to_string()]);
+
+        // A turn starts: the app-server tells every client, subscribed or not.
+        let out = t.on_rpc(&v(THREAD_STATUS_ACTIVE));
+        let retried = rpcs(&out);
+        assert_eq!(retried.len(), 1, "the status change drove a retry");
+        let Rpc::Request { id, method, .. } = retried[0].clone() else {
+            panic!()
+        };
+        assert_eq!(method, "thread/resume");
+
+        // It succeeds now that the rollout exists, and nothing retries afterwards.
+        let mut ok = v(RESUME_OK);
+        ok["id"] = json!(id);
+        t.on_rpc(&ok);
+        assert!(t.pending_subscriptions().is_empty());
+        assert!(
+            rpcs(&t.on_rpc(&v(THREAD_STATUS_ACTIVE))).is_empty(),
+            "a subscribed thread is never re-resumed"
         );
     }
 

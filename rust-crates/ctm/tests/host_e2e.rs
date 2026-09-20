@@ -453,8 +453,42 @@ async fn codex_remote_session_delivers_an_answerable_approval() {
         eprintln!("skip: codex or tmux missing");
         return;
     }
+    // Isolated CODEX_HOME: this test creates real Codex threads, and the operator's own
+    // ctm daemon is a client of the shared app-server — running against that one makes
+    // their Telegram sprout a topic per test run. Short path for the socket's sake.
+    let codex_home = PathBuf::from(format!("/tmp/ctm-e2e-ap-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&codex_home);
+    std::fs::create_dir_all(&codex_home).unwrap();
+    struct HomeGuard(PathBuf);
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            let _ = Command::new("codex")
+                .args(["app-server", "daemon", "stop"])
+                .env("CODEX_HOME", &self.0)
+                .output();
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _home_guard = HomeGuard(codex_home.clone());
+    let real_home = std::env::var("CODEX_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(std::env::var("HOME").unwrap()).join(".codex"));
+    let release = std::fs::canonicalize(real_home.join("packages/standalone/current"))
+        .unwrap_or_else(|_| real_home.join("packages/standalone/current"));
+    if !release.exists() {
+        eprintln!("skip: no managed standalone codex install to link");
+        return;
+    }
+    std::fs::create_dir_all(codex_home.join("packages/standalone")).unwrap();
+    std::os::unix::fs::symlink(&release, codex_home.join("packages/standalone/current")).unwrap();
+    for f in ["auth.json", "config.toml"] {
+        if real_home.join(f).exists() {
+            let _ = std::os::unix::fs::symlink(real_home.join(f), codex_home.join(f));
+        }
+    }
     let start = Command::new("codex")
         .args(["app-server", "daemon", "start"])
+        .env("CODEX_HOME", &codex_home)
         .output()
         .expect("codex app-server daemon start");
     let started: serde_json::Value =
@@ -507,8 +541,9 @@ async fn codex_remote_session_delivers_an_answerable_approval() {
     }
     let _guard = TmuxGuard(tmux.clone(), work.clone());
     let launch = format!(
-        "cd {w} && codex --remote unix://{s} -C {w} -c approval_policy='on-request' -c sandbox_mode='read-only'; sleep 30",
+        "cd {w} && CODEX_HOME={h} codex --remote unix://{s} -C {w} -c approval_policy='on-request' -c sandbox_mode='read-only'; sleep 30",
         w = work.display(),
+        h = codex_home.display(),
         s = socket_path.display()
     );
     assert!(Command::new("tmux")

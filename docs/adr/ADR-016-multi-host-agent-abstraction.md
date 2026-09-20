@@ -544,3 +544,22 @@ The operator still types `codex`.
 - ctm now defines a shell function named after another tool. That is intrusive by
   nature, so it is inert without the daemon, opt-out in one variable, and reported by
   `ctm doctor`.
+
+### Subscription retry: the event, not a timer (2026-09-20, 0.2.37)
+
+Two releases carried a wall-clock retry for a deferred `thread/resume`, and one of them
+shipped a bug (the window was measured from the observer's connection, so a long-lived
+daemon abandoned a new thread one second after its first deferral). Both existed on a
+false premise — that no event reaches an unsubscribed client at the moment a rollout
+appears.
+
+Captured traffic says otherwise. An unsubscribed client receives `thread/started`,
+**`thread/status/changed`**, `thread/name/updated` and `thread/closed`; only `turn/*`,
+`item/*` and `serverRequest/*` are withheld. A status change to `active` is precisely
+when the turn begins and the rollout is created, so it is the correct trigger. ctm now
+retries whenever the server mentions a thread it is not subscribed to. There is no
+window to mis-measure, no abandonment state, and a thread that can never be resumed
+(a bare `codex`) costs a few retries per turn and stops when it closes.
+
+The general lesson, recorded because it cost two releases: reaching for a timer was a
+signal that the event stream had not been read carefully enough.

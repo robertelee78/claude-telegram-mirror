@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.37] - 2026-09-20
+
+### Changed (the retry timer is gone — it was the wrong shape)
+- **Codex subscription retries are event-driven, not timed.** 0.2.35 added a wall-clock retry window and 0.2.36 fixed how it was measured; both existed only because the obvious trigger, `turn/started`, is delivered to *subscribed* clients. But `thread/status/changed` **is** delivered to unsubscribed ones (spike-verified: 5 such events for a remote session), and a change to `active` is exactly when the rollout comes into being. ctm now retries a deferred `thread/resume` when the server says anything about a thread it is not subscribed to. No window to mis-measure, no give-up state, and a thread that can never be resumed simply stops being mentioned when it closes.
+
+### Fixed (prune could offer to delete live conversations)
+- **`ctm prune-topics --ledger` contradicted the daemon's own liveness policy.** `liveness.rs` says a session with no tmux route may only be declared dead by inactivity; `prune.rs` said "no tmux route → dead". With ADR-016 host sessions (no pane at all) and Claude Code started outside tmux, `--ledger` therefore listed live sessions as prunable — observed offering 11 deletions including two live ones. Prune now follows the same policy and, better, asks each host directly: Codex's app-server lists the threads it holds (`thread/loaded/list`), an OpenCode server lists its sessions. A host that cannot be reached falls back to inactivity, never to "dead". On the same machine the candidate list went from 11 (including live sessions) to 1 (a genuinely ended session).
+
+### Fixed (test hygiene)
+- The Codex approval end-to-end test ran against the *shared* app-server, so every run created a real thread that the operator's own daemon mirrored into a new Telegram topic. It now runs against an isolated `CODEX_HOME`, like the hooks test.
+
 ## [0.2.36] - 2026-09-20
 
 ### Fixed (found by running 0.2.35 as a user — the approval buttons never appeared)
