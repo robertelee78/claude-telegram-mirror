@@ -571,19 +571,48 @@ fn check_tmux() -> CheckResult {
     }
 }
 
-fn check_service() -> CheckResult {
+fn check_service(fix: bool) -> CheckResult {
     let service = crate::service::get_service_status();
 
+    // With a configuration present, an uninstalled or stopped service is something
+    // `--fix` can simply resolve — it is the reason `ctm` appears not to work at all
+    // after a fresh install on a new machine.
+    let configured = config_file().exists();
+
     if service.info.contains("not installed") {
+        if fix && configured {
+            let installed = crate::service::install_service();
+            if !installed.success {
+                return CheckResult::fail("Service", "Service could not be installed")
+                    .with_details(&installed.message);
+            }
+            let started = crate::service::start_service();
+            return if started.success {
+                CheckResult::warn("Service", "Service not installed")
+                    .into_fixed("installed and started the service")
+            } else {
+                CheckResult::fail("Service", "Installed, but it would not start")
+                    .with_details(&started.message)
+            };
+        }
         return CheckResult::warn("Service", "Service not installed")
-            .with_details("Run: ctm service install");
+            .with_details("Run: ctm service install (or `ctm doctor --fix`)");
     }
 
     if service.running {
         CheckResult::pass("Service", "Running")
+    } else if fix {
+        let started = crate::service::start_service();
+        if started.success {
+            CheckResult::warn("Service", "Installed but not running")
+                .into_fixed("started the service")
+        } else {
+            CheckResult::fail("Service", "Installed but will not start")
+                .with_details(&started.message)
+        }
     } else {
         CheckResult::warn("Service", "Installed but not running")
-            .with_details("Run: ctm service start")
+            .with_details("Run: ctm service start (or `ctm doctor --fix`)")
     }
 }
 
@@ -1346,7 +1375,7 @@ pub async fn run_doctor(fix: bool) -> anyhow::Result<()> {
     checks.push(c);
 
     // [8/11] Service
-    let c = check_service();
+    let c = check_service(fix);
     print!("[8/13] ");
     print_result(&c);
     checks.push(c);

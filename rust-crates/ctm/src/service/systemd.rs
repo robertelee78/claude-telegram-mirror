@@ -85,18 +85,48 @@ pub(super) fn install_systemd_service() -> ServiceResult {
 
     println!("  Created env file: {}", env_file.display());
 
-    // Reload systemd
-    // M5.4: Uses `.status()` which inherits stdout/stderr so the user sees
-    // systemctl output. The uninstall path intentionally suppresses output
-    // with Stdio::null() because it runs during cleanup where noise is unhelpful.
-    let _ = Command::new("systemctl")
-        .args(["--user", "daemon-reload"])
-        .status();
-
-    // Enable
-    let _ = Command::new("systemctl")
-        .args(["--user", "enable", &format!("{SERVICE_NAME}.service")])
-        .status();
+    // Writing the unit file is not installing the service: it is only installed once
+    // the user manager has reloaded and enabled it. Both steps used to run with their
+    // results discarded and "Service installed" reported regardless — so on a box where
+    // `systemctl --user` cannot talk to a user manager (a plain SSH login with no
+    // lingering is the usual case) ctm claimed success and the next `ctm service start`
+    // failed with systemd's bare "Unit ... not found".
+    for (args, what) in [
+        (vec!["--user", "daemon-reload"], "daemon-reload"),
+        (
+            vec!["--user", "enable", &format!("{SERVICE_NAME}.service")],
+            "enable",
+        ),
+    ] {
+        match Command::new("systemctl").args(&args).output() {
+            Ok(out) if out.status.success() => {}
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                return ServiceResult {
+                    success: false,
+                    message: format!(
+                        "Unit file written to {}, but `systemctl --user {what}` failed: {}{}",
+                        service_path.display(),
+                        if stderr.is_empty() {
+                            "(no output)".into()
+                        } else {
+                            stderr.clone()
+                        },
+                        user_manager_hint(&stderr),
+                    ),
+                };
+            }
+            Err(e) => {
+                return ServiceResult {
+                    success: false,
+                    message: format!(
+                        "Unit file written to {}, but systemctl could not be run: {e}",
+                        service_path.display()
+                    ),
+                };
+            }
+        }
+    }
 
     ServiceResult {
         success: true,
@@ -105,6 +135,29 @@ pub(super) fn install_systemd_service() -> ServiceResult {
             service_path.display(),
         ),
     }
+}
+
+/// Advice for the failures that actually happen on a headless Linux box.
+///
+/// A user unit needs a running *user manager*, which a plain SSH session may not have:
+/// without `loginctl enable-linger` the manager stops with the last session, and without
+/// `XDG_RUNTIME_DIR`/`DBUS_SESSION_BUS_ADDRESS` `systemctl --user` cannot reach it at all.
+pub(super) fn user_manager_hint(stderr: &str) -> String {
+    let s = stderr.to_ascii_lowercase();
+    if s.contains("failed to connect to bus") || s.contains("no medium found") {
+        return format!(
+            "\n\nThis user has no running systemd user manager. Enable it with:\n               sudo loginctl enable-linger {}\n\
+             then log in again (or `export XDG_RUNTIME_DIR=/run/user/$(id -u)`) and re-run \
+             `ctm service install`.",
+            std::env::var("USER").unwrap_or_else(|_| "$USER".into())
+        );
+    }
+    String::new()
+}
+
+/// Has the unit file been written? (Distinct from "the manager knows about it".)
+pub(super) fn systemd_unit_present() -> bool {
+    systemd_service_file().exists()
 }
 
 pub(super) fn uninstall_systemd_service() -> ServiceResult {
@@ -138,17 +191,49 @@ pub(super) fn uninstall_systemd_service() -> ServiceResult {
 }
 
 pub(super) fn start_systemd_service() -> ServiceResult {
+    // "Unit not found" means the service was never installed, which is a thing ctm can
+    // simply do rather than make the operator decode systemd's error. (Reported from a
+    // fresh Linux install: `ctm service start` → "Unit claude-telegram-mirror.service
+    // not found." with no next step.)
+    if !systemd_unit_present() {
+        let installed = install_systemd_service();
+        if !installed.success {
+            return ServiceResult {
+                success: false,
+                message: format!(
+                    "Service is not installed, and installing it failed.\n{}",
+                    installed.message
+                ),
+            };
+        }
+        println!("Service was not installed; installed it first.");
+    }
     match Command::new("systemctl")
         .args(["--user", "start", &format!("{SERVICE_NAME}.service")])
-        .status()
+        .output()
     {
-        Ok(s) if s.success() => ServiceResult {
+        Ok(out) if out.status.success() => ServiceResult {
             success: true,
             message: "Service started.".into(),
         },
-        _ => ServiceResult {
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            ServiceResult {
+                success: false,
+                message: format!(
+                    "Failed to start systemd service: {}{}",
+                    if stderr.is_empty() {
+                        "(no output)".into()
+                    } else {
+                        stderr.clone()
+                    },
+                    user_manager_hint(&stderr)
+                ),
+            }
+        }
+        Err(e) => ServiceResult {
             success: false,
-            message: "Failed to start systemd service.".into(),
+            message: format!("Failed to run systemctl: {e}"),
         },
     }
 }
@@ -230,5 +315,29 @@ mod tests {
         assert!(content.contains("StartLimitBurst=5"));
         assert!(content.contains("[Install]"));
         assert!(content.contains("WantedBy=default.target"));
+    }
+
+    #[test]
+    fn a_missing_user_manager_is_explained_not_just_reported() {
+        // The failure a headless SSH login actually produces.
+        let hint = user_manager_hint("Failed to connect to bus: No medium found");
+        assert!(hint.contains("loginctl enable-linger"), "{hint}");
+        assert!(hint.contains("XDG_RUNTIME_DIR"), "{hint}");
+    }
+
+    #[test]
+    fn unrelated_errors_get_no_invented_advice() {
+        assert_eq!(user_manager_hint("Unit foo.service not found."), "");
+        assert_eq!(user_manager_hint(""), "");
+    }
+
+    #[test]
+    fn the_unit_path_is_the_users_systemd_directory() {
+        let p = systemd_service_file();
+        assert!(p.ends_with(format!("{SERVICE_NAME}.service")), "{p:?}");
+        assert!(
+            p.to_string_lossy().contains(".config/systemd/user"),
+            "a user unit, which is why every systemctl call passes --user: {p:?}"
+        );
     }
 }

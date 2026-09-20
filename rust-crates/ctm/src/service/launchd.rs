@@ -170,6 +170,21 @@ pub(super) fn uninstall_launchd_service() -> ServiceResult {
 
 pub(super) fn start_launchd_service() -> ServiceResult {
     let plist = launchd_plist();
+    // Symmetry with the systemd path: starting a service that was never installed is a
+    // thing ctm can do rather than fail with a platform error.
+    if !plist.exists() {
+        let installed = install_launchd_service();
+        if !installed.success {
+            return ServiceResult {
+                success: false,
+                message: format!(
+                    "Service is not installed, and installing it failed.\n{}",
+                    installed.message
+                ),
+            };
+        }
+        println!("Service was not installed; installed it first.");
+    }
     // Load if not loaded
     let _ = Command::new("launchctl")
         .args(["load", &plist.display().to_string()])

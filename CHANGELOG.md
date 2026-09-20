@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.38] - 2026-09-20
+
+### Fixed (reported from a fresh Linux install)
+- **`ctm service start` now installs the service if it is not installed.** On a new machine it failed with systemd's bare `Unit claude-telegram-mirror.service not found.` and no next step. It installs first, then starts. The launchd path does the same.
+- **`ctm service install` no longer claims success it did not verify.** It wrote the unit file and then ran `systemctl --user daemon-reload` and `enable` with their results discarded, reporting "Service installed" either way. Both are checked now, and the real systemd error is shown.
+- **A missing systemd *user manager* is explained rather than reported.** A plain SSH login without lingering has no user manager, so `systemctl --user` fails with `Failed to connect to bus`. ctm now says so and gives the fix (`sudo loginctl enable-linger <user>`, or exporting `XDG_RUNTIME_DIR`).
+- **`ctm doctor --fix` installs and starts the service** when a configuration exists and the service is missing or stopped, instead of only printing the command to run.
+
 ## [0.2.37] - 2026-09-20
 
 ### Changed (the retry timer is gone — it was the wrong shape)

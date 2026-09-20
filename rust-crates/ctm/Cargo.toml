@@ -1,6 +1,6 @@
 [package]
 name = "ctm"
-version = "0.2.37"
+version = "0.2.38"
 edition = "2021"
 description = "Claude Telegram Mirror — Bidirectional Claude Code <-> Telegram bridge"
 license = "MIT"
