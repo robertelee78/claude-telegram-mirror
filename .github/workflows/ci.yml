@@ -32,3 +32,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: scripts/test-darwin-signing-contract.sh
+
+  # ADR-019: the service layer against the REAL service manager, on each platform.
+  # A throwaway unit/plist under a unique label; the runner's own services are untouched.
+  service-managers:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust-crates
+      - run: cargo test --test service_managers -- --nocapture
+        working-directory: rust-crates
+        env:
+          CTM_TEST_SERVICE_MANAGER: "1"

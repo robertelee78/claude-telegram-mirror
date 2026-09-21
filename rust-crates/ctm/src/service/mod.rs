@@ -1,10 +1,17 @@
 //! Service Manager — systemd (Linux) and launchd (macOS) service management.
 //!
-//! Ported from `src/service/manager.ts`.
+//! ADR-019: every mutating operation is act → observe → report. The `*_state`
+//! modules are the only readers of the managers; the ops modules never derive a
+//! result from a command's exit status.
 
 pub mod env;
 mod launchd;
+pub mod launchd_state;
+mod spec;
 mod systemd;
+pub mod systemd_state;
+
+pub use spec::ServiceSpec;
 
 use std::collections::HashMap;
 use std::fs;
@@ -45,16 +52,8 @@ fn systemd_user_dir() -> PathBuf {
     home_dir().join(".config").join("systemd").join("user")
 }
 
-fn systemd_service_file() -> PathBuf {
-    systemd_user_dir().join(format!("{SERVICE_NAME}.service"))
-}
-
 fn launchd_dir() -> PathBuf {
     home_dir().join("Library").join("LaunchAgents")
-}
-
-fn launchd_plist() -> PathBuf {
-    launchd_dir().join(format!("com.claude.{SERVICE_NAME}.plist"))
 }
 
 fn env_file_path() -> PathBuf {
@@ -128,12 +127,118 @@ pub struct ServiceStatus {
 /// Re-export parse_env_file for external consumers.
 pub use env::parse_env_file;
 
-/// Check if the service is installed (service file / plist exists).
+fn unsupported() -> ServiceResult {
+    ServiceResult {
+        success: false,
+        message: "Unsupported platform. Only Linux (systemd) and macOS (launchd) are supported."
+            .into(),
+    }
+}
+
+// ---- generic operations on any spec (what the e2e test drives)
+
+pub fn install_with(spec: &ServiceSpec) -> ServiceResult {
+    if has_systemd() {
+        systemd::install_with(spec)
+    } else if is_macos() {
+        launchd::install_with(spec)
+    } else {
+        unsupported()
+    }
+}
+
+pub fn uninstall_with(spec: &ServiceSpec) -> ServiceResult {
+    if has_systemd() {
+        systemd::uninstall_with(spec)
+    } else if is_macos() {
+        launchd::uninstall_with(spec)
+    } else {
+        unsupported()
+    }
+}
+
+pub fn start_with(spec: &ServiceSpec) -> ServiceResult {
+    if has_systemd() {
+        systemd::start_with(spec)
+    } else if is_macos() {
+        launchd::start_with(spec)
+    } else {
+        unsupported()
+    }
+}
+
+pub fn stop_with(spec: &ServiceSpec) -> ServiceResult {
+    if has_systemd() {
+        systemd::stop_with(spec)
+    } else if is_macos() {
+        launchd::stop_with(spec)
+    } else {
+        unsupported()
+    }
+}
+
+pub fn restart_with(spec: &ServiceSpec) -> ServiceResult {
+    if has_systemd() {
+        systemd::restart_with(spec)
+    } else if is_macos() {
+        launchd::restart_with(spec)
+    } else {
+        unsupported()
+    }
+}
+
+pub fn status_with(spec: &ServiceSpec) -> ServiceStatus {
+    if has_systemd() {
+        systemd::status_with(spec)
+    } else if is_macos() {
+        launchd::status_with(spec)
+    } else {
+        ServiceStatus {
+            running: false,
+            enabled: false,
+            info: "Unsupported platform".into(),
+        }
+    }
+}
+
+/// The PID the manager reports for the spec's process, if it is running.
+pub fn pid_with(spec: &ServiceSpec) -> Option<u32> {
+    if has_systemd() {
+        match systemd_state::observe(&spec.systemd_unit()) {
+            systemd_state::Observation::Unit(u) if u.running() => u.main_pid,
+            _ => None,
+        }
+    } else if is_macos() {
+        launchd_state::observe(&spec.launchd_target())
+            .pid
+            .and_then(|p| u32::try_from(p).ok())
+    } else {
+        None
+    }
+}
+
+/// The program the manager has loaded for the spec (not the file on disk).
+pub fn program_with(spec: &ServiceSpec) -> Option<PathBuf> {
+    if has_systemd() {
+        match systemd_state::observe(&spec.systemd_unit()) {
+            systemd_state::Observation::Unit(u) => u.exec_path,
+            _ => None,
+        }
+    } else if is_macos() {
+        launchd_state::observe(&spec.launchd_target()).program
+    } else {
+        None
+    }
+}
+
+// ---- the ctm daemon
+
 /// ADR-017: the binary the installed service unit runs, if a unit exists.
 /// launchd: first `<string>` under `ProgramArguments`; systemd: `ExecStart=<bin> start`.
 pub fn service_binary_path() -> Option<PathBuf> {
+    let spec = ServiceSpec::ctm();
     if has_systemd() {
-        let text = std::fs::read_to_string(systemd_service_file()).ok()?;
+        let text = std::fs::read_to_string(spec.systemd_unit_path()).ok()?;
         let line = text
             .lines()
             .find(|l| l.trim_start().starts_with("ExecStart="))?;
@@ -141,7 +246,7 @@ pub fn service_binary_path() -> Option<PathBuf> {
         return rest.split_whitespace().next().map(PathBuf::from);
     }
     if is_macos() {
-        let text = std::fs::read_to_string(launchd_plist()).ok()?;
+        let text = std::fs::read_to_string(spec.launchd_plist_path()).ok()?;
         let after = text.split("<key>ProgramArguments</key>").nth(1)?;
         let start = after.find("<string>")? + "<string>".len();
         let end = after[start..].find("</string>")? + start;
@@ -150,11 +255,13 @@ pub fn service_binary_path() -> Option<PathBuf> {
     None
 }
 
+/// Is the ctm unit definition on disk? (Distinct from "the manager knows it".)
 pub fn is_service_installed() -> bool {
+    let spec = ServiceSpec::ctm();
     if has_systemd() {
-        systemd_service_file().exists()
+        spec.systemd_unit_path().exists()
     } else if is_macos() {
-        launchd_plist().exists()
+        spec.launchd_plist_path().exists()
     } else {
         false
     }
@@ -172,88 +279,54 @@ pub fn install_service() -> ServiceResult {
             ),
         };
     }
-
     if has_systemd() {
-        systemd::install_systemd_service()
-    } else if is_macos() {
-        launchd::install_launchd_service()
-    } else {
-        ServiceResult {
-            success: false,
-            message:
-                "Unsupported platform. Only Linux (systemd) and macOS (launchd) are supported."
-                    .into(),
+        // The unit's EnvironmentFile is generated from ~/.telegram-env on every install.
+        match env::create_systemd_env_file() {
+            Ok(f) => println!("  Created env file: {}", f.display()),
+            Err(e) => {
+                return ServiceResult {
+                    success: false,
+                    message: format!("Failed to create env file: {e}"),
+                }
+            }
         }
     }
+    install_with(&ServiceSpec::ctm())
 }
 
 pub fn uninstall_service() -> ServiceResult {
-    if has_systemd() {
-        systemd::uninstall_systemd_service()
-    } else if is_macos() {
-        launchd::uninstall_launchd_service()
-    } else {
-        ServiceResult {
-            success: false,
-            message: "Unsupported platform.".into(),
-        }
-    }
+    uninstall_with(&ServiceSpec::ctm())
 }
 
 pub fn start_service() -> ServiceResult {
-    if has_systemd() {
-        systemd::start_systemd_service()
-    } else if is_macos() {
-        launchd::start_launchd_service()
-    } else {
-        ServiceResult {
-            success: false,
-            message: "Unsupported platform.".into(),
+    // `start_with` installs first when the unit is missing; on Linux that needs the
+    // env file the ctm-specific installer generates.
+    if has_systemd() && !is_service_installed() {
+        let installed = install_service();
+        if !installed.success {
+            return ServiceResult {
+                success: false,
+                message: format!(
+                    "Service is not installed, and installing it failed.\n{}",
+                    installed.message
+                ),
+            };
         }
+        println!("Service was not installed; installed it first.");
     }
+    start_with(&ServiceSpec::ctm())
 }
 
 pub fn stop_service() -> ServiceResult {
-    if has_systemd() {
-        systemd::stop_systemd_service()
-    } else if is_macos() {
-        launchd::stop_launchd_service()
-    } else {
-        ServiceResult {
-            success: false,
-            message: "Unsupported platform.".into(),
-        }
-    }
+    stop_with(&ServiceSpec::ctm())
 }
 
 pub fn restart_service() -> ServiceResult {
-    if has_systemd() {
-        systemd::restart_systemd_service()
-    } else if is_macos() {
-        // launchd restart is atomic (kickstart -k) — NOT stop-then-start, which
-        // races (launchctl stop is async) and strands the service down because
-        // KeepAlive won't relaunch a clean exit. See restart_launchd_service.
-        launchd::restart_launchd_service()
-    } else {
-        ServiceResult {
-            success: false,
-            message: "Unsupported platform.".into(),
-        }
-    }
+    restart_with(&ServiceSpec::ctm())
 }
 
 pub fn get_service_status() -> ServiceStatus {
-    if has_systemd() {
-        systemd::get_systemd_status()
-    } else if is_macos() {
-        launchd::get_launchd_status()
-    } else {
-        ServiceStatus {
-            running: false,
-            enabled: false,
-            info: "Unsupported platform".into(),
-        }
-    }
+    status_with(&ServiceSpec::ctm())
 }
 
 /// Handle the `ctm service <action>` CLI command.
@@ -287,10 +360,19 @@ pub fn handle_service_command(action: &ServiceAction) -> anyhow::Result<()> {
             r
         }
         ServiceAction::Status => {
-            let s = get_service_status();
+            let spec = ServiceSpec::ctm();
+            let s = status_with(&spec);
             println!("\nService Status\n");
-            println!("  Running: {}", if s.running { "Yes" } else { "No" });
+            match pid_with(&spec) {
+                Some(pid) => println!("  Running: Yes (pid {pid})"),
+                None => println!("  Running: No"),
+            }
             println!("  Enabled: {}", if s.enabled { "Yes" } else { "No" });
+            if let Some(p) = program_with(&spec) {
+                // What the manager will exec, which after a move may differ from
+                // the unit on disk until the next restart (ADR-019).
+                println!("  Program: {}", p.display());
+            }
             println!("  Info:    {}", s.info);
             println!();
             return Ok(());
@@ -320,10 +402,35 @@ mod tests {
     }
 
     #[test]
-    fn test_service_status_unsupported() {
-        // On CI (likely Linux without systemd user session), this should still work
+    fn status_never_panics_wherever_it_runs() {
         let status = get_service_status();
-        // Just check it doesn't panic
         assert!(!status.info.is_empty());
+    }
+
+    /// ADR-019 contract: no command result in this module tree is discarded. A
+    /// discarded result is how "Service installed" got printed on a box with no
+    /// user manager and how a restart left the old binary running.
+    #[test]
+    fn no_service_command_result_is_discarded() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/service");
+        for entry in fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let text = fs::read_to_string(&path).unwrap();
+            for (n, line) in text.lines().enumerate() {
+                let l = line.trim_start();
+                assert!(
+                    !(l.starts_with("let _ = Command::new")
+                        || l.starts_with("let _ = std::process::Command::new")
+                        || l.starts_with("let _ = launchctl(")
+                        || l.starts_with("let _ = systemctl(")),
+                    "{}:{}: discards a command result: {line}",
+                    path.display(),
+                    n + 1
+                );
+            }
+        }
     }
 }

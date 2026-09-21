@@ -1,20 +1,34 @@
-//! systemd unit file generation and lifecycle.
+//! systemd user-unit generation and lifecycle.
+//!
+//! ADR-019: every operation here is act → observe → report. `systemctl`'s exit status
+//! is never the verdict; the unit's state as the manager reports it afterwards is.
 
+use super::systemd_state::{
+    observe, systemctl, wait_running_stable, wait_stopped, Observation, Waited,
+};
 use super::*;
+use std::time::Duration;
 
-pub(super) fn generate_systemd_service() -> String {
-    let binary = ctm_binary_path();
-    let config_dir = home_dir().join(".config").join(SERVICE_NAME);
-    let env_file = systemd_env_file_path();
+/// Longer than `RestartSec=10s`, so a unit that fails and is retried once is
+/// caught in `auto-restart` rather than mistaken for a slow start.
+const START_BUDGET: Duration = Duration::from_secs(14);
+const STOP_BUDGET: Duration = Duration::from_secs(10);
 
-    // Note (M2.7): WorkingDirectory uses %h (the user's home directory), which is the
-    // appropriate working directory for a Rust binary installed to the system.  The
-    // TypeScript implementation used the package directory because it required
-    // node_modules relative resolution — that constraint does not apply here.
-    // %h ensures the daemon always starts in a predictable, writable directory.
+pub(super) fn generate_systemd_service(spec: &ServiceSpec) -> String {
+    let exec = std::iter::once(spec.program.display().to_string())
+        .chain(spec.args.iter().cloned())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let env_line = spec
+        .env_file
+        .as_ref()
+        .map(|f| format!("EnvironmentFile={}\n", f.display()))
+        .unwrap_or_default();
+    // WorkingDirectory=%h: the user's home is always present and writable, which is
+    // all a self-contained binary needs.
     format!(
         r#"[Unit]
-Description=Claude Code Telegram Mirror Bridge
+Description={description}
 Documentation=https://github.com/robertelee78/claude-telegram-mirror
 After=network-online.target
 Wants=network-online.target
@@ -22,9 +36,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=%h
-ExecStart={binary} start
-EnvironmentFile={env_file}
-
+ExecStart={exec}
+{env_line}
 # Restart policy
 Restart=on-failure
 RestartSec=10s
@@ -34,107 +47,51 @@ StartLimitBurst=5
 # Logging
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier={SERVICE_NAME}
+SyslogIdentifier={name}
 
 # Security hardening
 NoNewPrivileges=true
 PrivateTmp=false
 
 # Allow writes to config directory
-ReadWritePaths={config_dir}
+ReadWritePaths={log_dir}
 
 [Install]
 WantedBy=default.target
 "#,
-        binary = binary.display(),
-        env_file = env_file.display(),
-        config_dir = config_dir.display(),
+        description = spec.description,
+        name = spec.name,
+        log_dir = spec.log_dir.display(),
     )
 }
 
-pub(super) fn install_systemd_service() -> ServiceResult {
-    let env_result = env::create_systemd_env_file();
-    let env_file = match env_result {
-        Ok(f) => f,
-        Err(e) => {
-            return ServiceResult {
-                success: false,
-                message: format!("Failed to create env file: {e}"),
-            };
-        }
-    };
-
-    let sdir = systemd_user_dir();
-    if !sdir.exists() {
-        if let Err(e) = fs::create_dir_all(&sdir) {
-            return ServiceResult {
-                success: false,
-                message: format!("Failed to create systemd dir: {e}"),
-            };
-        }
+fn fail(message: String) -> ServiceResult {
+    ServiceResult {
+        success: false,
+        message,
     }
+}
 
-    let service_path = systemd_service_file();
-    let content = generate_systemd_service();
-    if let Err(e) = fs::write(&service_path, content) {
-        return ServiceResult {
-            success: false,
-            message: format!("Failed to write service file: {e}"),
-        };
-    }
-
-    println!("  Created env file: {}", env_file.display());
-
-    // Writing the unit file is not installing the service: it is only installed once
-    // the user manager has reloaded and enabled it. Both steps used to run with their
-    // results discarded and "Service installed" reported regardless — so on a box where
-    // `systemctl --user` cannot talk to a user manager (a plain SSH login with no
-    // lingering is the usual case) ctm claimed success and the next `ctm service start`
-    // failed with systemd's bare "Unit ... not found".
-    for (args, what) in [
-        (vec!["--user", "daemon-reload"], "daemon-reload"),
-        (
-            vec!["--user", "enable", &format!("{SERVICE_NAME}.service")],
-            "enable",
-        ),
-    ] {
-        match Command::new("systemctl").args(&args).output() {
-            Ok(out) if out.status.success() => {}
-            Ok(out) => {
-                let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-                return ServiceResult {
-                    success: false,
-                    message: format!(
-                        "Unit file written to {}, but `systemctl --user {what}` failed: {}{}",
-                        service_path.display(),
-                        if stderr.is_empty() {
-                            "(no output)".into()
-                        } else {
-                            stderr.clone()
-                        },
-                        user_manager_hint(&stderr),
-                    ),
-                };
-            }
-            Err(e) => {
-                return ServiceResult {
-                    success: false,
-                    message: format!(
-                        "Unit file written to {}, but systemctl could not be run: {e}",
-                        service_path.display()
-                    ),
-                };
-            }
-        }
-    }
-
+fn ok(message: String) -> ServiceResult {
     ServiceResult {
         success: true,
-        message: format!(
-            "Service installed: {}\n\nCommands:\n  Start:   systemctl --user start {SERVICE_NAME}\n  Stop:    systemctl --user stop {SERVICE_NAME}\n  Status:  systemctl --user status {SERVICE_NAME}\n  Logs:    journalctl --user -u {SERVICE_NAME} -f\n\nTo run without being logged in:\n  sudo loginctl enable-linger $USER",
-            service_path.display(),
-        ),
+        message,
     }
+}
+
+fn unreachable_report(what: &str, err: &str) -> ServiceResult {
+    fail(format!(
+        "{what}, but the systemd user manager could not be reached: {}{}",
+        if err.is_empty() { "(no output)" } else { err },
+        user_manager_hint(err)
+    ))
+}
+
+fn logs_hint(spec: &ServiceSpec) -> String {
+    format!(
+        "\n  Logs:  journalctl --user -u {} -n 50 --no-pager",
+        spec.systemd_unit()
+    )
 }
 
 /// Advice for the failures that actually happen on a headless Linux box.
@@ -156,143 +113,222 @@ pub(super) fn user_manager_hint(stderr: &str) -> String {
 }
 
 /// Has the unit file been written? (Distinct from "the manager knows about it".)
-pub(super) fn systemd_unit_present() -> bool {
-    systemd_service_file().exists()
+pub(super) fn unit_present(spec: &ServiceSpec) -> bool {
+    spec.systemd_unit_path().exists()
 }
 
-pub(super) fn uninstall_systemd_service() -> ServiceResult {
-    // Stop and disable
-    let _ = Command::new("systemctl")
-        .args(["--user", "stop", &format!("{SERVICE_NAME}.service")])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-    let _ = Command::new("systemctl")
-        .args(["--user", "disable", &format!("{SERVICE_NAME}.service")])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-
-    let path = systemd_service_file();
-    if path.exists() {
-        let _ = fs::remove_file(&path);
+/// Goal: unit file on disk AND the manager has loaded and enabled it.
+pub(super) fn install_with(spec: &ServiceSpec) -> ServiceResult {
+    let sdir = systemd_user_dir();
+    if let Err(e) = fs::create_dir_all(&sdir) {
+        return fail(format!("Failed to create systemd dir: {e}"));
     }
-
-    let _ = Command::new("systemctl")
-        .args(["--user", "daemon-reload"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-
-    ServiceResult {
-        success: true,
-        message: "Service uninstalled successfully.".into(),
+    let unit_path = spec.systemd_unit_path();
+    if let Err(e) = fs::write(&unit_path, generate_systemd_service(spec)) {
+        return fail(format!("Failed to write service file: {e}"));
+    }
+    let unit = spec.systemd_unit();
+    for (args, what) in [
+        (vec!["daemon-reload"], "daemon-reload"),
+        (vec!["enable", unit.as_str()], "enable"),
+    ] {
+        if let Err(err) = systemctl(&args) {
+            return fail(format!(
+                "Unit file written to {}, but `systemctl --user {what}` failed: {err}{}",
+                unit_path.display(),
+                user_manager_hint(&err)
+            ));
+        }
+    }
+    match observe(&unit) {
+        Observation::Unit(u) if u.known() && u.unit_file == "enabled" => ok(format!(
+            "Service installed: {}\n\nCommands:\n  Start:   systemctl --user start {name}\n  Stop:    systemctl --user stop {name}\n  Status:  systemctl --user status {name}\n  Logs:    journalctl --user -u {name} -f\n\nTo run without being logged in:\n  sudo loginctl enable-linger $USER",
+            unit_path.display(),
+            name = spec.name,
+        )),
+        Observation::Unit(u) => fail(format!(
+            "Unit file written to {}, but the manager reports it as {} / {}",
+            unit_path.display(),
+            u.load,
+            if u.unit_file.is_empty() { "unknown" } else { &u.unit_file }
+        )),
+        Observation::Unreachable(err) => unreachable_report("Unit file written", &err),
     }
 }
 
-pub(super) fn start_systemd_service() -> ServiceResult {
-    // "Unit not found" means the service was never installed, which is a thing ctm can
-    // simply do rather than make the operator decode systemd's error. (Reported from a
-    // fresh Linux install: `ctm service start` → "Unit claude-telegram-mirror.service
-    // not found." with no next step.)
-    if !systemd_unit_present() {
-        let installed = install_systemd_service();
-        if !installed.success {
-            return ServiceResult {
-                success: false,
-                message: format!(
-                    "Service is not installed, and installing it failed.\n{}",
-                    installed.message
-                ),
+/// Goal: not loaded, not running, no unit file, no enable symlink.
+pub(super) fn uninstall_with(spec: &ServiceSpec) -> ServiceResult {
+    let unit = spec.systemd_unit();
+    let mut problems: Vec<String> = Vec::new();
+    // Order matters: `disable` needs the unit file to find its [Install] section.
+    for args in [vec!["stop", unit.as_str()], vec!["disable", unit.as_str()]] {
+        if let Err(err) = systemctl(&args) {
+            problems.push(format!("`systemctl --user {}`: {err}", args.join(" ")));
+        }
+    }
+    let unit_path = spec.systemd_unit_path();
+    if unit_path.exists() {
+        if let Err(e) = fs::remove_file(&unit_path) {
+            problems.push(format!("could not remove {}: {e}", unit_path.display()));
+        }
+    }
+    if let Err(err) = systemctl(&["daemon-reload"]) {
+        problems.push(format!("`systemctl --user daemon-reload`: {err}"));
+    }
+    let link = spec.systemd_wants_link();
+    let link_left = link.symlink_metadata().is_ok();
+    match observe(&unit) {
+        Observation::Unit(u) if !u.known() && !u.running() && !unit_path.exists() && !link_left => {
+            ok("Service uninstalled.".into())
+        }
+        Observation::Unit(u) => {
+            let mut left = Vec::new();
+            if u.known() {
+                left.push(format!(
+                    "the manager still knows the unit ({})",
+                    u.summary()
+                ));
+            }
+            if u.running() {
+                left.push(format!(
+                    "it is still running (pid {})",
+                    u.main_pid.unwrap_or(0)
+                ));
+            }
+            if unit_path.exists() {
+                left.push(format!("{} still exists", unit_path.display()));
+            }
+            if link_left {
+                left.push(format!("{} still exists", link.display()));
+            }
+            fail(format!(
+                "Uninstall incomplete: {}.\n{}",
+                left.join("; "),
+                problems.join("\n")
+            ))
+        }
+        Observation::Unreachable(err) => {
+            let done = if unit_path.exists() {
+                "Unit file could not be removed"
+            } else {
+                "Unit file removed"
             };
+            unreachable_report(
+                &format!("{done}, so it could not be stopped or disabled"),
+                &err,
+            )
+        }
+    }
+}
+
+/// Goal: running with a stable PID.
+pub(super) fn start_with(spec: &ServiceSpec) -> ServiceResult {
+    // Starting a service that was never installed is a thing ctm can do rather than
+    // make the operator decode systemd's "Unit ... not found".
+    if !unit_present(spec) {
+        let installed = install_with(spec);
+        if !installed.success {
+            return fail(format!(
+                "Service is not installed, and installing it failed.\n{}",
+                installed.message
+            ));
         }
         println!("Service was not installed; installed it first.");
     }
-    match Command::new("systemctl")
-        .args(["--user", "start", &format!("{SERVICE_NAME}.service")])
-        .output()
-    {
-        Ok(out) if out.status.success() => ServiceResult {
-            success: true,
-            message: "Service started.".into(),
-        },
-        Ok(out) => {
-            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-            ServiceResult {
-                success: false,
-                message: format!(
-                    "Failed to start systemd service: {}{}",
-                    if stderr.is_empty() {
-                        "(no output)".into()
-                    } else {
-                        stderr.clone()
-                    },
-                    user_manager_hint(&stderr)
-                ),
-            }
+    let unit = spec.systemd_unit();
+    let issued = systemctl(&["start", unit.as_str()]);
+    report_running(spec, &unit, issued, "start")
+}
+
+/// Goal: not running.
+pub(super) fn stop_with(spec: &ServiceSpec) -> ServiceResult {
+    let unit = spec.systemd_unit();
+    let issued = systemctl(&["stop", unit.as_str()]);
+    match wait_stopped(&unit, STOP_BUDGET) {
+        Waited::Done(_) => ok("Service stopped.".into()),
+        Waited::TimedOut(u) => fail(format!(
+            "Service did not stop: {}.{}",
+            u.summary(),
+            issued.err().map(|e| format!("\n  {e}")).unwrap_or_default()
+        )),
+        Waited::Unreachable(err) => unreachable_report("Stop requested", &err),
+    }
+}
+
+/// Goal: running with a stable PID that differs from before, from the unit file
+/// on disk (a stale definition is reloaded first — `systemctl restart` alone
+/// would run the old `ExecStart` and exit 0).
+pub(super) fn restart_with(spec: &ServiceSpec) -> ServiceResult {
+    let unit = spec.systemd_unit();
+    let before = match observe(&unit) {
+        Observation::Unit(u) => u,
+        Observation::Unreachable(err) => return unreachable_report("Restart requested", &err),
+    };
+    if before.need_reload {
+        if let Err(err) = systemctl(&["daemon-reload"]) {
+            return fail(format!(
+                "The unit file changed on disk and `daemon-reload` failed: {err}"
+            ));
         }
-        Err(e) => ServiceResult {
-            success: false,
-            message: format!("Failed to run systemctl: {e}"),
-        },
+    }
+    let issued = systemctl(&["restart", unit.as_str()]);
+    let r = report_running(spec, &unit, issued, "restart");
+    if !r.success {
+        return r;
+    }
+    match observe(&unit) {
+        Observation::Unit(after)
+            if before.main_pid.is_some() && after.main_pid == before.main_pid =>
+        {
+            fail(format!(
+                "Restart left the previous process running (pid {}).",
+                after.main_pid.unwrap_or(0)
+            ))
+        }
+        Observation::Unit(after) if after.need_reload => fail(
+            "Restarted, but the manager still reports the unit file as changed on disk.".into(),
+        ),
+        _ => ok("Service restarted.".into()),
     }
 }
 
-pub(super) fn stop_systemd_service() -> ServiceResult {
-    match Command::new("systemctl")
-        .args(["--user", "stop", &format!("{SERVICE_NAME}.service")])
-        .status()
-    {
-        Ok(s) if s.success() => ServiceResult {
-            success: true,
-            message: "Service stopped.".into(),
-        },
-        _ => ServiceResult {
-            success: false,
-            message: "Failed to stop systemd service.".into(),
-        },
+fn report_running(
+    spec: &ServiceSpec,
+    unit: &str,
+    issued: Result<(), String>,
+    verb: &str,
+) -> ServiceResult {
+    match wait_running_stable(unit, START_BUDGET) {
+        Waited::Done(_) => ok(format!("Service {verb}ed.")),
+        Waited::TimedOut(u) => fail(format!(
+            "Service did not stay running after {verb}: {}.{}{}{}",
+            u.summary(),
+            issued
+                .err()
+                .map(|e| format!("\n  systemctl said: {e}{}", user_manager_hint(&e)))
+                .unwrap_or_default(),
+            logs_hint(spec),
+            if u.exec_main_status.is_some_and(|c| c != 0) {
+                "\n  The program exits on its own; the logs above say why."
+            } else {
+                ""
+            }
+        )),
+        Waited::Unreachable(err) => unreachable_report(&format!("{verb} requested"), &err),
     }
 }
 
-pub(super) fn restart_systemd_service() -> ServiceResult {
-    match Command::new("systemctl")
-        .args(["--user", "restart", &format!("{SERVICE_NAME}.service")])
-        .status()
-    {
-        Ok(s) if s.success() => ServiceResult {
-            success: true,
-            message: "Service restarted.".into(),
-        },
-        _ => ServiceResult {
-            success: false,
-            message: "Failed to restart systemd service.".into(),
-        },
-    }
-}
-
-pub(super) fn get_systemd_status() -> ServiceStatus {
-    let running = Command::new("systemctl")
-        .args(["--user", "is-active", &format!("{SERVICE_NAME}.service")])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "active")
-        .unwrap_or(false);
-
-    let enabled = Command::new("systemctl")
-        .args(["--user", "is-enabled", &format!("{SERVICE_NAME}.service")])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "enabled")
-        .unwrap_or(false);
-
-    let info = if !systemd_service_file().exists() {
+pub(super) fn status_with(spec: &ServiceSpec) -> ServiceStatus {
+    let unit = spec.systemd_unit();
+    let (running, enabled) = match observe(&unit) {
+        Observation::Unit(u) => (u.running(), u.unit_file == "enabled"),
+        Observation::Unreachable(_) => (false, false),
+    };
+    let info = if !unit_present(spec) {
         "Service not installed".into()
     } else {
-        format!("Service file: {}", systemd_service_file().display())
+        format!("Service file: {}", spec.systemd_unit_path().display())
     };
-
     ServiceStatus {
         running,
         enabled,
@@ -305,21 +341,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_generate_systemd_service_contains_key_fields() {
-        let content = generate_systemd_service();
+    fn the_unit_names_the_program_and_the_policy() {
+        let content = generate_systemd_service(&ServiceSpec::ctm());
         assert!(content.contains("[Unit]"));
-        assert!(content.contains("[Service]"));
         assert!(content.contains("Type=simple"));
         assert!(content.contains("Restart=on-failure"));
         assert!(content.contains("RestartSec=10s"));
         assert!(content.contains("StartLimitBurst=5"));
-        assert!(content.contains("[Install]"));
         assert!(content.contains("WantedBy=default.target"));
+        assert!(content.contains("EnvironmentFile="));
+        assert!(content
+            .lines()
+            .any(|l| l.starts_with("ExecStart=") && l.ends_with(" start")));
+    }
+
+    #[test]
+    fn a_throwaway_spec_has_no_env_file_line() {
+        let s = ServiceSpec::throwaway(
+            "ctm-test",
+            PathBuf::from("/bin/sleep"),
+            vec!["300".into()],
+            PathBuf::from("/tmp"),
+        );
+        let content = generate_systemd_service(&s);
+        assert!(!content.contains("EnvironmentFile="));
+        assert!(content.contains("ExecStart=/bin/sleep 300"));
+        assert!(content.contains("SyslogIdentifier=ctm-test"));
     }
 
     #[test]
     fn a_missing_user_manager_is_explained_not_just_reported() {
-        // The failure a headless SSH login actually produces.
         let hint = user_manager_hint("Failed to connect to bus: No medium found");
         assert!(hint.contains("loginctl enable-linger"), "{hint}");
         assert!(hint.contains("XDG_RUNTIME_DIR"), "{hint}");
@@ -333,7 +384,7 @@ mod tests {
 
     #[test]
     fn the_unit_path_is_the_users_systemd_directory() {
-        let p = systemd_service_file();
+        let p = ServiceSpec::ctm().systemd_unit_path();
         assert!(p.ends_with(format!("{SERVICE_NAME}.service")), "{p:?}");
         assert!(
             p.to_string_lossy().contains(".config/systemd/user"),

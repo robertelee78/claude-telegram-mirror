@@ -1,6 +1,21 @@
 //! launchd plist generation and lifecycle.
+//!
+//! ADR-019: every operation here is act → observe → report. `launchctl`'s exit
+//! status is never the verdict (`load`/`unload` exit 0 when they did nothing; `start`
+//! exits 0 for a job that dies on launch); what `launchctl print` reports afterwards
+//! is. `load`/`unload` are not used at all: `bootstrap`/`bootout` are, gated and
+//! verified by `print`.
 
+use super::launchd_state::{
+    launchctl, observe, wait_not_running, wait_running_stable, wait_unloaded, JobState,
+};
 use super::*;
+use std::time::Duration;
+
+/// Longer than the plist's `ThrottleInterval` (10 s): a first launch that macOS
+/// kills and launchd relaunches is ridden out and reported as the success it is.
+const START_BUDGET: Duration = Duration::from_secs(14);
+const STOP_BUDGET: Duration = Duration::from_secs(10);
 
 fn get_macos_path() -> String {
     let home = home_dir();
@@ -13,7 +28,6 @@ fn get_macos_path() -> String {
         "/opt/homebrew/bin".into(),
         format!("{}/.local/bin", home.display()),
     ];
-
     // Merge with current PATH, excluding NVM paths (legacy Node.js artifact)
     if let Ok(current) = std::env::var("PATH") {
         for dir in current.split(':') {
@@ -22,40 +36,36 @@ fn get_macos_path() -> String {
             }
         }
     }
-
     paths.join(":")
 }
 
-pub(super) fn generate_launchd_plist() -> String {
-    let binary = ctm_binary_path();
+pub(super) fn generate_launchd_plist(spec: &ServiceSpec) -> String {
     let home = home_dir();
-    let config_dir = home.join(".config").join(SERVICE_NAME);
-    let log_file = config_dir.join("daemon.log");
-    let err_file = config_dir.join("daemon.err.log");
+    let log_file = spec.log_dir.join("daemon.log");
+    let err_file = spec.log_dir.join("daemon.err.log");
 
-    let env_vars = env::parse_env_file(&env_file_path());
-
-    let mut env_lines = Vec::new();
-    // Essential env vars
-    env_lines.push(format!(
-        "        <key>HOME</key>\n        <string>{}</string>",
-        escape_xml(&home.display().to_string())
-    ));
-    env_lines.push(format!(
-        "        <key>PATH</key>\n        <string>{}</string>",
-        escape_xml(&get_macos_path())
-    ));
-    // User-defined env vars from ~/.telegram-env
-    for (key, value) in &env_vars {
-        if key == "HOME" || key == "PATH" {
-            continue;
-        }
+    let mut env_lines = vec![
+        format!(
+            "        <key>HOME</key>\n        <string>{}</string>",
+            escape_xml(&home.display().to_string())
+        ),
+        format!(
+            "        <key>PATH</key>\n        <string>{}</string>",
+            escape_xml(&get_macos_path())
+        ),
+    ];
+    for (key, value) in &spec.env {
         env_lines.push(format!(
             "        <key>{}</key>\n        <string>{}</string>",
             escape_xml(key),
             escape_xml(value),
         ));
     }
+    let args = std::iter::once(&spec.program.display().to_string())
+        .chain(spec.args.iter())
+        .map(|a| format!("        <string>{}</string>", escape_xml(a)))
+        .collect::<Vec<_>>()
+        .join("\n");
 
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -63,12 +73,11 @@ pub(super) fn generate_launchd_plist() -> String {
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.claude.{service_name}</string>
+    <string>{label}</string>
 
     <key>ProgramArguments</key>
     <array>
-        <string>{binary}</string>
-        <string>start</string>
+{args}
     </array>
 
     <key>WorkingDirectory</key>
@@ -101,8 +110,7 @@ pub(super) fn generate_launchd_plist() -> String {
 </dict>
 </plist>
 "#,
-        service_name = SERVICE_NAME,
-        binary = escape_xml(&binary.display().to_string()),
+        label = spec.launchd_label(),
         home_dir = escape_xml(&home.display().to_string()),
         env_block = env_lines.join("\n"),
         log_file = escape_xml(&log_file.display().to_string()),
@@ -110,200 +118,22 @@ pub(super) fn generate_launchd_plist() -> String {
     )
 }
 
-pub(super) fn install_launchd_service() -> ServiceResult {
-    let plist_dir = launchd_dir();
-    if !plist_dir.exists() {
-        if let Err(e) = fs::create_dir_all(&plist_dir) {
-            return ServiceResult {
-                success: false,
-                message: format!("Failed to create LaunchAgents dir: {e}"),
-            };
-        }
+fn fail(message: String) -> ServiceResult {
+    ServiceResult {
+        success: false,
+        message,
     }
+}
 
-    // Ensure config dir for logs
-    let config_dir = home_dir().join(".config").join(SERVICE_NAME);
-    if let Err(e) = config::ensure_config_dir(&config_dir) {
-        return ServiceResult {
-            success: false,
-            message: format!("Failed to ensure config dir: {e}"),
-        };
-    }
-
-    let plist_path = launchd_plist();
-    let content = generate_launchd_plist();
-    if let Err(e) = fs::write(&plist_path, content) {
-        return ServiceResult {
-            success: false,
-            message: format!("Failed to write plist file: {e}"),
-        };
-    }
-
+fn ok(message: String) -> ServiceResult {
     ServiceResult {
         success: true,
-        message: format!(
-            "Service installed: {plist}\n\nCommands:\n  Load & Start:  launchctl load {plist}\n  Start:         launchctl start com.claude.{SERVICE_NAME}\n  Stop:          launchctl stop com.claude.{SERVICE_NAME}\n  Unload:        launchctl unload {plist}\n  Logs:          tail -f ~/.config/{SERVICE_NAME}/daemon.log",
-            plist = plist_path.display(),
-        ),
+        message,
     }
-}
-
-pub(super) fn uninstall_launchd_service() -> ServiceResult {
-    let plist = launchd_plist();
-
-    // Unload
-    let _ = Command::new("launchctl")
-        .args(["unload", &plist.display().to_string()])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-
-    if plist.exists() {
-        let _ = fs::remove_file(&plist);
-    }
-
-    ServiceResult {
-        success: true,
-        message: "Service uninstalled successfully.".into(),
-    }
-}
-
-pub(super) fn start_launchd_service() -> ServiceResult {
-    let plist = launchd_plist();
-    // Symmetry with the systemd path: starting a service that was never installed is a
-    // thing ctm can do rather than fail with a platform error.
-    if !plist.exists() {
-        let installed = install_launchd_service();
-        if !installed.success {
-            return ServiceResult {
-                success: false,
-                message: format!(
-                    "Service is not installed, and installing it failed.\n{}",
-                    installed.message
-                ),
-            };
-        }
-        println!("Service was not installed; installed it first.");
-    }
-    // Load if not loaded
-    let _ = Command::new("launchctl")
-        .args(["load", &plist.display().to_string()])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-
-    let kicked = Command::new("launchctl")
-        .args(["start", &format!("com.claude.{SERVICE_NAME}")])
-        .status();
-
-    if !matches!(kicked, Ok(s) if s.success()) {
-        return ServiceResult {
-            success: false,
-            message: "Failed to start launchd service.".into(),
-        };
-    }
-
-    wait_for_stable_start()
-}
-
-/// Restart the launchd service.
-///
-/// We do NOT stop-then-start: `launchctl stop` is asynchronous and returns
-/// before the process has actually exited, so a following `launchctl start` is
-/// coalesced/ignored while launchd is still tearing the old instance down. The
-/// old instance then exits cleanly (status 0), and because the plist's
-/// `KeepAlive { SuccessfulExit: false }` does not relaunch a clean exit, the
-/// service is left DOWN — exactly the "restart failed" symptom.
-///
-/// `launchctl kickstart -k` instead kills any running instance and starts a
-/// fresh one as a single atomic operation, with no race and no dependence on
-/// KeepAlive semantics. We fall back to a synchronous stop→wait→start only if
-/// kickstart is unavailable or fails.
-pub(super) fn restart_launchd_service() -> ServiceResult {
-    let plist = launchd_plist();
-    let uid = nix::unistd::getuid().as_raw();
-    let target = format!("gui/{uid}/com.claude.{SERVICE_NAME}");
-
-    // ADR-017: `kickstart -k` restarts launchd's LOADED job definition and never
-    // re-reads the plist. When the plist on disk names a different program than the
-    // loaded job (binary moved: npm -> standalone migration, reinstall elsewhere), the
-    // job must be booted out and bootstrapped again or the old binary keeps running
-    // while `ctm status` truthfully reports "running". Found live on 2026-09-19.
-    if let (Some(loaded), Some(on_disk)) = (loaded_program(&target), plist_program(&plist)) {
-        let same = std::fs::canonicalize(&loaded).ok() == std::fs::canonicalize(&on_disk).ok()
-            || loaded == on_disk;
-        if !same {
-            let _ = Command::new("launchctl")
-                .args(["bootout", &target])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
-            // bootout is asynchronous for the process; wait for it to be gone.
-            for _ in 0..40 {
-                if launchd_pid().is_none() {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(250));
-            }
-        }
-    }
-
-    // Ensure the job is bootstrapped from the plist ON DISK (no-op if already loaded).
-    let _ = Command::new("launchctl")
-        .args([
-            "bootstrap",
-            &format!("gui/{uid}"),
-            &plist.display().to_string(),
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-    let _ = Command::new("launchctl")
-        .args(["load", &plist.display().to_string()])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-
-    let kicked = Command::new("launchctl")
-        .args(["kickstart", "-k", &target])
-        .status();
-
-    if matches!(kicked, Ok(s) if s.success()) {
-        return wait_for_stable_start();
-    }
-
-    // Fallback: synchronous stop (wait for the process to actually exit) then start.
-    let _ = Command::new("launchctl")
-        .args(["stop", &format!("com.claude.{SERVICE_NAME}")])
-        .status();
-    use std::{thread::sleep, time::Duration};
-    for _ in 0..20 {
-        if launchd_pid().is_none() {
-            break;
-        }
-        sleep(Duration::from_millis(250));
-    }
-    start_launchd_service()
-}
-
-/// The `program` launchd currently has loaded for the job, if any.
-fn loaded_program(target: &str) -> Option<PathBuf> {
-    let out = Command::new("launchctl")
-        .args(["print", target])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
-    text.lines()
-        .map(str::trim)
-        .find_map(|l| l.strip_prefix("program = "))
-        .map(|p| PathBuf::from(p.trim()))
 }
 
 /// The first `ProgramArguments` entry in the plist on disk.
-fn plist_program(plist: &std::path::Path) -> Option<PathBuf> {
+fn plist_program(plist: &Path) -> Option<PathBuf> {
     let text = fs::read_to_string(plist).ok()?;
     let after = text.split("<key>ProgramArguments</key>").nth(1)?;
     let start = after.find("<string>")? + "<string>".len();
@@ -311,146 +141,262 @@ fn plist_program(plist: &std::path::Path) -> Option<PathBuf> {
     Some(PathBuf::from(after[start..end].trim()))
 }
 
-/// Wait for the service to actually come up and stay up after a start/restart
-/// request, returning a truthful `ServiceResult`.
-///
-/// `launchctl start`/`kickstart` only confirm launchd *accepted* the request —
-/// not that the daemon survived `exec`. On macOS a non-notarized / ad-hoc-signed
-/// binary can be SIGKILLed by the kernel for a code-signing / launch-constraint
-/// violation milliseconds after launch (EXC_CRASH / "Code Signature Invalid").
-/// When that happens the plist's `KeepAlive { Crashed: true }` makes launchd
-/// relaunch it — but only after `ThrottleInterval` (10s).
-///
-/// So we must wait *longer than the throttle window* before declaring failure,
-/// or we false-alarm on exactly the transient kill we describe: the first launch
-/// is killed, a short poll sees no PID, we cry failure — and then launchd quietly
-/// brings it back ~10s later. We instead poll for a *stable* PID (the same live
-/// PID observed across two polls): a healthy start settles in ~1s and returns
-/// immediately; a first-launch kill is ridden out across the throttle window and
-/// reported as success once the relaunched instance is up. Only a service that
-/// never stabilises within the budget is a failure.
-fn wait_for_stable_start() -> ServiceResult {
-    use std::{thread::sleep, time::Duration};
-    const POLL: Duration = Duration::from_millis(500);
-    const BUDGET: Duration = Duration::from_secs(14); // > ThrottleInterval (10s) + margin
-    let mut elapsed = Duration::ZERO;
-    let mut last_pid: Option<i32> = None;
-    let mut announced_wait = false;
-    while elapsed < BUDGET {
-        let pid = launchd_pid();
-        // Same live PID seen twice in a row ⇒ it survived past launch.
-        if pid.is_some() && pid == last_pid {
-            return ServiceResult {
-                success: true,
-                message: "Service started.".into(),
-            };
-        }
-        if !announced_wait && pid.is_none() && elapsed >= Duration::from_millis(1500) {
-            // We only get here when the first launch did not stay up. Tell the
-            // user we are intentionally waiting rather than hanging silently.
-            println!(
-                "Waiting for the service to come up (launchd may be retrying after a launch failure)..."
-            );
-            announced_wait = true;
-        }
-        last_pid = pid;
-        sleep(POLL);
-        elapsed += POLL;
-    }
+fn same_program(a: &Path, b: &Path) -> bool {
+    a == b || fs::canonicalize(a).ok() == fs::canonicalize(b).ok()
+}
 
-    ServiceResult {
-        success: false,
-        message: start_failure_hint(
-            "Service did not stay running — it failed to come up within 14s.",
-        ),
+/// Goal: a plist launchd will accept, on disk. Loading is `start`'s job.
+pub(super) fn install_with(spec: &ServiceSpec) -> ServiceResult {
+    if let Err(e) = fs::create_dir_all(launchd_dir()) {
+        return fail(format!("Failed to create LaunchAgents dir: {e}"));
+    }
+    if let Err(e) = config::ensure_config_dir(&spec.log_dir) {
+        return fail(format!("Failed to ensure log dir: {e}"));
+    }
+    let plist = spec.launchd_plist_path();
+    if let Err(e) = fs::write(&plist, generate_launchd_plist(spec)) {
+        return fail(format!("Failed to write plist file: {e}"));
+    }
+    // launchd would reject a malformed plist at bootstrap time with a bare
+    // "Input/output error"; check it here, where the message can say so.
+    if let Err(err) = run_checked("plutil", &["-lint", "-s", &plist.display().to_string()]) {
+        return fail(format!(
+            "Wrote {}, but it is not a valid plist: {err}",
+            plist.display()
+        ));
+    }
+    ok(format!(
+        "Service installed: {plist}\n\nCommands:\n  Start:   ctm service start\n  Stop:    ctm service stop\n  Status:  ctm service status\n  Logs:    tail -f {log}/daemon.log",
+        plist = plist.display(),
+        log = spec.log_dir.display(),
+    ))
+}
+
+fn run_checked(program: &str, args: &[&str]) -> Result<(), String> {
+    match Command::new(program).args(args).output() {
+        Ok(out) if out.status.success() => Ok(()),
+        Ok(out) => Err(String::from_utf8_lossy(&out.stderr).trim().to_string()),
+        Err(e) => Err(format!("{program} could not be run: {e}")),
     }
 }
 
-/// Build an actionable error message for a service that launched but did not
-/// stay up. The overwhelmingly common cause on macOS is the kernel killing a
-/// non-notarized binary for a code-signing / launch-constraint violation.
-fn start_failure_hint(headline: &str) -> String {
-    let binary = ctm_binary_path();
+/// Goal: not loaded, not running, no plist.
+pub(super) fn uninstall_with(spec: &ServiceSpec) -> ServiceResult {
+    let target = spec.launchd_target();
+    let plist = spec.launchd_plist_path();
+    let mut problems = Vec::new();
+    if observe(&target).loaded {
+        if let Err(err) = launchctl(&["bootout", &target]) {
+            problems.push(format!("`launchctl bootout {target}`: {err}"));
+        }
+        if let Err(j) = wait_unloaded(&target, STOP_BUDGET) {
+            problems.push(format!("job still loaded: {}", j.summary()));
+        }
+    }
+    if plist.exists() {
+        if let Err(e) = fs::remove_file(&plist) {
+            problems.push(format!("could not remove {}: {e}", plist.display()));
+        }
+    }
+    let after = observe(&target);
+    if !after.loaded && !plist.exists() {
+        ok("Service uninstalled.".into())
+    } else {
+        fail(format!(
+            "Uninstall incomplete: {}{}.\n{}",
+            if after.loaded {
+                format!("job still loaded ({})", after.summary())
+            } else {
+                String::new()
+            },
+            if plist.exists() {
+                format!(
+                    "{}{} still exists",
+                    if after.loaded { "; " } else { "" },
+                    plist.display()
+                )
+            } else {
+                String::new()
+            },
+            problems.join("\n")
+        ))
+    }
+}
+
+/// Bootstrap the plist on disk into the GUI domain unless it is already loaded, and
+/// verify launchd knows it afterwards.
+fn ensure_loaded(spec: &ServiceSpec) -> Result<JobState, String> {
+    let target = spec.launchd_target();
+    let before = observe(&target);
+    if before.loaded {
+        return Ok(before);
+    }
+    let plist = spec.launchd_plist_path().display().to_string();
+    let issued = launchctl(&["bootstrap", &ServiceSpec::launchd_domain(), &plist]);
+    let after = observe(&target);
+    if after.loaded {
+        Ok(after)
+    } else {
+        Err(match issued {
+            Err(e) => format!("`launchctl bootstrap` failed: {e}"),
+            Ok(()) => "`launchctl bootstrap` returned, but launchd does not know the job".into(),
+        })
+    }
+}
+
+/// Goal: running with a stable PID.
+pub(super) fn start_with(spec: &ServiceSpec) -> ServiceResult {
+    if !spec.launchd_plist_path().exists() {
+        let installed = install_with(spec);
+        if !installed.success {
+            return fail(format!(
+                "Service is not installed, and installing it failed.\n{}",
+                installed.message
+            ));
+        }
+        println!("Service was not installed; installed it first.");
+    }
+    if let Err(err) = ensure_loaded(spec) {
+        return fail(format!("Failed to load the service: {err}"));
+    }
+    let target = spec.launchd_target();
+    // RunAtLoad starts a freshly bootstrapped job by itself; for a loaded-but-idle
+    // job, kickstart it. Neither exit status is the verdict.
+    let issued = if observe(&target).running() {
+        Ok(())
+    } else {
+        launchctl(&["kickstart", &target])
+    };
+    report_running(spec, &target, issued, "start")
+}
+
+/// Goal: not running (launchd's `stop` is asynchronous, so wait for it).
+pub(super) fn stop_with(spec: &ServiceSpec) -> ServiceResult {
+    let target = spec.launchd_target();
+    if !observe(&target).running() {
+        return ok("Service stopped.".into());
+    }
+    let issued = launchctl(&["stop", &spec.launchd_label()]);
+    match wait_not_running(&target, STOP_BUDGET) {
+        Ok(_) => ok("Service stopped.".into()),
+        Err(j) => fail(format!(
+            "Service did not stop: {}.{}",
+            j.summary(),
+            issued
+                .err()
+                .map(|e| format!("\n  launchctl said: {e}"))
+                .unwrap_or_default()
+        )),
+    }
+}
+
+/// Goal: running with a stable PID that differs from before, as the plist on disk
+/// defines it.
+///
+/// `kickstart -k` restarts launchd's LOADED definition and never re-reads the plist,
+/// so when the plist names a different program (binary moved: reinstall elsewhere,
+/// migration) the job is booted out and bootstrapped again first — verified at
+/// each step, because the old binary silently staying up is exactly the failure
+/// this exists to prevent (found live on 2026-09-19).
+pub(super) fn restart_with(spec: &ServiceSpec) -> ServiceResult {
+    let target = spec.launchd_target();
+    let plist = spec.launchd_plist_path();
+    if !plist.exists() {
+        return fail("Service is not installed; run `ctm service install`.".into());
+    }
+    let before = observe(&target);
+    let on_disk = plist_program(&plist);
+    let stale = match (&before.program, &on_disk) {
+        (Some(loaded), Some(disk)) => before.loaded && !same_program(loaded, disk),
+        _ => false,
+    };
+    if stale {
+        if let Err(err) = launchctl(&["bootout", &target]) {
+            return fail(format!(
+                "The loaded job runs a different binary and `bootout` failed: {err}"
+            ));
+        }
+        if let Err(j) = wait_unloaded(&target, STOP_BUDGET) {
+            return fail(format!(
+                "The loaded job runs a different binary and did not unload: {}",
+                j.summary()
+            ));
+        }
+    }
+    if let Err(err) = ensure_loaded(spec) {
+        return fail(format!("Failed to load the service: {err}"));
+    }
+    let issued = launchctl(&["kickstart", "-k", &target]);
+    let r = report_running(spec, &target, issued, "restart");
+    if !r.success {
+        return r;
+    }
+    let after = observe(&target);
+    if before.pid.is_some() && after.pid == before.pid {
+        return fail(format!(
+            "Restart left the previous process running (pid {}).",
+            after.pid.unwrap_or(0)
+        ));
+    }
+    if let (Some(loaded), Some(disk)) = (&after.program, &on_disk) {
+        if !same_program(loaded, disk) {
+            return fail(format!(
+                "Restarted, but launchd is running {} while the plist names {}.",
+                loaded.display(),
+                disk.display()
+            ));
+        }
+    }
+    ok("Service restarted.".into())
+}
+
+fn report_running(
+    spec: &ServiceSpec,
+    target: &str,
+    issued: Result<(), String>,
+    verb: &str,
+) -> ServiceResult {
+    match wait_running_stable(target, START_BUDGET) {
+        Ok(_) => ok(format!("Service {verb}ed.")),
+        Err(j) => fail(start_failure_hint(
+            spec,
+            &format!(
+                "Service did not stay running after {verb}: {}.{}",
+                j.summary(),
+                issued
+                    .err()
+                    .map(|e| format!("\n  launchctl said: {e}"))
+                    .unwrap_or_default()
+            ),
+        )),
+    }
+}
+
+/// Actionable text for a job that launched but did not stay up.
+fn start_failure_hint(spec: &ServiceSpec, headline: &str) -> String {
     format!(
         "{headline}\n\
+         \n  Logs:           {log}/daemon.err.log\
+         \n  Crash reports:  ls ~/Library/Logs/DiagnosticReports/ctm-*.ips\
+         \n  Signature:      codesign -dvv {bin}   (a source build is ad-hoc signed; releases are Developer ID signed)\
+         \n  Then:           ctm doctor\n\
          \n\
-         On macOS this is almost always a code-signing / Gatekeeper rejection of\n\
-         the native binary (it is ad-hoc signed, not notarized). Check:\n\
-         \n  • Crash reports:  ls ~/Library/Logs/DiagnosticReports/ctm-*.ips\
-         \n  • Signature:      codesign -dvvv {bin}\
-         \n  • Quarantine:     xattr -dr com.apple.quarantine {bin}\
-         \n  • Then re-run:    ctm doctor\n\
-         \n\
-         launchd will keep retrying in the background, so the daemon may still\n\
-         come up shortly — check `ctm status` again in a moment. If it never\n\
-         stays up, reinstall the package or build from source\n\
-         (cd rust-crates && cargo build --release).",
-        bin = binary.display(),
+         launchd keeps retrying in the background (every 10s), so check `ctm status`\n\
+         again in a moment before assuming it is down for good.",
+        log = spec.log_dir.display(),
+        bin = spec.program.display(),
     )
 }
 
-pub(super) fn stop_launchd_service() -> ServiceResult {
-    match Command::new("launchctl")
-        .args(["stop", &format!("com.claude.{SERVICE_NAME}")])
-        .status()
-    {
-        Ok(s) if s.success() => ServiceResult {
-            success: true,
-            message: "Service stopped.".into(),
-        },
-        _ => ServiceResult {
-            success: false,
-            message: "Failed to stop launchd service.".into(),
-        },
-    }
-}
-
-/// Return the live PID of the launchd job, or `None` if it is loaded but not
-/// actually running.
-///
-/// `launchctl list` prints one tab-separated line per loaded job in the form
-/// `PID<TAB>Status<TAB>Label`. A job that is *loaded but dead* (e.g. it exited
-/// cleanly and `KeepAlive` did not restart it, or the kernel killed it for a
-/// code-signing violation) still appears in the list, but with `-` in the PID
-/// column. The previous implementation only checked that the label *appeared*
-/// anywhere in the output, so it reported "running" for any loaded job — making
-/// `ctm status`/`doctor` lie and turning `ctm start` into a no-op ("already
-/// running") that could never recover a dead service. We must parse the PID
-/// column and only treat a numeric PID as running.
-pub(super) fn launchd_pid() -> Option<i32> {
-    let label = format!("com.claude.{SERVICE_NAME}");
-    let output = Command::new("launchctl").arg("list").output().ok()?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    parse_launchd_pid(&stdout, &label)
-}
-
-/// Pure parser for `launchctl list` output. Extracted so the PID-column logic
-/// (the fix for the false "running" report) is unit-testable without shelling
-/// out. Returns the live PID for an exact `label` match, or `None` when the job
-/// is absent or loaded-but-dead (PID column `-`).
-fn parse_launchd_pid(stdout: &str, label: &str) -> Option<i32> {
-    for line in stdout.lines() {
-        let cols: Vec<&str> = line.split('\t').collect();
-        if cols.len() >= 3 && cols[2].trim() == label {
-            // PID column is `-` when loaded-but-dead; a real PID is a positive int.
-            return cols[0].trim().parse::<i32>().ok().filter(|&p| p > 0);
-        }
-    }
-    None
-}
-
-pub(super) fn get_launchd_status() -> ServiceStatus {
-    let plist = launchd_plist();
+pub(super) fn status_with(spec: &ServiceSpec) -> ServiceStatus {
+    let plist = spec.launchd_plist_path();
     let enabled = plist.exists();
-
-    let running = launchd_pid().is_some();
-
+    let running = observe(&spec.launchd_target()).running();
     let info = if !enabled {
         "Service not installed".into()
     } else {
         format!("Plist file: {}", plist.display())
     };
-
     ServiceStatus {
         running,
         enabled,
@@ -462,67 +408,40 @@ pub(super) fn get_launchd_status() -> ServiceStatus {
 mod tests {
     use super::*;
 
-    const LABEL: &str = "com.claude.claude-telegram-mirror";
-
     #[test]
-    fn parse_launchd_pid_running_returns_pid() {
-        // A live job: numeric PID in the first column.
-        let out = "PID\tStatus\tLabel\n80739\t0\tcom.claude.claude-telegram-mirror\n";
-        assert_eq!(parse_launchd_pid(out, LABEL), Some(80739));
-    }
-
-    #[test]
-    fn parse_launchd_pid_loaded_but_dead_returns_none() {
-        // The exact bug: job is loaded (appears in list) but not running (`-`).
-        // The old `contains(label)` check reported this as running.
-        let out = "PID\tStatus\tLabel\n-\t0\tcom.claude.claude-telegram-mirror\n";
-        assert_eq!(parse_launchd_pid(out, LABEL), None);
-    }
-
-    #[test]
-    fn parse_launchd_pid_absent_returns_none() {
-        let out = "PID\tStatus\tLabel\n123\t0\tcom.apple.something\n";
-        assert_eq!(parse_launchd_pid(out, LABEL), None);
-    }
-
-    #[test]
-    fn parse_launchd_pid_requires_exact_column_match() {
-        // A different label that merely *contains* ours as a substring must not
-        // match — exact column comparison guards against the substring bug.
-        let out = "456\t0\tcom.claude.claude-telegram-mirror-helper\n";
-        assert_eq!(parse_launchd_pid(out, LABEL), None);
-    }
-
-    #[test]
-    fn parse_launchd_pid_rejects_non_positive() {
-        let out = "0\t0\tcom.claude.claude-telegram-mirror\n";
-        assert_eq!(parse_launchd_pid(out, LABEL), None);
-    }
-
-    #[test]
-    fn test_generate_launchd_plist_contains_key_fields() {
-        let content = generate_launchd_plist();
+    fn the_plist_names_the_program_and_the_policy() {
+        let content = generate_launchd_plist(&ServiceSpec::ctm());
         assert!(content.contains("<key>Label</key>"));
+        assert!(content.contains("<string>com.claude.claude-telegram-mirror</string>"));
         assert!(content.contains("<key>KeepAlive</key>"));
         assert!(content.contains("<key>Crashed</key>"));
         assert!(content.contains("<key>ThrottleInterval</key>"));
         assert!(content.contains("<integer>10</integer>"));
-        assert!(content.contains("<key>StandardOutPath</key>"));
+        assert!(content.contains("<string>start</string>"));
         assert!(content.contains("<key>StandardErrorPath</key>"));
+        assert!(!content.contains("NODE_ENV"), "no TypeScript-era artifacts");
+        assert!(!content.contains(".nvm"), "no NVM paths");
     }
 
     #[test]
-    fn test_generate_launchd_plist_no_node_artifacts() {
-        let content = generate_launchd_plist();
-        // NODE_ENV was a TypeScript artifact — should not be in the Rust plist
-        assert!(
-            !content.contains("NODE_ENV"),
-            "plist should not contain NODE_ENV"
+    fn a_throwaway_spec_renders_its_own_program_and_args() {
+        let s = ServiceSpec::throwaway(
+            "ctm-test",
+            PathBuf::from("/bin/sleep"),
+            vec!["300".into()],
+            PathBuf::from("/tmp/ctm-test"),
         );
-        // NVM paths are not needed for the Rust binary
-        assert!(
-            !content.contains(".nvm"),
-            "plist should not contain NVM paths"
-        );
+        let content = generate_launchd_plist(&s);
+        assert!(content.contains("<string>com.claude.ctm-test</string>"));
+        assert!(content.contains("<string>/bin/sleep</string>\n        <string>300</string>"));
+        assert!(content.contains("/tmp/ctm-test/daemon.log"));
+    }
+
+    #[test]
+    fn plist_program_reads_the_first_argument() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("x.plist");
+        fs::write(&p, generate_launchd_plist(&ServiceSpec::ctm())).unwrap();
+        assert_eq!(plist_program(&p), Some(ctm_binary_path()));
     }
 }
