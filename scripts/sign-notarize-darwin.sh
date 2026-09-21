@@ -69,9 +69,12 @@ unset APPLE_DEVELOPER_ID_APPLICATION APPLE_DEVELOPER_ID_APPLICATION_P12_BASE64 \
 [[ "$notary_key_id" =~ ^[A-Z0-9]{10}$ ]] || fail "notary key ID is not canonical"
 [[ "$notary_issuer_id" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] || \
   fail "notary issuer ID is not canonical"
-# Recorded in the proof rather than pinned: cargo's default per target.
+# Recorded in the proof rather than pinned: cargo's default per target. Newer
+# linkers emit LC_BUILD_VERSION (`minos`); an SDK 14 linker still emits
+# LC_VERSION_MIN_MACOSX (`version`) for x86_64 targets below 10.14 — both are
+# the minimum OS, and the first such line is it.
 minimum_macos=$(/usr/bin/vtool -show-build "$input_binary" 2>/dev/null | \
-  awk '$1 == "minos" {print $2}')
+  awk '$1 == "minos" || $1 == "version" {print $2; exit}')
 [[ "$minimum_macos" =~ ^[0-9]+\.[0-9]+$ ]] || fail "input has no readable minimum macOS version"
 
 runner_temp=${RUNNER_TEMP:-${TMPDIR:-/tmp}}
