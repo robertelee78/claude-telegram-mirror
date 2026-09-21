@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.51] - 2026-09-21
+
+### Fixed (reported: `codex auth login --device-auth` → "`--remote …` is only supported for interactive TUI commands, not `codex login`")
+- **The `codex` shell function no longer decides by a list of subcommands.** It passed through a hard-coded set and rewrote everything else with `--remote`; Codex had since added `auth` (a hidden alias it rewrites to `login` before parsing), `fork`, `cloud`, `features` and more, and any such list goes stale the moment Codex ships a release. The function now asks codex itself: the `Usage:` line codex prints for `<your args> --help` names the resolved subcommand, or the bare TUI form — ~10 ms, no terminal needed, never stale. Only the bare interactive TUI gets `--remote`; every subcommand, hidden alias included, runs untouched. Verified against the real codex 0.155 in bash and zsh: `auth login`, `login`, `logout`, `exec`, `resume`, `fork`, `mcp`, `a` pass through; `codex`, `codex --model …`, `codex "a prompt"` are rewritten. Open a new shell after updating so the new function is loaded.
+
 ## [0.2.50] - 2026-09-21
 
 ### Changed

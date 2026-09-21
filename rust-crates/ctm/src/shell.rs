@@ -125,40 +125,48 @@ fn rc_files(home: &Path, shell: Shell) -> Vec<PathBuf> {
 ///   adopt the daemon's — verified);
 /// - `CTM_CODEX_REMOTE=0` turns it off.
 fn codex_wrapper(shell: Shell) -> String {
-    // Subcommands that must never be rewritten (`codex --help` prints this set).
-    const PASSTHROUGH: &str = "agents exec e review login logout mcp plugin app-server remote-control app completion update doctor sandbox debug apply resume queue archive delete migrate-rollouts unarchive help";
+    // Only the bare interactive TUI accepts `--remote`. Which invocations those are is
+    // not knowable from a list: Codex adds subcommands between releases and rewrites
+    // hidden aliases before parsing (`codex auth login` becomes `codex login`, and
+    // `codex auth --help` reports the TUI). So the wrapper asks codex itself: the
+    // `Usage:` line printed for `<args> --help` names the resolved subcommand, or the
+    // TUI form `codex [OPTIONS] [PROMPT]`. Costs ~10 ms, needs no terminal, and can
+    // never go stale. Anything that is not the bare TUI is passed through untouched.
     match shell {
-        Shell::Zsh | Shell::Bash => format!(
-            "codex() {{\n\
-             \x20 local sock=\"${{CODEX_HOME:-$HOME/.codex}}/app-server-control/app-server-control.sock\"\n\
-             \x20 if [ \"${{CTM_CODEX_REMOTE:-1}}\" = \"0\" ] || [ ! -S \"$sock\" ]; then command codex \"$@\"; return; fi\n\
-             \x20 case \" {PASSTHROUGH} \" in *\" ${{1:-}} \"*) command codex \"$@\"; return;; esac\n\
+        Shell::Zsh | Shell::Bash => "codex() {\n\
+             \x20 local sock=\"${CODEX_HOME:-$HOME/.codex}/app-server-control/app-server-control.sock\"\n\
+             \x20 if [ \"${CTM_CODEX_REMOTE:-1}\" = \"0\" ] || [ ! -S \"$sock\" ]; then command codex \"$@\"; return; fi\n\
              \x20 for a in \"$@\"; do case \"$a\" in --remote|--remote=*|-C|--cd|--cd=*) command codex \"$@\"; return;; esac; done\n\
+             \x20 case \"$(command codex \"$@\" --help 2>/dev/null | sed -n 's/^Usage: //p' | head -n 1)\" in\n\
+             \x20   \"codex [\"*|\"codex <\"*|codex) ;;\n\
+             \x20   *) command codex \"$@\"; return;;\n\
+             \x20 esac\n\
              \x20 command codex --remote \"unix://$sock\" -C \"$PWD\" \"$@\"\n\
              \x20 local rc=$?\n\
              \x20 command ctm codex-exited --cwd \"$PWD\" >/dev/null 2>&1 || true\n\
              \x20 return $rc\n\
-             }}\n"
-        ),
-        Shell::Fish => format!(
-            "function codex\n\
+             }\n"
+            .to_string(),
+        Shell::Fish => "function codex\n\
              \x20 set -l sock (test -n \"$CODEX_HOME\"; and echo $CODEX_HOME; or echo $HOME/.codex)/app-server-control/app-server-control.sock\n\
              \x20 if test \"$CTM_CODEX_REMOTE\" = 0 -o ! -S $sock\n\
-             \x20   command codex $argv; return\n\
-             \x20 end\n\
-             \x20 if contains -- \"$argv[1]\" {PASSTHROUGH_FISH}\n\
              \x20   command codex $argv; return\n\
              \x20 end\n\
              \x20 if string match -q -- '--remote*' $argv; or string match -q -- '-C' $argv; or string match -q -- '--cd*' $argv\n\
              \x20   command codex $argv; return\n\
              \x20 end\n\
+             \x20 set -l usage (command codex $argv --help 2>/dev/null | sed -n 's/^Usage: //p' | head -n 1)\n\
+             \x20 switch \"$usage\"\n\
+             \x20   case 'codex [*' 'codex <*' codex\n\
+             \x20   case '*'\n\
+             \x20     command codex $argv; return\n\
+             \x20 end\n\
              \x20 command codex --remote \"unix://$sock\" -C \"$PWD\" $argv\n\
              \x20 set -l rc $status\n\
              \x20 command ctm codex-exited --cwd \"$PWD\" >/dev/null 2>&1\n\
              \x20 return $rc\n\
-             end\n",
-            PASSTHROUGH_FISH = PASSTHROUGH
-        ),
+             end\n"
+            .to_string(),
     }
 }
 
@@ -538,13 +546,11 @@ mod tests {
         // app-server, and -C keeps the working directory (without it the session
         // silently adopts the daemon's — verified).
         assert!(b.contains(r#"command codex --remote "unix://$sock" -C "$PWD" "$@""#));
-        // Never touch a subcommand …
-        for sub in ["exec", "app-server", "resume", "login", "mcp"] {
-            assert!(
-                b.contains(&format!(" {sub} ")),
-                "{sub} must be in the passthrough set"
-            );
-        }
+        // Never touch a subcommand — decided by codex itself, not by a list that goes
+        // stale (`codex auth login` is a hidden alias no list would contain).
+        assert!(b.contains(r#"command codex "$@" --help 2>/dev/null | sed -n 's/^Usage: //p'"#));
+        assert!(b.contains(r#""codex ["*|"codex <"*|codex) ;;"#));
+        assert!(!b.contains("PASSTHROUGH"), "no static subcommand list");
         // … nor an invocation that already chose its own endpoint or directory …
         assert!(b.contains("--remote|--remote=*|-C|--cd|--cd=*"));
         // … nor anything when the daemon is down or the operator opted out.
