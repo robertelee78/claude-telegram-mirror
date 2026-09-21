@@ -1,6 +1,9 @@
 // Public API modules — some exports used in tests and future phases.
 use tokio::io::AsyncWriteExt;
 
+// ADR-018: the signature parser is platform-neutral so it is unit-tested everywhere,
+// but the bin only reaches it on macOS (`codesign` is the only producer of its input).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod apple_trust;
 mod bot;
 mod cli;
