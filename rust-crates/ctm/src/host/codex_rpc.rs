@@ -7,7 +7,9 @@
 //! observer, and so those calls are unit-testable against a stand-in socket.
 //!
 //! Transport is the same as the observer's: WebSocket over the Unix control socket,
-//! `initialize` first (no `experimentalApi`).
+//! `initialize` first. Management calls initialize without `experimentalApi`; only the
+//! ADR-022 launcher asks for it (`connect_experimental`), because
+//! `thread/settings/update` is behind that capability and nothing else ctm calls is.
 
 use crate::error::{AppError, Result};
 use futures_util::{SinkExt, StreamExt};
@@ -30,11 +32,29 @@ pub struct Rpc {
         tokio_tungstenite::WebSocketStream<tokio::net::UnixStream>,
     >,
     next_id: u64,
+    timeout: Duration,
 }
 
 impl Rpc {
-    /// Connect and complete `initialize`.
+    /// Connect and complete `initialize` (stable API surface only).
     pub async fn connect(socket_path: &Path) -> Result<Self> {
+        Self::connect_with(socket_path, false).await
+    }
+
+    /// Connect with the `experimentalApi` capability: `thread/settings/update` needs
+    /// it (ADR-022). Nothing else in ctm should use this connection.
+    pub async fn connect_experimental(socket_path: &Path) -> Result<Self> {
+        Self::connect_with(socket_path, true).await
+    }
+
+    /// Per-call reply budget for this connection (default 10 s). Loading a large
+    /// rollout through `thread/resume` can take longer than a management call.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    async fn connect_with(socket_path: &Path, experimental: bool) -> Result<Self> {
         let stream = tokio::net::UnixStream::connect(socket_path)
             .await
             .map_err(|e| {
@@ -47,16 +67,23 @@ impl Rpc {
             .await
             .map_err(|e| AppError::Socket(format!("Codex WebSocket handshake failed: {e}")))?;
         let (tx, rx) = ws.split();
-        let mut rpc = Self { tx, rx, next_id: 0 };
-        rpc.call(
-            "initialize",
-            json!({"clientInfo": {
+        let mut rpc = Self {
+            tx,
+            rx,
+            next_id: 0,
+            timeout: CALL_TIMEOUT,
+        };
+        let mut params = json!({
+            "clientInfo": {
                 "name": CLIENT_NAME,
                 "title": "Claude Telegram Mirror",
                 "version": env!("CARGO_PKG_VERSION"),
-            }}),
-        )
-        .await?;
+            },
+        });
+        if experimental {
+            params["capabilities"] = json!({"experimentalApi": true});
+        }
+        rpc.call("initialize", params).await?;
         Ok(rpc)
     }
 
@@ -70,7 +97,8 @@ impl Rpc {
             .await
             .map_err(|e| AppError::Socket(format!("Codex {method} send failed: {e}")))?;
 
-        tokio::time::timeout(CALL_TIMEOUT, async {
+        let budget = self.timeout;
+        tokio::time::timeout(budget, async {
             while let Some(frame) = self.rx.next().await {
                 let frame =
                     frame.map_err(|e| AppError::Socket(format!("Codex {method} read: {e}")))?;
@@ -101,7 +129,7 @@ impl Rpc {
         .map_err(|_| {
             AppError::Socket(format!(
                 "Codex {method}: no reply within {}s",
-                CALL_TIMEOUT.as_secs()
+                budget.as_secs()
             ))
         })?
     }

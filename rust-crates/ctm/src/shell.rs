@@ -125,48 +125,56 @@ fn rc_files(home: &Path, shell: Shell) -> Vec<PathBuf> {
 ///   adopt the daemon's — verified);
 /// - `CTM_CODEX_REMOTE=0` turns it off.
 fn codex_wrapper(shell: Shell) -> String {
-    // Only the bare interactive TUI accepts `--remote`. Which invocations those are is
-    // not knowable from a list: Codex adds subcommands between releases and rewrites
-    // hidden aliases before parsing (`codex auth login` becomes `codex login`, and
-    // `codex auth --help` reports the TUI). So the wrapper asks codex itself: the
-    // `Usage:` line printed for `<args> --help` names the resolved subcommand, or the
-    // TUI form `codex [OPTIONS] [PROMPT]`. Costs ~10 ms, needs no terminal, and can
-    // never go stale. Anything that is not the bare TUI is passed through untouched.
+    // Which invocations may go to the app-server is not knowable from a list: Codex
+    // adds subcommands between releases and rewrites hidden aliases before parsing
+    // (`codex auth login` becomes `codex login`; `codex auth --help` reports the
+    // TUI). So the function asks codex itself: the `Usage:` line printed for
+    // `<args> --help` names the resolved subcommand, or the TUI form
+    // `codex [OPTIONS] [PROMPT]`. Costs ~10 ms, needs no terminal, never stale. Only
+    // the words before `--` are probed: after it, `--help` would be a prompt word and
+    // the probe would start a session.
+    //
+    // The bare TUI, `codex resume …` and `codex fork …` are handed to `ctm codex-launch`, which
+    // starts or resumes the session in the app-server with the typed flags in effect
+    // (ADR-022: a remote resume ignores `--cd` and refuses permission flags, so the
+    // launcher applies them through the API first) — or runs codex locally, with one
+    // line saying so, when there is no app-server to attach to; that decision is the
+    // launcher's, made against ctm's configured socket, so the shell and the launcher
+    // can never disagree about which daemon counts. Everything else — every other
+    // subcommand, and anything that chose its own endpoint with `--remote` — runs
+    // exactly as typed.
     match shell {
         Shell::Zsh | Shell::Bash => "codex() {\n\
-             \x20 local sock=\"${CODEX_HOME:-$HOME/.codex}/app-server-control/app-server-control.sock\"\n\
-             \x20 if [ \"${CTM_CODEX_REMOTE:-1}\" = \"0\" ] || [ ! -S \"$sock\" ]; then command codex \"$@\"; return; fi\n\
-             \x20 for a in \"$@\"; do case \"$a\" in --remote|--remote=*|-C|--cd|--cd=*) command codex \"$@\"; return;; esac; done\n\
-             \x20 case \"$(command codex \"$@\" --help 2>/dev/null | sed -n 's/^Usage: //p' | head -n 1)\" in\n\
-             \x20   \"codex [\"*|\"codex <\"*|codex) ;;\n\
-             \x20   *) command codex \"$@\"; return;;\n\
+             \x20 if [ \"${CTM_CODEX_REMOTE:-1}\" = \"0\" ]; then command codex \"$@\"; return; fi\n\
+             \x20 local -a probe=(); local a\n\
+             \x20 for a in \"$@\"; do case \"$a\" in --) break;; --remote|--remote=*) command codex \"$@\"; return;; esac; probe+=(\"$a\"); done\n\
+             \x20 case \"$(command codex \"${probe[@]}\" --help 2>/dev/null | sed -n 's/^Usage: //p' | head -n 1)\" in\n\
+             \x20   \"codex [\"*|\"codex <\"*|codex|\"codex resume\"*|\"codex fork\"*) command ctm codex-launch \"$@\";;\n\
+             \x20   *) command codex \"$@\";;\n\
              \x20 esac\n\
-             \x20 command ctm codex-preflight >/dev/null || true\n\
-             \x20 command codex --remote \"unix://$sock\" -C \"$PWD\" \"$@\"\n\
-             \x20 local rc=$?\n\
-             \x20 command ctm codex-exited --cwd \"$PWD\" >/dev/null 2>&1 || true\n\
-             \x20 return $rc\n\
              }\n"
             .to_string(),
         Shell::Fish => "function codex\n\
-             \x20 set -l sock (test -n \"$CODEX_HOME\"; and echo $CODEX_HOME; or echo $HOME/.codex)/app-server-control/app-server-control.sock\n\
-             \x20 if test \"$CTM_CODEX_REMOTE\" = 0 -o ! -S $sock\n\
+             \x20 if test \"$CTM_CODEX_REMOTE\" = 0\n\
              \x20   command codex $argv; return\n\
              \x20 end\n\
-             \x20 if string match -q -- '--remote*' $argv; or string match -q -- '-C' $argv; or string match -q -- '--cd*' $argv\n\
-             \x20   command codex $argv; return\n\
+             \x20 set -l probe\n\
+             \x20 for a in $argv\n\
+             \x20   switch $a\n\
+             \x20     case --\n\
+             \x20       break\n\
+             \x20     case --remote '--remote=*'\n\
+             \x20       command codex $argv; return\n\
+             \x20   end\n\
+             \x20   set -a probe $a\n\
              \x20 end\n\
-             \x20 set -l usage (command codex $argv --help 2>/dev/null | sed -n 's/^Usage: //p' | head -n 1)\n\
+             \x20 set -l usage (command codex $probe --help 2>/dev/null | sed -n 's/^Usage: //p' | head -n 1)\n\
              \x20 switch \"$usage\"\n\
-             \x20   case 'codex [*' 'codex <*' codex\n\
+             \x20   case 'codex [*' 'codex <*' codex 'codex resume*' 'codex fork*'\n\
+             \x20     command ctm codex-launch $argv\n\
              \x20   case '*'\n\
-             \x20     command codex $argv; return\n\
+             \x20     command codex $argv\n\
              \x20 end\n\
-             \x20 command ctm codex-preflight >/dev/null || true\n\
-             \x20 command codex --remote \"unix://$sock\" -C \"$PWD\" $argv\n\
-             \x20 set -l rc $status\n\
-             \x20 command ctm codex-exited --cwd \"$PWD\" >/dev/null 2>&1\n\
-             \x20 return $rc\n\
              end\n"
             .to_string(),
     }
@@ -458,6 +466,7 @@ pub fn run_shell_setup(remove_it: bool) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     #[test]
     fn completions_generate_for_every_shell_and_mention_subcommands() {
@@ -544,24 +553,146 @@ mod tests {
             Path::new("/home/u/.local/bin"),
             Path::new("/home/u/.zsh"),
         );
-        // The rewrite that makes approvals answerable: the session lives in the
-        // app-server, and -C keeps the working directory (without it the session
-        // silently adopts the daemon's — verified).
-        assert!(b.contains(r#"command codex --remote "unix://$sock" -C "$PWD" "$@""#));
-        // Never touch a subcommand — decided by codex itself, not by a list that goes
-        // stale (`codex auth login` is a hidden alias no list would contain).
-        assert!(b.contains(r#"command codex "$@" --help 2>/dev/null | sed -n 's/^Usage: //p'"#));
-        assert!(b.contains(r#""codex ["*|"codex <"*|codex) ;;"#));
+        // The bare TUI and `resume` go to the launcher, which attaches them to the
+        // app-server with the typed flags in effect (ADR-022).
+        // The probe sees only the words before `--`: after it `--help` is a prompt.
+        assert!(b.contains(
+            r#"command codex "${probe[@]}" --help 2>/dev/null | sed -n 's/^Usage: //p'"#
+        ));
+        assert!(b.contains(r#"case "$a" in --) break;; --remote|--remote=*) command codex "$@"; return;; esac; probe+=("$a")"#));
+        assert!(b.contains(
+            r#""codex ["*|"codex <"*|codex|"codex resume"*|"codex fork"*) command ctm codex-launch "$@";;"#
+        ));
+        // Every other subcommand — decided by codex itself, not by a list that goes
+        // stale (`codex auth login` is a hidden alias no list would contain) — and an
+        // explicit endpoint run exactly as typed.
+        assert!(b.contains(r#"*) command codex "$@";;"#));
         assert!(!b.contains("PASSTHROUGH"), "no static subcommand list");
-        // … nor an invocation that already chose its own endpoint or directory …
-        assert!(b.contains("--remote|--remote=*|-C|--cd|--cd=*"));
-        // … nor anything when the daemon is down or the operator opted out.
-        assert!(b.contains(r#"[ ! -S "$sock" ]"#));
-        // Quitting a --remote TUI emits no event of its own (the thread stays loaded in
-        // the app-server), so the wrapper is what tells ctm the session is over.
-        assert!(b.contains(r#"command ctm codex-exited --cwd "$PWD""#));
-        assert!(b.contains("return $rc"), "codex's exit status is preserved");
-        assert!(b.contains(r#""${CTM_CODEX_REMOTE:-1}" = "0""#));
+        // Whether an app-server is there to attach to is the launcher's call, against
+        // ctm's configured socket — the shell no longer keeps its own idea of it.
+        assert!(!b.contains("app-server-control.sock"));
+        assert!(
+            b.contains(r#""${CTM_CODEX_REMOTE:-1}" = "0""#),
+            "opt-out stays"
+        );
+    }
+
+    /// The generated function, parsed and *run* by the real shells: a stub `codex`
+    /// records what the wrapper decided. Skipped per shell that is not installed.
+    #[test]
+    fn wrapper_routes_in_real_shells() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        // `codex … --help` answers with codex's real Usage lines; anything else logs.
+        let stub = r#"#!/bin/sh
+log="$CTM_TEST_LOG"
+last=""; for a in "$@"; do last="$a"; done
+if [ "$last" = "--help" ]; then
+  case "$1" in
+    resume) echo "Usage: codex resume [OPTIONS] [SESSION_ID] [PROMPT]";;
+    fork) echo "Usage: codex fork [OPTIONS] [SESSION_ID] [PROMPT]";;
+    auth|login) echo "Usage: codex login [OPTIONS] [COMMAND]";;
+    *) echo "Usage: codex [OPTIONS] [PROMPT]";;
+  esac
+  exit 0
+fi
+printf 'codex:%s
+' "$*" >> "$log"
+"#;
+        let ctm = "#!/bin/sh\nprintf 'ctm:%s\\n' \"$*\" >> \"$CTM_TEST_LOG\"\n";
+        for (name, body) in [("codex", stub), ("ctm", ctm)] {
+            let p = bin.join(name);
+            std::fs::write(&p, body).unwrap();
+            let mut perm = std::fs::metadata(&p).unwrap().permissions();
+            std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o755);
+            std::fs::set_permissions(&p, perm).unwrap();
+        }
+        let cases: &[(&str, &str)] = &[
+            (
+                "codex --yolo resume abc",
+                "ctm:codex-launch --yolo resume abc",
+            ),
+            ("codex", "ctm:codex-launch"),
+            ("codex -- resume", "ctm:codex-launch -- resume"),
+            ("codex fork --last", "ctm:codex-launch fork --last"),
+            (
+                "codex auth login --device-auth",
+                "codex:auth login --device-auth",
+            ),
+            (
+                "codex --remote unix:///x resume abc",
+                "codex:--remote unix:///x resume abc",
+            ),
+            (
+                "codex --remote-auth-token-env T resume abc",
+                "ctm:codex-launch --remote-auth-token-env T resume abc",
+            ),
+            ("CTM_CODEX_REMOTE=0 codex resume abc", "codex:resume abc"),
+        ];
+        for shell in [Shell::Zsh, Shell::Bash, Shell::Fish] {
+            let exe = match shell {
+                Shell::Zsh => "zsh",
+                Shell::Bash => "bash",
+                Shell::Fish => "fish",
+            };
+            if Command::new(exe).arg("--version").output().is_err() {
+                eprintln!("skip: {exe} not installed");
+                continue;
+            }
+            let block = codex_wrapper(shell);
+            for (invocation, want) in cases {
+                let log = dir.path().join("log");
+                let _ = std::fs::remove_file(&log);
+                let (env_prefix, cmd) = match invocation.strip_prefix("CTM_CODEX_REMOTE=0 ") {
+                    Some(rest) => ("set -x CTM_CODEX_REMOTE 0; ", rest),
+                    None => ("", *invocation),
+                };
+                let script = match shell {
+                    Shell::Fish => format!("{block}{}{cmd}", env_prefix),
+                    _ => format!(
+                        "{block}{}{cmd}",
+                        env_prefix.replace("set -x CTM_CODEX_REMOTE 0; ", "CTM_CODEX_REMOTE=0 ")
+                    ),
+                };
+                let out = Command::new(exe)
+                    .arg("-c")
+                    .arg(&script)
+                    .env(
+                        "PATH",
+                        format!(
+                            "{}:{}",
+                            bin.display(),
+                            std::env::var("PATH").unwrap_or_default()
+                        ),
+                    )
+                    .env("CTM_TEST_LOG", &log)
+                    .output()
+                    .unwrap();
+                let got = std::fs::read_to_string(&log).unwrap_or_default();
+                assert_eq!(
+                    got.trim_end(),
+                    *want,
+                    "{exe}: `{invocation}` (stderr: {})",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fish_wrapper_matches_remote_exactly_not_by_prefix() {
+        let b = block_body(
+            Shell::Fish,
+            Path::new("/home/u/.local/bin"),
+            Path::new("/home/u/c"),
+        );
+        // `--remote*` would also match `--remote-auth-token-env`, which is not an
+        // endpoint choice.
+        assert!(b.contains("case --remote '--remote=*'"));
+        assert!(!b.contains("'--remote*'"));
+        assert!(b.contains("case --\n"));
+        assert!(b.contains("command codex $probe --help"));
     }
 
     #[test]

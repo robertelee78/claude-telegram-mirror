@@ -385,11 +385,15 @@ How the daemon wires each host, automatically, at start and re-checked every min
     "Hooks need review" prompt for you to answer.
   - *Inbound*: ctm keeps Codex's app-server running (`codex app-server daemon start`,
     idempotent) using Codex's native binary, and a `codex` started while it runs joins it.
-  - *Approvals*: ctm's shell block defines a `codex` function adding
-    `--remote unix://<socket> -C "$PWD"`, which puts your session in that app-server —
-    where each approval is a request with an id ctm can resolve from Telegram. It passes
-    through every subcommand and any explicit `--remote`/`-C`, does nothing while the
-    daemon is down, and `CTM_CODEX_REMOTE=0` turns it off. Run `type codex` to see it.
+  - *Approvals*: ctm's shell block defines a `codex` function that hands the bare TUI,
+    `codex resume …` and `codex fork …` to `ctm codex-launch`, which runs your session
+    in that app-server — where each approval is a request with an id ctm can resolve
+    from Telegram. A resume there would ignore `-C` and refuse permission flags, so the
+    launcher applies them to the thread first and tells you what it applied
+    (`codex --dangerously-bypass-approvals-and-sandbox resume <id>` from a worktree
+    resumes it there with full access). Every other subcommand and any explicit
+    `--remote` run as typed; without a daemon it runs codex locally and says so;
+    `CTM_CODEX_REMOTE=0` turns it off. Run `type codex` to see it.
 
 `ctm doctor` check 12/13 "Hosts" shows what was detected and whether it is wired; a
 host that is not installed is simply reported as such and watched for.

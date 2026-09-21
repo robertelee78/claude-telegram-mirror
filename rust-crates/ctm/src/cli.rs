@@ -113,11 +113,22 @@ pub enum Commands {
     /// ADR-021: reconcile the app-server's account with auth.json before a launch.
     #[command(hide = true)]
     CodexPreflight,
+    /// ADR-022: start or resume a Codex session in the app-server with the typed
+    /// flags in effect. Everything after the command is passed to codex.
+    #[command(hide = true)]
+    CodexLaunch {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     #[command(hide = true)]
     CodexExited {
-        /// Working directory the session was started in
+        /// Working directory the session was started in (the newest live Codex
+        /// session there ends)
+        #[arg(long, required_unless_present = "thread")]
+        cwd: Option<String>,
+        /// ADR-022: the app-server thread id — exactly this session ends
         #[arg(long)]
-        cwd: String,
+        thread: Option<String>,
     },
 
     /// Update ctm to the latest GitHub release (ADR-017)

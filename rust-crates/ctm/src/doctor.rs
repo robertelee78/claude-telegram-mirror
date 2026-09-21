@@ -894,8 +894,9 @@ async fn check_hosts(fix: bool) -> CheckResult {
                         let r = if fix {
                             codex_account::reconcile(cx, live).await
                         } else {
-                            codex_account::reconcile(cx, usize::MAX).await
+                            codex_account::reconcile(cx, Some(usize::MAX)).await
                         };
+                        let live = live.unwrap_or(0);
                         match r {
                             Reconciled::InSync(who) => lines.push(format!(
                                 "Codex: app-server signed in as {who} (matches auth.json)"
@@ -913,6 +914,10 @@ async fn check_hosts(fix: bool) -> CheckResult {
                                     "Codex: app-server is signed in as {from} but auth.json says {to} — `ctm doctor --fix` restarts it{}",
                                     if live > 0 { format!(" once the {live} live session(s) end") } else { String::new() }
                                 ));
+                            }
+                            r @ Reconciled::Failed { .. } => {
+                                escalate(CheckStatus::Fail, &mut worst);
+                                lines.push(format!("Codex: {}", r.line()));
                             }
                             Reconciled::Unavailable(why) => {
                                 lines.push(format!("Codex: account not checked ({why})"))

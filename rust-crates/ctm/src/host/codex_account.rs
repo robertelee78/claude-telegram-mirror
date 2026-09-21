@@ -51,7 +51,13 @@ pub enum Reconciled {
         to: String,
         live: usize,
     },
-    /// Could not tell or could not act (daemon down, no auth.json, restart failed).
+    /// Mismatch found and a restart was due, but it could not be done or verified.
+    Failed {
+        from: String,
+        to: String,
+        why: String,
+    },
+    /// Could not tell (daemon down, no auth.json, session store unreadable).
     Unavailable(String),
 }
 
@@ -65,6 +71,9 @@ impl Reconciled {
             }
             Reconciled::Deferred { from, to, live } => format!(
                 "Codex app-server is signed in as {from}, but you are now {to}; {live} live session(s) — it switches when they end"
+            ),
+            Reconciled::Failed { from, to, why } => format!(
+                "Codex app-server is signed in as {from}, but you are now {to}; could not restart it: {why}"
             ),
             Reconciled::Unavailable(why) => format!("Codex account: {why}"),
         }
@@ -170,7 +179,10 @@ async fn daemon_account(sock: &Path) -> Result<Option<DaemonAccount>> {
 }
 
 /// Compare, and restart the daemon when it is safe to (ADR-021 §1–2).
-pub async fn reconcile(cx: &CodexHostConfig, live_sessions: usize) -> Reconciled {
+///
+/// `live_sessions` is `None` when ctm's session store could not be read: unknown
+/// liveness is not "no live session", so a mismatch is reported, never repaired.
+pub async fn reconcile(cx: &CodexHostConfig, live_sessions: Option<usize>) -> Reconciled {
     let auth_path = codex_home(cx).join("auth.json");
     let disk = match std::fs::read_to_string(&auth_path) {
         Ok(t) => match parse_auth_json(&t) {
@@ -187,37 +199,48 @@ pub async fn reconcile(cx: &CodexHostConfig, live_sessions: usize) -> Reconciled
     if !differs(&disk, daemon.as_ref()) {
         return Reconciled::InSync(from);
     }
-    if live_sessions > 0 {
-        return Reconciled::Deferred {
-            from,
-            to,
-            live: live_sessions,
-        };
+    let failed = |why: String| Reconciled::Failed {
+        from: from.clone(),
+        to: to.clone(),
+        why,
+    };
+    let live = match live_sessions {
+        Some(n) => n,
+        None => {
+            return failed(
+                "ctm's session store is unreadable, so it is unknown whether a session is live"
+                    .into(),
+            )
+        }
+    };
+    if live > 0 {
+        return Reconciled::Deferred { from, to, live };
     }
     let Some(bin) = super::detect::codex_binary(cx.binary.as_deref()) else {
-        return Reconciled::Unavailable("codex binary not found".into());
+        return failed("codex binary not found".into());
     };
     if let Err(e) = super::codex_daemon::stop(&bin, &codex_home(cx)).await {
-        return Reconciled::Unavailable(format!("could not stop the app-server: {e}"));
+        return failed(format!("could not stop the app-server: {e}"));
     }
     if !super::codex_daemon::wait_gone(&cx.socket_path, STOP_BUDGET).await {
-        return Reconciled::Unavailable("app-server did not stop".into());
+        return failed("app-server did not stop".into());
     }
     if let Err(e) = super::codex_daemon::ensure_running(cx).await {
-        return Reconciled::Unavailable(format!("app-server did not come back: {e}"));
+        return failed(format!("app-server did not come back: {e}"));
     }
     match daemon_account(&cx.socket_path).await {
         Ok(after) if !differs(&disk, after.as_ref()) => Reconciled::Restarted { from, to },
-        Ok(after) => Reconciled::Unavailable(format!(
-            "restarted, but the app-server reports {} while auth.json says {to}",
+        Ok(after) => failed(format!(
+            "restarted, but the app-server reports {}",
             label_daemon(after.as_ref())
         )),
-        Err(e) => Reconciled::Unavailable(format!("restarted, but not reachable: {e}")),
+        Err(e) => failed(format!("restarted, but not reachable: {e}")),
     }
 }
 
 /// Live Codex sessions in ctm's store — the "do not restart under them" signal.
-pub fn live_codex_sessions(config: &crate::config::Config) -> usize {
+/// `None` when the store cannot be read; callers must not treat that as zero.
+pub fn live_codex_sessions(config: &crate::config::Config) -> Option<usize> {
     crate::session::SessionManager::new(&config.config_dir, config.session_timeout)
         .and_then(|m| m.get_active_sessions())
         .map(|v| {
@@ -225,7 +248,7 @@ pub fn live_codex_sessions(config: &crate::config::Config) -> usize {
                 .filter(|s| s.host_kind() == crate::types::HostKind::Codex)
                 .count()
         })
-        .unwrap_or(0)
+        .ok()
 }
 
 /// The daemon's keeper: reconcile every `TICK` (ADR-021 §3).
@@ -236,7 +259,9 @@ pub async fn run_keeper(config: std::sync::Arc<crate::config::Config>, cx: Codex
         match reconcile(&cx, live).await {
             Reconciled::InSync(_) => {}
             r @ Reconciled::Restarted { .. } => tracing::info!("{}", r.line()),
-            r @ Reconciled::Deferred { .. } => tracing::warn!("{}", r.line()),
+            r @ (Reconciled::Deferred { .. } | Reconciled::Failed { .. }) => {
+                tracing::warn!("{}", r.line())
+            }
             Reconciled::Unavailable(why) => {
                 tracing::debug!(%why, "Codex account reconcile skipped")
             }
@@ -244,20 +269,24 @@ pub async fn run_keeper(config: std::sync::Arc<crate::config::Config>, cx: Codex
     }
 }
 
-/// `ctm codex-preflight`: run by the `codex` shell function right before a
-/// `--remote` launch. Prints one line to stderr when something happened or could not
-/// happen; silent when in sync; never fails the launch.
-pub async fn run_preflight() -> anyhow::Result<()> {
-    let Ok(cfg) = crate::config::load_config(false) else {
-        return Ok(());
-    };
+/// Right before a `--remote` launch (ADR-021 §3; called by the ADR-022 launcher and
+/// by `ctm codex-preflight`). Prints one line to stderr when the daemon was
+/// restarted, or when a restart was due and could not happen; silent when in sync or
+/// when there is nothing to compare; never fails the launch.
+pub async fn preflight(cfg: &crate::config::Config) {
     if !cfg.hosts.codex.enabled {
-        return Ok(());
+        return;
     }
-    let live = live_codex_sessions(&cfg);
-    match reconcile(&cfg.hosts.codex, live).await {
+    match reconcile(&cfg.hosts.codex, live_codex_sessions(cfg)).await {
         Reconciled::InSync(_) | Reconciled::Unavailable(_) => {}
         r => eprintln!("ctm: {}", r.line()),
+    }
+}
+
+/// `ctm codex-preflight`.
+pub async fn run_preflight() -> anyhow::Result<()> {
+    if let Ok(cfg) = crate::config::load_config(false) {
+        preflight(&cfg).await;
     }
     Ok(())
 }
@@ -332,6 +361,40 @@ mod tests {
             differs(&a, Some(&daemon_key)),
             "api key in memory, chatgpt on disk"
         );
+    }
+
+    #[test]
+    fn a_failed_restart_names_both_sides_and_the_reason() {
+        let r = Reconciled::Failed {
+            from: "a@x".into(),
+            to: "b@x".into(),
+            why: "app-server did not stop".into(),
+        };
+        assert!(r.line().contains("a@x") && r.line().contains("b@x"));
+        assert!(r
+            .line()
+            .contains("could not restart it: app-server did not stop"));
+    }
+
+    #[tokio::test]
+    async fn unknown_liveness_never_restarts() {
+        // A mismatch with an unreadable session store is reported as Failed, not
+        // repaired: the daemon under an unknown number of live sessions is untouched.
+        // Exercised through the public path with a home that has no auth.json — the
+        // pre-check stops first (Unavailable), which is the only outcome possible
+        // without a daemon; the `None` arm itself is straight-line code above.
+        let dir = tempfile::tempdir().unwrap();
+        let cx = CodexHostConfig {
+            enabled: true,
+            socket_path: dir
+                .path()
+                .join("app-server-control/app-server-control.sock"),
+            binary: None,
+        };
+        assert!(matches!(
+            reconcile(&cx, None).await,
+            Reconciled::Unavailable(_)
+        ));
     }
 
     #[test]

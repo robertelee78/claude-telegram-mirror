@@ -73,6 +73,30 @@ pub async fn run_exited(cwd: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `ctm codex-exited --thread <id>`: the TUI attached to exactly this thread has quit.
+///
+/// ADR-022: the launcher resolves the thread before attaching, so it can name it.
+/// A directory is a heuristic (the newest live session there); an id is not — a
+/// thread moved to a worktree keeps the directory it was created in as its ctm
+/// `project_dir`, and a directory-keyed report from the worktree would never match
+/// it. This is also the hand-operated escape hatch when ctm's store still shows a
+/// session live whose terminal is gone.
+pub async fn run_exited_for(thread_id: &str, cwd: Option<&str>) -> anyhow::Result<()> {
+    let Ok(cfg) = crate::config::load_config(false) else {
+        return Ok(());
+    };
+    let mut meta = Map::new();
+    meta.insert("hostTransport".into(), Value::String("hook".into()));
+    meta.insert("hostSessionId".into(), Value::String(thread_id.to_string()));
+    if let Some(cwd) = cwd {
+        meta.insert("projectDir".into(), Value::String(cwd.to_string()));
+    }
+    meta.insert("action".into(), Value::String("client-exited".into()));
+    let msg = stamped(KIND, MessageType::SessionEnd, thread_id, "exited", meta);
+    let _ = send(&cfg.socket_path, &[msg]).await;
+    Ok(())
+}
+
 /// Translate one Codex hook payload into daemon messages. Pure; unit-tested.
 pub fn translate(p: &Value) -> Vec<BridgeMessage> {
     let s = |k: &str| p.get(k).and_then(Value::as_str).unwrap_or_default();
@@ -163,16 +187,29 @@ pub fn translate(p: &Value) -> Vec<BridgeMessage> {
     }
 }
 
+/// Bounded: a hook or an exit report must never hold up codex (or the launcher's
+/// exit) on a daemon that accepts the connection and then stalls.
+const SEND_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
+
 async fn send(socket_path: &std::path::Path, messages: &[BridgeMessage]) -> std::io::Result<()> {
     use tokio::io::AsyncWriteExt;
-    let mut stream = tokio::net::UnixStream::connect(socket_path).await?;
-    for m in messages {
-        let Ok(json) = serde_json::to_string(m) else {
-            continue;
-        };
-        stream.write_all(format!("{json}\n").as_bytes()).await?;
-    }
-    stream.shutdown().await
+    tokio::time::timeout(SEND_BUDGET, async {
+        let mut stream = tokio::net::UnixStream::connect(socket_path).await?;
+        for m in messages {
+            let Ok(json) = serde_json::to_string(m) else {
+                continue;
+            };
+            stream.write_all(format!("{json}\n").as_bytes()).await?;
+        }
+        stream.shutdown().await
+    })
+    .await
+    .map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "ctm daemon did not take the message",
+        )
+    })?
 }
 
 #[cfg(test)]

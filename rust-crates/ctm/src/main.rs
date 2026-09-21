@@ -134,8 +134,12 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::ShellSetup { remove } => shell::run_shell_setup(remove),
         Commands::CodexHook => host::codex_hook_cmd::run().await,
-        Commands::CodexExited { cwd } => host::codex_hook_cmd::run_exited(&cwd).await,
+        Commands::CodexExited { cwd, thread } => match thread {
+            Some(id) => host::codex_hook_cmd::run_exited_for(&id, cwd.as_deref()).await,
+            None => host::codex_hook_cmd::run_exited(&cwd.unwrap_or_default()).await,
+        },
         Commands::CodexPreflight => host::codex_account::run_preflight().await,
+        Commands::CodexLaunch { args } => host::codex_launch_run::run(args).await,
         Commands::Service { action } => service::handle_service_command(&action),
         Commands::Toggle { on, off } => cmd_toggle(on, off).await,
         Commands::PruneTopics {

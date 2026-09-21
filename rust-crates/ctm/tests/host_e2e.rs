@@ -1245,7 +1245,10 @@ async fn codex_account_switch_restarts_the_idle_app_server() {
     );
 
     // In sync: nothing happens.
-    assert!(matches!(reconcile(&d.cx, 0).await, Reconciled::InSync(_)));
+    assert!(matches!(
+        reconcile(&d.cx, Some(0)).await,
+        Reconciled::InSync(_)
+    ));
 
     // The user signs in to another account: only the file changes; the daemon,
     // by Codex's own guarded reload, keeps the old one.
@@ -1258,7 +1261,7 @@ async fn codex_account_switch_restarts_the_idle_app_server() {
     );
 
     // A live session: ctm must not restart underneath it, and must say so.
-    match reconcile(&d.cx, 1).await {
+    match reconcile(&d.cx, Some(1)).await {
         Reconciled::Deferred { from, to, live } => {
             assert_eq!(from, original);
             assert_eq!(to, "other-account@example.com");
@@ -1269,7 +1272,7 @@ async fn codex_account_switch_restarts_the_idle_app_server() {
     assert_eq!(d.daemon_email().await, original, "deferred means untouched");
 
     // Idle: restart, and the daemon now reports the new account.
-    match reconcile(&d.cx, 0).await {
+    match reconcile(&d.cx, Some(0)).await {
         Reconciled::Restarted { from, to } => {
             assert_eq!(from, original);
             assert_eq!(to, "other-account@example.com");
@@ -1277,5 +1280,312 @@ async fn codex_account_switch_restarts_the_idle_app_server() {
         other => panic!("expected Restarted, got {other:?}"),
     }
     assert_eq!(d.daemon_email().await, "other-account@example.com");
-    assert!(matches!(reconcile(&d.cx, 0).await, Reconciled::InSync(_)));
+    assert!(matches!(
+        reconcile(&d.cx, Some(0)).await,
+        Reconciled::InSync(_)
+    ));
+}
+
+/// A terminal running `ctm codex-launch` (the binary under test) in `work`.
+struct LaunchTerminal {
+    tmux: String,
+}
+
+impl LaunchTerminal {
+    fn start(
+        tag: &str,
+        d: &IsolatedDaemon,
+        bridge: &Path,
+        work: &Path,
+        codex_args: &str,
+    ) -> Option<Self> {
+        if !have("tmux") {
+            eprintln!("skip: tmux missing");
+            return None;
+        }
+        let tmux = format!("ctm-e2e-{tag}-{}", std::process::id());
+        // Exactly the environment the shell function's launch runs under, pointed at
+        // the isolated home/daemon; `TELEGRAM_*` make config load without a file.
+        let launch = format!(
+            "cd {w} && CODEX_HOME={h} CTM_CODEX_SOCKET={s} TELEGRAM_BRIDGE_SOCKET={b} TELEGRAM_MIRROR=true \
+             TELEGRAM_BOT_TOKEN=1:test TELEGRAM_CHAT_ID=-1001234567890 {ctm} codex-launch {codex_args} 2>&1; \
+             echo LAUNCH_EXIT=$?; trap '' INT; sleep 30",
+            w = work.display(),
+            h = d.home.display(),
+            s = d.cx.socket_path.display(),
+            b = bridge.display(),
+            ctm = env!("CARGO_BIN_EXE_ctm"),
+        );
+        Command::new("tmux")
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                &tmux,
+                "-x",
+                "160",
+                "-y",
+                "45",
+                &launch,
+            ])
+            .status()
+            .ok()?;
+        Some(Self { tmux })
+    }
+
+    fn keys(&self, k: &str) {
+        let _ = Command::new("tmux")
+            .args(["send-keys", "-t", &self.tmux, k])
+            .output();
+    }
+
+    /// The pane plus its scrollback (the launcher's line scrolls off once the TUI draws).
+    fn screen(&self) -> String {
+        Command::new("tmux")
+            .args(["capture-pane", "-t", &self.tmux, "-p", "-S", "-200"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).replace('\n', " "))
+            .unwrap_or_default()
+    }
+
+    async fn wait_for_screen(&self, needle: &str, secs: u64) -> bool {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+        while tokio::time::Instant::now() < deadline {
+            if self.screen().contains(needle) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        false
+    }
+
+    /// Quit the TUI the way a person does (Ctrl-C, again if it asks) and wait for the
+    /// launcher to return. The pane's trailing `sleep` ignores INT, so a second
+    /// Ctrl-C that lands after the TUI has already gone does not kill the pane.
+    async fn quit(&self) -> bool {
+        self.keys("C-c");
+        if self.wait_for_screen("LAUNCH_EXIT=", 3).await {
+            return true;
+        }
+        self.keys("C-c");
+        self.wait_for_screen("LAUNCH_EXIT=", 20).await
+    }
+}
+
+impl Drop for LaunchTerminal {
+    fn drop(&mut self) {
+        let _ = Command::new("tmux")
+            .args(["kill-session", "-t", &self.tmux])
+            .output();
+    }
+}
+
+/// What the daemon says is in effect for a thread (`thread/resume`, metadata only).
+async fn effective(d: &IsolatedDaemon, id: &str) -> (String, String, String) {
+    let mut rpc = ctm::host::codex_rpc::Rpc::connect(&d.cx.socket_path)
+        .await
+        .expect("daemon reachable");
+    let v = rpc
+        .call(
+            "thread/resume",
+            serde_json::json!({"threadId": id, "excludeTurns": true}),
+        )
+        .await
+        .unwrap();
+    (
+        v["cwd"].as_str().unwrap_or("").to_string(),
+        v["sandbox"]["type"].as_str().unwrap_or("").to_string(),
+        v["approvalPolicy"].as_str().unwrap_or("").to_string(),
+    )
+}
+
+/// ADR-022: `csp resume <id>` from a worktree resumes the session there with full
+/// access, attached to the app-server — and `csp fork <id>` the same for a fork.
+///
+/// A remote resume ignores `--cd` and refuses permission flags; the launcher applies
+/// them through the API first. The thread starts *unloaded* (a fresh daemon, as after
+/// an ADR-021 restart), which is the state a plain settings update cannot handle.
+#[tokio::test]
+#[ignore = "drives the real codex app-server and TUI in an isolated CODEX_HOME"]
+async fn codex_resume_and_fork_reapply_the_typed_flags_before_attaching() {
+    let dir = tempfile::tempdir().unwrap();
+    let bridge = dir.path().join("bridge.sock");
+    let (mut rx, _down) = fake_daemon_rw(bridge.clone()).await;
+    let Some(d) = IsolatedDaemon::start("adr022") else {
+        return;
+    };
+    let work1 = std::fs::canonicalize(&d.home).unwrap().join("work1");
+    let work2 = std::fs::canonicalize(&d.home).unwrap().join("work2");
+    std::fs::create_dir_all(&work1).unwrap();
+    std::fs::create_dir_all(&work2).unwrap();
+
+    // A session that lives in work1 as Workspace / on-request (no model turn).
+    let id = {
+        let mut rpc = ctm::host::codex_rpc::Rpc::connect(&d.cx.socket_path)
+            .await
+            .expect("daemon reachable");
+        let v = rpc
+            .call(
+                "thread/start",
+                serde_json::json!({"cwd": work1.display().to_string(), "sandbox": "workspace-write", "approvalPolicy": "on-request"}),
+            )
+            .await
+            .unwrap();
+        v["thread"]["id"].as_str().unwrap().to_string()
+    };
+    // Unload it: restart the daemon (what ADR-021 does after a login).
+    let _ = Command::new("codex")
+        .args(["app-server", "daemon", "stop"])
+        .env("CODEX_HOME", &d.home)
+        .output();
+    assert!(ctm::host::codex_daemon::wait_gone(&d.cx.socket_path, Duration::from_secs(10)).await);
+    ctm::host::codex_daemon::ensure_running(&d.cx)
+        .await
+        .unwrap();
+    {
+        let mut rpc = ctm::host::codex_rpc::Rpc::connect(&d.cx.socket_path)
+            .await
+            .unwrap();
+        let v = rpc
+            .call(
+                "thread/read",
+                serde_json::json!({"threadId": id, "includeTurns": false}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            v["thread"]["status"]["type"], "notLoaded",
+            "the thread is persisted but unloaded"
+        );
+    }
+
+    // `csp resume <id>` from work2.
+    let short = &id[..8];
+    let Some(t) = LaunchTerminal::start(
+        "adr022r",
+        &d,
+        &bridge,
+        &work2,
+        &format!("--dangerously-bypass-approvals-and-sandbox resume {id}"),
+    ) else {
+        return;
+    };
+    assert!(
+        t.wait_for_screen(
+            &format!(
+                "ctm: session {short}: directory {}, Full Access, approval never",
+                work2.display()
+            ),
+            60
+        )
+        .await,
+        "the launcher reports what it applied; screen: {}",
+        t.screen()
+    );
+    assert!(
+        t.screen().contains("(was: directory"),
+        "…and what it was: {}",
+        t.screen()
+    );
+    // The daemon's own account of the thread, not the launcher's.
+    let (cwd, sandbox, approval) = effective(&d, &id).await;
+    assert_eq!(cwd, work2.display().to_string());
+    assert_eq!(
+        (sandbox.as_str(), approval.as_str()),
+        ("dangerFullAccess", "never")
+    );
+    // …and the TUI's.
+    assert!(
+        t.wait_for_screen("Ask Codex to do anything", 60).await,
+        "the TUI attached: {}",
+        t.screen()
+    );
+    t.keys("/status");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    t.keys("Enter");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    t.keys("Enter");
+    assert!(
+        t.wait_for_screen("Permissions:          Full Access", 20)
+            .await,
+        "/status: {}",
+        t.screen()
+    );
+    assert!(
+        t.screen()
+            .contains(&format!("Directory:            {}", work2.display())),
+        "/status: {}",
+        t.screen()
+    );
+    // Quitting reports the exit by thread id, so the daemon ends exactly this session.
+    assert!(t.quit().await, "the launcher returned: {}", t.screen());
+    let end = wait_for(&mut rx, |m| m.msg_type == MessageType::SessionEnd, 20)
+        .await
+        .expect("the exit was reported to ctm");
+    assert_eq!(end.session_id, id, "by thread id, not by directory");
+    assert_eq!(end.meta().host_kind(), HostKind::Codex);
+    assert_eq!(end.metadata.as_ref().unwrap()["action"], "client-exited");
+    assert!(
+        t.screen().contains("LAUNCH_EXIT=0"),
+        "codex's exit status is the launcher's: {}",
+        t.screen()
+    );
+    drop(t);
+
+    // `csp fork <id>` from work1: a new thread with the parent's history, in work1,
+    // with full access; the parent is untouched.
+    let Some(t) = LaunchTerminal::start(
+        "adr022f",
+        &d,
+        &bridge,
+        &work1,
+        &format!("--dangerously-bypass-approvals-and-sandbox fork {id}"),
+    ) else {
+        return;
+    };
+    assert!(
+        t.wait_for_screen(&format!("ctm: forked session {short} as "), 60)
+            .await,
+        "the launcher reports the fork; screen: {}",
+        t.screen()
+    );
+    let screen = t.screen();
+    let fork_short = screen
+        .split(&format!("ctm: forked session {short} as "))
+        .nth(1)
+        .and_then(|s| s.get(..8))
+        .unwrap()
+        .to_string();
+    assert!(
+        screen.contains(&format!(
+            "directory {}, Full Access, approval never",
+            work1.display()
+        )),
+        "{screen}"
+    );
+    assert!(
+        t.wait_for_screen("Thread forked from", 60).await,
+        "the TUI attached to the fork: {}",
+        t.screen()
+    );
+    let (cwd, sandbox, approval) = effective(&d, &id).await;
+    assert_eq!(
+        (cwd.as_str(), sandbox.as_str(), approval.as_str()),
+        (
+            work2.display().to_string().as_str(),
+            "dangerFullAccess",
+            "never"
+        ),
+        "the parent is untouched"
+    );
+    assert!(t.quit().await, "the launcher returned: {}", t.screen());
+    let end = wait_for(&mut rx, |m| m.msg_type == MessageType::SessionEnd, 20)
+        .await
+        .expect("the fork's exit was reported");
+    assert!(
+        end.session_id.starts_with(&fork_short),
+        "reported for the fork ({fork_short}), got {}",
+        end.session_id
+    );
+    assert_ne!(end.session_id, id);
 }
