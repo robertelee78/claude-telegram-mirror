@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.52] - 2026-09-21
+
+### Fixed (reported: signed in to another Codex account, resumed, still on the old one)
+- **The Codex app-server ctm keeps alive now follows `codex login`** (ADR-021). Root cause, reproduced against an isolated daemon: a running codex reloads `auth.json` only for the account it already holds — its own binary says `Skipping auth reload due to account id mismatch` — and ctm's design put every session inside a daemon it never restarts, so a CLI login changed a file nobody was reading. ctm now compares the daemon's `account/read` with `auth.json` every minute in the daemon and immediately before every `codex` launch (`ctm codex-preflight`, run by the shell function), and restarts the app-server when they differ — **only when no Codex session is live**; otherwise it says so (`ctm: Codex app-server is signed in as X, but you are now Y; N live session(s) — it switches when they end`) and does it once they end. `ctm doctor` shows the daemon's account and whether it matches. Switching accounts is now `codex login` → `codex`; the first launch pauses ~2 s and prints `Codex app-server restarted: now signed in as …`.
+- **Daemon start/stop are pinned to the socket's `CODEX_HOME`.** They ran with the caller's environment; found by the new e2e, which stopped the wrong daemon once.
+- Five orphaned `codex app-server daemon pid-update-loop` helpers from earlier spikes were removed by hand; a normal start/stop does not leak them (verified).
+
 ## [0.2.51] - 2026-09-21
 
 ### Fixed (reported: `codex auth login --device-auth` → "`--remote …` is only supported for interactive TUI commands, not `codex login`")

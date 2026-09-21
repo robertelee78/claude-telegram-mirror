@@ -141,6 +141,7 @@ fn codex_wrapper(shell: Shell) -> String {
              \x20   \"codex [\"*|\"codex <\"*|codex) ;;\n\
              \x20   *) command codex \"$@\"; return;;\n\
              \x20 esac\n\
+             \x20 command ctm codex-preflight >/dev/null || true\n\
              \x20 command codex --remote \"unix://$sock\" -C \"$PWD\" \"$@\"\n\
              \x20 local rc=$?\n\
              \x20 command ctm codex-exited --cwd \"$PWD\" >/dev/null 2>&1 || true\n\
@@ -161,6 +162,7 @@ fn codex_wrapper(shell: Shell) -> String {
              \x20   case '*'\n\
              \x20     command codex $argv; return\n\
              \x20 end\n\
+             \x20 command ctm codex-preflight >/dev/null || true\n\
              \x20 command codex --remote \"unix://$sock\" -C \"$PWD\" $argv\n\
              \x20 set -l rc $status\n\
              \x20 command ctm codex-exited --cwd \"$PWD\" >/dev/null 2>&1\n\

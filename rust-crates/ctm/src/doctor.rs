@@ -884,6 +884,41 @@ async fn check_hosts(fix: bool) -> CheckResult {
                         cx.socket_path.display()
                     ));
                     lines.push(caps_line(crate::types::HostKind::Codex));
+                    // ADR-021: the daemon must be on the account the user signed in with;
+                    // `--fix` restarts it when no Codex session is live.
+                    {
+                        use crate::host::codex_account::{self, Reconciled};
+                        let live = codex_account::live_codex_sessions(&cfg);
+                        // Without --fix, only look: a mismatch with no live session would
+                        // otherwise be repaired silently by a diagnostic.
+                        let r = if fix {
+                            codex_account::reconcile(cx, live).await
+                        } else {
+                            codex_account::reconcile(cx, usize::MAX).await
+                        };
+                        match r {
+                            Reconciled::InSync(who) => lines.push(format!(
+                                "Codex: app-server signed in as {who} (matches auth.json)"
+                            )),
+                            r @ Reconciled::Restarted { .. } => fixes.push(r.line()),
+                            Reconciled::Deferred { from, to, live: n } if fix => {
+                                escalate(CheckStatus::Warn, &mut worst);
+                                lines.push(format!(
+                                    "Codex: app-server is signed in as {from} but auth.json says {to}; {n} live session(s) — it switches when they end"
+                                ));
+                            }
+                            Reconciled::Deferred { from, to, .. } => {
+                                escalate(CheckStatus::Warn, &mut worst);
+                                lines.push(format!(
+                                    "Codex: app-server is signed in as {from} but auth.json says {to} — `ctm doctor --fix` restarts it{}",
+                                    if live > 0 { format!(" once the {live} live session(s) end") } else { String::new() }
+                                ));
+                            }
+                            Reconciled::Unavailable(why) => {
+                                lines.push(format!("Codex: account not checked ({why})"))
+                            }
+                        }
+                    }
                     // Outbound needs Codex's own hooks: the app-server cannot observe a
                     // thread a bare `codex` owns (ADR-016 amendment 2026-09-20).
                     let exe = std::env::current_exe().unwrap_or_else(|_| bin.clone());

@@ -29,6 +29,17 @@ async fn reachable(sock: &Path) -> bool {
     tokio::net::UnixStream::connect(sock).await.is_ok()
 }
 
+/// The `CODEX_HOME` the control socket belongs to: `<home>/app-server-control/<sock>`.
+/// Every `daemon start`/`stop` is pinned to it, so the process acted on is always the
+/// one behind `cx.socket_path` — never whichever home the caller's environment names.
+pub fn codex_home(cx: &CodexHostConfig) -> PathBuf {
+    cx.socket_path
+        .parent()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| crate::config::home_dir().join(".codex"))
+}
+
 /// Make sure the app-server daemon is up. Cheap when it already is (one connect).
 pub async fn ensure_running(cx: &CodexHostConfig) -> Result<Ensured> {
     if reachable(&cx.socket_path).await {
@@ -37,7 +48,7 @@ pub async fn ensure_running(cx: &CodexHostConfig) -> Result<Ensured> {
     let Some(bin) = super::detect::codex_binary(cx.binary.as_deref()) else {
         return Ok(Ensured::NotInstalled);
     };
-    start(&bin).await?;
+    start(&bin, &codex_home(cx)).await?;
     let deadline = tokio::time::Instant::now() + SOCKET_WAIT;
     while tokio::time::Instant::now() < deadline {
         if reachable(&cx.socket_path).await {
@@ -52,12 +63,14 @@ pub async fn ensure_running(cx: &CodexHostConfig) -> Result<Ensured> {
     )))
 }
 
-/// `codex app-server daemon start`, bounded. Returns the socket path it reported.
-pub async fn start(bin: &Path) -> Result<Option<PathBuf>> {
+/// `codex app-server daemon start` for `home`, bounded. Returns the socket path it
+/// reported.
+pub async fn start(bin: &Path, home: &Path) -> Result<Option<PathBuf>> {
     let out = tokio::time::timeout(
         START_TIMEOUT,
         tokio::process::Command::new(bin)
             .args(["app-server", "daemon", "start"])
+            .env("CODEX_HOME", home)
             .stdin(std::process::Stdio::null())
             .output(),
     )
@@ -80,6 +93,49 @@ pub async fn start(bin: &Path) -> Result<Option<PathBuf>> {
         )));
     }
     Ok(parse_start_output(&stdout))
+}
+
+/// `codex app-server daemon stop`, bounded. The only way a running daemon adopts a
+/// different signed-in account is to be restarted (ADR-021).
+pub async fn stop(bin: &Path, home: &Path) -> Result<()> {
+    let out = tokio::time::timeout(
+        START_TIMEOUT,
+        tokio::process::Command::new(bin)
+            .args(["app-server", "daemon", "stop"])
+            .env("CODEX_HOME", home)
+            .stdin(std::process::Stdio::null())
+            .output(),
+    )
+    .await
+    .map_err(|_| {
+        AppError::Socket(format!(
+            "`{} app-server daemon stop` timed out",
+            bin.display()
+        ))
+    })?
+    .map_err(|e| AppError::Socket(format!("cannot run {}: {e}", bin.display())))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(AppError::Socket(format!(
+            "`{} app-server daemon stop` failed ({}): {}",
+            bin.display(),
+            out.status,
+            crate::formatting::truncate(stderr.trim(), 300)
+        )));
+    }
+    Ok(())
+}
+
+/// Wait for the control socket to stop accepting connections after `stop`.
+pub async fn wait_gone(sock: &Path, budget: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + budget;
+    while tokio::time::Instant::now() < deadline {
+        if !reachable(sock).await {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    false
 }
 
 /// `{"status":"alreadyRunning"|"started",…,"socketPath":"…"}` → socket path.

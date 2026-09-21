@@ -1135,3 +1135,147 @@ s.write('GET / HTTP/1.1\r\nHost: l\r\nUpgrade: websocket\r\nConnection: Upgrade\
             .output();
     }
 }
+
+// ============================================================================ ADR-021
+
+/// An isolated app-server daemon with its OWN COPY of auth.json (never a link: the
+/// test rewrites it), stopped and removed on drop.
+struct IsolatedDaemon {
+    home: PathBuf,
+    cx: ctm::config::CodexHostConfig,
+}
+
+impl IsolatedDaemon {
+    fn start(tag: &str) -> Option<Self> {
+        if !have("codex") {
+            eprintln!("skip: codex missing");
+            return None;
+        }
+        let real_home = std::env::var("CODEX_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from(std::env::var("HOME").unwrap()).join(".codex"));
+        let release = std::fs::canonicalize(real_home.join("packages/standalone/current")).ok()?;
+        if !real_home.join("auth.json").exists() {
+            eprintln!("skip: not signed in to Codex");
+            return None;
+        }
+        let home = PathBuf::from(format!("/tmp/ctm-e2e-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join("packages/standalone")).ok()?;
+        std::os::unix::fs::symlink(&release, home.join("packages/standalone/current")).ok()?;
+        std::fs::copy(real_home.join("auth.json"), home.join("auth.json")).ok()?;
+        let out = Command::new("codex")
+            .args(["app-server", "daemon", "start"])
+            .env("CODEX_HOME", &home)
+            .output()
+            .ok()?;
+        let started: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+        let socket_path = PathBuf::from(started["socketPath"].as_str()?);
+        Some(Self {
+            home,
+            cx: ctm::config::CodexHostConfig {
+                enabled: true,
+                socket_path,
+                binary: None,
+            },
+        })
+    }
+
+    /// Rewrite auth.json to name a different ChatGPT account (label only; the daemon
+    /// never talks to OpenAI in this test).
+    fn switch_account_on_disk(&self, email: &str) {
+        use base64::Engine;
+        let p = self.home.join("auth.json");
+        let mut v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        let id_token = v["tokens"]["id_token"].as_str().unwrap().to_string();
+        let mut parts: Vec<String> = id_token.split('.').map(str::to_string).collect();
+        let padded = format!("{}{}", parts[1], "=".repeat((4 - parts[1].len() % 4) % 4));
+        let mut claims: serde_json::Value = serde_json::from_slice(
+            &base64::engine::general_purpose::URL_SAFE
+                .decode(padded)
+                .unwrap(),
+        )
+        .unwrap();
+        claims["email"] = serde_json::json!(email);
+        parts[1] = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims.to_string());
+        v["tokens"]["id_token"] = serde_json::json!(parts.join("."));
+        v["tokens"]["account_id"] = serde_json::json!(format!("test-{}", std::process::id()));
+        std::fs::write(&p, v.to_string()).unwrap();
+    }
+
+    async fn daemon_email(&self) -> String {
+        let mut rpc = ctm::host::codex_rpc::Rpc::connect(&self.cx.socket_path)
+            .await
+            .expect("daemon reachable");
+        let v = rpc
+            .call("account/read", serde_json::json!({}))
+            .await
+            .unwrap();
+        v["account"]["email"]
+            .as_str()
+            .unwrap_or("")
+            .to_ascii_lowercase()
+    }
+}
+
+impl Drop for IsolatedDaemon {
+    fn drop(&mut self) {
+        let _ = Command::new("codex")
+            .args(["app-server", "daemon", "stop"])
+            .env("CODEX_HOME", &self.home)
+            .output();
+        let _ = std::fs::remove_dir_all(&self.home);
+    }
+}
+
+/// ADR-021: after `codex login` to another account, the app-server ctm keeps alive
+/// must follow — by restart, and only when no Codex session is live.
+#[tokio::test]
+#[ignore = "drives the real codex app-server in an isolated CODEX_HOME"]
+async fn codex_account_switch_restarts_the_idle_app_server() {
+    use ctm::host::codex_account::{reconcile, Reconciled};
+    let Some(d) = IsolatedDaemon::start("acct") else {
+        return;
+    };
+    let original = d.daemon_email().await;
+    assert!(
+        !original.is_empty(),
+        "the daemon reports the signed-in account"
+    );
+
+    // In sync: nothing happens.
+    assert!(matches!(reconcile(&d.cx, 0).await, Reconciled::InSync(_)));
+
+    // The user signs in to another account: only the file changes; the daemon,
+    // by Codex's own guarded reload, keeps the old one.
+    d.switch_account_on_disk("other-account@example.com");
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    assert_eq!(
+        d.daemon_email().await,
+        original,
+        "Codex ignores a different account on disk"
+    );
+
+    // A live session: ctm must not restart underneath it, and must say so.
+    match reconcile(&d.cx, 1).await {
+        Reconciled::Deferred { from, to, live } => {
+            assert_eq!(from, original);
+            assert_eq!(to, "other-account@example.com");
+            assert_eq!(live, 1);
+        }
+        other => panic!("expected Deferred, got {other:?}"),
+    }
+    assert_eq!(d.daemon_email().await, original, "deferred means untouched");
+
+    // Idle: restart, and the daemon now reports the new account.
+    match reconcile(&d.cx, 0).await {
+        Reconciled::Restarted { from, to } => {
+            assert_eq!(from, original);
+            assert_eq!(to, "other-account@example.com");
+        }
+        other => panic!("expected Restarted, got {other:?}"),
+    }
+    assert_eq!(d.daemon_email().await, "other-account@example.com");
+    assert!(matches!(reconcile(&d.cx, 0).await, Reconciled::InSync(_)));
+}

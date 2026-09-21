@@ -508,6 +508,10 @@ impl Daemon {
             // cannot observe a thread another process owns (ADR-016 amendment).
             let cx = hosts.codex.clone();
             tokio::spawn(async move { crate::host::codex_hooks::run_keeper(cx).await });
+            // ADR-021: the daemon we keep alive must follow `codex login`.
+            let cfg = Arc::clone(&self.state.config);
+            let cx = hosts.codex.clone();
+            tokio::spawn(async move { crate::host::codex_account::run_keeper(cfg, cx).await });
         } else {
             tracing::info!("Codex mirroring disabled by config");
         }

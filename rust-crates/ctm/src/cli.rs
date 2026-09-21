@@ -110,6 +110,9 @@ pub enum Commands {
     CodexHook,
 
     /// Report that a Codex TUI exited (ADR-016; run by ctm's shell integration)
+    /// ADR-021: reconcile the app-server's account with auth.json before a launch.
+    #[command(hide = true)]
+    CodexPreflight,
     #[command(hide = true)]
     CodexExited {
         /// Working directory the session was started in
