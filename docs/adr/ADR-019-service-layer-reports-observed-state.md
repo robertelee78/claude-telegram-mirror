@@ -9,7 +9,7 @@
 > Just pure excellence, done the right way the entire time.
 > Chesterton's fence: always understand the current implementation fully before changing it.
 
-**Status:** Implemented (2026-09-21)
+**Status:** Implemented (2026-09-21) — shipped in 0.2.47; proof below.
 **Date:** 2026-09-21
 **Authors:** Robert, Claude
 **Tags:** service, systemd, launchd, reliability, testing
@@ -128,3 +128,26 @@ across a restart on both.
   500-line rule.
 - The `ServiceStatus` API is unchanged; `main.rs`, `doctor`, `setup` and `update`
   need no changes and inherit truthful results.
+
+## Proof (Kata step 6 — recorded 2026-09-21)
+
+- CI run 35594760000-series (`service-managers`): `tests/service_managers.rs`
+  **3 passed** on `ubuntu-latest` (systemd 255 user manager, 15.3 s) and on
+  `macos-latest` (launchd gui domain). Locally on this Mac: 3 passed, 23 s.
+- `ctm update` 0.2.46 → 0.2.47 on this Mac, as a user:
+
+```
+$ ctm update
+verified: Developer ID 3T2D2YNTVW as us.ctm.cli, notarized
+installed ctm 0.2.47 at /Users/robert.lee/.local/bin/ctm
+restarting service so the daemon runs the new binary …
+Service restarted.
+$ ctm service status
+  Running: Yes (pid 74796)
+  Program: /Users/robert.lee/.local/bin/ctm
+$ time ctm service restart          → Service restarted.  (10.5 s: launchd's throttle, now reported truthfully)
+$ ctm service status | grep Running → Running: Yes (pid 75213)
+$ ctm service stop; ctm service status | grep Running → Service stopped. / Running: No
+$ ctm service start; ctm service status | grep Running → Service started. / Running: Yes (pid 75745)
+$ ctm doctor                        → All checks passed!
+```
