@@ -1033,6 +1033,33 @@ async fn check_update(fix: bool) -> CheckResult {
         }
     }
 
+    // ADR-020: the release signature kept beside a standalone binary, re-verified
+    // against the running bytes with the pinned keys — on every platform.
+    if let crate::update::Channel::Standalone { install_dir } = &channel {
+        let sig_path = install_dir.join(crate::release_trust::SIGNATURE_FILE);
+        match fs::read_to_string(&sig_path) {
+            Ok(armored) => match crate::release_trust::verify_release_candidate(&exe, &armored) {
+                Ok(id) => lines.push(format!(
+                    "release signature: verified, key {} ({})",
+                    id.fingerprint, id.namespace
+                )),
+                Err(e) => {
+                    escalate(CheckStatus::Fail, &mut worst);
+                    lines.push(format!(
+                        "release signature: {e} — the binary and its signature disagree; reinstall with the one-line installer"
+                    ));
+                }
+            },
+            Err(_) => {
+                escalate(CheckStatus::Warn, &mut worst);
+                lines.push(
+                    "release signature: none kept beside the binary (installed before 0.2.48); run `ctm update`"
+                        .into(),
+                );
+            }
+        }
+    }
+
     let current = env!("CARGO_PKG_VERSION");
     match crate::update::latest_version().await {
         Some(latest) => {

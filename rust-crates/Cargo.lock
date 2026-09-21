@@ -276,9 +276,10 @@ dependencies = [
 
 [[package]]
 name = "ctm"
-version = "0.2.47"
+version = "0.2.48"
 dependencies = [
  "anyhow",
+ "base64",
  "chrono",
  "clap",
  "clap_complete",
@@ -289,6 +290,7 @@ dependencies = [
  "nix",
  "regex",
  "reqwest",
+ "ring",
  "rusqlite",
  "semver",
  "serde",

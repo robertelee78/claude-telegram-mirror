@@ -6,8 +6,9 @@
 # Installs the latest ctm release for this machine into ~/.local/bin (override with
 # CTM_INSTALL_DIR). Fetches the per-target release record via GitHub's
 # releases/latest/download redirect, downloads the matching binary from the same
-# release, verifies size and SHA-256 — and on macOS the Developer ID signature and
-# Apple notarization ticket (ADR-018) — then installs it atomically, then runs
+# release, verifies size and SHA-256, the Ed25519 release signature every binary
+# carries (ADR-020, `ssh-keygen -Y verify`) — and on macOS the Developer ID
+# signature and Apple notarization ticket (ADR-018) — then installs it atomically, then runs
 # `ctm shell-setup` so PATH and tab completion work in your next shell (one
 # marker-delimited block at the end of your rc; CTM_NO_SHELL_SETUP=1 skips it).
 #
@@ -20,6 +21,14 @@ REPO="robertelee78/claude-telegram-mirror"
 # record that names it was replaced too.
 APPLE_TEAM_ID="3T2D2YNTVW"
 APPLE_IDENTIFIER="us.ctm.cli"
+# ADR-020: every release binary is signed (OpenSSH signature format) by one of these
+# Ed25519 keys — the signing key and an offline standby — in this namespace. Pinned
+# here and in the binary's own updater (src/release_trust.rs); the contract test keeps
+# the two lists identical.
+RELEASE_SIGNING_KEYS="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIG7D2ChtUbftl2H92GnPLA4ol3Wws2ksy0zzhKdByWtj
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFIwO9PqTyjmlysEDMhb9GEhiREqxGUlDRDYCXkOvWAd"
+RELEASE_NAMESPACE="ctm.release"
+RELEASE_PRINCIPAL="release@ctm.cli"
 # CTM_RELEASE_BASE exists for the installer's own end-to-end test against a local
 # stand-in server; the origin check below still applies to redirects from it.
 BASE="${CTM_RELEASE_BASE:-https://github.com/${REPO}/releases}"
@@ -53,6 +62,12 @@ RECORD="stable-${TARGET}.json"
 
 # --- tools -------------------------------------------------------------------
 command -v curl >/dev/null 2>&1 || fail "curl is required"
+# `ssh-keygen -Y` (OpenSSH 8.1, 2019) verifies the release signature; it is part of
+# the OpenSSH client on every Linux and macOS, so its absence is worth naming.
+command -v ssh-keygen >/dev/null 2>&1 \
+  || fail "ssh-keygen is required to verify the release signature (install openssh-client / openssh-clients)"
+ssh-keygen -Y 2>&1 | grep -q 'verify' \
+  || fail "ssh-keygen is too old to verify signatures (needs OpenSSH 8.1 or newer)"
 if command -v sha256sum >/dev/null 2>&1; then
   sha() { sha256sum "$1" | cut -d' ' -f1; }
 elif command -v shasum >/dev/null 2>&1; then
@@ -99,6 +114,29 @@ got_sha=$(sha "$tmp/$ASSET")
 [ "$got_sha" = "$sha256" ] || fail "sha256 mismatch: expected $sha256, got $got_sha"
 chmod 0755 "$tmp/$ASSET"
 
+# --- release signature (every platform) — ADR-020 -----------------------------------
+# The signature is fetched from the same release as the binary, bounded, and
+# verified with the pinned keys over the exact bytes that passed the sha256 check.
+sig_url="${BASE}/download/v${version}/${ASSET}.sshsig"
+curl -fsSL $CURL_PROTO --max-filesize 4096 \
+  -w '%{url_effective}\n' -o "$tmp/$ASSET.sshsig" "$sig_url" >"$tmp/sig_final_url" \
+  || fail "could not fetch the release signature: $sig_url (every release since 0.2.48 carries one)"
+sig_final=$(cat "$tmp/sig_final_url")
+case "$sig_final" in
+  https://github.com/*|https://release-assets.githubusercontent.com/*|https://objects.githubusercontent.com/*) ;;
+  "$BASE"/*) ;;
+  *) fail "signature download redirected off GitHub: $sig_final" ;;
+esac
+: >"$tmp/allowed_signers"
+printf '%s\n' "$RELEASE_SIGNING_KEYS" | while IFS= read -r key; do
+  [ -n "$key" ] && printf '%s namespaces="%s" %s\n' "$RELEASE_PRINCIPAL" "$RELEASE_NAMESPACE" "$key" >>"$tmp/allowed_signers"
+done
+if ! verdict=$(ssh-keygen -Y verify -f "$tmp/allowed_signers" -I "$RELEASE_PRINCIPAL" \
+      -n "$RELEASE_NAMESPACE" -s "$tmp/$ASSET.sshsig" <"$tmp/$ASSET" 2>&1); then
+  fail "release signature verification failed: $verdict"
+fi
+say "verified: release signature — $(printf '%s' "$verdict" | sed -n 's/.*with ED25519 key //p')"
+
 # --- Apple Developer ID + notarization (macOS) ------------------------------------
 # The bytes (already pinned by the record's sha256) must carry a valid Developer ID
 # signature by our team, as our identifier, with the hardened runtime and a secure
@@ -136,6 +174,8 @@ if [ -e "$INSTALL_DIR/ctm" ]; then
 fi
 printf 'standalone\n' >"$INSTALL_DIR/$MARKER"
 mv -f "$INSTALL_DIR/.ctm-candidate.partial" "$INSTALL_DIR/ctm"
+# Keep the verified signature beside the binary so `ctm doctor` can re-verify it.
+cp "$tmp/$ASSET.sshsig" "$INSTALL_DIR/.ctm-signature" && chmod 0644 "$INSTALL_DIR/.ctm-signature"
 
 installed=$("$INSTALL_DIR/ctm" --version 2>/dev/null || true)
 [ -n "$installed" ] || fail "installed binary did not run (see: codesign -dv $INSTALL_DIR/ctm)"

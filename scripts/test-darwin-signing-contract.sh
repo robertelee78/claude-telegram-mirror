@@ -69,8 +69,11 @@ done
 publish=$(workflow_job publish)
 grep -q 'runs-on: macos-latest' <<<"$publish" || fail "publish must run on macOS to re-verify with codesign"
 grep -q -- "--check-notarization --test-requirement '=notarized'" <<<"$publish" || fail "publish does not verify notarization online"
-grep -q 'needs: \[build-linux, sign-darwin\]' <<<"$publish" || fail "publish does not depend on the signed candidates"
-grep -q 'pattern: release-\*' <<<"$publish" || fail "publish could pick up unsigned candidates"
+# publish depends on sign-darwin through sign-release (ADR-020), and downloads only
+# what sign-release produced.
+grep -q 'needs: \[build-linux, sign-darwin\]' <<<"$(workflow_job sign-release)" || fail "sign-release does not depend on the Apple-signed candidates"
+grep -q 'needs: \[sign-release\]' <<<"$publish" || fail "publish does not depend on sign-release"
+grep -q 'pattern: signed-\*' <<<"$publish" || fail "publish could pick up unsigned candidates"
 grep -q '"kind,schema_version,package,channel,target,version,size,sha256"' <<<"$publish" || fail "publish does not pin the frozen record shape"
 ! grep -q 'signing:{' "$RELEASE" || fail "release.yml writes a signing block into the record (strands pre-0.2.45 clients)"
 

@@ -197,6 +197,11 @@ fn asset_url(version: &str, target: &str) -> String {
     format!("https://github.com/{REPO}/releases/download/v{version}/ctm-{target}")
 }
 
+/// ADR-020: the release signature published beside the binary, same tag.
+fn signature_url(version: &str, target: &str) -> String {
+    format!("{}.sshsig", asset_url(version, target))
+}
+
 fn allowed_origin(url: &reqwest::Url) -> bool {
     url.scheme() == "https"
         && matches!(
@@ -289,6 +294,74 @@ async fn download_asset(version: &str, target: &str, exp: &Expectation, dest: &P
         ));
     }
     Ok(())
+}
+
+/// ADR-020: fetch `ctm-<triple>.sshsig` from the same release, bounded and
+/// origin-checked like the binary. Its verification happens against the
+/// downloaded bytes in `verify_release_signature`.
+async fn download_signature(version: &str, target: &str) -> Result<String> {
+    let client = reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(RECORD_TIMEOUT)
+        .build()?;
+    let resp = client.get(signature_url(version, target)).send().await?;
+    if !allowed_origin(resp.url()) {
+        return Err(AppError::Config(
+            "release signature left GitHub origins".into(),
+        ));
+    }
+    if !resp.status().is_success() {
+        return Err(AppError::Config(format!(
+            "release signature download: HTTP {} (every release since 0.2.48 carries one)",
+            resp.status()
+        )));
+    }
+    let bytes = resp.bytes().await?;
+    if bytes.len() > crate::release_trust::MAX_SIG_BYTES {
+        return Err(AppError::Config(
+            "release signature larger than any we publish".into(),
+        ));
+    }
+    String::from_utf8(bytes.to_vec())
+        .map_err(|_| AppError::Config("release signature is not text".into()))
+}
+
+/// ADR-020: the candidate must carry a signature by a pinned release key before
+/// anything else looks at it. The signature is returned so it can be kept beside
+/// the installed binary for `ctm doctor`.
+fn verify_release_signature(candidate: &Path, armored: &str) -> Result<()> {
+    match crate::release_trust::verify_release_candidate(candidate, armored) {
+        Ok(id) => {
+            println!(
+                "verified: release signature by key {} (namespace {})",
+                id.fingerprint, id.namespace
+            );
+            Ok(())
+        }
+        Err(e) => {
+            let _ = fs::remove_file(candidate);
+            Err(e)
+        }
+    }
+}
+
+/// Keep the verified signature beside the binary (mode 0644) so `doctor` can
+/// re-verify the running binary offline. Not fatal: the swap already happened.
+fn store_signature(dir: &Path, armored: &str) {
+    let path = dir.join(crate::release_trust::SIGNATURE_FILE);
+    let written = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o644)
+        .open(&path)
+        .and_then(|mut f| f.write_all(armored.as_bytes()));
+    if let Err(e) = written {
+        eprintln!(
+            "warning: could not keep the release signature at {}: {e}",
+            path.display()
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------- publish
@@ -458,8 +531,11 @@ pub async fn run_update(check_only: bool, do_rollback: bool) -> anyhow::Result<(
     let candidate = install_dir.join(CANDIDATE_PARTIAL);
     println!("downloading ctm {} for {target} …", record.version);
     download_asset(&record.version, target, &exp, &candidate).await?;
+    let signature = download_signature(&record.version, target).await?;
+    verify_release_signature(&candidate, &signature)?;
     verify_apple_signature(&candidate)?;
     publish_candidate(&install_dir, &candidate, &exp)?;
+    store_signature(&install_dir, &signature);
     let new_bin = install_dir.join(ACTIVE_NAME);
     let installed = binary_version(&new_bin).unwrap_or_else(|| record.version.clone());
     println!("installed ctm {installed} at {}", new_bin.display());
@@ -695,6 +771,14 @@ mod tests {
         assert!(a.contains("?ts="), "{a}");
         let ts: u64 = a.split("?ts=").nth(1).unwrap().parse().unwrap();
         assert!(ts > 1_700_000_000, "a real epoch timestamp: {ts}");
+    }
+
+    #[test]
+    fn the_signature_sits_beside_the_asset_on_the_same_tag() {
+        assert_eq!(
+            signature_url("0.2.48", "x86_64-unknown-linux-gnu"),
+            "https://github.com/robertelee78/claude-telegram-mirror/releases/download/v0.2.48/ctm-x86_64-unknown-linux-gnu.sshsig"
+        );
     }
 
     #[test]

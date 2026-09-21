@@ -2,25 +2,34 @@ name: Release
 
 # ADR-017: the GitHub Release IS the distribution — per target one raw binary,
 # its .sha256, and a stable-<triple>.json record that `ctm update` and install.sh
-# resolve through releases/latest/download/.
+# resolve through releases/latest/download/. The record's field set is frozen.
 #
-# ADR-018: darwin binaries are Developer ID signed and notarized, and there is no
-# fallback. Building (no secrets) and signing (the `apple-release` environment)
-# are separate jobs; the signing job treats the unsigned candidate as data and
-# never executes it. `publish` re-verifies every darwin asset independently —
-# signature, identity, CDHash, online notary ticket — before the Release exists.
+# ADR-018: darwin binaries are Developer ID signed and notarized (sign-darwin,
+# environment apple-release). No fallback.
+#
+# ADR-020: every final binary is then signed with the ctm release key (sign-release,
+# environment release-signing, reviewer-gated) and publish re-verifies each
+# signature against the install.sh pins before the Release exists. Provenance is
+# attested for auditors; verify-install then runs the PUBLISHED installer as a user
+# on both platforms. Third-party actions are pinned by commit.
 
 on:
   push:
     tags: ['v*']
   workflow_dispatch:
 
+permissions: {}
+
 env:
   CARGO_TERM_COLOR: always
+  CTM_RELEASE_NAMESPACE: ctm.release
+  CTM_RELEASE_PRINCIPAL: release@ctm.cli
 
 jobs:
   # ---------------------------------------------------------------- linux (unsigned)
   build-linux:
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -32,11 +41,12 @@ jobs:
             linker: aarch64-linux-gnu-gcc
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: rust-crates
           key: ${{ matrix.target }}
@@ -73,7 +83,7 @@ jobs:
           cat "dist/stable-$TARGET.json"
           ls -l dist
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-${{ matrix.target }}
           path: dist/*
@@ -81,6 +91,8 @@ jobs:
 
   # ------------------------------------------------------- darwin: build (no secrets)
   build-darwin:
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -91,11 +103,12 @@ jobs:
             runner: macos-14
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: rust-crates
           key: ${{ matrix.target }}
@@ -126,16 +139,18 @@ jobs:
             > candidate/build.json
           cat candidate/build.json
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: unsigned-${{ matrix.target }}
           path: candidate/*
           if-no-files-found: error
           retention-days: 7
 
-  # -------------------------------------------- darwin: sign + notarize (protected)
+  # -------------------------------------------- darwin: Apple sign + notarize
   sign-darwin:
     needs: build-darwin
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -144,7 +159,7 @@ jobs:
     environment: apple-release
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
 
@@ -155,7 +170,7 @@ jobs:
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           git diff --exit-code
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: unsigned-${{ matrix.target }}
           path: ${{ runner.temp }}/candidate
@@ -223,26 +238,96 @@ jobs:
           cat "dist/stable-$TARGET.json"
           ls -l dist
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-${{ matrix.target }}
           path: dist/*
           if-no-files-found: error
 
+  # ------------------------------------------ every target: release key (protected)
+  sign-release:
+    needs: [build-linux, sign-darwin]
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    environment: release-signing
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Verify exact source identity
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git diff --exit-code
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: release-*
+          path: ${{ runner.temp }}/final
+
+      - name: Verify records, sign every binary
+        env:
+          CTM_RELEASE_SIGNING_KEY_BASE64: ${{ secrets.CTM_RELEASE_SIGNING_KEY_BASE64 }}
+          CTM_RELEASE_SIGNING_KEY_PASSPHRASE: ${{ secrets.CTM_RELEASE_SIGNING_KEY_PASSPHRASE }}
+          CTM_RELEASE_SIGNING_PUBLIC_KEY: ${{ vars.CTM_RELEASE_SIGNING_PUBLIC_KEY }}
+        run: |
+          set -euo pipefail
+          VERSION=$(grep -m1 '^version' rust-crates/ctm/Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          final="$RUNNER_TEMP/final"
+          test -z "$(find "$final" -type l -print -quit)"
+          signer="$GITHUB_WORKSPACE/scripts/sign-release.sh"
+          test -x "$signer"
+          mkdir -p dist
+          for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu aarch64-apple-darwin x86_64-apple-darwin; do
+            src="$final/release-$target"
+            bin="$src/ctm-$target"; rec="$src/stable-$target.json"
+            test -f "$bin" && test -f "$rec"
+            # The binary is data here: hashed and signed, never executed.
+            jq -e --arg v "$VERSION" --arg t "$target" \
+              '.kind=="ctm.standalone-release" and .schema_version==1 and .package=="ctm" and .channel=="stable" and .version==$v and .target==$t' "$rec" >/dev/null
+            test "$(jq -r 'keys_unsorted | join(",")' "$rec")" = "kind,schema_version,package,channel,target,version,size,sha256"
+            test "$(stat -c %s "$bin")" = "$(jq -r .size "$rec")"
+            test "$(sha256sum "$bin" | awk '{print $1}')" = "$(jq -r .sha256 "$rec")"
+            export CTM_RELEASE_SECRET_DIRECTORY="$RUNNER_TEMP/ctm-release-signing-secrets-$target"
+            "$signer" "$bin" "$RUNNER_TEMP/signed-$target" "$VERSION" "$GITHUB_SHA" "$target" \
+              "$CTM_RELEASE_NAMESPACE" "$CTM_RELEASE_PRINCIPAL"
+            mkdir -p "dist/$target"
+            cp "$RUNNER_TEMP/signed-$target/ctm-$target" "$RUNNER_TEMP/signed-$target/ctm-$target.sha256" \
+               "$RUNNER_TEMP/signed-$target/ctm-$target.sshsig" "dist/$target/"
+            cp "$RUNNER_TEMP/signed-$target/sigproof.json" "dist/$target/sigproof-$target.json"
+            cp "$rec" "dist/$target/"
+            # Apple's proof travels with the darwin assets.
+            for extra in "proof-$target.json" "notary-log-$target.json"; do
+              [ -f "$src/$extra" ] && cp "$src/$extra" "dist/$target/"
+            done
+            ls -l "dist/$target"
+          done
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: signed-all
+          path: dist/*
+          if-no-files-found: error
+
   # ------------------------------------------------------------------- publish
   publish:
-    needs: [build-linux, sign-darwin]
+    needs: [sign-release]
     # macOS so the darwin assets can be re-verified with Apple's own tools here,
     # independently of the job that produced them.
     runs-on: macos-latest
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          pattern: release-*
+          pattern: signed-*
           path: artifacts
 
       - name: Assemble and verify release assets
@@ -254,25 +339,42 @@ jobs:
             echo "ERROR: tag ${TAG} does not match Cargo.toml version ${VERSION}"; exit 1
           fi
           mkdir -p release
-          cp artifacts/*/ctm-* artifacts/*/stable-*.json release/
-          cp artifacts/*/proof-*.json artifacts/*/notary-log-*.json release/
+          cp artifacts/signed-all/*/* release/
           cp install.sh release/install.sh
 
+          # ADR-020: the pins install.sh carries are the verifier here — not the
+          # signing job's key, not the proof.
+          principal="$CTM_RELEASE_PRINCIPAL"; ns="$CTM_RELEASE_NAMESPACE"
+          awk '/^RELEASE_SIGNING_KEYS="/{f=1} f{line=$0; end=(line ~ /"$/); sub(/^RELEASE_SIGNING_KEYS="/,"",line); sub(/"$/,"",line); print line; if(end) exit}' install.sh \
+            | while IFS= read -r pin; do [ -n "$pin" ] && printf '%s namespaces="%s" %s\n' "$principal" "$ns" "$pin"; done > allowed_signers
+          test "$(wc -l < allowed_signers | tr -d ' ')" = 2
+          grep -q "^RELEASE_NAMESPACE=\"$ns\"$" install.sh
+          grep -q "^RELEASE_PRINCIPAL=\"$principal\"$" install.sh
+
           for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu aarch64-apple-darwin x86_64-apple-darwin; do
-            bin="release/ctm-$target"; rec="release/stable-$target.json"
-            test -f "$bin" && test -f "$rec"
+            bin="release/ctm-$target"; rec="release/stable-$target.json"; sig="release/ctm-$target.sshsig"; sp="release/sigproof-$target.json"
+            test -f "$bin" && test -f "$rec" && test -f "$sig" && test -f "$sp"
             jq -e --arg v "$VERSION" --arg t "$target" \
               '.kind=="ctm.standalone-release" and .version==$v and .target==$t' "$rec" >/dev/null
+            test "$(jq -r 'keys_unsorted | join(",")' "$rec")" = "kind,schema_version,package,channel,target,version,size,sha256"
             test "$(stat -f %z "$bin")" = "$(jq -r .size "$rec")"
-            test "$(shasum -a 256 "$bin" | awk '{print $1}')" = "$(jq -r .sha256 "$rec")"
+            sha=$(shasum -a 256 "$bin" | awk '{print $1}')
+            test "$sha" = "$(jq -r .sha256 "$rec")"
+            test "$(stat -f %z "$sig")" -le 4096
+            ssh-keygen -Y verify -f allowed_signers -I "$principal" -n "$ns" -s "$sig" < "$bin"
+            test "$(ssh-keygen -Y find-principals -f allowed_signers -s "$sig")" = "$principal"
+            jq -e --arg v "$VERSION" --arg t "$target" --arg sha "$sha" --arg src "$GITHUB_SHA" --arg ns "$ns" --arg p "$principal" '
+                .kind=="ctm.release-signature-proof" and .version==$v and .target==$t and .source_sha==$src
+                and .asset.sha256==$sha and .signature.namespace==$ns and .signature.principal==$p
+                and .signature.key_type=="ssh-ed25519" and .verification.ssh_keygen_verify=="accepted"
+              ' "$sp" >/dev/null
+            echo "verified $target: release signature $(jq -r .signature.fingerprint "$sp") in $ns"
           done
 
           # ADR-018: every darwin asset, independently: valid signature, pinned
           # identity, CDHash agreeing between bytes and proof, online notary ticket.
-          # The record must keep the frozen 0.2.44 shape (no extra fields).
           for target in aarch64-apple-darwin x86_64-apple-darwin; do
             bin="release/ctm-$target"; rec="release/stable-$target.json"; proof="release/proof-$target.json"
-            test "$(jq -r 'keys_unsorted | join(",")' "$rec")" = "kind,schema_version,package,channel,target,version,size,sha256"
             /usr/bin/codesign --verify --strict --all-architectures "$bin"
             info=$(/usr/bin/codesign --display --verbose=4 "$bin" 2>&1)
             team=$(jq -r .signing.team_id "$proof"); ident=$(jq -r .signing.identifier "$proof"); cdhash=$(jq -r .signing.cdhash "$proof")
@@ -294,11 +396,53 @@ jobs:
               --check-notarization --test-requirement '=notarized' "$bin"
             echo "verified $target: Developer ID $team as $ident, cdhash $cdhash, notarized"
           done
+          rm -f allowed_signers
           ls -l release
 
+      # Auditor layer (ADR-020): SLSA provenance for every binary, verifiable with
+      # `gh attestation verify ctm-<triple> -R robertelee78/claude-telegram-mirror`.
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          subject-path: |
+            release/ctm-x86_64-unknown-linux-gnu
+            release/ctm-aarch64-unknown-linux-gnu
+            release/ctm-aarch64-apple-darwin
+            release/ctm-x86_64-apple-darwin
+
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         if: startsWith(github.ref, 'refs/tags/')
         with:
           files: release/*
           generate_release_notes: true
+
+  # ------------------------------------------------- as a user, from the Release
+  verify-install:
+    needs: [publish]
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions: {}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Install the published release with the published installer
+        env:
+          CTM_NO_SHELL_SETUP: "1"
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          # The tag was just published; retry briefly while the release propagates.
+          for i in $(seq 1 12); do
+            if curl -fsSL --proto '=https' --tlsv1.2 \
+                 "https://github.com/${GITHUB_REPOSITORY}/releases/download/v${VERSION}/install.sh" -o install.sh; then break; fi
+            sleep 10
+          done
+          test -s install.sh
+          sh install.sh
+          "$HOME/.local/bin/ctm" --version | tee version.txt
+          grep -q "ctm ${VERSION}" version.txt
+          test -s "$HOME/.local/bin/.ctm-signature"
+          grep -q 'BEGIN SSH SIGNATURE' "$HOME/.local/bin/.ctm-signature"

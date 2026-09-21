@@ -1,6 +1,6 @@
 [package]
 name = "ctm"
-version = "0.2.47"
+version = "0.2.48"
 edition = "2021"
 description = "Claude Telegram Mirror — Bidirectional Claude Code <-> Telegram bridge"
 license = "MIT"
@@ -36,6 +36,9 @@ dialoguer = "0.11"
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
 futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
 sha2 = "0.10"
+# ADR-020: release-signature verification. Both are already in the tree via reqwest/rustls.
+ring = "0.17"
+base64 = "0.22"
 semver = "1"
 clap_complete = "4"
 

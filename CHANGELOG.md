@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.48] - 2026-09-21
+
+### Added (ADR-020: every release binary carries a signature every consumer verifies)
+- **All four release binaries are now signed with ctm's Ed25519 release key** in OpenSSH signature format (`ctm-<target>.sshsig` beside each binary, `sigproof-<target>.json` as the receipt). The Linux binaries had only a sha256 fetched from the same origin as the bytes; the macOS binaries had no signature Apple could not revoke. Two public keys are pinned in the binary and in `install.sh` — the signing key and an **offline standby**, so a leaked key is answered by a release every installed client already trusts.
+- **`ctm update` verifies the signature before the atomic swap, on every platform**, using `ring` (already ctm's TLS crypto — no new crates), and keeps it beside the binary as `.ctm-signature`. **`install.sh` verifies with `ssh-keygen -Y verify`** (OpenSSH ≥ 8.1) and now requires it. Order: sha256 → release key → (macOS) Apple. **`ctm doctor`** check 13 re-verifies the running binary against the kept signature on Linux as well as macOS.
+- **Signing is a separate, reviewer-gated job.** The new `sign-release` job runs under the `release-signing` environment (release tags only, required reviewer: the owner) after every build and after Apple signing; it refuses a key the consumers do not pin, self-verifies against the `install.sh` pins, and never executes a candidate. The same required reviewer now gates `apple-release`. A release needs an explicit approval after the tag push.
+- **`publish` re-verifies every signature independently** against the `install.sh` pins before the Release exists, attests SLSA build provenance (`gh attestation verify ctm-<target> -R robertelee78/claude-telegram-mirror`), and a **`verify-install` job then runs the published `install.sh` as a user on ubuntu and macOS**. Immutable releases are enabled on the repository; third-party actions are pinned by commit.
+- Decision record with the research behind it (Sigstore keyless and GitHub attestations rejected for the consumer side; why SSH signatures): `docs/adr/ADR-020-release-signatures-for-every-binary.md`, `docs/research/linux-release-signing-2026-09-21.md`.
+
 ## [0.2.47] - 2026-09-21
 
 ### Fixed (ADR-019: the service layer reports what the manager says, not what ctm asked for)

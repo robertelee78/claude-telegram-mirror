@@ -19,6 +19,8 @@ mod injector;
 mod installer;
 mod liveness;
 mod prune;
+// ADR-020: the release-signature verifier; pure parts are tested everywhere.
+mod release_trust;
 mod service;
 mod session;
 mod setup;

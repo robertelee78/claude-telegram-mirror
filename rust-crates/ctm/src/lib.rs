@@ -19,6 +19,7 @@ pub mod injector;
 pub mod installer;
 pub mod liveness;
 pub mod prune;
+pub mod release_trust;
 pub mod service;
 pub mod session;
 pub mod setup;

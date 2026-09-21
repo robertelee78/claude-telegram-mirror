@@ -32,6 +32,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: scripts/test-darwin-signing-contract.sh
+      - run: scripts/test-release-signing-contract.sh
+
+  # ADR-020: the release-signature contract on the OS most installs run on, too.
+  release-signing-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: scripts/test-release-signing-contract.sh
 
   # ADR-019: the service layer against the REAL service manager, on each platform.
   # A throwaway unit/plist under a unique label; the runner's own services are untouched.
