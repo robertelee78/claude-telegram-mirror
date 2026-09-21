@@ -53,8 +53,9 @@ jobs:
     runs-on: macos-latest
     steps:
       - run: |
-          set -x
+          set +e; set -x
           id -u; launchctl print gui/$(id -u) 2>&1 | head -3
+          sw_vers
           mkdir -p ~/Library/LaunchAgents
           P=~/Library/LaunchAgents/com.ctm.spike.plist
           cat > "$P" <<'X'
@@ -81,4 +82,12 @@ jobs:
           launchctl list | grep spike || echo "gone from list"
           launchctl bootout "$T"; echo "bootout-again=$?"
           launchctl unload "$P"; echo "unload-when-unloaded=$?"
+          launchctl start com.ctm.spike; echo "start-when-unloaded=$?"
           rm "$P"
+          echo "--- a job that dies immediately ---"
+          D=~/Library/LaunchAgents/com.ctm.dies.plist
+          sed -e 's#com.ctm.spike#com.ctm.dies#' -e 's#/bin/sleep#/usr/bin/false#' -e 's#<string>300</string>##' "$P.bak" > "$D" 2>/dev/null || printf '<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict><key>Label</key><string>com.ctm.dies</string><key>ProgramArguments</key><array><string>/usr/bin/false</string></array><key>RunAtLoad</key><true/><key>KeepAlive</key><dict><key>SuccessfulExit</key><false/><key>Crashed</key><true/></dict><key>ThrottleInterval</key><integer>10</integer></dict></plist>\n' > "$D"
+          launchctl bootstrap gui/$(id -u) "$D"; echo "bootstrap-dies=$?"
+          launchctl start com.ctm.dies; echo "start-dies=$?"
+          sleep 1; launchctl list | grep dies; launchctl print gui/$(id -u)/com.ctm.dies | grep -E 'state =|pid =|last exit'
+          launchctl bootout gui/$(id -u)/com.ctm.dies; rm "$D"
