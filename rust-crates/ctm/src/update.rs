@@ -299,7 +299,7 @@ async fn download_asset(version: &str, target: &str, exp: &Expectation, dest: &P
 /// ADR-020: fetch `ctm-<triple>.sshsig` from the same release, bounded and
 /// origin-checked like the binary. Its verification happens against the
 /// downloaded bytes in `verify_release_signature`.
-async fn download_signature(version: &str, target: &str) -> Result<String> {
+pub async fn download_signature(version: &str, target: &str) -> Result<String> {
     let client = reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(RECORD_TIMEOUT)
@@ -347,7 +347,7 @@ fn verify_release_signature(candidate: &Path, armored: &str) -> Result<()> {
 
 /// Keep the verified signature beside the binary (mode 0644) so `doctor` can
 /// re-verify the running binary offline. Not fatal: the swap already happened.
-fn store_signature(dir: &Path, armored: &str) {
+pub fn store_signature(dir: &Path, armored: &str) {
     let path = dir.join(crate::release_trust::SIGNATURE_FILE);
     let written = fs::OpenOptions::new()
         .create(true)

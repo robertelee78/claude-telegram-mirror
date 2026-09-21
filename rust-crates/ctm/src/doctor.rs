@@ -1050,10 +1050,38 @@ async fn check_update(fix: bool) -> CheckResult {
                     ));
                 }
             },
+            Err(_) if fix => {
+                // Installed by a pre-0.2.48 updater: fetch this version's signature
+                // from its release, verify it against the running bytes, keep it.
+                let target = crate::update::target_triple();
+                match crate::update::download_signature(env!("CARGO_PKG_VERSION"), target).await {
+                    Ok(armored) => {
+                        match crate::release_trust::verify_release_candidate(&exe, &armored) {
+                            Ok(id) => {
+                                crate::update::store_signature(install_dir, &armored);
+                                lines.push(format!(
+                                    "fixed: release signature fetched and verified, key {} ({})",
+                                    id.fingerprint, id.namespace
+                                ));
+                            }
+                            Err(e) => {
+                                escalate(CheckStatus::Fail, &mut worst);
+                                lines.push(format!(
+                                "release signature: the published signature does not match this binary ({e}); reinstall with the one-line installer"
+                            ));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        escalate(CheckStatus::Warn, &mut worst);
+                        lines.push(format!("release signature: could not fetch it ({e})"));
+                    }
+                }
+            }
             Err(_) => {
                 escalate(CheckStatus::Warn, &mut worst);
                 lines.push(
-                    "release signature: none kept beside the binary (installed before 0.2.48); run `ctm update`"
+                    "release signature: none kept beside the binary (installed before 0.2.48); `ctm doctor --fix` fetches and verifies it"
                         .into(),
                 );
             }

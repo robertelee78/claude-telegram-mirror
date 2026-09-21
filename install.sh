@@ -222,4 +222,9 @@ else
   say "next:"
   say "  ctm setup"
 fi
-[ -n "$npm_removed" ] && say "" && say "the old npm binary is gone; open a new shell so PATH finds $INSTALL_DIR/ctm"
+if [ -n "$npm_removed" ]; then
+  say ""
+  say "the old npm binary is gone; open a new shell so PATH finds $INSTALL_DIR/ctm"
+fi
+# The last command above must not decide the exit status: a successful install is 0.
+exit 0

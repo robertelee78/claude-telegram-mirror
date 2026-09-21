@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.49] - 2026-09-21
+
+### Fixed (found by 0.2.48's own `verify-install` job, running the published installer as a user)
+- **`install.sh` exited 1 after a successful install** whenever there was no old npm package to remove — its last line was a `[ -n "$npm_removed" ] && …` chain. Invisible under `curl | sh`, wrong for anything that checks the status. It now exits 0 on success.
+- **`ctm doctor --fix` fetches and verifies the release signature for a binary installed by a pre-0.2.48 updater** (which kept none), so the first hop onto the signed channel does not leave check 13 warning until the next update.
+
 ## [0.2.48] - 2026-09-21
 
 ### Added (ADR-020: every release binary carries a signature every consumer verifies)
