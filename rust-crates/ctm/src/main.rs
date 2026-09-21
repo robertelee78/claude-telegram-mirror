@@ -1,6 +1,7 @@
 // Public API modules — some exports used in tests and future phases.
 use tokio::io::AsyncWriteExt;
 
+mod apple_trust;
 mod bot;
 mod cli;
 mod colors;

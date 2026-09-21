@@ -1,258 +1,240 @@
 name: Release
 
+# ADR-017: the GitHub Release IS the distribution — per target one raw binary,
+# its .sha256, and a stable-<triple>.json record that `ctm update` and install.sh
+# resolve through releases/latest/download/.
+#
+# ADR-018: darwin binaries are Developer ID signed and notarized, and there is no
+# fallback. Building (no secrets) and signing (the `apple-release` environment)
+# are separate jobs; the signing job treats the unsigned candidate as data and
+# never executes it. `publish` re-verifies every darwin asset independently —
+# signature, identity, CDHash, online notary ticket — before the Release exists.
+
 on:
   push:
     tags: ['v*']
   workflow_dispatch:
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  build-linux-x64:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: rust-crates
-
-      - name: Build release binary
-        working-directory: rust-crates
-        run: |
-          cargo build --release --bin ctm
-          strip target/release/ctm
-          ls -lh target/release/ctm
-
-      - name: Package release asset
-        run: |
-          # ADR-017: one raw binary + one .sha256 + one release record per target.
-          # `ctm update` and install.sh read the record; the sha256 file is for humans.
-          mkdir -p dist
-          cp rust-crates/target/release/ctm dist/ctm-x86_64-unknown-linux-gnu
-          chmod 755 dist/ctm-x86_64-unknown-linux-gnu
-          ( cd dist && sha256sum ctm-x86_64-unknown-linux-gnu > ctm-x86_64-unknown-linux-gnu.sha256 )
-          VERSION=$(grep -m1 '^version' rust-crates/ctm/Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
-          SIZE=$(stat -c %s dist/ctm-x86_64-unknown-linux-gnu 2>/dev/null || stat -f %z dist/ctm-x86_64-unknown-linux-gnu)
-          SHA=$(cut -d' ' -f1 dist/ctm-x86_64-unknown-linux-gnu.sha256)
-          printf '{"kind":"ctm.standalone-release","schema_version":1,"package":"ctm","channel":"stable","target":"x86_64-unknown-linux-gnu","version":"%s","size":%s,"sha256":"%s"}\n' \
-            "$VERSION" "$SIZE" "$SHA" > dist/stable-x86_64-unknown-linux-gnu.json
-          cat dist/stable-x86_64-unknown-linux-gnu.json
-          ls -l dist
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: x86_64-unknown-linux-gnu
-          path: dist/*
-
-  build-darwin-arm64:
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: rust-crates
-
-      - name: Build release binary
-        working-directory: rust-crates
-        run: |
-          cargo build --release --bin ctm
-          strip target/release/ctm
-          ls -lh target/release/ctm
-
-      # Sign + notarize AFTER strip (strip rewrites the Mach-O and invalidates any
-      # signature) and BEFORE the checksum/pack step (so checksums.json covers the
-      # signed bytes). Without a trusted Developer ID signature, modern macOS
-      # SIGKILLs the launchd-spawned daemon for a code-signing / launch-constraint
-      # violation. Gated on secrets so forks/PRs still build (ad-hoc fallback).
-      - name: Sign and notarize (Developer ID)
-        working-directory: rust-crates
-        env:
-          APPLE_CERT_P12_BASE64: ${{ secrets.APPLE_CERT_P12_BASE64 }}
-          APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          APPLE_NOTARY_PASSWORD: ${{ secrets.APPLE_NOTARY_PASSWORD }}
-        run: |
-          set -euo pipefail
-          BIN=target/release/ctm
-          if [ -z "${APPLE_SIGNING_IDENTITY:-}" ] || [ -z "${APPLE_CERT_P12_BASE64:-}" ]; then
-            echo "::warning::Apple signing secrets not set — shipping an ad-hoc-signed binary that macOS Gatekeeper may reject. Configure APPLE_* secrets to notarize."
-            codesign --force --sign - --timestamp=none "$BIN" || true
-            codesign -dvvv "$BIN" 2>&1 || true
-            exit 0
-          fi
-          KEYCHAIN="$RUNNER_TEMP/ctm-signing.keychain-db"
-          KEYCHAIN_PW="$(openssl rand -hex 20)"
-          security create-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
-          security set-keychain-settings -lut 21600 "$KEYCHAIN"
-          security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
-          echo "$APPLE_CERT_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
-          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$APPLE_CERT_PASSWORD" -T /usr/bin/codesign
-          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PW" "$KEYCHAIN"
-          security list-keychains -d user -s "$KEYCHAIN"
-          # Hardened runtime + secure timestamp are required for notarization.
-          codesign --force --options runtime --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$BIN"
-          codesign --verify --strict --verbose=2 "$BIN"
-          # A bare CLI Mach-O is notarized via a zip (it cannot be stapled; Gatekeeper
-          # validates the registered cdhash online).
-          ditto -c -k --keepParent "$BIN" "$RUNNER_TEMP/ctm.zip"
-          xcrun notarytool submit "$RUNNER_TEMP/ctm.zip" \
-            --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" \
-            --password "$APPLE_NOTARY_PASSWORD" --wait
-          codesign -dvvv "$BIN" 2>&1 | grep -E 'Authority|TeamIdentifier' || true
-          rm -f "$RUNNER_TEMP/cert.p12"
-
-      - name: Package release asset
-        run: |
-          # ADR-017: one raw binary + one .sha256 + one release record per target.
-          # `ctm update` and install.sh read the record; the sha256 file is for humans.
-          mkdir -p dist
-          cp rust-crates/target/release/ctm dist/ctm-aarch64-apple-darwin
-          chmod 755 dist/ctm-aarch64-apple-darwin
-          ( cd dist && shasum -a 256 ctm-aarch64-apple-darwin > ctm-aarch64-apple-darwin.sha256 )
-          VERSION=$(grep -m1 '^version' rust-crates/ctm/Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
-          SIZE=$(stat -c %s dist/ctm-aarch64-apple-darwin 2>/dev/null || stat -f %z dist/ctm-aarch64-apple-darwin)
-          SHA=$(cut -d' ' -f1 dist/ctm-aarch64-apple-darwin.sha256)
-          printf '{"kind":"ctm.standalone-release","schema_version":1,"package":"ctm","channel":"stable","target":"aarch64-apple-darwin","version":"%s","size":%s,"sha256":"%s"}\n' \
-            "$VERSION" "$SIZE" "$SHA" > dist/stable-aarch64-apple-darwin.json
-          cat dist/stable-aarch64-apple-darwin.json
-          ls -l dist
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: aarch64-apple-darwin
-          path: dist/*
-
-  build-darwin-x64:
-    runs-on: macos-14
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-apple-darwin
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: rust-crates
-
-      - name: Build release binary
-        working-directory: rust-crates
-        run: |
-          cargo build --release --target x86_64-apple-darwin --bin ctm
-          strip target/x86_64-apple-darwin/release/ctm
-          ls -lh target/x86_64-apple-darwin/release/ctm
-
-      # See darwin-arm64 job for rationale. Note: `strip` on the x64 cross-built
-      # binary removes its signature entirely, so signing here is mandatory for the
-      # Intel package to be runnable at all.
-      - name: Sign and notarize (Developer ID)
-        working-directory: rust-crates
-        env:
-          APPLE_CERT_P12_BASE64: ${{ secrets.APPLE_CERT_P12_BASE64 }}
-          APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          APPLE_NOTARY_PASSWORD: ${{ secrets.APPLE_NOTARY_PASSWORD }}
-        run: |
-          set -euo pipefail
-          BIN=target/x86_64-apple-darwin/release/ctm
-          if [ -z "${APPLE_SIGNING_IDENTITY:-}" ] || [ -z "${APPLE_CERT_P12_BASE64:-}" ]; then
-            echo "::warning::Apple signing secrets not set — shipping an ad-hoc-signed binary that macOS Gatekeeper may reject. Configure APPLE_* secrets to notarize."
-            codesign --force --sign - --timestamp=none "$BIN" || true
-            codesign -dvvv "$BIN" 2>&1 || true
-            exit 0
-          fi
-          KEYCHAIN="$RUNNER_TEMP/ctm-signing.keychain-db"
-          KEYCHAIN_PW="$(openssl rand -hex 20)"
-          security create-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
-          security set-keychain-settings -lut 21600 "$KEYCHAIN"
-          security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
-          echo "$APPLE_CERT_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
-          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$APPLE_CERT_PASSWORD" -T /usr/bin/codesign
-          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PW" "$KEYCHAIN"
-          security list-keychains -d user -s "$KEYCHAIN"
-          codesign --force --options runtime --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$BIN"
-          codesign --verify --strict --verbose=2 "$BIN"
-          ditto -c -k --keepParent "$BIN" "$RUNNER_TEMP/ctm.zip"
-          xcrun notarytool submit "$RUNNER_TEMP/ctm.zip" \
-            --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" \
-            --password "$APPLE_NOTARY_PASSWORD" --wait
-          codesign -dvvv "$BIN" 2>&1 | grep -E 'Authority|TeamIdentifier' || true
-          rm -f "$RUNNER_TEMP/cert.p12"
-
-      - name: Package release asset
-        run: |
-          # ADR-017: one raw binary + one .sha256 + one release record per target.
-          # `ctm update` and install.sh read the record; the sha256 file is for humans.
-          mkdir -p dist
-          cp rust-crates/target/x86_64-apple-darwin/release/ctm dist/ctm-x86_64-apple-darwin
-          chmod 755 dist/ctm-x86_64-apple-darwin
-          ( cd dist && shasum -a 256 ctm-x86_64-apple-darwin > ctm-x86_64-apple-darwin.sha256 )
-          VERSION=$(grep -m1 '^version' rust-crates/ctm/Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
-          SIZE=$(stat -c %s dist/ctm-x86_64-apple-darwin 2>/dev/null || stat -f %z dist/ctm-x86_64-apple-darwin)
-          SHA=$(cut -d' ' -f1 dist/ctm-x86_64-apple-darwin.sha256)
-          printf '{"kind":"ctm.standalone-release","schema_version":1,"package":"ctm","channel":"stable","target":"x86_64-apple-darwin","version":"%s","size":%s,"sha256":"%s"}\n' \
-            "$VERSION" "$SIZE" "$SHA" > dist/stable-x86_64-apple-darwin.json
-          cat dist/stable-x86_64-apple-darwin.json
-          ls -l dist
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: x86_64-apple-darwin
-          path: dist/*
-
-  build-linux-arm64:
+  # ---------------------------------------------------------------- linux (unsigned)
+  build-linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            strip: strip
+          - target: aarch64-unknown-linux-gnu
+            strip: aarch64-linux-gnu-strip
+            linker: aarch64-linux-gnu-gcc
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-unknown-linux-gnu
+          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust-crates
+          key: ${{ matrix.target }}
 
       - name: Install cross-linker
+        if: matrix.linker
         run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
 
       - name: Build release binary
         working-directory: rust-crates
         env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.linker }}
         run: |
-          cargo build --release --target aarch64-unknown-linux-gnu --bin ctm
-          aarch64-linux-gnu-strip target/aarch64-unknown-linux-gnu/release/ctm
-          ls -lh target/aarch64-unknown-linux-gnu/release/ctm
+          cargo build --release --target ${{ matrix.target }} --bin ctm
+          ${{ matrix.strip }} target/${{ matrix.target }}/release/ctm
+          ls -lh target/${{ matrix.target }}/release/ctm
 
       - name: Package release asset
+        env:
+          TARGET: ${{ matrix.target }}
         run: |
-          # ADR-017: one raw binary + one .sha256 + one release record per target.
-          # `ctm update` and install.sh read the record; the sha256 file is for humans.
+          set -euo pipefail
           mkdir -p dist
-          cp rust-crates/target/aarch64-unknown-linux-gnu/release/ctm dist/ctm-aarch64-unknown-linux-gnu
-          chmod 755 dist/ctm-aarch64-unknown-linux-gnu
-          ( cd dist && sha256sum ctm-aarch64-unknown-linux-gnu > ctm-aarch64-unknown-linux-gnu.sha256 )
+          cp "rust-crates/target/$TARGET/release/ctm" "dist/ctm-$TARGET"
+          chmod 755 "dist/ctm-$TARGET"
+          ( cd dist && sha256sum "ctm-$TARGET" > "ctm-$TARGET.sha256" )
           VERSION=$(grep -m1 '^version' rust-crates/ctm/Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
-          SIZE=$(stat -c %s dist/ctm-aarch64-unknown-linux-gnu 2>/dev/null || stat -f %z dist/ctm-aarch64-unknown-linux-gnu)
-          SHA=$(cut -d' ' -f1 dist/ctm-aarch64-unknown-linux-gnu.sha256)
-          printf '{"kind":"ctm.standalone-release","schema_version":1,"package":"ctm","channel":"stable","target":"aarch64-unknown-linux-gnu","version":"%s","size":%s,"sha256":"%s"}\n' \
-            "$VERSION" "$SIZE" "$SHA" > dist/stable-aarch64-unknown-linux-gnu.json
-          cat dist/stable-aarch64-unknown-linux-gnu.json
+          SIZE=$(stat -c %s "dist/ctm-$TARGET")
+          SHA=$(cut -d' ' -f1 "dist/ctm-$TARGET.sha256")
+          jq -nc --arg target "$TARGET" --arg version "$VERSION" --argjson size "$SIZE" --arg sha "$SHA" \
+            '{kind:"ctm.standalone-release",schema_version:1,package:"ctm",channel:"stable",
+              target:$target,version:$version,size:$size,sha256:$sha}' \
+            > "dist/stable-$TARGET.json"
+          cat "dist/stable-$TARGET.json"
           ls -l dist
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: aarch64-unknown-linux-gnu
+          name: release-${{ matrix.target }}
           path: dist/*
+          if-no-files-found: error
 
+  # ------------------------------------------------------- darwin: build (no secrets)
+  build-darwin:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+          - target: x86_64-apple-darwin
+            runner: macos-14
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust-crates
+          key: ${{ matrix.target }}
+
+      - name: Build release binary
+        working-directory: rust-crates
+        run: |
+          cargo build --release --target ${{ matrix.target }} --bin ctm
+          # strip rewrites the Mach-O: the arm64 output keeps a linker ad-hoc
+          # signature, the x64 one is left wholly unsigned. Both are signed for
+          # real in sign-darwin; nothing here is a signature anyone should trust.
+          strip target/${{ matrix.target }}/release/ctm
+          ls -lh target/${{ matrix.target }}/release/ctm
+
+      - name: Stage unsigned candidate with receipt
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          mkdir -p candidate
+          cp "rust-crates/target/$TARGET/release/ctm" "candidate/ctm-$TARGET-unsigned"
+          chmod 0555 "candidate/ctm-$TARGET-unsigned"
+          VERSION=$(grep -m1 '^version' rust-crates/ctm/Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          SHA=$(shasum -a 256 "candidate/ctm-$TARGET-unsigned" | awk '{print $1}')
+          jq -nc --arg source_sha "$GITHUB_SHA" --arg version "$VERSION" --arg target "$TARGET" --arg sha "$SHA" \
+            '{kind:"ctm.darwin-build-candidate",schema_version:1,source_sha:$source_sha,
+              version:$version,target:$target,unsigned_binary_sha256:$sha}' \
+            > candidate/build.json
+          cat candidate/build.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-${{ matrix.target }}
+          path: candidate/*
+          if-no-files-found: error
+          retention-days: 7
+
+  # -------------------------------------------- darwin: sign + notarize (protected)
+  sign-darwin:
+    needs: build-darwin
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [aarch64-apple-darwin, x86_64-apple-darwin]
+    runs-on: macos-latest
+    environment: apple-release
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Verify exact source identity
+        run: |
+          set -euo pipefail
+          test "$(uname -s)" = Darwin
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git diff --exit-code
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: unsigned-${{ matrix.target }}
+          path: ${{ runner.temp }}/candidate
+
+      - name: Verify receipt, sign, notarize
+        env:
+          TARGET: ${{ matrix.target }}
+          APPLE_DEVELOPER_ID_APPLICATION: ${{ vars.APPLE_DEVELOPER_ID_APPLICATION }}
+          APPLE_DEVELOPER_ID_APPLICATION_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_APPLICATION_P12_BASE64 }}
+          APPLE_DEVELOPER_ID_APPLICATION_P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_APPLICATION_P12_PASSWORD }}
+          APPLE_NOTARY_KEY_P8_BASE64: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 }}
+          APPLE_NOTARY_KEY_ID: ${{ vars.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ vars.APPLE_NOTARY_ISSUER_ID }}
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+          APPLE_CODESIGN_IDENTIFIER: ${{ vars.APPLE_CODESIGN_IDENTIFIER }}
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/candidate"
+          receipt="$root/build.json"
+          unsigned="$root/ctm-$TARGET-unsigned"
+          VERSION=$(grep -m1 '^version' rust-crates/ctm/Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          test -z "$(find "$root" -type l -print -quit)"
+          test "$(find "$root" -mindepth 1 -maxdepth 1 -print | wc -l | tr -d ' ')" = 2
+          jq -e --arg source_sha "$GITHUB_SHA" --arg version "$VERSION" --arg target "$TARGET" '
+              .kind == "ctm.darwin-build-candidate"
+              and .schema_version == 1
+              and .source_sha == $source_sha
+              and .version == $version
+              and .target == $target
+              and (.unsigned_binary_sha256 | test("^[0-9a-f]{64}$"))
+            ' "$receipt" >/dev/null
+          chmod 0555 "$unsigned"
+          test "$(shasum -a 256 "$unsigned" | awk '{print $1}')" = \
+            "$(jq -er .unsigned_binary_sha256 "$receipt")"
+          # The pins in src/apple_trust.rs and install.sh must be what we sign as,
+          # or every consumer would refuse the release we are about to cut.
+          test "$APPLE_CODESIGN_IDENTIFIER" = us.ctm.cli
+          test "$APPLE_TEAM_ID" = 3T2D2YNTVW
+          grep -q "pub const TEAM_ID: &str = \"$APPLE_TEAM_ID\";" rust-crates/ctm/src/apple_trust.rs
+          grep -q "pub const IDENTIFIER: &str = \"$APPLE_CODESIGN_IDENTIFIER\";" rust-crates/ctm/src/apple_trust.rs
+          grep -q "^APPLE_TEAM_ID=\"$APPLE_TEAM_ID\"$" install.sh
+          grep -q "^APPLE_IDENTIFIER=\"$APPLE_CODESIGN_IDENTIFIER\"$" install.sh
+          signer="$GITHUB_WORKSPACE/scripts/sign-notarize-darwin.sh"
+          test -x "$signer"
+          export APPLE_RELEASE_SECRET_DIRECTORY="$RUNNER_TEMP/ctm-apple-release-secrets-$TARGET"
+          "$signer" "$unsigned" "$RUNNER_TEMP/signed" "$VERSION" "$GITHUB_SHA" \
+            "$APPLE_TEAM_ID" "$APPLE_CODESIGN_IDENTIFIER" "$TARGET"
+
+      - name: Write release record from the proof
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          signed="$RUNNER_TEMP/signed"
+          mkdir -p dist
+          cp "$signed/ctm-$TARGET" "$signed/ctm-$TARGET.sha256" dist/
+          cp "$signed/proof.json" "dist/proof-$TARGET.json"
+          cp "$signed/notary-log.json" "dist/notary-log-$TARGET.json"
+          # The record names the SIGNED bytes (sha256 changed at signing) and the
+          # identity consumers must find on them.
+          jq -c '{kind:"ctm.standalone-release",schema_version:1,package:"ctm",channel:"stable",
+                  target:.target,version:.version,size:.asset.size,sha256:.asset.sha256,
+                  signing:{team_id:.signing.team_id,identifier:.signing.identifier,cdhash:.signing.cdhash}}' \
+            "$signed/proof.json" > "dist/stable-$TARGET.json"
+          cat "dist/stable-$TARGET.json"
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  # ------------------------------------------------------------------- publish
   publish:
-    needs: [build-linux-x64, build-linux-arm64, build-darwin-arm64, build-darwin-x64]
-    runs-on: ubuntu-latest
+    needs: [build-linux, sign-darwin]
+    # macOS so the darwin assets can be re-verified with Apple's own tools here,
+    # independently of the job that produced them.
+    runs-on: macos-latest
     permissions:
       contents: write
     steps:
@@ -260,25 +242,55 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
+          pattern: release-*
           path: artifacts
 
-      - name: Assemble release assets
+      - name: Assemble and verify release assets
         run: |
-          # ADR-017: the GitHub Release IS the distribution. Per target: the binary,
-          # its .sha256, and the stable-<triple>.json record that `ctm update` and
-          # install.sh resolve through releases/latest/download/. Plus install.sh
-          # itself, so a pinned copy travels with every release.
-          mkdir -p release
-          cp artifacts/*/ctm-* artifacts/*/stable-*.json release/
-          cp install.sh release/install.sh
+          set -euo pipefail
           VERSION=$(grep -m1 '^version' rust-crates/ctm/Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
           TAG="${GITHUB_REF_NAME}"
           if [ "${TAG}" != "v${VERSION}" ]; then
             echo "ERROR: tag ${TAG} does not match Cargo.toml version ${VERSION}"; exit 1
           fi
-          # Every record must carry this version, or `ctm update` would install the wrong tag's asset.
-          for r in release/stable-*.json; do
-            grep -q "\"version\":\"${VERSION}\"" "$r" || { echo "ERROR: $r is not for ${VERSION}"; cat "$r"; exit 1; }
+          mkdir -p release
+          cp artifacts/*/ctm-* artifacts/*/stable-*.json release/
+          cp artifacts/*/proof-*.json artifacts/*/notary-log-*.json release/
+          cp install.sh release/install.sh
+
+          for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu aarch64-apple-darwin x86_64-apple-darwin; do
+            bin="release/ctm-$target"; rec="release/stable-$target.json"
+            test -f "$bin" && test -f "$rec"
+            jq -e --arg v "$VERSION" --arg t "$target" \
+              '.kind=="ctm.standalone-release" and .version==$v and .target==$t' "$rec" >/dev/null
+            test "$(stat -f %z "$bin")" = "$(jq -r .size "$rec")"
+            test "$(shasum -a 256 "$bin" | awk '{print $1}')" = "$(jq -r .sha256 "$rec")"
+          done
+
+          # ADR-018: every darwin asset, independently: valid signature, pinned
+          # identity, CDHash agreeing across bytes/record/proof, online notary ticket.
+          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+            bin="release/ctm-$target"; rec="release/stable-$target.json"; proof="release/proof-$target.json"
+            /usr/bin/codesign --verify --strict --all-architectures "$bin"
+            info=$(/usr/bin/codesign --display --verbose=4 "$bin" 2>&1)
+            team=$(jq -r .signing.team_id "$rec"); ident=$(jq -r .signing.identifier "$rec"); cdhash=$(jq -r .signing.cdhash "$rec")
+            test "$team" = 3T2D2YNTVW && test "$ident" = us.ctm.cli
+            grep -qx "TeamIdentifier=$team" <<<"$info"
+            grep -qx "Identifier=$ident" <<<"$info"
+            grep -qx "CDHash=$cdhash" <<<"$info"
+            grep -q "^Authority=Developer ID Application: .* ($team)\$" <<<"$info"
+            grep -qx "Authority=Developer ID Certification Authority" <<<"$info"
+            grep -qx "Authority=Apple Root CA" <<<"$info"
+            grep -Eq '^CodeDirectory .* flags=0x[0-9a-f]+\(runtime' <<<"$info"
+            grep -Eq '^Timestamp=.+$' <<<"$info"
+            jq -e --arg v "$VERSION" --arg t "$target" --arg sha "$(jq -r .sha256 "$rec")" --arg cd "$cdhash" --arg src "$GITHUB_SHA" '
+                .kind=="ctm.darwin-release-proof" and .version==$v and .target==$t and .source_sha==$src
+                and .asset.sha256==$sha and .signing.cdhash==$cd
+                and .notarization.status=="Accepted" and .verification.online_notarization=="accepted"
+              ' "$proof" >/dev/null
+            /usr/bin/codesign --verify --strict --all-architectures \
+              --check-notarization --test-requirement '=notarized' "$bin"
+            echo "verified $target: Developer ID $team as $ident, cdhash $cdhash, notarized"
           done
           ls -l release
 

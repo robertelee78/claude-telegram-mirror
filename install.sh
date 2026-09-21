@@ -6,7 +6,8 @@
 # Installs the latest ctm release for this machine into ~/.local/bin (override with
 # CTM_INSTALL_DIR). Fetches the per-target release record via GitHub's
 # releases/latest/download redirect, downloads the matching binary from the same
-# release, verifies size and SHA-256, then installs it atomically, then runs
+# release, verifies size and SHA-256 — and on macOS the Developer ID signature and
+# Apple notarization ticket (ADR-018) — then installs it atomically, then runs
 # `ctm shell-setup` so PATH and tab completion work in your next shell (one
 # marker-delimited block at the end of your rc; CTM_NO_SHELL_SETUP=1 skips it).
 #
@@ -14,6 +15,11 @@
 set -eu
 
 REPO="robertelee78/claude-telegram-mirror"
+# ADR-018: every darwin release is signed by this team under this identifier. Pinned
+# here, as in the binary's own updater, so a re-signed asset is refused even if the
+# record that names it was replaced too.
+APPLE_TEAM_ID="3T2D2YNTVW"
+APPLE_IDENTIFIER="us.ctm.cli"
 # CTM_RELEASE_BASE exists for the installer's own end-to-end test against a local
 # stand-in server; the origin check below still applies to redirects from it.
 BASE="${CTM_RELEASE_BASE:-https://github.com/${REPO}/releases}"
@@ -92,6 +98,34 @@ got_size=$(wc -c <"$tmp/$ASSET" | tr -d ' ')
 got_sha=$(sha "$tmp/$ASSET")
 [ "$got_sha" = "$sha256" ] || fail "sha256 mismatch: expected $sha256, got $got_sha"
 chmod 0755 "$tmp/$ASSET"
+
+# --- Apple Developer ID + notarization (macOS) ------------------------------------
+# The record's "signing" block must name our team/identifier, the bytes must carry a
+# valid Developer ID signature with the hardened runtime whose CDHash the record
+# names, and Apple must confirm the notary ticket online. No step here is optional.
+if [ "$os" = Darwin ]; then
+  r_team=$(field team_id); r_ident=$(field identifier); r_cdhash=$(field cdhash)
+  [ "$r_team" = "$APPLE_TEAM_ID" ] && [ "$r_ident" = "$APPLE_IDENTIFIER" ] \
+    || fail "release record names signer '$r_team' as '$r_ident'; expected $APPLE_TEAM_ID as $APPLE_IDENTIFIER"
+  [ -n "$r_cdhash" ] || fail "release record has no signed CDHash"
+  /usr/bin/codesign --verify --strict --all-architectures "$tmp/$ASSET" 2>/dev/null \
+    || fail "Apple code-signature verification failed"
+  info=$(/usr/bin/codesign --display --verbose=4 "$tmp/$ASSET" 2>&1)
+  printf '%s\n' "$info" | grep -qx "TeamIdentifier=$APPLE_TEAM_ID" \
+    || fail "binary is not signed by team $APPLE_TEAM_ID"
+  printf '%s\n' "$info" | grep -qx "Identifier=$APPLE_IDENTIFIER" \
+    || fail "binary is not signed as $APPLE_IDENTIFIER"
+  printf '%s\n' "$info" | grep -q "^Authority=Developer ID Application: .* ($APPLE_TEAM_ID)\$" \
+    || fail "binary is not signed with a Developer ID Application certificate"
+  printf '%s\n' "$info" | grep -q '^CodeDirectory .*flags=0x[0-9a-f]*(runtime' \
+    || fail "binary signature lacks the hardened runtime"
+  printf '%s\n' "$info" | grep -qx "CDHash=$r_cdhash" \
+    || fail "signed CDHash does not match the release record"
+  /usr/bin/codesign --verify --strict --all-architectures --check-notarization \
+    --test-requirement '=notarized' "$tmp/$ASSET" 2>/dev/null \
+    || fail "Apple did not confirm the notarization ticket (is this machine online?)"
+  say "verified: Developer ID $APPLE_TEAM_ID as $APPLE_IDENTIFIER, notarized"
+fi
 
 # --- install (atomic) -----------------------------------------------------------
 mkdir -p "$INSTALL_DIR"

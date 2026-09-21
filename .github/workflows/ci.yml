@@ -24,3 +24,11 @@ jobs:
       - run: cargo clippy -- -D warnings
       - run: cargo fmt --check
       - run: cargo test
+
+  # ADR-018: the signing pipeline's shape and the signer's refusals, on the OS
+  # that signs. Static checks; no credentials are involved.
+  darwin-signing-contract:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: scripts/test-darwin-signing-contract.sh

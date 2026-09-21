@@ -107,6 +107,10 @@ pub struct ReleaseRecord {
     pub version: String,
     pub size: u64,
     pub sha256: String,
+    /// ADR-018: present on darwin records — the Developer ID team, identifier and
+    /// CDHash the signed asset must carry. Absent on Linux records.
+    #[serde(default)]
+    pub signing: Option<crate::apple_trust::RecordSigning>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,6 +148,13 @@ pub fn parse_record(bytes: &[u8], target: &str) -> Result<(Version, ReleaseRecor
         ));
     }
     let sha = hex32(&r.sha256)?;
+    // A darwin release without a signing block is not a release we ship any more
+    // (ADR-018); refuse it here so the updater cannot be talked into an unsigned swap.
+    if r.target.ends_with("-apple-darwin") && r.signing.is_none() {
+        return Err(AppError::Config(
+            "darwin release record carries no Developer ID signing block".into(),
+        ));
+    }
     Ok((
         version,
         r.clone(),
@@ -456,6 +467,7 @@ pub async fn run_update(check_only: bool, do_rollback: bool) -> anyhow::Result<(
     let candidate = install_dir.join(CANDIDATE_PARTIAL);
     println!("downloading ctm {} for {target} …", record.version);
     download_asset(&record.version, target, &exp, &candidate).await?;
+    verify_apple_signature(&candidate, &record)?;
     publish_candidate(&install_dir, &candidate, &exp)?;
     let new_bin = install_dir.join(ACTIVE_NAME);
     let installed = binary_version(&new_bin).unwrap_or_else(|| record.version.clone());
@@ -490,6 +502,32 @@ pub async fn run_update(check_only: bool, do_rollback: bool) -> anyhow::Result<(
     Ok(())
 }
 
+/// ADR-018: on macOS the candidate must carry the pinned Developer ID signature
+/// and an accepted notary ticket before it is allowed to become `ctm`. Elsewhere
+/// there is nothing to check (Linux assets are unsigned beyond sha256 + origin).
+fn verify_apple_signature(candidate: &Path, record: &ReleaseRecord) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let signing = record.signing.as_ref().ok_or_else(|| {
+            AppError::Config("darwin release record carries no signing block".into())
+        })?;
+        if let Err(e) = crate::apple_trust::verify_release_candidate(candidate, signing) {
+            let _ = fs::remove_file(candidate);
+            return Err(e);
+        }
+        println!(
+            "verified: Developer ID {} as {}, notarized",
+            signing.team_id, signing.identifier
+        );
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (candidate, record);
+        Ok(())
+    }
+}
+
 fn run_new(bin: &Path, args: &[&str]) {
     match Command::new(bin).args(args).status() {
         Ok(s) if s.success() => {}
@@ -522,14 +560,52 @@ pub async fn latest_version() -> Option<Version> {
 mod tests {
     use super::*;
 
-    fn record_json(target: &str, version: &str, size: u64, sha: &str) -> Vec<u8> {
-        serde_json::to_vec(&serde_json::json!({
+    fn record_value(target: &str, version: &str, size: u64, sha: &str) -> serde_json::Value {
+        let mut v = serde_json::json!({
             "kind": RECORD_KIND, "schema_version": RECORD_SCHEMA, "package": "ctm",
             "channel": "stable", "target": target, "version": version, "size": size, "sha256": sha
-        }))
-        .unwrap()
+        });
+        // ADR-018: darwin records name their signer; Linux records do not.
+        if target.ends_with("-apple-darwin") {
+            v["signing"] = serde_json::json!({
+                "team_id": crate::apple_trust::TEAM_ID,
+                "identifier": crate::apple_trust::IDENTIFIER,
+                "cdhash": "51c099661a857daeb11a8b631adfe83b4df470b7"
+            });
+        }
+        v
+    }
+    fn record_json(target: &str, version: &str, size: u64, sha: &str) -> Vec<u8> {
+        serde_json::to_vec(&record_value(target, version, size, sha)).unwrap()
     }
     const SHA: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+    #[test]
+    fn darwin_records_must_name_their_signer_linux_records_need_not() {
+        let mac = "aarch64-apple-darwin";
+        let (_, r, _) = parse_record(&record_json(mac, "0.2.45", 10, SHA), mac).unwrap();
+        let s = r.signing.expect("darwin record parsed its signing block");
+        assert_eq!(s.team_id, crate::apple_trust::TEAM_ID);
+        assert_eq!(s.identifier, crate::apple_trust::IDENTIFIER);
+
+        let mut unsigned = record_value(mac, "0.2.45", 10, SHA);
+        unsigned.as_object_mut().unwrap().remove("signing");
+        assert!(
+            parse_record(&serde_json::to_vec(&unsigned).unwrap(), mac).is_err(),
+            "a darwin record without a signing block is refused"
+        );
+
+        let mut odd = record_value(mac, "0.2.45", 10, SHA);
+        odd["signing"]["extra"] = serde_json::json!(true);
+        assert!(
+            parse_record(&serde_json::to_vec(&odd).unwrap(), mac).is_err(),
+            "unknown signing fields are refused"
+        );
+
+        let linux = "x86_64-unknown-linux-gnu";
+        let (_, r, _) = parse_record(&record_json(linux, "0.2.45", 10, SHA), linux).unwrap();
+        assert!(r.signing.is_none(), "linux records carry no signing block");
+    }
 
     #[test]
     fn record_parses_and_rejects_identity_and_target_mismatches() {

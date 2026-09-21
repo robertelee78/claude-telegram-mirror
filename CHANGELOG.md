@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.45] - 2026-09-21
+
+### Changed (ADR-018: macOS releases are Developer ID signed and notarized — no exceptions)
+- **Every macOS binary ctm had published was ad-hoc signed.** `release.yml` carried a signing step gated on secrets that were never configured, and fell back to `codesign --sign -` with a warning. The fallback is gone: darwin binaries are now signed with the team's Developer ID (hardened runtime, secure timestamp, identifier `us.ctm.cli`) and notarized by Apple, by a signing job bound to a protected `apple-release` environment that only release tags can use. The build jobs see no secrets and the signing job never executes the unsigned candidate. `publish` re-verifies each darwin asset with Apple's own tools — signature, identity, CDHash, online notary ticket — before the GitHub Release exists, and ships the proofs (`proof-<target>.json`, `notary-log-<target>.json`) beside the binaries.
+- **`ctm update` and `install.sh` verify the signature, not just the sha256.** On macOS a candidate is refused unless it carries a valid Developer ID signature by team `3T2D2YNTVW` as `us.ctm.cli`, its CDHash matches the release record's new `signing` block, and Apple confirms the notarization ticket online — all before the atomic swap. The team and identifier are pinned in the binary (`apple_trust.rs`) and in `install.sh`, so a re-signed asset is refused even if the record naming it was replaced too. A darwin record without a `signing` block is refused outright.
+- **`ctm doctor` reports what the running binary is signed as** (check 13): Developer ID + identifier, or a warning for an ad-hoc release-channel binary; a source build is reported as ad-hoc without complaint.
+- Spiked before shipping: both targets notarized for real under the new identifier; the hardened-runtime binary passed every `doctor` check (TLS, SQLite, tmux, launchd). `scripts/test-darwin-signing-contract.sh` pins the pipeline's shape (no fallback, protected environment, candidate never executed, consumer pins agree) and runs in CI on macOS.
+
 ## [0.2.44] - 2026-09-20
 
 ### Fixed (reported: a Telegram reply sat in Claude's composer, unsent)

@@ -1012,6 +1012,27 @@ async fn check_update(fix: bool) -> CheckResult {
     };
     lines.push(channel_line);
 
+    // ADR-018: what this binary is signed as. A source build is ad-hoc by nature;
+    // a release-channel binary without a Developer ID is a release we no longer ship.
+    if let Some(state) = crate::apple_trust::signing_state(&exe) {
+        use crate::apple_trust::SigningState;
+        let released = matches!(
+            channel,
+            crate::update::Channel::Standalone { .. } | crate::update::Channel::Npm { .. }
+        );
+        let desc = crate::apple_trust::describe(&state);
+        match (&state, released) {
+            (SigningState::DeveloperId(_), _) => lines.push(format!("signature: {desc}")),
+            (_, false) => lines.push(format!("signature: {desc} (expected for this channel)")),
+            (_, true) => {
+                escalate(CheckStatus::Warn, &mut worst);
+                lines.push(format!(
+                    "signature: {desc} — releases since 0.2.45 are Developer ID signed and notarized; run `ctm update`"
+                ));
+            }
+        }
+    }
+
     let current = env!("CARGO_PKG_VERSION");
     match crate::update::latest_version().await {
         Some(latest) => {

@@ -4,6 +4,7 @@
 //! Downstream Rust consumers can depend on this crate and access any public
 //! module, e.g. `use ctm::session::SessionManager`.
 
+pub mod apple_trust;
 pub mod bot;
 pub mod cli;
 pub mod colors;
