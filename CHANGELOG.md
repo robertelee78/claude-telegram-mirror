@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.47] - 2026-09-21
+
+### Fixed (ADR-019: the service layer reports what the manager says, not what ctm asked for)
+- **Three shipped defects had one shape** — "running" for a loaded-but-dead launchd job, "Service installed" on a box with no user manager, a restart that kept the old binary — and a sweep found nine more discarded command results in the same files. The spike behind ADR-019 showed why checking exit status would not have helped either: `systemctl start` of a unit whose program exits immediately returns 0 (the unit sits in `activating/auto-restart`), `systemctl restart` after the unit file changed returns 0 while running the old `ExecStart`, and `launchctl load`/`unload`/`start` return 0 when they did nothing or the job died on launch.
+- Every mutating operation is now act → observe → report. `start`/`restart` succeed only on a *stable* PID (the same PID seen twice, within a budget longer than the restart throttle); `restart` also requires the PID to change and the manager to be running the definition on disk (`daemon-reload` when systemd reports `NeedDaemonReload`; `bootout` + `bootstrap`, each verified, when launchd's loaded program differs from the plist); `stop` waits for the PID to be gone (launchd's `stop` is asynchronous); `uninstall` verifies not-loaded, no unit, no enable symlink; `install` verifies the unit is enabled (systemd) or the plist lints (launchd). `launchctl load`/`unload` are no longer used at all.
+- `ctm service status` now shows the PID and the program the manager will actually exec.
+- Proven against the real managers: `tests/service_managers.rs` runs a throwaway service through the full lifecycle on ubuntu (systemd user manager) and macOS (launchd) in CI, including a program that exits at once being a *start failure* that carries its exit status — where it used to be "Service started.". A unit test pins that no command result in `src/service/` is discarded.
+
+### Changed
+- CI lints test targets too (`clippy --all-targets`); the five lints it found are fixed.
+
 ## [0.2.46] - 2026-09-21
 
 ### Fixed (0.2.45 could not be installed by `ctm update` from any existing install)
