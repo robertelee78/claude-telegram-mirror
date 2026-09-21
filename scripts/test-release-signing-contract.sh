@@ -114,6 +114,40 @@ if command -v ssh-keygen >/dev/null 2>&1; then
     "$SIGNER" "$probe/bin" "$probe/out" 0.2.48 "$sha" x86_64-unknown-linux-gnu "$ns" "$principal" 2>&1) && fail "signer signed with an unpinned key"
   grep -q 'not pinned in install.sh' <<<"$out" || fail "unpinned key was not the reason: $out"
   [[ ! -e "$probe/out" ]] || fail "signer produced output for an unpinned key"
+  # A FULL signing run on this OS, with a throwaway key: the signer only trusts the
+  # pins in its own repository tree, so copy the tree and pin the throwaway key
+  # there. This is what catches GNU/BSD userland divergence in the success path
+  # (a `stat -f` that means "filesystem" on Linux once slipped past a macOS box).
+  tree="$probe/tree"; mkdir -p "$tree/scripts" "$tree/rust-crates/ctm/src"
+  cp "$SIGNER" "$tree/scripts/"; cp "$INSTALL" "$tree/"; cp "$TRUST" "$tree/rust-crates/ctm/src/"
+  ssh-keygen -q -t ed25519 -N 'tpw' -f "$probe/tkey"
+  tpub=$(awk '{print $1" "$2}' "$probe/tkey.pub")
+  first=$(head -1 <<<"$install_pins")
+  python3 - "$tree/install.sh" "$tree/rust-crates/ctm/src/release_trust.rs" "$first" "$tpub" <<'PY2' || fail "could not pin the throwaway key in the copied tree"
+import sys
+for path in sys.argv[1:3]:
+    s = open(path).read()
+    assert s.count(sys.argv[3]) == 1, path
+    open(path, "w").write(s.replace(sys.argv[3], sys.argv[4], 1))
+PY2
+  printf 'release binary bytes %s\n' "$RANDOM" >"$probe/full-in"
+  out_dir="$probe/full-out"
+  RUNNER_TEMP="$probe" CTM_RELEASE_SIGNING_KEY_BASE64="$(base64 <"$probe/tkey" | tr -d '\n')" \
+    CTM_RELEASE_SIGNING_KEY_PASSPHRASE=tpw CTM_RELEASE_SIGNING_PUBLIC_KEY="$tpub" \
+    "$tree/scripts/sign-release.sh" "$probe/full-in" "$out_dir" 0.2.48 "$sha" x86_64-unknown-linux-gnu "$ns" "$principal" >/dev/null \
+    || fail "a full signing run failed on this OS"
+  for f in ctm-x86_64-unknown-linux-gnu ctm-x86_64-unknown-linux-gnu.sha256 ctm-x86_64-unknown-linux-gnu.sshsig sigproof.json; do
+    [[ -f "$out_dir/$f" ]] || fail "signer output lacks $f"
+  done
+  [[ $(find "$out_dir" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ') == 4 ]] || fail "signer output has unexpected entries"
+  size=$(jq -r .asset.size "$out_dir/sigproof.json")
+  [[ "$size" == "$(wc -c <"$probe/full-in" | tr -d ' ')" ]] || fail "sigproof size is wrong: $size"
+  [[ "$(jq -r .signature.public_key "$out_dir/sigproof.json")" == "$tpub" ]] || fail "sigproof names a different key"
+  printf '%s namespaces="%s" %s\n' "$principal" "$ns" "$tpub" >"$probe/tallowed"
+  ssh-keygen -Y verify -f "$probe/tallowed" -I "$principal" -n "$ns" -s "$out_dir/ctm-x86_64-unknown-linux-gnu.sshsig" <"$out_dir/ctm-x86_64-unknown-linux-gnu" >/dev/null 2>&1 \
+    || fail "the full run's signature does not verify"
+  [[ -z "$(find "$probe" -maxdepth 1 -name 'ctm-release-signing-secrets*' -print -quit)" ]] || fail "signer left its secret directory behind"
+
   # The install.sh verification, run exactly as install.sh does it, against the
   # repository fixture signed by the real release key: accepts; and refuses tampering.
   fx="$ROOT_DIR/rust-crates/ctm/tests/fixtures/release-sig"

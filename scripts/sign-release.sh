@@ -115,7 +115,10 @@ cp "$candidate" "$output_directory/$asset_name"
 chmod 0555 "$output_directory/$asset_name"
 cp "$candidate.sig" "$output_directory/$asset_name.sshsig"
 chmod 0444 "$output_directory/$asset_name.sshsig"
-binary_size=$(stat -f '%z' "$output_directory/$asset_name" 2>/dev/null || stat -c '%s' "$output_directory/$asset_name")
+# `wc -c` is the one size probe that is the same on GNU and BSD userlands
+# (`stat -f` means "filesystem status" on GNU and prints junk before failing).
+binary_size=$(wc -c <"$output_directory/$asset_name" | tr -d ' ')
+[[ "$binary_size" =~ ^[0-9]+$ ]] || fail "could not measure the output"
 binary_sha=$(sha256_file "$output_directory/$asset_name")
 [[ "$binary_sha" == "$input_sha" ]] || fail "output bytes differ from the input"
 printf '%s  %s\n' "$binary_sha" "$asset_name" >"$output_directory/$asset_name.sha256"
