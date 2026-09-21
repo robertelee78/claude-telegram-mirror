@@ -8,7 +8,7 @@ name: Release
 # environment apple-release). No fallback.
 #
 # ADR-020: every final binary is then signed with the ctm release key (sign-release,
-# environment release-signing, reviewer-gated) and publish re-verifies each
+# environment release-signing, tags only) and publish re-verifies each
 # signature against the install.sh pins before the Release exists. Provenance is
 # attested for auditors; verify-install then runs the PUBLISHED installer as a user
 # on both platforms. Third-party actions are pinned by commit.

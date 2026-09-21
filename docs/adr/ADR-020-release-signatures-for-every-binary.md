@@ -44,9 +44,10 @@ on `reqwest`/rustls/`ring`. The findings that decide it:
    attestations cannot be verified in sh.
 4. Prior art is thin: of the shipped Rust CLIs surveyed only `mise` verifies a
    signature inside its self-updater; `rustup` removed verification in 2023.
-5. The `apple-release` environment had **no required reviewer**: a leaked token
-   with `contents: write` could push a `v*` tag and have the Apple key used
-   unattended.
+5. The `apple-release` environment has no required reviewer, so a leaked token
+   with `contents: write` can push a `v*` tag and have the keys used unattended.
+   Accepted (see Decision 4): revocation at Apple and the offline standby are
+   the answer, not a manual gate.
 
 ## Decision
 
@@ -68,15 +69,17 @@ on `reqwest`/rustls/`ring`. The findings that decide it:
    Apple → publish. Both consumers keep the signature beside the installed binary
    (`.ctm-signature`) so `ctm doctor` can re-verify the running binary offline on
    Linux as well as macOS.
-4. **Signing is a separate, reviewer-gated job.** `sign-release` runs under the
-   environment `release-signing` (tags `v*` only, **required reviewer: the
-   owner**) after every build and after Apple signing, with
-   `persist-credentials: false`, never executes a candidate, asserts the key's
-   public half equals the pins in both consumers, signs with
-   `scripts/sign-release.sh`, self-verifies with an `allowed_signers` built from
-   the *install.sh* pin, and emits `sigproof-<triple>.json`. The same required
-   reviewer is added to `apple-release`. A release now needs an explicit approval
-   after the tag push.
+4. **Signing is a separate job under a protected environment.** `sign-release`
+   runs under the environment `release-signing` (deployable from `v*` tags only)
+   after every build and after Apple signing, with `persist-credentials: false`,
+   never executes a candidate, asserts the key's public half equals the pins in
+   both consumers, signs with `scripts/sign-release.sh`, self-verifies with an
+   `allowed_signers` built from the *install.sh* pin, and emits
+   `sigproof-<triple>.json`. Releases stay **fully automatic** on a tag push:
+   the research suggested a required reviewer on both signing environments; the
+   owner rejected it (2026-09-21 — hf2q does not gate either, and an Apple-side
+   revocation plus the offline standby cover the leaked-token case), so neither
+   environment has one.
 5. **`publish` re-verifies every signature independently** (`ssh-keygen -Y
    verify` against the install.sh pin, `find-principals`, sigproof ↔ record
    agreement) before the Release exists, then runs `actions/attest-build-provenance`
@@ -129,8 +132,8 @@ Apple's bytes and not what `ssh-keygen -Y verify < file` expects).
   *published* `install.sh` as a user: ubuntu `verified: release signature —
   SHA256:0biQ8NOu…`, `installed: … (ctm 0.2.49)`; macOS the same plus
   `verified: Developer ID 3T2D2YNTVW as us.ctm.cli, notarized`.
-- Both gated environments required an explicit approval after the tag push
-  (approved by the owner via `gh api …/pending_deployments`).
+- 0.2.48 and 0.2.49 were cut while a required-reviewer gate was briefly on;
+  it was removed the same day at the owner's direction (Decision 4).
 - Provenance: `gh attestation verify ctm-x86_64-unknown-linux-gnu -R
   robertelee78/claude-telegram-mirror` → built by
   `.github/workflows/release.yml @ refs/tags/v0.2.48`.
