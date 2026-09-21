@@ -14,19 +14,20 @@ side. Install it and all three are mirrored; there is nothing to enable per host
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/robertelee78/claude-telegram-mirror/master/install.sh | sh
-ctm setup    # Interactive setup wizard
+ctm setup
 ```
 
-One static binary, installed to `~/.local/bin/ctm` from the [GitHub Release](https://github.com/robertelee78/claude-telegram-mirror/releases/latest) for your platform (macOS arm64/x64, Linux x64/arm64). Every binary is **signed with ctm's Ed25519 release key** (OpenSSH signature format), and both the installer (`ssh-keygen -Y verify`, OpenSSH ≥ 8.1) and `ctm update` (built in, no network beyond the download) verify that signature against keys pinned in the code before anything is swapped in (ADR-020). On macOS the binary is additionally **Developer ID signed and notarized**, verified the same way — pinned team and identifier, hardened runtime, Apple's notary ticket (ADR-018). The verified signature is kept beside the binary so `ctm doctor` can re-check it any time. The installer also puts `~/.local/bin` first on your `PATH` and installs tab completion for bash, zsh and fish — one marker-delimited block at the end of your shell rc, removable with `ctm shell-setup --remove` (set `CTM_NO_SHELL_SETUP=1` to skip). Open a new shell afterwards.
+Installs one binary to `~/.local/bin/ctm` (macOS arm64/x64, Linux x64/arm64), adds it to
+your `PATH` with tab completion, and walks you through creating the Telegram bot. Open a
+new shell afterwards.
 
 ```bash
-ctm update            # upgrade to the latest release (restarts the service if installed)
-ctm update --check    # just report
-ctm update --rollback # put the previous binary back
+ctm update            # upgrade to the latest release
+ctm update --rollback # put the previous version back
 ```
 
-Prefer to verify by hand? Every release ships `ctm-<target>`, `ctm-<target>.sha256`, `ctm-<target>.sshsig`, a `sigproof-<target>.json`, and a `stable-<target>.json` record. The release keys (signing + offline standby) are the two `ssh-ed25519` lines in [`install.sh`](install.sh); with them in an `allowed_signers` file: `ssh-keygen -Y verify -f allowed_signers -I release@ctm.cli -n ctm.release -s ctm-<target>.sshsig < ctm-<target>`. Build provenance is attested too: `gh attestation verify ctm-<target> -R robertelee78/claude-telegram-mirror`. For the macOS binaries there is also `proof-<target>.json` and Apple's `notary-log-<target>.json`: `codesign --verify --strict --check-notarization --test-requirement '=notarized' ctm-<target>`.
-
+Every download is verified before it is installed: sha256, ctm's release signature, and on
+macOS Apple's notarization. Details in [ADR-020](docs/adr/ADR-020-release-signatures-for-every-binary.md).
 
 ## Features
 
@@ -562,24 +563,6 @@ cargo test -- --ignored
 ./target/release/ctm setup
 ./target/release/ctm start
 ```
-
-### Releasing
-
-Fully automatic on a tag push — no approvals, no manual steps:
-
-```bash
-./scripts/bump-version.sh 0.2.51      # Cargo.toml + Cargo.lock
-# add the CHANGELOG entry, commit "chore: release 0.2.51", push, wait for CI
-git tag v0.2.51 && git push origin v0.2.51
-```
-
-`release.yml` then builds all four targets, Developer-ID-signs and notarizes the two
-macOS binaries (ADR-018), signs every binary with the release key (ADR-020),
-re-verifies each signature against the pins in `install.sh` before the Release
-exists, attests build provenance, publishes, and finally runs the *published*
-`install.sh` as a user on ubuntu and macOS. The Release is immutable once published.
-Secrets live in the `apple-release` and `release-signing` GitHub environments, which
-only `v*` tags can use.
 
 ### Project Structure (49 source files)
 
