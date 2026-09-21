@@ -9,7 +9,7 @@
 > Just pure excellence, done the right way the entire time.
 > Chesterton's fence: always understand the current implementation fully before changing it.
 
-**Status:** Implemented (2026-09-21) — first release signed under this ADR is 0.2.45.
+**Status:** Implemented (2026-09-21) — first release signed under this ADR is 0.2.45; amended the same day (§Record shape), first release installable by pre-0.2.45 clients is 0.2.46.
 **Date:** 2026-09-21
 **Authors:** Robert, Claude
 **Tags:** distribution, signing, notarization, macos, supply-chain
@@ -78,10 +78,15 @@ to the binary, for both arm64 and the cross-built x64.
    restriction bit.
 5. **Hygiene.** After both runs the user keychain search list was restored
    verbatim and the secret directories were gone.
-6. **minos.** Both targets declare `minos 11.0` (cargo's default; hf2q pins
-   14.0). Recorded in the proof rather than pinned — nothing in ctm needs 14.
+6. **minos.** Both targets declare `minos 11.0` locally (cargo's default; hf2q
+   pins 14.0). Recorded in the proof rather than pinned — nothing in ctm needs 14.
+7. **Found by the first CI run, not the spike.** macos-14's SDK 14.5 linker emits
+   `LC_VERSION_MIN_MACOSX version 10.12` for the x86_64 target, where the local
+   SDK 27 linker emits `LC_BUILD_VERSION minos 11.0`; the signer read only
+   `minos` and refused CI's x64 candidate. It now reads either load command, and
+   the fix was proven by notarizing that exact CI artifact (`Accepted`, 10.12).
 
-**Reformulated hypothesis:** confirmed with (1), (3) and (6) as adjustments.
+**Reformulated hypothesis:** confirmed with (1), (3), (6) and (7) as adjustments.
 
 ## Decision
 
@@ -112,22 +117,21 @@ to the binary, for both arm64 and the cross-built x64.
    pins the workflow shape (no fallback, environment, no execution of the
    candidate) and the signer's refusals; CI runs it on macOS.
 
-4. **The record carries the signing identity.** `stable-<darwin-triple>.json`
-   gains `"signing": {"team_id","identifier","cdhash"}`. Linux records are
-   unchanged. The `publish` job runs on macOS and independently re-verifies each
-   darwin asset (`codesign --verify --strict`, online `=notarized`, identity ==
-   record == proof, sha256 == record == proof) before the GitHub Release is
-   created. Proofs and notary logs are published as release assets
-   (`proof-<target>.json`, `notary-log-<target>.json`).
+4. **The record does not change shape** (see §Record shape, amended). The
+   `publish` job runs on macOS and independently re-verifies each darwin asset
+   (`codesign --verify --strict`, online `=notarized`, identity == pins == proof,
+   CDHash == proof, sha256 == record == proof, record keys == the frozen 0.2.44
+   set) before the GitHub Release is created. Proofs and notary logs are
+   published as release assets (`proof-<target>.json`,
+   `notary-log-<target>.json`) — they are the audit trail.
 
 5. **The updater and installer verify the signature, pinned in code.**
    `src/apple_trust.rs` holds `TEAM_ID = "3T2D2YNTVW"` and `IDENTIFIER =
    "us.ctm.cli"`. On macOS, `ctm update` refuses a candidate unless
    `codesign --verify --strict` passes, the parsed identity (team, identifier,
    full Developer ID authority chain, hardened runtime, timestamp) equals the
-   constants **and** the record's `signing`, and the online notarization check
-   passes — all before the atomic swap. A darwin record without `signing` is
-   refused. The pin lives in the running binary, which is itself signed by the
+   constants, and the online notarization check passes — all before the atomic
+   swap. The pin lives in the running binary, which is itself signed by the
    team: changing the team requires shipping code through a release the current
    team signed. `install.sh` performs the same checks in POSIX sh with the team
    and identifier hard-coded. hf2q pins to the *installed* binary's identity
@@ -146,6 +150,34 @@ to the binary, for both arm64 and the cross-built x64.
    `APPLE_CODESIGN_IDENTIFIER=us.ctm.cli`, `APPLE_NOTARY_KEY_ID`,
    `APPLE_NOTARY_ISSUER_ID`. The stale `NPM_TOKEN` is deleted.
 
+## Record shape (amendment, 2026-09-21 — learned from 0.2.45)
+
+The first cut added `"signing": {team_id, identifier, cdhash}` to the darwin
+`stable-<triple>.json`. The 0.2.45 release published fine and then `ctm update`
+on this machine — a 0.2.44 client — failed:
+
+```
+release record is not valid: unknown field `signing`, expected one of `kind`, …
+```
+
+ADR-017's parser carries `#[serde(deny_unknown_fields)]`, so every installed
+client rejects any record with a field it does not know. **The record's shape
+is frozen for as long as those clients exist**, and 0.2.45 was unreachable from
+every install in the field. The block was also redundant: the record's sha256
+fixes the exact bytes, which fixes the CDHash; the team and identifier are
+pinned in code. Decision:
+
+- The record keeps the exact 0.2.44 field set; `publish` asserts it. Signing
+  identity is pinned in the consumers; CDHash and the notary trail live in
+  `proof-<target>.json`, which is published for auditors and not consumed by
+  clients.
+- From 0.2.46 the parser tolerates *additive* fields. Identity was always
+  established by `kind`/`schema_version`/`package`/`channel`, not by field-set
+  equality; a foreign record is still refused by its `kind`. Records can grow
+  again once no pre-0.2.46 client remains.
+- 0.2.45 stays published (its binaries are correctly signed) but is superseded
+  immediately by 0.2.46 so `latest` serves a compatible record.
+
 ## Consequences
 
 - A darwin release now takes ~1 minute longer (two notary round-trips, run in
@@ -153,8 +185,8 @@ to the binary, for both arm64 and the cross-built x64.
 - `ctm update` on macOS makes one extra network call (Apple's ticket lookup).
   Offline updates are refused rather than trusted — consistent with the channel
   already requiring GitHub.
-- The 0.2.44 → 0.2.45 upgrade is the one hop the *old* updater cannot verify
-  beyond sha256; it is verified by hand after the hop (§Proof). From 0.2.45 on,
+- The 0.2.44 → 0.2.46 upgrade is the one hop the *old* updater cannot verify
+  beyond sha256; it is verified by hand after the hop (§Proof). From 0.2.46 on,
   every hop is verified by the running binary.
 - Linux binaries remain unsigned beyond sha256 + origin pinning. Sigstore
   attestation for Linux is a separate decision, not taken here.

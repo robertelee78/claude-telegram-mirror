@@ -94,10 +94,12 @@ pub fn detect_channel(exe: &Path) -> Channel {
     Channel::Unmanaged { exe }
 }
 
-/// `stable-<triple>.json` as published by the release workflow. Strict: unknown
-/// fields are rejected so a differently-shaped file can never be mistaken for ours.
+/// `stable-<triple>.json` as published by the release workflow. Identity is
+/// established by `kind`/`schema_version`/`package`/`channel`, not by the exact
+/// field set: additive fields are tolerated so a future record can grow without
+/// stranding every installed client (clients before 0.2.45 reject unknown fields,
+/// which is why this shape is frozen for as long as they exist — ADR-018).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ReleaseRecord {
     pub kind: String,
     pub schema_version: u32,
@@ -107,10 +109,6 @@ pub struct ReleaseRecord {
     pub version: String,
     pub size: u64,
     pub sha256: String,
-    /// ADR-018: present on darwin records — the Developer ID team, identifier and
-    /// CDHash the signed asset must carry. Absent on Linux records.
-    #[serde(default)]
-    pub signing: Option<crate::apple_trust::RecordSigning>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -148,13 +146,6 @@ pub fn parse_record(bytes: &[u8], target: &str) -> Result<(Version, ReleaseRecor
         ));
     }
     let sha = hex32(&r.sha256)?;
-    // A darwin release without a signing block is not a release we ship any more
-    // (ADR-018); refuse it here so the updater cannot be talked into an unsigned swap.
-    if r.target.ends_with("-apple-darwin") && r.signing.is_none() {
-        return Err(AppError::Config(
-            "darwin release record carries no Developer ID signing block".into(),
-        ));
-    }
     Ok((
         version,
         r.clone(),
@@ -467,7 +458,7 @@ pub async fn run_update(check_only: bool, do_rollback: bool) -> anyhow::Result<(
     let candidate = install_dir.join(CANDIDATE_PARTIAL);
     println!("downloading ctm {} for {target} …", record.version);
     download_asset(&record.version, target, &exp, &candidate).await?;
-    verify_apple_signature(&candidate, &record)?;
+    verify_apple_signature(&candidate)?;
     publish_candidate(&install_dir, &candidate, &exp)?;
     let new_bin = install_dir.join(ACTIVE_NAME);
     let installed = binary_version(&new_bin).unwrap_or_else(|| record.version.clone());
@@ -505,25 +496,23 @@ pub async fn run_update(check_only: bool, do_rollback: bool) -> anyhow::Result<(
 /// ADR-018: on macOS the candidate must carry the pinned Developer ID signature
 /// and an accepted notary ticket before it is allowed to become `ctm`. Elsewhere
 /// there is nothing to check (Linux assets are unsigned beyond sha256 + origin).
-fn verify_apple_signature(candidate: &Path, record: &ReleaseRecord) -> Result<()> {
+fn verify_apple_signature(candidate: &Path) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
-        let signing = record.signing.as_ref().ok_or_else(|| {
-            AppError::Config("darwin release record carries no signing block".into())
-        })?;
-        if let Err(e) = crate::apple_trust::verify_release_candidate(candidate, signing) {
+        if let Err(e) = crate::apple_trust::verify_release_candidate(candidate) {
             let _ = fs::remove_file(candidate);
             return Err(e);
         }
         println!(
             "verified: Developer ID {} as {}, notarized",
-            signing.team_id, signing.identifier
+            crate::apple_trust::TEAM_ID,
+            crate::apple_trust::IDENTIFIER
         );
         Ok(())
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (candidate, record);
+        let _ = candidate;
         Ok(())
     }
 }
@@ -560,51 +549,27 @@ pub async fn latest_version() -> Option<Version> {
 mod tests {
     use super::*;
 
-    fn record_value(target: &str, version: &str, size: u64, sha: &str) -> serde_json::Value {
-        let mut v = serde_json::json!({
+    fn record_json(target: &str, version: &str, size: u64, sha: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
             "kind": RECORD_KIND, "schema_version": RECORD_SCHEMA, "package": "ctm",
             "channel": "stable", "target": target, "version": version, "size": size, "sha256": sha
-        });
-        // ADR-018: darwin records name their signer; Linux records do not.
-        if target.ends_with("-apple-darwin") {
-            v["signing"] = serde_json::json!({
-                "team_id": crate::apple_trust::TEAM_ID,
-                "identifier": crate::apple_trust::IDENTIFIER,
-                "cdhash": "51c099661a857daeb11a8b631adfe83b4df470b7"
-            });
-        }
-        v
-    }
-    fn record_json(target: &str, version: &str, size: u64, sha: &str) -> Vec<u8> {
-        serde_json::to_vec(&record_value(target, version, size, sha)).unwrap()
+        }))
+        .unwrap()
     }
     const SHA: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
+    /// The exact record 0.2.44 publishes and parses — byte-for-byte the shape the
+    /// installed clients accept. If this stops parsing, every existing install is
+    /// stranded (ADR-018 learned that the hard way).
     #[test]
-    fn darwin_records_must_name_their_signer_linux_records_need_not() {
-        let mac = "aarch64-apple-darwin";
-        let (_, r, _) = parse_record(&record_json(mac, "0.2.45", 10, SHA), mac).unwrap();
-        let s = r.signing.expect("darwin record parsed its signing block");
-        assert_eq!(s.team_id, crate::apple_trust::TEAM_ID);
-        assert_eq!(s.identifier, crate::apple_trust::IDENTIFIER);
-
-        let mut unsigned = record_value(mac, "0.2.45", 10, SHA);
-        unsigned.as_object_mut().unwrap().remove("signing");
-        assert!(
-            parse_record(&serde_json::to_vec(&unsigned).unwrap(), mac).is_err(),
-            "a darwin record without a signing block is refused"
+    fn the_frozen_0_2_44_record_shape_still_parses() {
+        let t = "aarch64-apple-darwin";
+        let frozen = format!(
+            r#"{{"kind":"ctm.standalone-release","schema_version":1,"package":"ctm","channel":"stable","target":"{t}","version":"0.2.46","size":10605840,"sha256":"{SHA}"}}"#
         );
-
-        let mut odd = record_value(mac, "0.2.45", 10, SHA);
-        odd["signing"]["extra"] = serde_json::json!(true);
-        assert!(
-            parse_record(&serde_json::to_vec(&odd).unwrap(), mac).is_err(),
-            "unknown signing fields are refused"
-        );
-
-        let linux = "x86_64-unknown-linux-gnu";
-        let (_, r, _) = parse_record(&record_json(linux, "0.2.45", 10, SHA), linux).unwrap();
-        assert!(r.signing.is_none(), "linux records carry no signing block");
+        let (v, r, _) = parse_record(frozen.as_bytes(), t).unwrap();
+        assert_eq!(v, Version::new(0, 2, 46));
+        assert_eq!(r.size, 10605840);
     }
 
     #[test]
@@ -630,8 +595,15 @@ mod tests {
             serde_json::from_slice(&record_json(t, "0.2.29", 10, SHA)).unwrap();
         extra["surprise"] = serde_json::json!(1);
         assert!(
-            parse_record(&serde_json::to_vec(&extra).unwrap(), t).is_err(),
-            "unknown field refused"
+            parse_record(&serde_json::to_vec(&extra).unwrap(), t).is_ok(),
+            "an additive field is tolerated; identity comes from kind/schema/package"
+        );
+        let mut foreign: serde_json::Value =
+            serde_json::from_slice(&record_json(t, "0.2.29", 10, SHA)).unwrap();
+        foreign["kind"] = serde_json::json!("hf2q.standalone-release");
+        assert!(
+            parse_record(&serde_json::to_vec(&foreign).unwrap(), t).is_err(),
+            "a differently-shaped file is still refused by its kind"
         );
         assert!(
             parse_record(&vec![b'x'; MAX_RECORD_BYTES + 1], t).is_err(),

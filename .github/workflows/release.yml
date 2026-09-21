@@ -214,11 +214,11 @@ jobs:
           cp "$signed/ctm-$TARGET" "$signed/ctm-$TARGET.sha256" dist/
           cp "$signed/proof.json" "dist/proof-$TARGET.json"
           cp "$signed/notary-log.json" "dist/notary-log-$TARGET.json"
-          # The record names the SIGNED bytes (sha256 changed at signing) and the
-          # identity consumers must find on them.
+          # The record names the SIGNED bytes (sha256 changed at signing). Its shape
+          # is frozen — clients before 0.2.45 reject unknown fields — so the signing
+          # identity is NOT here: consumers pin it in code, and proof.json carries it.
           jq -c '{kind:"ctm.standalone-release",schema_version:1,package:"ctm",channel:"stable",
-                  target:.target,version:.version,size:.asset.size,sha256:.asset.sha256,
-                  signing:{team_id:.signing.team_id,identifier:.signing.identifier,cdhash:.signing.cdhash}}' \
+                  target:.target,version:.version,size:.asset.size,sha256:.asset.sha256}' \
             "$signed/proof.json" > "dist/stable-$TARGET.json"
           cat "dist/stable-$TARGET.json"
           ls -l dist
@@ -268,12 +268,14 @@ jobs:
           done
 
           # ADR-018: every darwin asset, independently: valid signature, pinned
-          # identity, CDHash agreeing across bytes/record/proof, online notary ticket.
+          # identity, CDHash agreeing between bytes and proof, online notary ticket.
+          # The record must keep the frozen 0.2.44 shape (no extra fields).
           for target in aarch64-apple-darwin x86_64-apple-darwin; do
             bin="release/ctm-$target"; rec="release/stable-$target.json"; proof="release/proof-$target.json"
+            test "$(jq -r 'keys_unsorted | join(",")' "$rec")" = "kind,schema_version,package,channel,target,version,size,sha256"
             /usr/bin/codesign --verify --strict --all-architectures "$bin"
             info=$(/usr/bin/codesign --display --verbose=4 "$bin" 2>&1)
-            team=$(jq -r .signing.team_id "$rec"); ident=$(jq -r .signing.identifier "$rec"); cdhash=$(jq -r .signing.cdhash "$rec")
+            team=$(jq -r .signing.team_id "$proof"); ident=$(jq -r .signing.identifier "$proof"); cdhash=$(jq -r .signing.cdhash "$proof")
             test "$team" = 3T2D2YNTVW && test "$ident" = us.ctm.cli
             grep -qx "TeamIdentifier=$team" <<<"$info"
             grep -qx "Identifier=$ident" <<<"$info"

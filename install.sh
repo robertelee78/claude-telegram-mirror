@@ -100,14 +100,10 @@ got_sha=$(sha "$tmp/$ASSET")
 chmod 0755 "$tmp/$ASSET"
 
 # --- Apple Developer ID + notarization (macOS) ------------------------------------
-# The record's "signing" block must name our team/identifier, the bytes must carry a
-# valid Developer ID signature with the hardened runtime whose CDHash the record
-# names, and Apple must confirm the notary ticket online. No step here is optional.
+# The bytes (already pinned by the record's sha256) must carry a valid Developer ID
+# signature by our team, as our identifier, with the hardened runtime and a secure
+# timestamp, and Apple must confirm the notary ticket online. No step is optional.
 if [ "$os" = Darwin ]; then
-  r_team=$(field team_id); r_ident=$(field identifier); r_cdhash=$(field cdhash)
-  [ "$r_team" = "$APPLE_TEAM_ID" ] && [ "$r_ident" = "$APPLE_IDENTIFIER" ] \
-    || fail "release record names signer '$r_team' as '$r_ident'; expected $APPLE_TEAM_ID as $APPLE_IDENTIFIER"
-  [ -n "$r_cdhash" ] || fail "release record has no signed CDHash"
   /usr/bin/codesign --verify --strict --all-architectures "$tmp/$ASSET" 2>/dev/null \
     || fail "Apple code-signature verification failed"
   info=$(/usr/bin/codesign --display --verbose=4 "$tmp/$ASSET" 2>&1)
@@ -119,8 +115,8 @@ if [ "$os" = Darwin ]; then
     || fail "binary is not signed with a Developer ID Application certificate"
   printf '%s\n' "$info" | grep -q '^CodeDirectory .*flags=0x[0-9a-f]*(runtime' \
     || fail "binary signature lacks the hardened runtime"
-  printf '%s\n' "$info" | grep -qx "CDHash=$r_cdhash" \
-    || fail "signed CDHash does not match the release record"
+  printf '%s\n' "$info" | grep -q '^Timestamp=.' \
+    || fail "binary signature lacks a secure timestamp"
   /usr/bin/codesign --verify --strict --all-architectures --check-notarization \
     --test-requirement '=notarized' "$tmp/$ASSET" 2>/dev/null \
     || fail "Apple did not confirm the notarization ticket (is this machine online?)"

@@ -1,20 +1,22 @@
 //! ADR-018: Apple Developer ID trust for darwin release binaries.
 //!
 //! The release pipeline signs every darwin asset with the team's Developer ID and
-//! notarizes it; the record it publishes names the team, identifier and CDHash. This
-//! module is the consumer side: `ctm update` refuses a candidate whose signature does
-//! not match the constants pinned here **and** the record, and `ctm doctor` reports
-//! what the running binary carries.
+//! notarizes it. This module is the consumer side: `ctm update` refuses a candidate
+//! whose signature does not match the constants pinned here, and `ctm doctor`
+//! reports what the running binary carries.
 //!
 //! The pin lives in code on purpose. The running binary is itself signed by this
 //! team, so moving to another team requires shipping code through a release the
-//! current team signed — a GitHub compromise alone cannot re-point it.
+//! current team signed — a GitHub compromise alone cannot re-point it. The release
+//! record deliberately carries no signing block: its sha256 already fixes the exact
+//! bytes (and so the CDHash), the identity is pinned here, and the audit trail lives
+//! in the published `proof-<target>.json`. Clients before 0.2.45 parse the record
+//! strictly, so its shape is frozen.
 //!
 //! Parsing is pure and tested against captured `codesign --display --verbose=4`
 //! output; only the process spawns are macOS-only.
 
 use crate::error::{AppError, Result};
-use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 /// Apple Developer Team that signs ctm releases.
@@ -26,15 +28,6 @@ const AUTHORITY_INTERMEDIATE: &str = "Developer ID Certification Authority";
 const AUTHORITY_ROOT: &str = "Apple Root CA";
 #[cfg(target_os = "macos")]
 const MAX_SIGNING_INFO_BYTES: usize = 64 * 1024;
-
-/// The `signing` object of a darwin `stable-<triple>.json` record.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct RecordSigning {
-    pub team_id: String,
-    pub identifier: String,
-    pub cdhash: String,
-}
 
 /// What a Developer ID signature says about itself, after strict parsing.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -171,26 +164,13 @@ pub fn classify(text: &str) -> SigningState {
     }
 }
 
-/// The identity a release candidate must present, cross-checked three ways:
-/// the constants in this binary, the record that named the asset, and the
-/// signature on the bytes.
-pub fn check_expected(identity: &SigningIdentity, record: &RecordSigning) -> Result<()> {
+/// The identity a release candidate must present: the constants in this binary.
+pub fn check_expected(identity: &SigningIdentity) -> Result<()> {
     if identity.team_id != TEAM_ID || identity.identifier != IDENTIFIER {
         return Err(AppError::Config(format!(
             "release is signed by {} as {}, expected {TEAM_ID} as {IDENTIFIER}",
             identity.team_id, identity.identifier
         )));
-    }
-    if record.team_id != TEAM_ID || record.identifier != IDENTIFIER {
-        return Err(AppError::Config(format!(
-            "release record names signer {} as {}, expected {TEAM_ID} as {IDENTIFIER}",
-            record.team_id, record.identifier
-        )));
-    }
-    if !canonical_cdhash(&record.cdhash) || record.cdhash != identity.cdhash {
-        return Err(AppError::Config(
-            "release record CDHash does not match the signed binary".into(),
-        ));
     }
     Ok(())
 }
@@ -217,9 +197,9 @@ pub fn read_signing_text(path: &Path) -> Result<String> {
 
 /// Everything `ctm update` requires of a downloaded darwin candidate before it is
 /// allowed near the install directory. Order: static signature validity, identity
-/// against the pins and the record, then Apple's online ticket lookup.
+/// against the pins, then Apple's online ticket lookup.
 #[cfg(target_os = "macos")]
-pub fn verify_release_candidate(path: &Path, record: &RecordSigning) -> Result<()> {
+pub fn verify_release_candidate(path: &Path) -> Result<()> {
     let v = codesign(&["--verify", "--strict", "--all-architectures"], path)?;
     if !v.status.success() {
         return Err(AppError::Config(
@@ -227,7 +207,7 @@ pub fn verify_release_candidate(path: &Path, record: &RecordSigning) -> Result<(
         ));
     }
     let identity = parse_signing_identity(&read_signing_text(path)?)?;
-    check_expected(&identity, record)?;
+    check_expected(&identity)?;
     let n = codesign(
         &[
             "--verify",
@@ -306,14 +286,6 @@ CDHash=f3b3477ece379b934b1ed8381b2c4547f1089906\n\
 Signature=adhoc\n\
 TeamIdentifier=not set\n";
 
-    fn record() -> RecordSigning {
-        RecordSigning {
-            team_id: TEAM_ID.into(),
-            identifier: IDENTIFIER.into(),
-            cdhash: "51c099661a857daeb11a8b631adfe83b4df470b7".into(),
-        }
-    }
-
     #[test]
     fn parses_the_spike_signature() {
         let id = parse_signing_identity(SIGNED).unwrap();
@@ -324,7 +296,7 @@ TeamIdentifier=not set\n";
             id.authority,
             "Developer ID Application: ROBERT E LEE (3T2D2YNTVW)"
         );
-        check_expected(&id, &record()).unwrap();
+        check_expected(&id).unwrap();
     }
 
     #[test]
@@ -393,24 +365,16 @@ TeamIdentifier=not set\n";
     }
 
     #[test]
-    fn expected_identity_is_pinned_three_ways() {
+    fn expected_identity_is_pinned_in_code() {
         let id = parse_signing_identity(SIGNED).unwrap();
-        // Binary signed by someone else, even if the record agrees with them.
+        // A valid Developer ID signature by someone else is not ours.
         let mut other = id.clone();
         other.team_id = "ABCDE12345".into();
-        assert!(check_expected(&other, &record()).is_err());
-        // Record naming a different team than the pinned one.
-        let mut r = record();
-        r.team_id = "ABCDE12345".into();
-        assert!(check_expected(&id, &r).is_err());
-        // Record for a different build of ours (cdhash mismatch).
-        let mut r = record();
-        r.cdhash = "84abab4406d6baf953f2a6e5a4e3b0ba7d26c9ef".into();
-        assert!(check_expected(&id, &r).is_err());
-        // Record with a malformed cdhash.
-        let mut r = record();
-        r.cdhash = "nope".into();
-        assert!(check_expected(&id, &r).is_err());
+        assert!(check_expected(&other).is_err());
+        // Our team, but not the release identifier.
+        let mut other = id.clone();
+        other.identifier = "us.ctm.something-else".into();
+        assert!(check_expected(&other).is_err());
     }
 
     #[test]
@@ -436,6 +400,27 @@ TeamIdentifier=not set\n";
             "test binary reported {state:?}"
         );
         // And a candidate check against it fails closed rather than passing.
-        assert!(verify_release_candidate(&exe, &record()).is_err());
+        assert!(verify_release_candidate(&exe).is_err());
+    }
+
+    /// The full consumer path against a real published asset (network: Apple's
+    /// ticket lookup). Point `CTM_TEST_SIGNED_BINARY` at a downloaded
+    /// `ctm-<target>-apple-darwin` release asset.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "needs a downloaded release asset and Apple's notary service"]
+    fn a_real_release_asset_is_accepted() {
+        let Ok(path) = std::env::var("CTM_TEST_SIGNED_BINARY") else {
+            eprintln!("skip: set CTM_TEST_SIGNED_BINARY");
+            return;
+        };
+        let path = std::path::PathBuf::from(path);
+        let state = signing_state(&path).unwrap();
+        let SigningState::DeveloperId(id) = &state else {
+            panic!("release asset is not Developer ID signed: {state:?}");
+        };
+        assert_eq!(id.team_id, TEAM_ID);
+        assert_eq!(id.identifier, IDENTIFIER);
+        verify_release_candidate(&path).expect("signature, pins and notary ticket all agree");
     }
 }

@@ -71,10 +71,13 @@ grep -q 'runs-on: macos-latest' <<<"$publish" || fail "publish must run on macOS
 grep -q -- "--check-notarization --test-requirement '=notarized'" <<<"$publish" || fail "publish does not verify notarization online"
 grep -q 'needs: \[build-linux, sign-darwin\]' <<<"$publish" || fail "publish does not depend on the signed candidates"
 grep -q 'pattern: release-\*' <<<"$publish" || fail "publish could pick up unsigned candidates"
+grep -q '"kind,schema_version,package,channel,target,version,size,sha256"' <<<"$publish" || fail "publish does not pin the frozen record shape"
+! grep -q 'signing:{' "$RELEASE" || fail "release.yml writes a signing block into the record (strands pre-0.2.45 clients)"
 
 # --- install.sh verifies on darwin -------------------------------------------------
 grep -q -- "--check-notarization" "$INSTALL" || fail "install.sh does not verify notarization"
-grep -q 'CDHash=\$r_cdhash' "$INSTALL" || fail "install.sh does not bind the record CDHash"
+grep -qF "'^Timestamp=" "$INSTALL" || fail "install.sh does not require a secure timestamp"
+! grep -q 'field team_id\|field cdhash' "$INSTALL" || fail "install.sh reads signing fields from the record (frozen shape)"
 grep -q '(runtime' "$INSTALL" || fail "install.sh does not require the hardened runtime"
 
 # --- the signer refuses before it touches credentials or a keychain ----------------
