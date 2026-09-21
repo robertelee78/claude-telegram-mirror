@@ -9,7 +9,7 @@
 > Just pure excellence, done the right way the entire time.
 > Chesterton's fence: always understand the current implementation fully before changing it.
 
-**Status:** Implemented (2026-09-21) — first release signed under this ADR is 0.2.48.
+**Status:** Implemented (2026-09-21) — first release signed under this ADR is 0.2.48; 0.2.49 the same day fixed the installer's exit status and taught `doctor --fix` to fetch a missing signature. Proof below.
 **Date:** 2026-09-21
 **Authors:** Robert, Claude
 **Tags:** distribution, signing, supply-chain, linux, macos
@@ -120,3 +120,36 @@ Apple's bytes and not what `ssh-keygen -Y verify < file` expects).
   re-serve an old signed release as `latest` is refused by `ctm update`'s SemVer
   check but not by `install.sh`; full owner-account compromise defeats every
   on-GitHub option — only the offline standby survives it.
+
+## Proof (Kata step 6 — recorded 2026-09-21)
+
+- Release runs: `v0.2.48` 35599051380 (publish verified all four signatures; its
+  `verify-install` then exposed the installer's exit-status bug), `v0.2.49`
+  35600096095 — **every job green**, including `verify-install` running the
+  *published* `install.sh` as a user: ubuntu `verified: release signature —
+  SHA256:0biQ8NOu…`, `installed: … (ctm 0.2.49)`; macOS the same plus
+  `verified: Developer ID 3T2D2YNTVW as us.ctm.cli, notarized`.
+- Both gated environments required an explicit approval after the tag push
+  (approved by the owner via `gh api …/pending_deployments`).
+- Provenance: `gh attestation verify ctm-x86_64-unknown-linux-gnu -R
+  robertelee78/claude-telegram-mirror` → built by
+  `.github/workflows/release.yml @ refs/tags/v0.2.48`.
+- On this Mac, as a user, through the first updater that verifies the signature:
+
+```
+$ ctm update
+downloading ctm 0.2.49 for aarch64-apple-darwin …
+verified: release signature by key SHA256:0biQ8NOuSS0b7nEU/71bWgZ9yNDa3nf5QFXzJtv60ck (namespace ctm.release)
+verified: Developer ID 3T2D2YNTVW as us.ctm.cli, notarized
+installed ctm 0.2.49 at /Users/robert.lee/.local/bin/ctm
+$ ctm doctor
+[13/13]   OK: Update: standalone, 0.2.49
+release signature: verified, key SHA256:0biQ8NOuSS0b7nEU/71bWgZ9yNDa3nf5QFXzJtv60ck (ctm.release)
+$ ssh-keygen -Y verify -f allowed_signers -I release@ctm.cli -n ctm.release -s ctm-aarch64-apple-darwin.sshsig < ~/.local/bin/ctm
+Good "ctm.release" signature for release@ctm.cli with ED25519 key SHA256:0biQ8NOu…
+```
+
+- Negative cases, `install.sh` against a stand-in serving the real asset: a
+  signature by another key → `release signature verification failed`; no
+  signature → `could not fetch the release signature`; nothing installed either
+  time. Rust: a one-byte change → `release signature does not match the bytes`.
