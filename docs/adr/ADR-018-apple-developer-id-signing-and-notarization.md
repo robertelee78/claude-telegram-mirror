@@ -193,13 +193,37 @@ pinned in code. Decision:
 - The Developer ID certificate expires 2031-08-22; the notary API key does not
   expire. Rotation means: new P12 in the environment, nothing in code.
 
-## Proof (Kata step 6)
+## Proof (Kata step 6 — recorded 2026-09-21)
 
-Recorded when 0.2.45 is published: release run URL, both `proof-*.json`
-assets, and on this machine after `ctm update`:
+- Release run for `v0.2.46`: https://github.com/robertelee78/claude-telegram-mirror/actions/runs/35573920966
+  — `publish` logged `verified aarch64-apple-darwin: Developer ID 3T2D2YNTVW as
+  us.ctm.cli, cdhash 73deacb3…, notarized` and `verified x86_64-apple-darwin: …
+  cdhash 13131c27…, notarized`. `proof-*.json` and `notary-log-*.json` are on the
+  Release.
+- On this machine, from the installed ad-hoc 0.2.44, as a user:
 
 ```
-codesign -dvv ~/.local/bin/ctm            → Identifier=us.ctm.cli, TeamIdentifier=3T2D2YNTVW
-codesign --verify --strict --check-notarization --test-requirement '=notarized' ~/.local/bin/ctm → exit 0
-ctm doctor                                → [13/13] … Developer ID 3T2D2YNTVW, notarized
+$ ctm update
+updated ctm 0.2.44 -> 0.2.46
+$ codesign -dvv ~/.local/bin/ctm
+Identifier=us.ctm.cli
+Authority=Developer ID Application: ROBERT E LEE (3T2D2YNTVW)
+Authority=Developer ID Certification Authority
+Authority=Apple Root CA
+Timestamp=Sep 21, 2026 at 9:43:07 AM
+TeamIdentifier=3T2D2YNTVW
+$ codesign --verify --strict --check-notarization --test-requirement '=notarized' ~/.local/bin/ctm; echo $?
+0
+$ ctm doctor
+[13/13]   OK: Update: standalone, 0.2.46
+signature: Developer ID 3T2D2YNTVW as us.ctm.cli, hardened runtime, notarizable (cdhash 73deacb3b728)
+$ ctm status
+🟢 Status: Running (via system service)
 ```
+
+- `install.sh` against a local stand-in serving the real 0.2.45 asset: installs
+  with `verified: Developer ID 3T2D2YNTVW as us.ctm.cli, notarized`; the same
+  record with ad-hoc bytes and a *matching* sha256 is refused (`binary is not
+  signed by team 3T2D2YNTVW`) — the case sha256 alone can never catch.
+- The Rust verifier against the real 0.2.45 asset: `a_real_release_asset_is_accepted`
+  passes (`CTM_TEST_SIGNED_BINARY=…/ctm-aarch64-apple-darwin cargo test -- --ignored`).
