@@ -563,6 +563,24 @@ cargo test -- --ignored
 ./target/release/ctm start
 ```
 
+### Releasing
+
+Fully automatic on a tag push — no approvals, no manual steps:
+
+```bash
+./scripts/bump-version.sh 0.2.51      # Cargo.toml + Cargo.lock
+# add the CHANGELOG entry, commit "chore: release 0.2.51", push, wait for CI
+git tag v0.2.51 && git push origin v0.2.51
+```
+
+`release.yml` then builds all four targets, Developer-ID-signs and notarizes the two
+macOS binaries (ADR-018), signs every binary with the release key (ADR-020),
+re-verifies each signature against the pins in `install.sh` before the Release
+exists, attests build provenance, publishes, and finally runs the *published*
+`install.sh` as a user on ubuntu and macOS. The Release is immutable once published.
+Secrets live in the `apple-release` and `release-signing` GitHub environments, which
+only `v*` tags can use.
+
 ### Project Structure (49 source files)
 
 ```
