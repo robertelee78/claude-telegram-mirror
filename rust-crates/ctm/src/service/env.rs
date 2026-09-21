@@ -122,7 +122,7 @@ mod tests {
         writeln!(f, "CHAT_ID=\"-100999\"").unwrap();
         writeln!(f, "SINGLE='hello world'").unwrap();
         writeln!(f, "INLINE=value # comment").unwrap();
-        writeln!(f, "").unwrap();
+        writeln!(f).unwrap();
         writeln!(f, "NOVAL=").unwrap();
         drop(f);
 

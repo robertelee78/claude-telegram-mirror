@@ -641,11 +641,9 @@ mod tests {
         assert!(!m.is_empty());
         assert!(text.replace(' ', "").ends_with(&m), "it is the tail: {m}");
 
-        let wrapped = format!(
-            "some earlier output\n│ > 1) explain this part better. 7) what do you\n│   suggest? Again I want this to be simple ux for a\n│   user, like a tor hidden service.\n"
-        );
+        let wrapped = "some earlier output\n│ > 1) explain this part better. 7) what do you\n│   suggest? Again I want this to be simple ux for a\n│   user, like a tor hidden service.\n";
         assert!(
-            composer_contains(&wrapped, &m),
+            composer_contains(wrapped, &m),
             "wrapped across lines still matches"
         );
     }

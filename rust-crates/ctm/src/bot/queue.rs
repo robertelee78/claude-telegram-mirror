@@ -572,7 +572,7 @@ mod tests {
     fn jitter_fraction_is_in_range() {
         for _ in 0..100 {
             let f = simple_jitter_fraction();
-            assert!(f >= 0.0 && f < 1.0, "jitter {f} out of [0, 1) range");
+            assert!((0.0..1.0).contains(&f), "jitter {f} out of [0, 1) range");
         }
     }
 

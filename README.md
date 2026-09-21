@@ -469,9 +469,9 @@ ctm install-hooks --project
   can share one supergroup
 - **Rate limiting**: Governor-based, with a retry queue and exponential backoff
 - **Token scrubbing**: every log line is filtered so a bot token cannot leak
-- **Tests**: 878 passing across 48 source files and 13 integration test files. Nine more
+- **Tests**: 894 passing across 49 source files and 13 integration test files. Eleven more
   run only on request (`cargo test -- --ignored`) because they drive the real `codex`,
-  `opencode` and Claude Code binaries end to end.
+  `opencode` and Claude Code binaries, a real tmux pane, or Apple's notary service.
 
 ## Troubleshooting
 
@@ -550,7 +550,7 @@ cd claude-telegram-mirror/rust-crates
 cargo build --release
 # Binary at: rust-crates/target/release/ctm
 
-# 2. Run tests (878 of them)
+# 2. Run tests (894 of them)
 cargo test
 
 # ...and the end-to-end ones, which drive real codex/opencode/tmux binaries
@@ -561,7 +561,7 @@ cargo test -- --ignored
 ./target/release/ctm start
 ```
 
-### Project Structure (48 source files)
+### Project Structure (49 source files)
 
 ```
 rust-crates/ctm/src/
@@ -578,6 +578,7 @@ rust-crates/ctm/src/
   liveness.rs         # Pane/host liveness policy for topic reconciliation
   prune.rs            # prune-topics (host-aware liveness)
   update.rs           # Self-update: release record, verified download, atomic swap
+  apple_trust.rs      # ADR-018: Developer ID pins + codesign/notarization verification
   shell.rs            # PATH, completions, and the `codex` remote-mode function
   doctor.rs           # Diagnostics with --fix
   installer.rs        # Claude Code hook installer

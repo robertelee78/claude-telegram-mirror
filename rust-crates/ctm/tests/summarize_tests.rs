@@ -572,7 +572,7 @@ fn grep_with_pattern() {
 fn grep_truncates_long_pattern() {
     let long_pattern = "a".repeat(50);
     let result = summarize_tool_action("Grep", &json!({"pattern": long_pattern}));
-    assert_eq!(result, format!("Searching for '{}...'", &"a".repeat(27)));
+    assert_eq!(result, format!("Searching for '{}...'", "a".repeat(27)));
 }
 
 #[test]
@@ -600,7 +600,7 @@ fn websearch_with_query() {
 fn websearch_truncates_long_query() {
     let long_query = "a".repeat(60);
     let result = summarize_tool_action("WebSearch", &json!({"query": long_query}));
-    assert_eq!(result, format!("Searching: {}...", &"a".repeat(37)));
+    assert_eq!(result, format!("Searching: {}...", "a".repeat(37)));
 }
 
 #[test]
