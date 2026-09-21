@@ -24,6 +24,7 @@ pub const IDENTIFIER: &str = "us.ctm.cli";
 
 const AUTHORITY_INTERMEDIATE: &str = "Developer ID Certification Authority";
 const AUTHORITY_ROOT: &str = "Apple Root CA";
+#[cfg(target_os = "macos")]
 const MAX_SIGNING_INFO_BYTES: usize = 64 * 1024;
 
 /// The `signing` object of a darwin `stable-<triple>.json` record.
