@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.50] - 2026-09-21
+
+### Changed
+- **Releases are fully automatic again.** 0.2.48 briefly added a required-reviewer approval on the two signing environments; it is gone. A `v*` tag push runs build → Apple signing → release signing → publish → verify-install with nobody in the loop, exactly as before and exactly as hf2q does.
+
 ## [0.2.49] - 2026-09-21
 
 ### Fixed (found by 0.2.48's own `verify-install` job, running the published installer as a user)
