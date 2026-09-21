@@ -188,11 +188,14 @@ fn against_a_real_claude_code_pane() {
     };
     let marker = format!("CTMREAL{}", std::process::id());
     let injector = InputInjector::new();
+    // Multi-line on purpose: a Telegram message may contain newlines, and a
+    // literal LF keypress is a newline INSIDE Claude Code's composer, not a submit
+    // (spiked 2026-09-21 against v2.1.278) — so the whole message must go as one.
     let ok = injector
         .inject(
             &target,
             Some(&socket),
-            &format!("reply with exactly {marker} and nothing else"),
+            &format!("reply with exactly {marker}\nand nothing else"),
         )
         .expect("inject ran");
     assert!(ok, "inject reported the message submitted");
