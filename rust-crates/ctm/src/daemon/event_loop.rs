@@ -35,6 +35,23 @@ pub(super) async fn run_event_loop(
     // Cleanup tasks are exempt — they must always run regardless of load.
     let handler_semaphore = Arc::new(Semaphore::new(50));
 
+    // ADR-023: the async heartbeat. Its job is to stop landing when no worker can
+    // run a task at all — the one failure a watchdog living inside the runtime
+    // could never report. It also publishes the free-permit count, which is how
+    // handler starvation shows up in the stall log.
+    {
+        let health = Arc::clone(&state.health);
+        let sem = Arc::clone(&handler_semaphore);
+        tokio::spawn(async move {
+            let mut beat = tokio::time::interval(tokio::time::Duration::from_secs(1));
+            loop {
+                beat.tick().await;
+                health.beat();
+                health.set_permits(sem.available_permits());
+            }
+        });
+    }
+
     // Pre-construct a single HandlerContext; .clone() is cheap (Arc refcount bumps).
     let base_ctx = HandlerContext {
         bot: Arc::clone(&state.bot),
@@ -92,10 +109,21 @@ pub(super) async fn run_event_loop(
                     Ok(msg) => {
                         let ctx = base_ctx.clone();
                         let sem = handler_semaphore.clone();
-                        tokio::spawn(async move {
+                        // ADR-023: registered before the permit is acquired, so a
+                        // handler starved of a permit is visible as in-flight too —
+                        // that is what permit exhaustion looks like from outside.
+                        let health = Arc::clone(&state.health);
+                        let id = health.reserve(
+                            "event",
+                            format!("{} {}", msg.msg_type, short_id(&msg.session_id)),
+                        );
+                        let guard_health = Arc::clone(&health);
+                        let task = tokio::spawn(async move {
+                            let _done = guard_health.guard(id);
                             let _permit = sem.acquire().await.expect("semaphore closed");
                             handle_socket_message(ctx, msg).await;
                         });
+                        health.attach_abort(id, task.abort_handle());
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         tracing::warn!(skipped = n, "Socket broadcast receiver lagged");
@@ -112,10 +140,15 @@ pub(super) async fn run_event_loop(
             Some(session_id) = flush_rx.recv() => {
                 let ctx = base_ctx.clone();
                 let sem = handler_semaphore.clone();
-                tokio::spawn(async move {
+                let health = Arc::clone(&state.health);
+                let id = health.reserve("flush", short_id(&session_id));
+                let guard_health = Arc::clone(&health);
+                let task = tokio::spawn(async move {
+                    let _done = guard_health.guard(id);
                     let _permit = sem.acquire().await.expect("semaphore closed");
                     super::flush_pending_for_session(&ctx, &session_id).await;
                 });
+                health.attach_abort(id, task.abort_handle());
             }
 
             // Telegram long-polling (poll every iteration)
@@ -130,10 +163,15 @@ pub(super) async fn run_event_loop(
                             }
                             let ctx = base_ctx.clone();
                             let sem = handler_semaphore.clone();
-                            tokio::spawn(async move {
+                            let health = Arc::clone(&state.health);
+                            let id = health.reserve("telegram", format!("update {}", update.update_id));
+                            let guard_health = Arc::clone(&health);
+                            let task = tokio::spawn(async move {
+                                let _done = guard_health.guard(id);
                                 let _permit = sem.acquire().await.expect("semaphore closed");
                                 telegram_handlers::handle_telegram_update(ctx, update).await;
                             });
+                            health.attach_abort(id, task.abort_handle());
                         }
                     }
                     Err(e) => {
@@ -169,12 +207,22 @@ pub(super) async fn run_event_loop(
             // Cleanup timer — exempt from semaphore so it always runs.
             _ = cleanup_interval.tick() => {
                 let ctx = base_ctx.clone();
-                tokio::spawn(async move {
+                let health = Arc::clone(&state.health);
+                let id = health.reserve("cleanup", "periodic sweep");
+                let guard_health = Arc::clone(&health);
+                let task = tokio::spawn(async move {
+                    let _done = guard_health.guard(id);
                     cleanup::run_cleanup(ctx).await;
                 });
+                health.attach_abort(id, task.abort_handle());
             }
         }
     }
+}
+
+/// Short, log-friendly session id for the in-flight table.
+fn short_id(id: &str) -> &str {
+    id.get(..8).unwrap_or(id)
 }
 
 /// Handle a permanently deleted Telegram topic by clearing the stale thread_id

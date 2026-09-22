@@ -90,6 +90,9 @@ pub struct SocketServer {
     tx: broadcast::Sender<BridgeMessage>,
     clients: Arc<Mutex<HashMap<String, Arc<Mutex<tokio::net::unix::OwnedWriteHalf>>>>>,
     shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    /// ADR-023: counts events as they are accepted — before any handler exists —
+    /// so "arriving but never handled" is visible to the watchdog.
+    health: Option<Arc<crate::daemon::health::Health>>,
 }
 
 impl SocketServer {
@@ -102,7 +105,13 @@ impl SocketServer {
             tx,
             clients: Arc::new(Mutex::new(HashMap::new())),
             shutdown_tx: None,
+            health: None,
         }
+    }
+
+    /// ADR-023: give the socket layer the daemon's health counters.
+    pub fn attach_health(&mut self, health: Arc<crate::daemon::health::Health>) {
+        self.health = Some(health);
     }
 
     /// Subscribe to the broadcast channel to receive incoming messages.
@@ -169,6 +178,7 @@ impl SocketServer {
         self._lock = Some(lock);
 
         let tx = self.tx.clone();
+        let health = self.health.clone();
         let clients = Arc::clone(&self.clients);
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
         self.shutdown_tx = Some(shutdown_tx);
@@ -194,6 +204,7 @@ impl SocketServer {
                                 let tx2 = tx.clone();
                                 let clients2 = Arc::clone(&clients);
                                 let cid = client_id.clone();
+                                let health2 = health.clone();
 
                                 let (reader, writer) = stream.into_split();
                                 clients.lock().await.insert(
@@ -202,7 +213,7 @@ impl SocketServer {
                                 );
 
                                 tokio::spawn(async move {
-                                    handle_client(reader, &cid, tx2).await;
+                                    handle_client(reader, &cid, tx2, health2).await;
                                     clients2.lock().await.remove(&cid);
                                 });
                             }
@@ -319,6 +330,7 @@ async fn handle_client(
     reader: tokio::net::unix::OwnedReadHalf,
     client_id: &str,
     tx: broadcast::Sender<BridgeMessage>,
+    health: Option<Arc<crate::daemon::health::Health>>,
 ) {
     tracing::info!(client_id, "Socket client connected");
     let mut buf_reader = BufReader::new(reader);
@@ -352,6 +364,9 @@ async fn handle_client(
                             "_client_id".to_string(),
                             serde_json::Value::String(client_id.to_string()),
                         );
+                        if let Some(h) = &health {
+                            h.event_received();
+                        }
                         let _ = tx.send(msg);
                     }
                     Err(e) => {

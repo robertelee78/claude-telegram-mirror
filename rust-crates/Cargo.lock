@@ -276,7 +276,7 @@ dependencies = [
 
 [[package]]
 name = "ctm"
-version = "0.2.53"
+version = "0.2.54"
 dependencies = [
  "anyhow",
  "base64",

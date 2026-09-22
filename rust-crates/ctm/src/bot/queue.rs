@@ -126,12 +126,34 @@ fn simple_jitter_fraction() -> f64 {
 }
 
 impl TelegramBot {
-    /// Enqueue a message and start processing if not already running.
+    /// Enqueue a message and wake the drainer.
+    ///
+    /// ADR-023: this used to *be* the drainer — the first caller ran the queue down
+    /// inline, which meant a daemon event handler inherited the queue's entire
+    /// backlog and its rate-limit pauses, holding a semaphore permit for as long as
+    /// Telegram stayed unhappy. Queueing is now what its name says: push, wake,
+    /// return. [`run_queue_drainer`] does the waiting, in a task of its own that
+    /// holds no permit and blocks nobody.
     pub(super) async fn enqueue(&self, msg: QueuedMessage) {
-        let mut q = self.queue.lock().await;
-        q.enqueue(msg);
-        drop(q);
-        self.process_queue().await;
+        let depth = {
+            let mut q = self.queue.lock().await;
+            q.enqueue(msg);
+            q.total_len()
+        };
+        self.mark_queue_depth(depth);
+        self.queue_wake.notify_one();
+    }
+
+    /// The single queue drainer. Started once by the daemon; runs for its lifetime.
+    ///
+    /// Waking before waiting closes the race where a message is queued between the
+    /// drain finishing and the wait starting (`Notify` stores one permit, so a
+    /// notify that arrives first is not lost).
+    pub async fn run_queue_drainer(&self) {
+        loop {
+            self.process_queue().await;
+            self.queue_wake.notified().await;
+        }
     }
 
     /// Process the message queue with retry logic.
@@ -160,11 +182,13 @@ impl TelegramBot {
                     None => break,
                 }
             };
+            self.mark_queue_depth(self.queue.lock().await.total_len());
 
             match self.send_item(&item).await {
                 Ok(()) => {
                     // Additive increase: successful send, rate can grow.
                     self.aimd.lock().await.on_success();
+                    self.mark_send_ok();
                 }
                 Err(AppError::RateLimited { retry_after_secs }) => {
                     // Telegram 429 — the entire bot token is globally blocked.

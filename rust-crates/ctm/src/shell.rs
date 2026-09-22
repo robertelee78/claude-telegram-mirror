@@ -655,7 +655,14 @@ printf 'codex:%s
                         env_prefix.replace("set -x CTM_CODEX_REMOTE 0; ", "CTM_CODEX_REMOTE=0 ")
                     ),
                 };
-                let out = Command::new(exe)
+                let mut cmd = Command::new(exe);
+                if shell == Shell::Fish {
+                    // fish prepends its universal `fish_user_paths` to PATH at
+                    // startup, which would shadow this test's stub binaries with the
+                    // real ones. `--no-config` gives a shell with neither.
+                    cmd.arg("--no-config");
+                }
+                let out = cmd
                     .arg("-c")
                     .arg(&script)
                     .env(

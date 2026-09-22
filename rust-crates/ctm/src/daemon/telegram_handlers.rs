@@ -138,8 +138,13 @@ async fn handle_telegram_text(ctx: &HandlerContext, msg: &TgMessage, text: &str)
 
     // BUG-004: Interrupt commands (Escape)
     if is_interrupt_command(text) {
-        let inj = ctx.injector.lock().await;
-        let ok = inj.send_key(target, socket, "Escape").unwrap_or(false);
+        // ADR-023: the lock is released before the reply is sent. tmux injection is
+        // synchronous and instant; a Telegram send is neither, and holding a shared
+        // lock across it is how one slow reply blocks every other one.
+        let ok = {
+            let inj = ctx.injector.lock().await;
+            inj.send_key(target, socket, "Escape").unwrap_or(false)
+        };
         let msg_text = if ok {
             "\u{23F8}\u{FE0F} *Interrupt sent* (Escape)\n\n_Claude should pause the current operation._"
         } else {
@@ -160,8 +165,10 @@ async fn handle_telegram_text(ctx: &HandlerContext, msg: &TgMessage, text: &str)
 
     // BUG-004: Kill commands (Ctrl-C)
     if is_kill_command(text) {
-        let inj = ctx.injector.lock().await;
-        let ok = inj.send_key(target, socket, "Ctrl-C").unwrap_or(false);
+        let ok = {
+            let inj = ctx.injector.lock().await;
+            inj.send_key(target, socket, "Ctrl-C").unwrap_or(false)
+        };
         let msg_text = if ok {
             "\u{1F6D1} *Kill sent* (Ctrl-C)\n\n_Claude should exit entirely._"
         } else {
@@ -434,10 +441,11 @@ async fn inject_to_session(
     let tmux_target = get_tmux_target(ctx, &session.id, session.tmux_socket.as_deref()).await;
 
     if let Some(target) = tmux_target {
-        let inj = ctx.injector.lock().await;
-        let ok = inj
-            .inject(&target, session.tmux_socket.as_deref(), text)
-            .unwrap_or(false);
+        let ok = {
+            let inj = ctx.injector.lock().await;
+            inj.inject(&target, session.tmux_socket.as_deref(), text)
+                .unwrap_or(false)
+        };
         if ok {
             ctx.bot
                 .send_message(&format!("{what} sent to Claude"), None, Some(thread_id))
@@ -658,12 +666,13 @@ async fn handle_bot_command(ctx: &HandlerContext, msg: &TgMessage, text: &str) {
                 let tmux_target =
                     get_tmux_target(ctx, &session.id, session.tmux_socket.as_deref()).await;
                 if let Some(target) = tmux_target {
-                    let inj = ctx.injector.lock().await;
-                    let command = format!("/rename {args}");
-                    if inj
-                        .send_slash_command(&target, session.tmux_socket.as_deref(), &command)
-                        .unwrap_or(false)
-                    {
+                    let sent = {
+                        let inj = ctx.injector.lock().await;
+                        let command = format!("/rename {args}");
+                        inj.send_slash_command(&target, session.tmux_socket.as_deref(), &command)
+                            .unwrap_or(false)
+                    };
+                    if sent {
                         ctx.bot
                             .send_message(
                                 &format!("Sending rename to Claude Code: *{args}*"),

@@ -68,6 +68,11 @@ impl AimdState {
 pub struct TelegramBot {
     pub(super) token: String,
     pub(super) chat_id: i64,
+    /// Telegram API origin. Always `https://api.telegram.org` in production;
+    /// `CTM_TELEGRAM_API_BASE` points it at a stand-in server so the failure
+    /// modes that only Telegram can produce — 429 with `retry_after`, a deleted
+    /// topic, a stalled response — are reproducible in tests (ADR-023).
+    pub(super) api_base: String,
     /// HTTP client for short API calls (sendMessage, editMessage, etc.).
     /// 15s total timeout, 5s connect timeout.
     pub(super) client: Client,
@@ -96,6 +101,20 @@ pub struct TelegramBot {
     pub(super) topic_invalidated_tx: tokio::sync::mpsc::UnboundedSender<i64>,
     /// Receiver end — taken once by the daemon via `take_topic_invalidated_rx`.
     topic_invalidated_rx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<i64>>>>,
+    /// ADR-023: set once by the daemon. Delivery progress (the last successful send
+    /// and the queue depth) is what tells the watchdog the difference between "a
+    /// Telegram outage" and "this daemon has stopped sending".
+    health: std::sync::OnceLock<Arc<crate::daemon::health::Health>>,
+    /// ADR-023: wakes the one task allowed to drain the queue.
+    pub(super) queue_wake: Arc<tokio::sync::Notify>,
+}
+
+/// The Telegram origin to talk to. Production default; overridable for tests only.
+fn api_base() -> String {
+    match std::env::var("CTM_TELEGRAM_API_BASE") {
+        Ok(v) if !v.trim().is_empty() => v.trim().trim_end_matches('/').to_string(),
+        _ => "https://api.telegram.org".to_string(),
+    }
 }
 
 impl TelegramBot {
@@ -135,6 +154,7 @@ impl TelegramBot {
         Ok(Self {
             token: config.bot_token.clone(),
             chat_id: config.chat_id,
+            api_base: api_base(),
             client,
             poll_client,
             rate_limiter: Arc::new(limiter),
@@ -143,6 +163,8 @@ impl TelegramBot {
             queue_processing: Arc::new(AtomicBool::new(false)),
             chunk_size: config.chunk_size,
             running: Arc::new(AtomicBool::new(false)),
+            health: std::sync::OnceLock::new(),
+            queue_wake: Arc::new(tokio::sync::Notify::new()),
             topic_invalidated_tx: tx,
             topic_invalidated_rx: Arc::new(Mutex::new(Some(rx))),
         })
@@ -190,8 +212,25 @@ impl TelegramBot {
 
     // -------------------------------------------------------------- API
 
+    /// ADR-023: give the bot the daemon's health counters (once).
+    pub fn attach_health(&self, health: Arc<crate::daemon::health::Health>) {
+        let _ = self.health.set(health);
+    }
+
+    pub(super) fn mark_send_ok(&self) {
+        if let Some(h) = self.health.get() {
+            h.send_ok();
+        }
+    }
+
+    pub(super) fn mark_queue_depth(&self, n: usize) {
+        if let Some(h) = self.health.get() {
+            h.set_queue_depth(n);
+        }
+    }
+
     pub(super) fn api_url(&self, method: &str) -> String {
-        format!("https://api.telegram.org/bot{}/{}", self.token, method)
+        format!("{}/bot{}/{}", self.api_base, self.token, method)
     }
 
     /// Call a Telegram Bot API method.
@@ -218,6 +257,21 @@ impl TelegramBot {
         // previous code returned a blanket Err on any post-429 failure, which wrongly
         // turned a harmless "message is not modified" after a retry into an error.
         const MAX_429_RETRIES: u32 = 3;
+        // ADR-023: the hard cap on how long one API call may hold its caller.
+        //
+        // This is the root-cause fix for the 2026-09-22 stall. Every handler runs
+        // under one of 50 semaphore permits; `retry_after` is chosen by Telegram and
+        // was 37–43 s. Absorbing three of those inside the call meant a single
+        // `createForumTopic` held a permit for two minutes, and
+        // `create_forum_topic_resilient` multiplied that by four. At 80 events/min
+        // the permits were gone in under a minute and the daemon went silent in both
+        // directions with nothing logged — nothing had failed, every task was
+        // politely asleep. A call now waits only while it can finish inside this
+        // budget; past it the 429 is handed back as `RateLimited` for the caller to
+        // deal with *without* waiting (the queue's drainer is the one task allowed
+        // to sleep out a `retry_after`).
+        const CALL_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+        let deadline = std::time::Instant::now() + CALL_BUDGET;
         let mut attempt: u32 = 0;
         loop {
             // Layer 1: AIMD adaptive inter-message delay.
@@ -253,7 +307,9 @@ impl TelegramBot {
                         .and_then(|p| p.retry_after)
                         .unwrap_or(1);
                     self.aimd.lock().await.on_rate_limit(retry_after);
-                    if attempt < MAX_429_RETRIES {
+                    let wait = tokio::time::Duration::from_secs(retry_after);
+                    let fits = std::time::Instant::now() + wait <= deadline;
+                    if attempt < MAX_429_RETRIES && fits {
                         attempt += 1;
                         tracing::warn!(
                             method,
@@ -261,12 +317,19 @@ impl TelegramBot {
                             attempt,
                             "Telegram 429, retrying after backoff"
                         );
-                        tokio::time::sleep(tokio::time::Duration::from_secs(retry_after)).await;
+                        tokio::time::sleep(wait).await;
                         continue;
                     }
-                    return Err(AppError::Telegram(format!(
-                        "{method}: {desc} (after {attempt} retries)"
-                    )));
+                    // Out of budget: never hold the caller for Telegram's penalty.
+                    tracing::warn!(
+                        method,
+                        retry_after,
+                        attempt,
+                        "Telegram 429 beyond this call's budget — returning to the caller instead of waiting"
+                    );
+                    return Err(AppError::RateLimited {
+                        retry_after_secs: retry_after,
+                    });
                 }
 
                 // 400 "message is not modified": harmless no-op (expected during
@@ -551,6 +614,11 @@ impl TelegramBot {
         for attempt in 0..MAX_ATTEMPTS {
             match self.create_forum_topic(name, color_index).await {
                 Ok(some_or_none) => return Ok(some_or_none),
+                // ADR-023: these retries exist for transient network faults. Rate
+                // limiting is not transient and not ours to wait out in a handler —
+                // the caller buffers the event and the topic is created on a later
+                // pass, which is exactly what the "topic not ready" path already does.
+                Err(e @ AppError::RateLimited { .. }) => return Err(e),
                 Err(e) => {
                     last_err = Some(e);
                     if attempt + 1 < MAX_ATTEMPTS {
@@ -876,10 +944,7 @@ impl TelegramBot {
         };
 
         // Step 2: Download from Telegram file server
-        let url = format!(
-            "https://api.telegram.org/file/bot{}/{}",
-            self.token, file_path
-        );
+        let url = format!("{}/file/bot{}/{}", self.api_base, self.token, file_path);
         let download_resp = self
             .client
             .get(&url)

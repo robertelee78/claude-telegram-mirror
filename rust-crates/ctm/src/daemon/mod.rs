@@ -17,6 +17,7 @@ mod callback_handlers;
 mod cleanup;
 mod event_loop;
 mod files;
+pub mod health;
 mod host_dispatch;
 mod reconcile;
 mod socket_handlers;
@@ -238,6 +239,10 @@ pub(super) struct DaemonState {
     // requests by running `flush_pending_for_session`.
     pub(super) flush_tx: tokio::sync::mpsc::UnboundedSender<String>,
     pub(super) flush_rx: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<String>>>,
+
+    // ADR-023: progress counters and the in-flight handler registry the watchdog
+    // reads from its own OS thread.
+    pub(super) health: Arc<health::Health>,
 }
 
 /// Bridge Daemon — orchestrates all components.
@@ -292,6 +297,7 @@ impl Daemon {
             pending_topic_msgs: Arc::new(RwLock::new(HashMap::new())),
             flush_tx,
             flush_rx: Mutex::new(Some(flush_rx)),
+            health: Arc::new(health::Health::new()),
         });
 
         Ok(Self {
@@ -306,6 +312,13 @@ impl Daemon {
         self.state
             .running
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// ADR-023: the progress counters and in-flight registry. The stall harness
+    /// asserts on these, and `ctm status` reports them.
+    #[allow(dead_code)] // Library API — used by tests/daemon_stall.rs
+    pub fn health(&self) -> Arc<health::Health> {
+        Arc::clone(&self.state.health)
     }
 
     /// L3.2: Get programmatic daemon status.
@@ -364,6 +377,9 @@ impl Daemon {
         // Start socket server
         let pid_path = self.state.config.config_dir.join("bridge.pid");
         let mut socket = SocketServer::new(&self.state.config.socket_path, &pid_path);
+        // ADR-023: count events where they arrive, before any handler exists.
+        socket.attach_health(Arc::clone(&self.state.health));
+        self.state.bot.attach_health(Arc::clone(&self.state.health));
         socket.listen().await?;
         let socket_rx = socket.subscribe();
         let daemon_socket_clients = socket.clients_ref();
@@ -514,6 +530,41 @@ impl Daemon {
             tokio::spawn(async move { crate::host::codex_account::run_keeper(cfg, cx).await });
         } else {
             tracing::info!("Codex mirroring disabled by config");
+        }
+
+        // ADR-023: the one task allowed to wait out Telegram's rate limits. Handlers
+        // queue and return; this drains.
+        {
+            let bot = Arc::clone(&self.state.bot);
+            tokio::spawn(async move { bot.run_queue_drainer().await });
+        }
+
+        // ADR-023: the watchdog runs on its own OS thread so it still reports when
+        // no tokio worker can run a task. `CTM_WATCHDOG=0` disables it.
+        if std::env::var("CTM_WATCHDOG").as_deref() != Ok("0") {
+            health::Watchdog {
+                health: Arc::clone(&self.state.health),
+                config_dir: self.state.config.config_dir.clone(),
+                thresholds: health::Thresholds::default(),
+                max_restarts_per_hour: 5,
+                may_restart: true,
+            }
+            .spawn();
+        }
+
+        // ADR-023: if the previous process ended itself, say so where the user is
+        // looking — they should never have to read a log to learn the mirror was out.
+        if let Some(marker) = health::read_marker(&self.state.config.config_dir) {
+            let line = format!(
+                "\u{1F504} ctm recovered from a stall\n\n{}\nStalled at {} with {} handler(s) stuck; {}.\nDetails are in the daemon log.",
+                if marker.restarted { "The daemon restarted itself." } else { "The daemon could not restart itself." },
+                marker.at,
+                marker.in_flight,
+                format_args!("{} events in, {} handled", marker.received, marker.completed),
+            );
+            tracing::warn!(reason = %marker.reason, at = %marker.at, "ADR-023: previous process ended in a stall");
+            let bot = Arc::clone(&self.state.bot);
+            tokio::spawn(async move { bot.send_message(&line, None, None).await });
         }
 
         tracing::info!("Bridge daemon started");
