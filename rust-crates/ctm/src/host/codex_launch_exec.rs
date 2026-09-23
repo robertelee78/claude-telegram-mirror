@@ -71,10 +71,10 @@ pub(super) async fn attach(
     match thread_id {
         Some(id) => full.extend(codex_launch::args_with_thread(plan, id)),
         None => {
-            if !plan.explicit_cd {
-                full.push("-C".into());
-                full.push(plan.cwd.display().to_string());
-            }
+            // The planner took any -C/--cd into `plan.cwd` (0.2.58), so it is always
+            // passed here, once.
+            full.push("-C".into());
+            full.push(plan.cwd.display().to_string());
             full.extend(plan.codex_args.iter().cloned());
         }
     }

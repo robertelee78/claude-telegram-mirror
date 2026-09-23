@@ -208,3 +208,21 @@ attached, which a remote resume refuses.
 product's main path is a worse defect than the fault. When the evidence a guard depends
 on is derived from ctm's own bookkeeping rather than from the app-server, the guard must
 warn, never refuse.
+
+## Amendment 2026-09-24 — new sessions must not get the flags either
+
+Reported: `csp`, then `/resume` inside the session, then pick one → *"Permission
+overrides are not supported when resuming a remote task."* The TUI keeps the permission
+flags it was launched with and re-sends them on every in-session `/resume`; the
+app-server refuses them exactly as it does on a command-line resume. Reproduced on an
+isolated daemon (Codex 0.156.1): `csp` → `/resume` fails; plain `codex` → `/resume`
+works. ctm had translated flags only for `resume`/`fork`; a new session passed them to
+codex verbatim.
+
+**Decision:** codex is never given permission flags by ctm. A new session is launched
+without them; the launcher snapshots `thread/loaded/list`, waits for the TUI's new thread
+(loaded within a second, before the first message — spiked), and applies the settings
+with `thread/settings/update`, which an attached TUI adopts immediately (`/status` →
+Full Access). `--add-dir` and `-c permissions*` are still passed to a new session, which
+can only take them at start. Proven through the real zsh function: `csp` → `/status`
+Full Access → `/resume` → select → opens, no error.

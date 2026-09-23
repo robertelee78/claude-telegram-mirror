@@ -96,8 +96,28 @@ async fn launch(args: Vec<String>) -> i32 {
     };
     match &plan.kind {
         Kind::New => {
-            drop(rpc);
-            attach(&bin, &cx, &plan, None).await
+            if plan.settings == codex_launch::Settings::default() {
+                drop(rpc);
+                return attach(&bin, &cx, &plan, None).await;
+            }
+            // The TUI is started without permission flags (so its in-session
+            // `/resume` works) and the new thread is given them as soon as it exists.
+            let mut rpc = rpc;
+            let before = loaded_threads(&mut rpc).await;
+            let applier = {
+                let plan = plan.clone();
+                tokio::spawn(async move { apply_to_new_thread(rpc, before, &plan).await })
+            };
+            let code = attach(&bin, &cx, &plan, None).await;
+            // Codex owned the terminal until now; report only after it is gone.
+            match applier.await {
+                Ok(Ok(_)) => {}
+                Ok(Err(why)) => {
+                    eprintln!("ctm: that session ran without your permission flags: {why}")
+                }
+                Err(e) => eprintln!("ctm: could not apply your permission flags: {e}"),
+            }
+            code
         }
         Kind::Resume(thread) => match prepare_resume(rpc, &plan, thread).await {
             Ok(id) => attach(&bin, &cx, &plan, Some(&id)).await,
@@ -136,6 +156,65 @@ fn plain(e: crate::error::AppError) -> String {
         crate::error::AppError::Socket(m) => m,
         other => other.to_string(),
     }
+}
+
+/// Threads the app-server has loaded right now.
+async fn loaded_threads(rpc: &mut Rpc) -> std::collections::HashSet<String> {
+    rpc.call("thread/loaded/list", json!({}))
+        .await
+        .ok()
+        .and_then(|v| v.get("data").and_then(Value::as_array).cloned())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// How long a new session has to appear before ctm gives up applying the flags.
+/// Spike (0.156.1): the TUI's thread is loaded within a second of launch, before the
+/// first message can be typed.
+const NEW_THREAD_WAIT: Duration = Duration::from_secs(20);
+
+/// 0.2.58: find the thread the just-started TUI created — loaded now, not before, in
+/// this directory — and give it the settings the command line asked for. Codex applies
+/// a settings change to an attached TUI immediately (spike: `/status` then reads Full
+/// Access). Returns the thread id.
+async fn apply_to_new_thread(
+    mut rpc: Rpc,
+    before: std::collections::HashSet<String>,
+    plan: &Plan,
+) -> Result<String, String> {
+    let deadline = std::time::Instant::now() + NEW_THREAD_WAIT;
+    while std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        for id in loaded_threads(&mut rpc).await.difference(&before) {
+            let Ok(summary) = read_thread(&mut rpc, id).await else {
+                continue;
+            };
+            if !super::codex_threads::same_dir(&summary.cwd, &plan.cwd) {
+                continue;
+            }
+            let mut params = json!({"threadId": id});
+            if let Some(p) = &plan.settings.permissions {
+                params["permissions"] = Value::String(p.clone());
+            }
+            if let Some(a) = &plan.settings.approval {
+                params["approvalPolicy"] = Value::String(a.clone());
+            }
+            return rpc
+                .call("thread/settings/update", params)
+                .await
+                .map(|_| id.clone())
+                .map_err(plain);
+        }
+    }
+    Err(format!(
+        "no new session appeared in {} within {}s",
+        plan.cwd.display(),
+        NEW_THREAD_WAIT.as_secs()
+    ))
 }
 
 /// Which thread the command names, as an exact id.

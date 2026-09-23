@@ -251,19 +251,18 @@ pub fn plan(args: &[String], pwd: &Path, value_flags: &BTreeSet<String>) -> Resu
         .first()
         .filter(|(idx, s)| *idx < terminator && (s == "resume" || s == "fork"))
         .map(|(idx, s)| (*idx, s.clone()));
-    let Some((resume_idx, subcommand)) = subcommand else {
-        return Ok(Plan {
-            kind: Kind::New,
-            cwd,
-            settings: Settings::default(),
-            codex_args: args.to_vec(),
-            thread_token: None,
-            subcommand_token: None,
-            explicit_cd: explicit_cd.is_some(),
-        });
+    // A new session is translated too (0.2.58). Codex keeps the permission flags a
+    // remote TUI was started with and re-sends them on every in-session `/resume`,
+    // which the app-server refuses — "Permission overrides are not supported when
+    // resuming a remote task" from inside a `csp` session. So codex is never given
+    // them: the launcher applies them to the new thread through the API instead.
+    let (resume_idx, subcommand) = match subcommand {
+        Some((i, s)) => (Some(i), s),
+        None => (None, String::new()),
     };
+    let is_new = resume_idx.is_none();
 
-    // Pass 2 (resume/fork only): translate and strip.
+    // Pass 2: translate and strip.
     let mut settings = Settings::default();
     let mut out: Vec<String> = Vec::new();
     let mut thread_token: Option<usize> = None;
@@ -314,6 +313,14 @@ pub fn plan(args: &[String], pwd: &Path, value_flags: &BTreeSet<String>) -> Resu
                 settings.approval = Some(v);
             }
             "-C" | "--cd" => {} // already in `cwd`
+            // A new session can take these at start (codex applies them itself);
+            // only a resume must refuse them.
+            "--add-dir" if is_new => {
+                out.push(a.clone());
+                if t.attached.is_none() {
+                    out.push(value.clone().unwrap_or_default());
+                }
+            }
             "--add-dir" => {
                 return Err(refuse(format!(
                     "--add-dir {} cannot be applied to a session in the app-server; grant it under [permissions] in {}/.codex/config.toml and resume with -c default_permissions=<name>",
@@ -331,6 +338,15 @@ pub fn plan(args: &[String], pwd: &Path, value_flags: &BTreeSet<String>) -> Resu
                         return Err(refuse("-c default_permissions needs a profile name"));
                     }
                     settings.permissions = Some(name);
+                } else if is_new
+                    && (key.starts_with("permissions")
+                        || key.starts_with("sandbox")
+                        || key == "approval_policy")
+                {
+                    out.push(a.clone());
+                    if t.attached.is_none() {
+                        out.push(kv);
+                    }
                 } else if key.starts_with("permissions")
                     || key.starts_with("sandbox")
                     || key == "approval_policy"
@@ -366,10 +382,10 @@ pub fn plan(args: &[String], pwd: &Path, value_flags: &BTreeSet<String>) -> Resu
                 }
             }
             _ => {
-                if i == resume_idx {
+                if Some(i) == resume_idx {
                     subcommand_token = Some(out.len());
                     out.push(a.clone());
-                } else if thread_token.is_none() && i > resume_idx {
+                } else if thread_token.is_none() && resume_idx.is_some_and(|r| i > r) {
                     // The first positional after `resume` names the session.
                     thread_token = Some(out.len());
                     out.push(a.clone());
@@ -400,6 +416,17 @@ pub fn plan(args: &[String], pwd: &Path, value_flags: &BTreeSet<String>) -> Resu
         None if last => last_ref,
         None => ThreadRef::Picker,
     };
+    if is_new {
+        return Ok(Plan {
+            kind: Kind::New,
+            cwd,
+            settings,
+            codex_args: out,
+            thread_token: None,
+            subcommand_token: None,
+            explicit_cd: explicit_cd.is_some(),
+        });
+    }
     if thread == ThreadRef::Picker && nothing_to_apply && !explicit_cd.is_some() {
         return Ok(verbatim(args, pwd, "picker with nothing to apply"));
     }
@@ -759,12 +786,34 @@ mod tests {
     }
 
     #[test]
-    fn a_new_session_is_left_exactly_as_typed() {
-        let a = args("--dangerously-bypass-approvals-and-sandbox fix-the-bug");
-        let p = plan(&a, &pwd(), &vf()).unwrap();
+    fn a_new_session_never_hands_codex_its_permission_flags() {
+        // 0.2.58: `csp` then `/resume` inside the session failed with "Permission
+        // overrides are not supported when resuming a remote task" — codex re-sends
+        // the flags its TUI was started with. The flags become settings instead.
+        let p = plan(
+            &args("--dangerously-bypass-approvals-and-sandbox fix-the-bug"),
+            &pwd(),
+            &vf(),
+        )
+        .unwrap();
         assert_eq!(p.kind, Kind::New);
-        assert_eq!(p.codex_args, a);
-        assert!(!p.explicit_cd);
+        assert_eq!(
+            p.codex_args,
+            args("fix-the-bug"),
+            "no permission flag reaches codex"
+        );
+        assert_eq!(
+            p.settings.permissions.as_deref(),
+            Some(":danger-full-access")
+        );
+        assert_eq!(p.settings.approval.as_deref(), Some("never"));
+        // A bare `codex` has nothing to translate.
+        let p = plan(&args(""), &pwd(), &vf()).unwrap();
+        assert_eq!(
+            (p.kind.clone(), p.settings.clone()),
+            (Kind::New, Settings::default())
+        );
+        // -C becomes the plan's directory (the runner always passes it on).
         let d = tempfile::tempdir().unwrap();
         let p = plan(
             &args(&format!("-C {} --yolo", d.path().display())),
@@ -773,16 +822,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(p.cwd, std::fs::canonicalize(d.path()).unwrap());
-        assert!(p.explicit_cd, "run must not add a second -C");
+        assert!(p.codex_args.is_empty(), "{:?}", p.codex_args);
         // A flag value that happens to be `resume` is not the subcommand.
         assert_eq!(
             plan(&args("-m resume"), &pwd(), &vf()).unwrap().kind,
             Kind::New
         );
-        // A new session with a bad flag value is codex's to reject, not ours.
-        assert_eq!(
-            plan(&args("-s yolo hi"), &pwd(), &vf()).unwrap().kind,
-            Kind::New
-        );
+        // A prompt word is never mistaken for a flag or a session.
+        let p = plan(&args("--yolo explain the resume flow"), &pwd(), &vf()).unwrap();
+        assert_eq!(p.codex_args, args("explain the resume flow"));
+        // What codex can only take at start is still passed at start.
+        let p = plan(&args("--add-dir /tmp hi"), &pwd(), &vf()).unwrap();
+        assert_eq!(p.codex_args, args("--add-dir /tmp hi"));
     }
 }

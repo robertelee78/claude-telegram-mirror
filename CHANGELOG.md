@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.58] - 2026-09-24
+
+### Fixed (reported: "Permission overrides are not supported when resuming a remote task. <-- STILL!!!")
+- **`/resume` inside a `csp` session failed.** ctm started a new `csp` session as `codex --remote … --dangerously-bypass-approvals-and-sandbox`. Codex remembers the flags its window was started with and re-sends them whenever you `/resume` from inside it — and the shared Codex server refuses permission flags on a resume. 0.2.53 fixed `codex resume …` typed at the shell, but not this path. ctm now never hands Codex permission flags at all: a new session starts without them and ctm gives the session Full Access (or whatever you asked for) through the Codex server the moment it appears — about a second after launch, before you can type. Proven the way you use it: `csp`, `/status` shows Full Access, `/resume` → pick a session → it opens. **Sessions started before this update still carry the old flags; start them again to get a working `/resume`.**
+
 ## [0.2.57] - 2026-09-23
 
 ### Fixed (reported: "messages were going back and forth, but was getting false errors when I sent messages")
