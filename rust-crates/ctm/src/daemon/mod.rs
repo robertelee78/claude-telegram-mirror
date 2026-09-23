@@ -234,6 +234,11 @@ pub(super) struct DaemonState {
     // is created (see `buffer_pending_message` / `flush_pending_for_session`).
     pub(super) pending_topic_msgs: Arc<RwLock<HashMap<String, Vec<BridgeMessage>>>>,
 
+    // ADR-024: topics Telegram said are gone, by the session that owned them. Their
+    // messages are held in the outbox; when the session's replacement topic exists,
+    // they are moved to it (`adopt_orphans`).
+    pub(super) orphaned_topics: Arc<RwLock<HashMap<String, Vec<i64>>>>,
+
     // BUG-002 (review M1): flush-request channel. `flush_tx` is cloned into each
     // HandlerContext; `flush_rx` is taken once by the event loop, which services
     // requests by running `flush_pending_for_session`.
@@ -295,6 +300,7 @@ impl Daemon {
             session_transports: Arc::new(RwLock::new(HashMap::new())),
             session_host_clients: Arc::new(RwLock::new(HashMap::new())),
             pending_topic_msgs: Arc::new(RwLock::new(HashMap::new())),
+            orphaned_topics: Arc::new(RwLock::new(HashMap::new())),
             flush_tx,
             flush_rx: Mutex::new(Some(flush_rx)),
             health: Arc::new(health::Health::new()),
@@ -535,8 +541,13 @@ impl Daemon {
         // ADR-023: the one task allowed to wait out Telegram's rate limits. Handlers
         // queue and return; this drains.
         {
+            // ADR-024: pick up whatever the previous process left waiting, then drain
+            // it and keep saving it while it changes.
+            self.state.bot.restore_outbox().await;
             let bot = Arc::clone(&self.state.bot);
             tokio::spawn(async move { bot.run_queue_drainer().await });
+            let bot = Arc::clone(&self.state.bot);
+            tokio::spawn(async move { bot.run_outbox_saver().await });
         }
 
         // ADR-023: the watchdog runs on its own OS thread so it still reports when
@@ -574,6 +585,8 @@ impl Daemon {
     /// Stop the daemon gracefully.
     pub async fn stop(self) {
         tracing::info!("Stopping bridge daemon...");
+        // ADR-024: whatever is still waiting survives the restart.
+        self.state.bot.save_outbox_now().await;
 
         // Send shutdown notification
         self.state
@@ -664,6 +677,7 @@ struct HandlerContext {
     /// BUG-002 (no-silent-loss): per-session buffer of content events awaiting
     /// topic creation. Flushed by `flush_pending_for_session`.
     pending_topic_msgs: Arc<RwLock<HashMap<String, Vec<BridgeMessage>>>>,
+    orphaned_topics: Arc<RwLock<HashMap<String, Vec<i64>>>>,
     /// BUG-002 (review M1): channel for posting a session-id flush request,
     /// decoupling the lost-wakeup re-trigger from the handler call graph.
     flush_tx: tokio::sync::mpsc::UnboundedSender<String>,
@@ -1194,6 +1208,7 @@ async fn ensure_session_exists(ctx: &HandlerContext, msg: &BridgeMessage) -> boo
                     .write()
                     .await
                     .insert(msg.session_id.clone(), tid);
+                adopt_orphans(ctx, &msg.session_id, tid).await;
                 // ADR-013 E3: Enhanced session resume context message.
                 // Include custom title and inactivity duration if available.
                 let resume_msg = {
@@ -1297,6 +1312,19 @@ async fn ensure_session_exists(ctx: &HandlerContext, msg: &BridgeMessage) -> boo
     tracing::info!(session_id = %msg.session_id, "Creating session on-the-fly");
     socket_handlers::handle_session_start(ctx, msg).await;
     true
+}
+
+/// ADR-024: a session has a (new) topic; send it everything that was being held for
+/// the topics it lost. Called wherever a topic is assigned, so whichever path makes
+/// the replacement — the vanished-topic handler, or the session's next event — the
+/// held messages follow it.
+async fn adopt_orphans(ctx: &HandlerContext, session_id: &str, new_tid: i64) {
+    let old = ctx.orphaned_topics.write().await.remove(session_id);
+    for old_tid in old.into_iter().flatten() {
+        if old_tid != new_tid {
+            ctx.bot.retarget(old_tid, new_tid).await;
+        }
+    }
 }
 
 /// BUG-002 (no-silent-loss): cap on buffered content events per session. A burst

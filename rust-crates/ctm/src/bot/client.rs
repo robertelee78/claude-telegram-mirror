@@ -21,6 +21,9 @@ pub(super) struct AimdState {
     pub(super) decrease_factor: f64,
     /// Timestamp of the last multiplicative decrease (for debouncing).
     pub(super) last_decrease: Option<std::time::Instant>,
+    /// ADR-024: the earliest moment the next group post may go out. Posts are spaced
+    /// by the current rate, and a 429 pushes this past Telegram's `retry_after`.
+    pub(super) next_slot: Option<std::time::Instant>,
 }
 
 impl AimdState {
@@ -28,12 +31,35 @@ impl AimdState {
     pub(super) fn new(max_rate: f64) -> Self {
         Self {
             rate: max_rate,
-            min_rate: 0.5,
+            // ADR-024: the floor must sit *below* the ceiling Telegram grants, or the
+            // controller can never converge. It used to be 0.5 msg/s — 30 a minute,
+            // above the group's 20 — so every backoff still overshot and the bot was
+            // rate-limited continuously (615 global pauses in one day).
+            min_rate: (max_rate / 4.0).max(0.01),
             max_rate,
-            increase: 0.5,
+            increase: (max_rate / 8.0).max(0.005),
             decrease_factor: 0.5,
             last_decrease: None,
+            next_slot: None,
         }
+    }
+
+    /// ADR-024: book the next group-post slot, if it falls before `deadline`.
+    ///
+    /// `Ok(when)` reserves it (the caller sleeps until then); `Err(wait)` leaves the
+    /// schedule untouched and says how far away the slot is, so a caller that must not
+    /// wait that long (a daemon handler — ADR-023) can hand the work back instead.
+    pub(super) fn book(
+        &mut self,
+        now: std::time::Instant,
+        deadline: std::time::Instant,
+    ) -> std::result::Result<std::time::Instant, std::time::Duration> {
+        let at = self.next_slot.map_or(now, |s| s.max(now));
+        if at > deadline {
+            return Err(at - now);
+        }
+        self.next_slot = Some(at + self.inter_message_delay());
+        Ok(at)
     }
 
     /// Additive increase: called after each successful send.
@@ -45,7 +71,10 @@ impl AimdState {
     /// Multiplicative decrease: called when Telegram returns 429.
     /// Rate halves, clamped to `min_rate`. Debounced to at most once per second
     /// to prevent cascading decreases from a burst of 429 responses in flight.
-    pub(super) fn on_rate_limit(&mut self, _retry_after_secs: u64) {
+    pub(super) fn on_rate_limit(&mut self, retry_after_secs: u64) {
+        // Telegram says when it will listen again; nothing goes out before then.
+        let resume = std::time::Instant::now() + std::time::Duration::from_secs(retry_after_secs);
+        self.next_slot = Some(self.next_slot.map_or(resume, |s| s.max(resume)));
         // Debounce: don't decrease more than once per second.
         if self
             .last_decrease
@@ -90,7 +119,7 @@ pub struct TelegramBot {
     /// AIMD adaptive rate controller. Adjusts effective send rate in response
     /// to Telegram 429 signals. The governor enforces the absolute ceiling.
     pub(super) aimd: Arc<Mutex<AimdState>>,
-    pub(super) queue: Arc<Mutex<PriorityMessageQueue>>,
+    pub(super) queue: Arc<Mutex<super::outbox::Outbox>>,
     pub(super) queue_processing: Arc<AtomicBool>,
     pub(super) chunk_size: usize,
     #[allow(dead_code)] // Library API
@@ -107,6 +136,28 @@ pub struct TelegramBot {
     health: std::sync::OnceLock<Arc<crate::daemon::health::Health>>,
     /// ADR-023: wakes the one task allowed to drain the queue.
     pub(super) queue_wake: Arc<tokio::sync::Notify>,
+    /// ADR-024: where the outbox is saved (`<config>/outbox.json`), and whether it has
+    /// changed since the last save.
+    pub(super) outbox_path: Option<std::path::PathBuf>,
+    pub(super) outbox_dirty: Arc<AtomicBool>,
+}
+
+/// ADR-024: does this call post into the group, and so spend its 20-a-minute budget?
+fn counts_against_group_budget(method: &str) -> bool {
+    matches!(
+        method,
+        "sendMessage"
+            | "sendPhoto"
+            | "sendDocument"
+            | "sendMediaGroup"
+            | "sendVideo"
+            | "sendAudio"
+            | "sendVoice"
+            | "sendAnimation"
+            | "copyMessage"
+            | "forwardMessage"
+            | "createForumTopic"
+    )
 }
 
 /// The Telegram origin to talk to. Production default; overridable for tests only.
@@ -119,10 +170,16 @@ fn api_base() -> String {
 
 impl TelegramBot {
     pub fn new(config: &Config) -> Result<Self> {
-        // Rate limiter: use config.rate_limit msgs/sec, clamped to [1, 30].
-        // Telegram enforces ~30 msgs/sec per bot; values above that cause 429 errors.
-        let rate = config.rate_limit.clamp(1, 30);
-        let quota = Quota::per_second(NonZeroU32::new(rate).unwrap());
+        // ADR-024: the budget is per MINUTE, because that is what Telegram grants a
+        // bot in a group: "In a group, bots are not able to send more than 20
+        // messages per minute." Every topic is the same group, so this is the whole
+        // mirror's budget. Clamped to [1, 60] — 60/min is one per second, the FAQ's
+        // single-chat ceiling, and nothing above it is ever sustainable.
+        let per_min = config.rate_limit.clamp(1, 60);
+        // The group budget is enforced by the pacer (`AimdState::book`) on the calls
+        // that post into the group. This governor is only the bot-wide ceiling
+        // Telegram documents for everything else ("about 30 messages per second").
+        let quota = Quota::per_second(NonZeroU32::new(30).unwrap());
         let limiter = RateLimiter::direct(quota);
 
         // API client: 15s total timeout, 5s connect timeout.
@@ -147,7 +204,8 @@ impl TelegramBot {
             .build()
             .map_err(|e| AppError::Telegram(format!("Failed to build poll reqwest Client: {e}")))?;
 
-        let max_rate = f64::from(rate);
+        // AIMD works in messages per second, below the per-minute ceiling.
+        let max_rate = f64::from(per_min) / 60.0;
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -159,12 +217,14 @@ impl TelegramBot {
             poll_client,
             rate_limiter: Arc::new(limiter),
             aimd: Arc::new(Mutex::new(AimdState::new(max_rate))),
-            queue: Arc::new(Mutex::new(PriorityMessageQueue::new())),
+            queue: Arc::new(Mutex::new(super::outbox::Outbox::new())),
             queue_processing: Arc::new(AtomicBool::new(false)),
             chunk_size: config.chunk_size,
             running: Arc::new(AtomicBool::new(false)),
             health: std::sync::OnceLock::new(),
             queue_wake: Arc::new(tokio::sync::Notify::new()),
+            outbox_path: Some(config.config_dir.join(super::queue::OUTBOX_FILE)),
+            outbox_dirty: Arc::new(AtomicBool::new(false)),
             topic_invalidated_tx: tx,
             topic_invalidated_rx: Arc::new(Mutex::new(Some(rx))),
         })
@@ -274,11 +334,26 @@ impl TelegramBot {
         let deadline = std::time::Instant::now() + CALL_BUDGET;
         let mut attempt: u32 = 0;
         loop {
-            // Layer 1: AIMD adaptive inter-message delay.
-            let delay = self.aimd.lock().await.inter_message_delay();
-            tokio::time::sleep(delay).await;
-
-            // Layer 2: Governor absolute ceiling check.
+            // ADR-024: calls that post into the group share its 20-a-minute budget and
+            // wait for their slot. Everything else — a button press being answered, an
+            // edit, a file fetch — goes straight out; it used to sit behind the same
+            // per-call delay, which made the whole bot sluggish for no reason.
+            if counts_against_group_budget(method) {
+                let booked = self
+                    .aimd
+                    .lock()
+                    .await
+                    .book(std::time::Instant::now(), deadline);
+                match booked {
+                    Ok(at) => tokio::time::sleep_until(at.into()).await,
+                    Err(wait) => {
+                        return Err(AppError::RateLimited {
+                            retry_after_secs: wait.as_secs().max(1),
+                        })
+                    }
+                }
+            }
+            // Bot-wide ceiling.
             self.rate_limiter.until_ready().await;
 
             let resp = self
@@ -427,6 +502,7 @@ impl TelegramBot {
                 retries: 0,
                 created_at: epoch_millis(),
                 priority,
+                seq: 0,
             })
             .await;
         }
@@ -498,6 +574,7 @@ impl TelegramBot {
             retries: 0,
             created_at: epoch_millis(),
             priority,
+            seq: 0,
         })
         .await;
     }
@@ -1271,7 +1348,7 @@ mod tests {
             .unwrap();
         rt.block_on(async {
             let q = bot.queue.lock().await;
-            assert_eq!(q.total_len(), 0);
+            assert_eq!(q.len(), 0);
         });
     }
 

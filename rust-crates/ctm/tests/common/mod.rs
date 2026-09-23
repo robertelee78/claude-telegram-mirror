@@ -41,6 +41,19 @@ struct FakeState {
     /// How long `getUpdates` holds before answering (Telegram long-polls for 30 s).
     poll_hold_ms: u64,
     calls: HashMap<String, u64>,
+    /// Every `text` this server accepted, in order — so a test can assert that a
+    /// particular message reached Telegram rather than being dropped.
+    delivered: Vec<String>,
+    /// ADR-024: when set, the server enforces Telegram's documented group limit —
+    /// "In a group, bots are not able to send more than 20 messages per minute" —
+    /// answering 429 beyond it, exactly as the real API does.
+    enforce_per_min: Option<u32>,
+    window: Vec<std::time::Instant>,
+    throttled: u64,
+    /// Topics "deleted in the app": sends to them fail as Telegram's do.
+    dead_topics: std::collections::HashSet<i64>,
+    /// (topic, text) of every accepted send, for "which topic did it land in".
+    delivered_to: Vec<(Option<i64>, String)>,
 }
 
 #[derive(Clone)]
@@ -59,6 +72,12 @@ impl FakeTelegram {
                 send: SendBehaviour::Ok,
                 poll_hold_ms: 200,
                 calls: HashMap::new(),
+                delivered: Vec::new(),
+                enforce_per_min: None,
+                window: Vec::new(),
+                throttled: 0,
+                dead_topics: std::collections::HashSet::new(),
+                delivered_to: Vec::new(),
             })),
             port,
             next_id: Arc::new(AtomicI64::new(1000)),
@@ -88,6 +107,49 @@ impl FakeTelegram {
         *self.state.lock().unwrap().calls.get(method).unwrap_or(&0)
     }
 
+    /// Behave like the real API: refuse more than `per_min` messages a minute.
+    pub fn enforce_group_limit(&self, per_min: u32) {
+        self.state.lock().unwrap().enforce_per_min = Some(per_min);
+    }
+
+    pub fn delivered(&self) -> Vec<String> {
+        self.state.lock().unwrap().delivered.clone()
+    }
+
+    pub fn was_delivered(&self, needle: &str) -> bool {
+        self.state
+            .lock()
+            .unwrap()
+            .delivered
+            .iter()
+            .any(|t| t.contains(needle))
+    }
+
+    pub fn throttled(&self) -> u64 {
+        self.state.lock().unwrap().throttled
+    }
+
+    /// Delete a topic, as the user would in the Telegram app.
+    pub fn kill_topic(&self, thread_id: i64) {
+        self.state.lock().unwrap().dead_topics.insert(thread_id);
+    }
+
+    /// The topic a message containing `needle` was delivered to.
+    pub fn topic_of(&self, needle: &str) -> Option<Option<i64>> {
+        self.state
+            .lock()
+            .unwrap()
+            .delivered_to
+            .iter()
+            .find(|(_, t)| t.contains(needle))
+            .map(|(tid, _)| *tid)
+    }
+
+    /// Topics created so far, in order.
+    pub fn created_topics(&self) -> u64 {
+        self.calls("createForumTopic")
+    }
+
     async fn serve(self, sock: tokio::net::TcpStream) {
         let (r, mut w) = sock.into_split();
         let mut reader = BufReader::new(r);
@@ -111,20 +173,66 @@ impl FakeTelegram {
                     len = v.trim().parse().unwrap_or(0);
                 }
             }
+            let mut body_text = String::new();
             if len > 0 {
                 let mut body = vec![0u8; len];
                 if reader.read_exact(&mut body).await.is_err() {
                     return;
                 }
+                body_text = String::from_utf8_lossy(&body).into_owned();
             }
             let method = path.rsplit('/').next().unwrap_or("").to_string();
+            let mut over_limit = None;
             let (behaviour, hold) = {
                 let mut st = self.state.lock().unwrap();
                 *st.calls.entry(method.clone()).or_insert(0) += 1;
+                let thread: Option<i64> = serde_json::from_str::<serde_json::Value>(&body_text)
+                    .ok()
+                    .and_then(|v| v.get("message_thread_id").and_then(|t| t.as_i64()));
+                let dead = thread.is_some_and(|t| st.dead_topics.contains(&t));
+                if method == "sendMessage" && dead {
+                    // handled below: Telegram's answer for a deleted topic
+                } else if method == "sendMessage" {
+                    if let Some(t) = extract_text(&body_text) {
+                        st.delivered_to.push((thread, t));
+                    }
+                    if let Some(per_min) = st.enforce_per_min {
+                        let now = std::time::Instant::now();
+                        st.window
+                            .retain(|t| now.duration_since(*t) < Duration::from_secs(60));
+                        if st.window.len() >= per_min as usize {
+                            st.throttled += 1;
+                            let oldest = st.window.first().copied().unwrap_or(now);
+                            let wait = 60u64
+                                .saturating_sub(now.duration_since(oldest).as_secs())
+                                .max(1);
+                            over_limit = Some(wait);
+                        } else {
+                            st.window.push(now);
+                            if let Some(t) = extract_text(&body_text) {
+                                st.delivered.push(t);
+                            }
+                        }
+                    } else if let Some(t) = extract_text(&body_text) {
+                        st.delivered.push(t);
+                    }
+                }
                 (st.send, st.poll_hold_ms)
             };
 
-            let body = match method.as_str() {
+            let dead_topic = method == "sendMessage"
+                && serde_json::from_str::<serde_json::Value>(&body_text)
+                    .ok()
+                    .and_then(|v| v.get("message_thread_id").and_then(|t| t.as_i64()))
+                    .is_some_and(|t| self.state.lock().unwrap().dead_topics.contains(&t));
+            let body = if dead_topic {
+                r#"{"ok":false,"error_code":400,"description":"Bad Request: message thread not found"}"#.to_string()
+            } else if let Some(retry_after) = over_limit {
+                format!(
+                    r#"{{"ok":false,"error_code":429,"description":"Too Many Requests: retry after {retry_after}","parameters":{{"retry_after":{retry_after}}}}}"#
+                )
+            } else {
+                match method.as_str() {
                 "getMe" => r#"{"ok":true,"result":{"id":1,"is_bot":true,"username":"faketestbot"}}"#.to_string(),
                 "getUpdates" => {
                     tokio::time::sleep(Duration::from_millis(hold)).await;
@@ -150,7 +258,8 @@ impl FakeTelegram {
                     SendBehaviour::TopicNotFound => {
                         r#"{"ok":false,"error_code":400,"description":"Bad Request: message thread not found"}"#.to_string()
                     }
-                },
+                    },
+                }
             };
             let resp = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{}",
@@ -162,6 +271,12 @@ impl FakeTelegram {
             }
         }
     }
+}
+
+/// Pull `"text":"…"` out of a sendMessage body (the fake speaks just enough JSON).
+fn extract_text(body: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    v.get("text").and_then(|t| t.as_str()).map(str::to_string)
 }
 
 // ------------------------------------------------------------------- harness

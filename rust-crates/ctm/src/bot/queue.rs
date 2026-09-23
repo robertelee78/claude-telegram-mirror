@@ -1,4 +1,24 @@
-//! Message queue, rate limiting, and retry logic for TelegramBot.
+//! The send path: the one task that drains the outbox into Telegram (ADR-023, ADR-024).
+//!
+//! Handlers never wait on Telegram: they put a message in the outbox and return
+//! (ADR-023). This drainer is the only thing that waits — for its slot in the group's
+//! 20-a-minute budget, for Telegram's `retry_after`, for the network to come back.
+//!
+//! **It never drops a message for load or for a transient failure** (ADR-024). Each
+//! send takes the next *batch* — everything waiting for the most urgent topic, packed
+//! into one message — so a backlog drains at dozens of lines per post. What happens
+//! when a send fails:
+//!
+//! | Telegram said                 | The drainer                                       |
+//! |-------------------------------|---------------------------------------------------|
+//! | 429 "retry after N"           | puts it back, waits N, tries again                |
+//! | the topic no longer exists    | holds the topic's messages until the daemon makes |
+//! |                               | a new topic, then sends them there                |
+//! | network error / 5xx           | puts it back, backs off (up to a minute), retries |
+//! | this content is invalid (400) | the one case it gives up — logged with the text   |
+//!
+//! The outbox is saved to disk every couple of seconds while it changes, so a daemon
+//! restart resumes where it left off.
 
 use super::*;
 
@@ -13,107 +33,12 @@ impl Drop for ProcessingGuard {
     }
 }
 
-/// Three-tier priority message queue.
-///
-/// Messages are dequeued strictly in priority order: Critical first, then
-/// Normal, then Low. Within each tier, ordering is FIFO.
-///
-/// Each tier has an independent overflow cap. When a tier overflows, the
-/// oldest message in that tier is dropped — higher-priority tiers are never
-/// affected by lower-priority overflows.
-pub(super) struct PriorityMessageQueue {
-    critical: VecDeque<QueuedMessage>,
-    normal: VecDeque<QueuedMessage>,
-    low: VecDeque<QueuedMessage>,
-    /// ADR-014 D6: drops accumulated since the last aggregate log line.
-    dropped_since_log: u64,
-    /// ADR-014 D6: when the last aggregate drop line was emitted.
-    last_drop_log: Option<std::time::Instant>,
-}
-
-impl PriorityMessageQueue {
-    /// Maximum critical messages queued. Should never be hit in normal operation.
-    const MAX_CRITICAL: usize = 50;
-    /// Maximum normal-priority messages queued.
-    const MAX_NORMAL: usize = 300;
-    /// Maximum low-priority messages queued.
-    const MAX_LOW: usize = 150;
-    /// ADR-014 D6: minimum interval between aggregate backpressure log lines.
-    const DROP_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
-
-    pub(super) fn new() -> Self {
-        Self {
-            critical: VecDeque::new(),
-            normal: VecDeque::new(),
-            low: VecDeque::new(),
-            dropped_since_log: 0,
-            last_drop_log: None,
-        }
-    }
-
-    /// Enqueue a message, routing to the correct tier by priority.
-    /// If the tier is full, the oldest message in that tier is dropped.
-    pub(super) fn enqueue(&mut self, msg: QueuedMessage) {
-        let (queue, max) = match msg.priority {
-            MessagePriority::Critical => (&mut self.critical, Self::MAX_CRITICAL),
-            MessagePriority::Normal => (&mut self.normal, Self::MAX_NORMAL),
-            MessagePriority::Low => (&mut self.low, Self::MAX_LOW),
-        };
-        if queue.len() >= max {
-            queue.pop_front();
-            // ADR-014 D6: a tool-spam storm overflows a tier every few ms. Logging each
-            // drop individually buried the journal in per-second spam (the symptom that
-            // motivated this fix). Aggregate instead: count drops and emit at most one
-            // summary line per DROP_LOG_INTERVAL. Higher tiers are never evicted by
-            // lower-tier overflow, so this is overwhelmingly Low-tier preview churn.
-            self.dropped_since_log += 1;
-            let now = std::time::Instant::now();
-            let should_log = self
-                .last_drop_log
-                .map(|t| now.duration_since(t) >= Self::DROP_LOG_INTERVAL)
-                .unwrap_or(true);
-            if should_log {
-                tracing::warn!(
-                    dropped = self.dropped_since_log,
-                    "Queue backpressure: evicted {} oldest queued message(s) since last report (mostly Low-priority tool previews)",
-                    self.dropped_since_log
-                );
-                self.dropped_since_log = 0;
-                self.last_drop_log = Some(now);
-            }
-        }
-        queue.push_back(msg);
-    }
-
-    /// Pop the highest-priority available message.
-    /// Drains Critical first, then Normal, then Low.
-    pub(super) fn pop_next(&mut self) -> Option<QueuedMessage> {
-        self.critical
-            .pop_front()
-            .or_else(|| self.normal.pop_front())
-            .or_else(|| self.low.pop_front())
-    }
-
-    /// Push a message to the front of its priority tier's sub-queue.
-    /// Used to re-enqueue a message for retry without changing its priority order.
-    pub(super) fn push_front(&mut self, msg: QueuedMessage) {
-        match msg.priority {
-            MessagePriority::Critical => self.critical.push_front(msg),
-            MessagePriority::Normal => self.normal.push_front(msg),
-            MessagePriority::Low => self.low.push_front(msg),
-        }
-    }
-
-    /// Total number of messages across all priority tiers.
-    pub(super) fn total_len(&self) -> usize {
-        self.critical.len() + self.normal.len() + self.low.len()
-    }
-
-    /// Whether all priority tiers are empty.
-    pub(super) fn is_empty(&self) -> bool {
-        self.critical.is_empty() && self.normal.is_empty() && self.low.is_empty()
-    }
-}
+/// Longest back-off between retries of a message that failed for a transient reason.
+const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
+/// How often a changed outbox is written to disk.
+const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
+/// File the outbox is saved to, in ctm's config directory.
+pub(super) const OUTBOX_FILE: &str = "outbox.json";
 
 /// Deterministic jitter fraction in the range [0.0, 1.0), derived from the
 /// current wall-clock nanoseconds. Avoids adding a `rand` crate dependency.
@@ -125,21 +50,24 @@ fn simple_jitter_fraction() -> f64 {
     (nanos % 1000) as f64 / 1000.0
 }
 
+/// Back-off for the `n`th consecutive transient failure: 2 s, 4 s, 8 s … capped.
+pub(super) fn backoff(n: u32) -> std::time::Duration {
+    let secs = 1u64
+        .checked_shl(n.min(10))
+        .unwrap_or(u64::MAX)
+        .saturating_mul(2);
+    std::time::Duration::from_secs(secs).min(MAX_BACKOFF)
+}
+
 impl TelegramBot {
-    /// Enqueue a message and wake the drainer.
-    ///
-    /// ADR-023: this used to *be* the drainer — the first caller ran the queue down
-    /// inline, which meant a daemon event handler inherited the queue's entire
-    /// backlog and its rate-limit pauses, holding a semaphore permit for as long as
-    /// Telegram stayed unhappy. Queueing is now what its name says: push, wake,
-    /// return. [`run_queue_drainer`] does the waiting, in a task of its own that
-    /// holds no permit and blocks nobody.
+    /// Put a message in the outbox and wake the drainer. Never blocks on Telegram.
     pub(super) async fn enqueue(&self, msg: QueuedMessage) {
         let depth = {
             let mut q = self.queue.lock().await;
-            q.enqueue(msg);
-            q.total_len()
+            q.push(msg);
+            q.len()
         };
+        self.outbox_dirty.store(true, Ordering::Release);
         self.mark_queue_depth(depth);
         self.queue_wake.notify_one();
     }
@@ -156,7 +84,116 @@ impl TelegramBot {
         }
     }
 
-    /// Process the message queue with retry logic.
+    /// How many messages are still waiting for this topic. The daemon waits for this
+    /// to reach zero before deleting a finished session's topic (ADR-024), so a
+    /// session's last reply is not deleted along with it.
+    pub async fn pending_for(&self, thread_id: i64) -> usize {
+        self.queue.lock().await.pending_for(thread_id)
+    }
+
+    /// Send everything that was waiting for a vanished topic to its replacement.
+    pub async fn retarget(&self, old: i64, new: i64) -> usize {
+        let moved = self.queue.lock().await.retarget(old, new);
+        if moved > 0 {
+            tracing::info!(
+                old_thread_id = old,
+                new_thread_id = new,
+                moved,
+                "ADR-024: messages held for a vanished topic are going to its replacement"
+            );
+            self.outbox_dirty.store(true, Ordering::Release);
+            self.queue_wake.notify_one();
+        }
+        moved
+    }
+
+    /// The topic is gone and nothing will replace it (its session ended and ctm deleted
+    /// the topic on purpose). Returns how many messages were waiting for it.
+    pub async fn discard_topic(&self, thread_id: i64) -> usize {
+        let n = self.queue.lock().await.discard_topic(thread_id);
+        if n > 0 {
+            self.outbox_dirty.store(true, Ordering::Release);
+        }
+        n
+    }
+
+    /// Is this topic's traffic being held because Telegram says it is gone?
+    pub async fn is_parked(&self, thread_id: i64) -> bool {
+        self.queue.lock().await.is_parked(thread_id)
+    }
+
+    /// Reload what the previous process left waiting. Call before the drainer starts.
+    pub async fn restore_outbox(&self) -> usize {
+        let Some(path) = &self.outbox_path else {
+            return 0;
+        };
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return 0;
+        };
+        let items: Vec<QueuedMessage> = match serde_json::from_str(&text) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, path = %path.display(), "ADR-024: saved outbox unreadable; starting empty");
+                return 0;
+            }
+        };
+        let n = items.len();
+        let mut q = self.queue.lock().await;
+        q.restore(items);
+        self.mark_queue_depth(q.len());
+        if n > 0 {
+            tracing::info!(
+                restored = n,
+                "ADR-024: resuming messages that were waiting when the daemon stopped"
+            );
+        }
+        n
+    }
+
+    /// Write the outbox to disk if it changed. Atomic (temp file + rename), owner-only.
+    pub async fn save_outbox(&self) {
+        let Some(path) = &self.outbox_path else {
+            return;
+        };
+        if !self.outbox_dirty.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        let snapshot = self.queue.lock().await.snapshot();
+        let Ok(text) = serde_json::to_string(&snapshot) else {
+            return;
+        };
+        let tmp = path.with_extension("json.tmp");
+        let written = std::fs::write(&tmp, text).and_then(|()| {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+            }
+            std::fs::rename(&tmp, path)
+        });
+        if let Err(e) = written {
+            self.outbox_dirty.store(true, Ordering::Release);
+            tracing::warn!(error = %e, "ADR-024: could not save the outbox; will retry");
+        }
+    }
+
+    /// Save immediately, changed or not (daemon shutdown).
+    pub async fn save_outbox_now(&self) {
+        self.outbox_dirty.store(true, Ordering::Release);
+        self.save_outbox().await;
+    }
+
+    /// Save the outbox every couple of seconds while it changes. Runs for the daemon's
+    /// lifetime.
+    pub async fn run_outbox_saver(&self) {
+        let mut tick = tokio::time::interval(SAVE_EVERY);
+        loop {
+            tick.tick().await;
+            self.save_outbox().await;
+        }
+    }
+
+    /// Drain the outbox.
     async fn process_queue(&self) {
         // Atomically set processing = true only if it was false.
         // If it was already true, another task is processing — return immediately.
@@ -174,76 +211,79 @@ impl TelegramBot {
         loop {
             let item = {
                 let mut q = self.queue.lock().await;
-                if q.is_empty() {
-                    break;
-                }
-                match q.pop_next() {
+                let next = q.next_batch(self.chunk_size);
+                self.mark_queue_depth(q.len());
+                match next {
                     Some(m) => m,
-                    None => break,
+                    None => break, // empty, or everything left is held for a gone topic
                 }
             };
-            self.mark_queue_depth(self.queue.lock().await.total_len());
+            self.outbox_dirty.store(true, Ordering::Release);
 
             match self.send_item(&item).await {
                 Ok(()) => {
-                    // Additive increase: successful send, rate can grow.
                     self.aimd.lock().await.on_success();
                     self.mark_send_ok();
                 }
                 Err(AppError::RateLimited { retry_after_secs }) => {
-                    // Telegram 429 — the entire bot token is globally blocked.
-                    // No API calls of any type succeed during the retry_after window.
-                    // The entire queue must pause; continuing to send other messages
-                    // extends the penalty and risks a 900-second IP ban.
-
-                    // Multiplicative decrease: halve the effective send rate.
+                    // Telegram's own answer to "too much": nothing goes out for this
+                    // bot until `retry_after`. The pacer records it; wait it out here —
+                    // this task holds no permit and blocks nobody.
                     self.aimd.lock().await.on_rate_limit(retry_after_secs);
-
-                    // grammY-style philosophy (ADR-014 A7): honor the server-provided
-                    // `retry_after` and pause this token's sends for that window. There
-                    // is no millisecond-precision field in the real Bot API — the former
-                    // `adaptive_retry` path was dead code built on a fabricated field and
-                    // was removed.
                     let wait_ms = retry_after_secs * 1000;
-                    // Add ~10% jitter to prevent thundering herd if multiple bots recover
-                    // simultaneously. Jitter is deterministic (no rand crate).
                     let jitter_ms = (wait_ms as f64 * 0.1 * simple_jitter_fraction()) as u64;
                     let total_wait = tokio::time::Duration::from_millis(wait_ms + jitter_ms);
-
-                    let q_depth = self.queue.lock().await.total_len();
+                    let depth = {
+                        let mut q = self.queue.lock().await;
+                        q.push_front(item);
+                        q.len()
+                    };
                     tracing::warn!(
                         retry_after_secs,
-                        total_wait_ms = total_wait.as_millis(),
-                        queue_depth = q_depth,
-                        "429 rate limited — pausing entire queue (bot token globally blocked)"
+                        queue_depth = depth,
+                        "429 rate limited — holding the outbox until Telegram accepts again"
                     );
-
-                    // Sleep before re-enqueuing so the queue is unlocked during the wait.
                     tokio::time::sleep(total_wait).await;
-
-                    // Push the message back to the front of its priority tier WITHOUT
-                    // incrementing retries — rate limiting is flow control, not a failure.
-                    let mut q = self.queue.lock().await;
-                    q.push_front(item);
+                }
+                Err(AppError::TopicGone { thread_id }) => {
+                    // Hold, never drop: the daemon was told (`topic_invalidated_tx`) and
+                    // will make a replacement topic and `retarget` these messages.
+                    let held = {
+                        let mut q = self.queue.lock().await;
+                        q.push_front(item);
+                        q.park(thread_id);
+                        q.pending_for(thread_id)
+                    };
+                    tracing::warn!(
+                        thread_id,
+                        held,
+                        "ADR-024: topic is gone — holding its messages for a replacement topic"
+                    );
+                }
+                Err(AppError::Rejected(reason)) => {
+                    // The one case where retrying cannot help: Telegram refused this
+                    // content itself (and the plain-text fallback, where it applied).
+                    let preview: String = item.text.chars().take(120).collect();
+                    tracing::error!(
+                        reason = %reason,
+                        thread_id = ?item.thread_id,
+                        text = %preview,
+                        "ADR-024: Telegram refused this message's content; it cannot be delivered"
+                    );
                 }
                 Err(e) => {
-                    let err_str = self.scrub_token(&e.to_string());
-                    if item.retries < 3 {
-                        let mut retry = item.clone();
-                        retry.retries += 1;
-                        let delay_ms = 1000u64.saturating_mul(1u64 << retry.retries.min(10));
-                        tracing::warn!(
-                            retries = retry.retries,
-                            delay_ms,
-                            error = %err_str,
-                            "Message send failed, retrying"
-                        );
-                        tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
-                        let mut q = self.queue.lock().await;
-                        q.push_front(retry);
-                    } else {
-                        tracing::error!(error = %err_str, "Failed to send message after 3 retries");
-                    }
+                    // Network, 5xx, anything transient: back off and try again, forever.
+                    let mut retry = item;
+                    retry.retries = retry.retries.saturating_add(1);
+                    let wait = backoff(retry.retries);
+                    tracing::warn!(
+                        attempt = retry.retries,
+                        wait_secs = wait.as_secs(),
+                        error = %self.scrub_token(&e.to_string()),
+                        "Message send failed — will retry (never dropped)"
+                    );
+                    self.queue.lock().await.push_front(retry);
+                    tokio::time::sleep(wait).await;
                 }
             }
         }
@@ -344,8 +384,9 @@ impl TelegramBot {
                     "Topic permanently deleted (TOPIC_ID_INVALID), clearing stale mapping"
                 );
                 let _ = self.topic_invalidated_tx.send(tid);
+                return Err(AppError::TopicGone { thread_id: tid });
             }
-            return Err(AppError::Telegram("Topic deleted".into()));
+            return Err(AppError::Rejected("Topic deleted".into()));
         }
 
         // "message thread not found": stale thread_id or Telegram state inconsistency.
@@ -359,8 +400,9 @@ impl TelegramBot {
                     "Topic not found (stale thread_id), clearing stale mapping"
                 );
                 let _ = self.topic_invalidated_tx.send(tid);
+                return Err(AppError::TopicGone { thread_id: tid });
             }
-            return Err(AppError::Telegram("Topic not found".into()));
+            return Err(AppError::Rejected("Topic not found".into()));
         }
 
         // Entity parse error: strip formatting, retry as plain text
@@ -393,12 +435,18 @@ impl TelegramBot {
             // secondary error so process_queue does not retry with the original
             // broken Markdown body.
             let plain_desc = plain_resp.description.unwrap_or_default();
-            return Err(AppError::Telegram(format!(
+            return Err(AppError::Rejected(format!(
                 "Plain text fallback also failed: {}",
                 self.scrub_token(&plain_desc)
             )));
         }
 
+        // Any other 400 is Telegram refusing this message's content — retrying it
+        // unchanged cannot succeed. Everything that is not a 400 (network, 5xx) has
+        // already come back as an `Err` from `api_call` and is retried by the drainer.
+        if code == 400 {
+            return Err(AppError::Rejected(self.scrub_token(&desc)));
+        }
         Err(AppError::Telegram(self.scrub_token(&desc)))
     }
 }
@@ -435,152 +483,12 @@ mod tests {
         }
     }
 
-    /// Build a minimal QueuedMessage for tests.
-    fn make_msg(text: &str, priority: MessagePriority) -> QueuedMessage {
-        QueuedMessage {
-            chat_id: -100999,
-            text: text.to_string(),
-            thread_id: None,
-            buttons: None,
-            parse_mode: None,
-            disable_notification: None,
-            reply_to_message_id: None,
-            retries: 0,
-            created_at: 0,
-            priority,
-        }
-    }
-
-    // ---------------------------------------------------------------- PriorityMessageQueue
-
-    #[test]
-    fn priority_queue_starts_empty() {
-        let q = PriorityMessageQueue::new();
-        assert!(q.is_empty());
-        assert_eq!(q.total_len(), 0);
-    }
-
-    #[test]
-    fn priority_queue_drains_critical_before_normal_before_low() {
-        let mut q = PriorityMessageQueue::new();
-        q.enqueue(make_msg("low-1", MessagePriority::Low));
-        q.enqueue(make_msg("normal-1", MessagePriority::Normal));
-        q.enqueue(make_msg("critical-1", MessagePriority::Critical));
-        q.enqueue(make_msg("low-2", MessagePriority::Low));
-        q.enqueue(make_msg("normal-2", MessagePriority::Normal));
-        q.enqueue(make_msg("critical-2", MessagePriority::Critical));
-
-        // Critical drained first (FIFO within tier)
-        assert_eq!(q.pop_next().unwrap().text, "critical-1");
-        assert_eq!(q.pop_next().unwrap().text, "critical-2");
-        // Then normal
-        assert_eq!(q.pop_next().unwrap().text, "normal-1");
-        assert_eq!(q.pop_next().unwrap().text, "normal-2");
-        // Then low
-        assert_eq!(q.pop_next().unwrap().text, "low-1");
-        assert_eq!(q.pop_next().unwrap().text, "low-2");
-        // Empty
-        assert!(q.pop_next().is_none());
-    }
-
-    #[test]
-    fn priority_queue_total_len_counts_all_tiers() {
-        let mut q = PriorityMessageQueue::new();
-        q.enqueue(make_msg("a", MessagePriority::Critical));
-        q.enqueue(make_msg("b", MessagePriority::Normal));
-        q.enqueue(make_msg("c", MessagePriority::Low));
-        assert_eq!(q.total_len(), 3);
-    }
-
-    #[test]
-    fn priority_queue_overflow_drops_oldest_in_tier() {
-        let mut q = PriorityMessageQueue::new();
-        // Fill the low-priority tier to its cap
-        for i in 0..PriorityMessageQueue::MAX_LOW {
-            q.enqueue(make_msg(&format!("low-{i}"), MessagePriority::Low));
-        }
-        assert_eq!(q.low.len(), PriorityMessageQueue::MAX_LOW);
-
-        // Adding one more should drop the oldest (low-0) and add the new one
-        q.enqueue(make_msg("low-overflow", MessagePriority::Low));
-        assert_eq!(q.low.len(), PriorityMessageQueue::MAX_LOW);
-        // The oldest "low-0" should have been dropped; "low-1" is now front
-        assert_eq!(q.low.front().unwrap().text, "low-1");
-        // The new message is at the back
-        assert_eq!(q.low.back().unwrap().text, "low-overflow");
-    }
-
-    #[test]
-    fn priority_queue_overflow_does_not_affect_other_tiers() {
-        let mut q = PriorityMessageQueue::new();
-        // Pre-fill normal tier to its cap
-        for i in 0..PriorityMessageQueue::MAX_NORMAL {
-            q.enqueue(make_msg(&format!("normal-{i}"), MessagePriority::Normal));
-        }
-        // Add a critical message — should not be affected by normal overflow
-        q.enqueue(make_msg("critical-safe", MessagePriority::Critical));
-        assert_eq!(q.critical.len(), 1);
-        assert_eq!(q.critical.front().unwrap().text, "critical-safe");
-    }
-
-    /// ADR-014 D6: under a tool-spam storm, Low-priority ToolStart previews shed
-    /// (oldest-first) while Normal-priority ToolResults are fully preserved AND
-    /// drained first. This is the core D6 guarantee.
-    #[test]
-    fn d6_low_previews_shed_while_normal_results_survive() {
-        let mut q = PriorityMessageQueue::new();
-        // Storm: far more Low previews than the tier holds, plus some Normal results.
-        for i in 0..(PriorityMessageQueue::MAX_LOW + 100) {
-            q.enqueue(make_msg(&format!("preview-{i}"), MessagePriority::Low));
-        }
-        for i in 0..10 {
-            q.enqueue(make_msg(&format!("result-{i}"), MessagePriority::Normal));
-        }
-        // Normal results are untouched by Low overflow.
-        assert_eq!(q.normal.len(), 10);
-        // Low tier is capped; the oldest 100 previews were shed.
-        assert_eq!(q.low.len(), PriorityMessageQueue::MAX_LOW);
-        // ALL results drain before ANY preview.
-        for i in 0..10 {
-            assert_eq!(q.pop_next().unwrap().text, format!("result-{i}"));
-        }
-        // Remaining previews start at preview-100 (preview-0..99 were evicted oldest-first).
-        assert_eq!(q.pop_next().unwrap().text, "preview-100");
-    }
-
-    #[test]
-    fn priority_queue_push_front_preserves_priority() {
-        let mut q = PriorityMessageQueue::new();
-        q.enqueue(make_msg("normal-first", MessagePriority::Normal));
-        q.push_front(make_msg("normal-retry", MessagePriority::Normal));
-
-        // push_front should place it at the head of the Normal tier
-        assert_eq!(q.pop_next().unwrap().text, "normal-retry");
-        assert_eq!(q.pop_next().unwrap().text, "normal-first");
-        assert!(q.pop_next().is_none());
-    }
-
-    #[test]
-    fn priority_queue_fifo_within_tier() {
-        let mut q = PriorityMessageQueue::new();
-        for i in 0..5 {
-            q.enqueue(make_msg(&format!("msg-{i}"), MessagePriority::Normal));
-        }
-        for i in 0..5 {
-            assert_eq!(q.pop_next().unwrap().text, format!("msg-{i}"));
-        }
-        assert!(q.pop_next().is_none());
-    }
-
-    // ---------------------------------------------------------------- TelegramBot queue
-
     #[tokio::test]
     async fn bot_queue_starts_empty() {
         let config = test_config();
         let bot = TelegramBot::new(&config).unwrap();
         let q = bot.queue.lock().await;
-        assert!(q.is_empty());
-        assert_eq!(q.total_len(), 0);
+        assert_eq!(q.len(), 0);
     }
 
     #[tokio::test]
@@ -600,46 +508,98 @@ mod tests {
         }
     }
 
-    // ---------------------------------------------------------------- AimdState
-
     #[test]
-    fn aimd_on_success_increases_rate() {
-        let mut aimd = AimdState::new(20.0);
-        aimd.rate = 10.0; // Start below max
-        aimd.on_success();
-        assert_eq!(aimd.rate, 10.5);
+    fn transient_failures_back_off_to_a_minute_and_stay_there() {
+        assert_eq!(backoff(1).as_secs(), 4);
+        assert_eq!(backoff(2).as_secs(), 8);
+        assert_eq!(backoff(20), MAX_BACKOFF, "capped, and never gives up");
     }
 
     #[test]
-    fn aimd_on_success_clamps_to_max() {
-        let mut aimd = AimdState::new(20.0);
-        aimd.rate = 19.8;
-        aimd.on_success();
-        assert_eq!(aimd.rate, 20.0); // Clamped to max_rate
+    fn the_pacer_spaces_group_posts_and_honours_retry_after() {
+        let mut p = AimdState::new(20.0 / 60.0);
+        let now = std::time::Instant::now();
+        let far = now + std::time::Duration::from_secs(3600);
+        let a = p.book(now, far).unwrap();
+        let b = p.book(now, far).unwrap();
+        assert_eq!(
+            (b - a).as_secs(),
+            3,
+            "20 a minute is one every three seconds"
+        );
+        // A 429 pushes the schedule past Telegram's retry_after…
+        p.on_rate_limit(40);
+        let c = p.book(now, far).unwrap();
+        assert!(c >= now + std::time::Duration::from_secs(40));
+        // …and a caller that cannot wait that long is told so instead of blocking.
+        let soon = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        assert!(p.book(std::time::Instant::now(), soon).is_err());
+    }
+
+    // ---------------------------------------------------------------- AimdState
+
+    /// The budget Telegram grants a bot in a group, as messages per second.
+    /// "In a group, bots are not able to send more than 20 messages per minute."
+    const GROUP_BUDGET: f64 = 20.0 / 60.0;
+
+    #[test]
+    fn aimd_never_settles_above_the_group_budget() {
+        // ADR-024, the regression test for the whole incident: the controller's floor
+        // used to be a flat 0.5 msg/s — 30 a minute — while Telegram allows 20. Every
+        // backoff still overshot, so the bot was rate-limited continuously (615 global
+        // pauses in a day) and the queue never drained.
+        let mut aimd = AimdState::new(GROUP_BUDGET);
+        for _ in 0..50 {
+            aimd.on_rate_limit(40);
+            // The debounce means only the first decrease per second lands; step time
+            // forward by clearing it, which is what a real 40 s pause does.
+            aimd.last_decrease = None;
+        }
+        assert!(
+            aimd.rate <= GROUP_BUDGET,
+            "settled at {} msg/s, above Telegram's {} msg/s for a group",
+            aimd.rate,
+            GROUP_BUDGET
+        );
+        assert!(aimd.rate > 0.0, "and it must still send *something*");
+        assert_eq!(aimd.rate, aimd.min_rate, "it converges on the floor");
+    }
+
+    #[test]
+    fn aimd_recovers_toward_the_budget_but_not_past_it() {
+        let mut aimd = AimdState::new(GROUP_BUDGET);
+        aimd.rate = aimd.min_rate;
+        for _ in 0..200 {
+            aimd.on_success();
+        }
+        assert_eq!(
+            aimd.rate, GROUP_BUDGET,
+            "success walks the rate back up to the budget and stops there"
+        );
     }
 
     #[test]
     fn aimd_on_rate_limit_halves_rate() {
-        let mut aimd = AimdState::new(20.0);
-        aimd.rate = 20.0;
+        let mut aimd = AimdState::new(GROUP_BUDGET);
+        aimd.rate = GROUP_BUDGET;
         aimd.on_rate_limit(30);
-        assert_eq!(aimd.rate, 10.0);
+        assert!((aimd.rate - GROUP_BUDGET / 2.0).abs() < f64::EPSILON);
     }
 
     #[test]
     fn aimd_on_rate_limit_clamps_to_min() {
-        let mut aimd = AimdState::new(20.0);
-        aimd.rate = 0.6; // Just above min
+        let mut aimd = AimdState::new(GROUP_BUDGET);
+        aimd.rate = aimd.min_rate * 1.2;
         aimd.on_rate_limit(30);
-        assert_eq!(aimd.rate, 0.5); // Clamped to min_rate
+        assert_eq!(aimd.rate, aimd.min_rate);
     }
 
     #[test]
     fn aimd_inter_message_delay_at_max_rate() {
-        let aimd = AimdState::new(20.0);
+        let aimd = AimdState::new(GROUP_BUDGET);
         let delay = aimd.inter_message_delay();
-        // 1.0 / 20.0 = 50ms
-        assert_eq!(delay.as_millis(), 50);
+        // 20 a minute is one every three seconds.
+        assert_eq!(delay.as_secs(), 3);
     }
 
     #[test]

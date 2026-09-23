@@ -10,6 +10,7 @@
 //! Ported from `telegram.ts`.
 
 mod client;
+mod outbox;
 mod queue;
 mod types;
 
@@ -27,7 +28,6 @@ use crate::formatting::chunk_message;
 use governor::{Quota, RateLimiter};
 use regex::Regex;
 use reqwest::Client;
-use std::collections::VecDeque;
 use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
@@ -35,8 +35,6 @@ use tokio::sync::Mutex;
 
 // Re-export internal types for sub-modules
 use types::{ForumTopicResult, MessagePriority, QueuedMessage, TgFile, TgResponse, TOPIC_COLORS};
-// Make PriorityMessageQueue visible to client.rs (via `use super::*`)
-use queue::PriorityMessageQueue;
 
 static BOT_TOKEN_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"bot\d+:[A-Za-z0-9_-]+/").unwrap());

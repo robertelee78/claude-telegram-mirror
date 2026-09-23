@@ -75,6 +75,7 @@ pub(super) async fn run_event_loop(
         session_transports: Arc::clone(&state.session_transports),
         session_host_clients: Arc::clone(&state.session_host_clients),
         pending_topic_msgs: Arc::clone(&state.pending_topic_msgs),
+        orphaned_topics: Arc::clone(&state.orphaned_topics),
         flush_tx: state.flush_tx.clone(),
     };
 
@@ -225,61 +226,107 @@ fn short_id(id: &str) -> &str {
     id.get(..8).unwrap_or(id)
 }
 
-/// Handle a permanently deleted Telegram topic by clearing the stale thread_id
-/// from both the in-memory cache and the database. This allows
-/// `ensure_session_exists` to create a replacement topic on the next message.
+/// A topic Telegram says no longer exists (deleted in the app, or by ctm).
+///
+/// ADR-024: the messages already waiting for it are *held* in the outbox, not dropped.
+/// If its session is still going, ctm makes a replacement topic and moves them there;
+/// if the session has ended, there is nothing to post to and they are discarded (the
+/// daemon waits for a finished session's outbox to drain before deleting its topic,
+/// so this is not where replies are lost).
 async fn handle_topic_invalidated(ctx: HandlerContext, thread_id: i64) {
-    // Reverse lookup: find which session owns this thread_id
-    let session_id = {
+    // Owner: the in-memory map first, then the store.
+    let cached = {
         let threads = ctx.session_threads.read().await;
         threads
             .iter()
             .find(|(_, &tid)| tid == thread_id)
             .map(|(sid, _)| sid.clone())
     };
+    let session = match cached {
+        Some(sid) => {
+            let sid2 = sid.clone();
+            ctx.db_op(move |sess| sess.get_session(&sid2).ok().flatten())
+                .await
+        }
+        None => {
+            ctx.db_op(move |sess| sess.get_session_by_thread_id(thread_id).ok().flatten())
+                .await
+        }
+    };
 
-    let Some(session_id) = session_id else {
-        // Not in cache — try DB
-        let tid = thread_id;
-        let found = ctx
-            .db_op(move |sess| {
-                sess.get_session_by_thread_id(tid)
-                    .ok()
-                    .flatten()
-                    .map(|s| s.id)
-            })
-            .await;
-        if let Some(sid) = found {
-            // Clear from DB
-            let sid_clone = sid.clone();
-            ctx.db_op(move |sess| {
-                let _ = sess.clear_thread_id(&sid_clone);
-            })
-            .await;
-            tracing::info!(
-                session_id = %sid,
+    let Some(session) = session else {
+        let n = ctx.bot.discard_topic(thread_id).await;
+        if n > 0 {
+            tracing::warn!(
                 thread_id,
-                "Cleared stale thread_id from DB (topic permanently deleted)"
+                discarded = n,
+                "ADR-024: messages were waiting for a topic no session owns; discarded"
             );
-        } else {
-            tracing::debug!(thread_id, "No session found for invalidated thread_id");
         }
         return;
     };
 
-    // Clear from in-memory cache
-    ctx.session_threads.write().await.remove(&session_id);
+    // Forget the dead topic, but only if the session still points at it: several
+    // queued messages can report the same dead topic, and a replacement may already
+    // have been made by the time the later reports arrive.
+    {
+        let mut threads = ctx.session_threads.write().await;
+        if threads.get(&session.id) == Some(&thread_id) {
+            threads.remove(&session.id);
+        }
+    }
+    if session.thread_id == Some(thread_id) {
+        let sid = session.id.clone();
+        ctx.db_op(move |sess| {
+            let _ = sess.clear_thread_id(&sid);
+        })
+        .await;
+    }
 
-    // Clear from DB
-    let sid = session_id.clone();
-    ctx.db_op(move |sess| {
-        let _ = sess.clear_thread_id(&sid);
-    })
-    .await;
+    if session.status != crate::types::SessionStatus::Active {
+        let n = ctx.bot.discard_topic(thread_id).await;
+        tracing::info!(
+            session_id = %session.id,
+            thread_id,
+            discarded = n,
+            "ADR-024: topic of an ended session is gone; nothing left to post to"
+        );
+        return;
+    }
 
+    ctx.orphaned_topics
+        .write()
+        .await
+        .entry(session.id.clone())
+        .or_default()
+        .push(thread_id);
     tracing::info!(
-        session_id = %session_id,
+        session_id = %session.id,
         thread_id,
-        "Cleared stale thread_id from cache and DB (topic permanently deleted)"
+        "ADR-024: topic is gone while its session is live — making a replacement for the held messages"
+    );
+
+    // Make the replacement now rather than waiting for the session's next event: the
+    // messages being held are the ones the user is waiting for. Topic creation fails
+    // fast under a rate limit (ADR-023), so keep trying, spaced out, until it lands.
+    let probe = crate::types::BridgeMessage {
+        msg_type: crate::types::MessageType::AgentResponse,
+        session_id: session.id.clone(),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        content: String::new(),
+        metadata: None,
+    };
+    for _ in 0..60 {
+        super::ensure_session_exists(&ctx, &probe).await;
+        if let Some(new_tid) = ctx.get_thread_id(&session.id).await {
+            super::adopt_orphans(&ctx, &session.id, new_tid).await;
+            return;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+    }
+    tracing::error!(
+        session_id = %session.id,
+        thread_id,
+        "ADR-024: could not make a replacement topic in 30 minutes; the held messages go out when the session's next event creates one"
     );
 }

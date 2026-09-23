@@ -44,6 +44,16 @@ pub enum AppError {
         /// Seconds to wait before any API call, as reported by Telegram.
         retry_after_secs: u64,
     },
+
+    /// ADR-024: the forum topic a message was addressed to no longer exists. Not a
+    /// reason to drop the message — it is held until a replacement topic exists.
+    #[error("Telegram topic {thread_id} no longer exists")]
+    TopicGone { thread_id: i64 },
+
+    /// ADR-024: Telegram refused this message's *content* (a 400 other than a missing
+    /// topic). Retrying it unchanged cannot succeed.
+    #[error("Telegram refused the message: {0}")]
+    Rejected(String),
 }
 
 pub type Result<T> = std::result::Result<T, AppError>;

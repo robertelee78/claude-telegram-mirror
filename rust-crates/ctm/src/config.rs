@@ -184,6 +184,13 @@ pub struct Config {
     pub approvals: bool,
     pub use_threads: bool,
     pub chunk_size: usize,
+    /// Messages per **minute** to the Telegram group (ADR-024).
+    ///
+    /// Telegram's own limit, verbatim from the Bot API FAQ: *"In a group, bots are
+    /// not able to send more than 20 messages per minute."* Every topic in the forum
+    /// is the same group, so this is the whole mirror's budget, shared by every
+    /// session. It was read as messages per *second* until 0.2.56 — sixty times the
+    /// real ceiling, which is why the bot lived in a permanent 429.
     pub rate_limit: u32,
     pub session_timeout: u32,
     #[allow(dead_code)] // Library API

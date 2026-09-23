@@ -298,6 +298,7 @@ pub(super) async fn handle_session_start(ctx: &HandlerContext, msg: &BridgeMessa
                             .write()
                             .await
                             .insert(msg.session_id.clone(), tid);
+                        super::adopt_orphans(ctx, &msg.session_id, tid).await;
                         Some(tid)
                     }
                     _ => None,
@@ -501,27 +502,15 @@ pub(super) async fn handle_session_end(ctx: &HandlerContext, msg: &BridgeMessage
                 // exactly how a failed/crashed delete left a permanent, unrecoverable
                 // row-less orphan topic. The persistent ledger (kept on `Err`) is the
                 // backstop so even a never-retried orphan stays findable by prune-topics.
-                match ctx.bot.delete_forum_topic(tid).await {
-                    Ok(_) => {
-                        let sid_clear = msg.session_id.clone();
-                        ctx.db_op(move |sess| {
-                            let _ = sess.clear_thread_id(&sid_clear);
-                            let _ = sess.forget_topic(tid);
-                        })
-                        .await;
-                        tracing::info!(
-                            session_id = %msg.session_id,
-                            thread_id = tid,
-                            "ADR-014 A4: Forum topic deleted/confirmed-gone on SessionEnd"
-                        );
-                    }
-                    Err(e) => tracing::warn!(
-                        session_id = %msg.session_id,
-                        thread_id = tid,
-                        error = %e,
-                        "STALE-TOPICS: topic delete failed (transient) — retaining thread_id + ledger for retry"
-                    ),
-                }
+                // ADR-024: never delete a topic out from under messages still waiting
+                // to be posted to it — at this moment that is usually the agent's
+                // final reply. Wait (off the handler, ADR-023) for the outbox to
+                // drain this topic, then delete.
+                let task_ctx = ctx.clone();
+                let sid = msg.session_id.clone();
+                tokio::spawn(async move {
+                    delete_topic_when_drained(task_ctx, sid, tid).await;
+                });
             } else {
                 let _ = ctx.bot.close_forum_topic(tid).await;
                 ctx.session_threads.write().await.remove(&msg.session_id);
@@ -918,7 +907,10 @@ pub(super) async fn handle_tool_result(ctx: &HandlerContext, msg: &BridgeMessage
     // reads, so it must survive a tool-spam storm and outrank Low-tier previews.
     // (Low is reserved for ToolStart previews; Critical for approvals/questions.)
     ctx.bot
-        .send_message(
+        // ADR-024: Low, like the preview it completes. Telegram grants the whole
+        // forum 20 messages a minute; tool output must never be the reason an agent's
+        // reply to the user is delayed or dropped.
+        .send_message_low(
             &format!("\u{2705} {result_summary}\n{formatted}"),
             Some(&SendOptions {
                 parse_mode: Some("Markdown".into()),
@@ -1754,6 +1746,61 @@ pub(super) async fn handle_send_image(ctx: &HandlerContext, msg: &BridgeMessage)
                 "Failed to send file to Telegram"
             );
         }
+    }
+}
+
+/// Longest a finished session's topic waits for its outbox to drain before deletion.
+const DRAIN_BEFORE_DELETE: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// ADR-024 + ADR-014 A4: delete a finished session's topic once nothing is waiting to
+/// be posted to it — and not at all if the session came back meanwhile.
+async fn delete_topic_when_drained(ctx: HandlerContext, session_id: String, tid: i64) {
+    let started = std::time::Instant::now();
+    loop {
+        let waiting = ctx.bot.pending_for(tid).await;
+        if waiting == 0 || ctx.bot.is_parked(tid).await {
+            break;
+        }
+        if started.elapsed() > DRAIN_BEFORE_DELETE {
+            tracing::warn!(
+                session_id = %session_id,
+                thread_id = tid,
+                waiting,
+                "ADR-024: topic still has messages waiting after 10 minutes; deleting it as the session ended"
+            );
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+    }
+    // A resumed session keeps its topic.
+    let sid = session_id.clone();
+    let status = ctx
+        .db_op(move |sess| sess.get_session(&sid).ok().flatten().map(|s| s.status))
+        .await;
+    if status == Some(crate::types::SessionStatus::Active) {
+        tracing::info!(session_id = %session_id, thread_id = tid, "Session resumed before its topic was deleted — keeping it");
+        return;
+    }
+    match ctx.bot.delete_forum_topic(tid).await {
+        Ok(_) => {
+            let sid_clear = session_id.clone();
+            ctx.db_op(move |sess| {
+                let _ = sess.clear_thread_id(&sid_clear);
+                let _ = sess.forget_topic(tid);
+            })
+            .await;
+            tracing::info!(
+                session_id = %session_id,
+                thread_id = tid,
+                "ADR-014 A4: Forum topic deleted/confirmed-gone on SessionEnd"
+            );
+        }
+        Err(e) => tracing::warn!(
+            session_id = %session_id,
+            thread_id = tid,
+            error = %e,
+            "STALE-TOPICS: topic delete failed (transient) — retaining thread_id + ledger for retry"
+        ),
     }
 }
 

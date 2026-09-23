@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.56] - 2026-09-23
+
+### Fixed (reported: "the agent session responded, its response did not go to telegram")
+- **Agent replies were being silently deleted before they reached Telegram.** Telegram allows a bot 20 messages a minute in a group ("In a group, bots are not able to send more than 20 messages per minute" — Bot API FAQ), and every forum topic is the same group. ctm treated its limit of 20 as per *second*, and even its slowest back-off (30 a minute) was above Telegram's ceiling, so it was refused continuously — 615 queue-wide pauses in one day — and its full queue deleted the oldest messages to make room. A reply went the same way as tool chatter, with nothing logged. Reproduced: the old code loses 3 of 5 replies under a tool-call flood against a stand-in Telegram enforcing the real limit (ADR-024).
+- **Nothing is dropped any more; the backlog is packed instead.** ctm now posts on Telegram's schedule (one every three seconds at the default budget, slower if Telegram asks), retries rather than giving up (waiting out "retry after", backing off on network errors), and when messages pile up it packs everything waiting for a topic into one post, in order, up to Telegram's size limit — dozens of tool calls per post, each keeping its Details button, numbered. Approvals and questions still get their own message and still go first. Under the same flood: all 5 replies and all 100 tool calls delivered in 7 posts, with zero refusals.
+- **A deleted topic no longer eats messages.** Messages for a topic that was deleted in the app are held, a new topic is made, and they are posted there (they used to get three tries and be thrown away).
+- **A session's last reply is no longer deleted with its topic.** When a session ends, its topic is deleted only after everything waiting for it has been posted.
+- **Waiting messages survive a daemon restart** — saved to `outbox.json` in the config directory.
+- `rate_limit` in the config now means messages per **minute** (default 20, Telegram's group limit; clamped to 60). Button presses, edits and file fetches no longer wait behind the posting schedule.
+
 ## [0.2.55] - 2026-09-23
 
 ### Fixed (reported: "it's not even possible for me to rejoin a prior session anymore")

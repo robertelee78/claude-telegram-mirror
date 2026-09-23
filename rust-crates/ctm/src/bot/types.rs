@@ -27,9 +27,9 @@ pub struct SendOptions {
 
 /// Message priority tier for the three-tier priority queue.
 ///
-/// Critical messages are drained first; Low messages are drained last and
-/// dropped first when their sub-queue overflows.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+/// Critical messages are drained first; Low messages are drained last. Nothing is
+/// dropped for load (ADR-024) — under a backlog, messages are packed instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[allow(dead_code)] // Critical and Low are used in tests and future callers
 pub(super) enum MessagePriority {
     /// User-blocking or safety-critical (approvals, session start/end, errors).
@@ -41,8 +41,9 @@ pub(super) enum MessagePriority {
     Low = 2,
 }
 
-/// A queued message waiting to be sent.
-#[derive(Debug, Clone)]
+/// A queued message waiting to be sent. Serializable because the outbox is saved to
+/// disk (ADR-024): a daemon restart must not lose what was waiting.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct QueuedMessage {
     pub(super) chat_id: i64,
     pub(super) text: String,
@@ -57,6 +58,10 @@ pub(super) struct QueuedMessage {
     pub(super) created_at: u64,
     /// Priority tier for queue ordering. Defaults to Normal.
     pub(super) priority: MessagePriority,
+    /// ADR-024: arrival order, stamped by the outbox. Packing a topic's backlog into
+    /// one message follows it, so a topic always reads in the order things happened.
+    #[serde(default)]
+    pub(super) seq: u64,
 }
 
 /// Telegram API response parameters — present in certain error responses.
