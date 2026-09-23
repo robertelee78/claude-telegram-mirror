@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.55] - 2026-09-23
+
+### Fixed (reported: "it's not even possible for me to rejoin a prior session anymore")
+- **`codex resume <id>` refused every session.** 0.2.53 added a guard that would not touch a thread ctm's session store called "live in another terminal" — but that store learns a Codex TUI has exited only if ctm's launcher tells it, and a `--remote` thread outlives its terminal silently. Every session started before 0.2.53, and any whose exit report was missed, keeps a row saying `active` forever, so the guard refused forever. It was also a restriction Codex itself does not have: quitting a remote TUI prints "Reconnect: codex --remote … resume &lt;id&gt;". **The guard is gone.** A turn in progress is no longer a refusal either — the launcher applies your flags, rejoins, and prints one line saying what it found. Nothing about a resume can be blocked by ctm's own bookkeeping any more, and `ctm codex-exited --thread <id>` is no longer a chore anyone needs to know about.
+- **A bare `codex resume` (or `fork`) now gets Codex's own picker again**, including its "session directory or current directory?" question. ctm's numbered picker is used only when flags must be applied to the thread before attaching, which is the one case a remote resume refuses.
+
 ## [0.2.54] - 2026-09-22
 
 ### Fixed (reported: "ctm is dead now on this machine — neither direction working")

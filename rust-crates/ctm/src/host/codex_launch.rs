@@ -382,6 +382,13 @@ pub fn plan(args: &[String], pwd: &Path, value_flags: &BTreeSet<String>) -> Resu
     }
     out.extend(args.iter().skip(terminator).cloned());
 
+    // A bare `resume`/`fork` with nothing to apply is passed straight through, so the
+    // user gets codex's own picker — which also asks its own "session directory or
+    // current directory?" question (ADR-022 amendment, 2026-09-23). ctm's numbered
+    // picker exists only for the case codex cannot serve: flags that must be applied
+    // to the thread before it is attached, which a remote resume would refuse.
+    let nothing_to_apply = settings == Settings::default();
+
     let last_ref = ThreadRef::Last {
         all,
         include_non_interactive,
@@ -393,6 +400,9 @@ pub fn plan(args: &[String], pwd: &Path, value_flags: &BTreeSet<String>) -> Resu
         None if last => last_ref,
         None => ThreadRef::Picker,
     };
+    if thread == ThreadRef::Picker && nothing_to_apply && !explicit_cd.is_some() {
+        return Ok(verbatim(args, pwd, "picker with nothing to apply"));
+    }
     Ok(Plan {
         kind: if subcommand == "fork" {
             Kind::Fork(thread)
@@ -693,10 +703,29 @@ mod tests {
             args(&format!("resume {ID}")),
             "a picked id goes after the subcommand"
         );
-        // A uuid-shaped VALUE of a flag is not the session.
+        // A uuid-shaped VALUE of a flag is not the session; with nothing to apply,
+        // codex's own picker is better than ctm's, so it is passed through.
         let p = plan(&args(&format!("resume -m {ID}")), &pwd(), &vf()).unwrap();
-        assert_eq!(p.kind, Kind::Resume(ThreadRef::Picker));
+        assert!(matches!(p.kind, Kind::Verbatim(_)));
         assert!(!is_uuid("01a0aba7"), "a prefix is not an id");
+    }
+
+    #[test]
+    fn a_bare_resume_is_codexs_own_picker() {
+        // ADR-022 amendment: ctm's numbered picker exists only for the case codex
+        // cannot serve — flags that must be applied before attaching. With nothing to
+        // apply, the user gets the picker they had before ctm existed (which asks its
+        // own "session directory or current directory?" question).
+        for a in ["resume", "fork", "resume --all"] {
+            let p = plan(&args(a), &pwd(), &vf()).unwrap();
+            assert!(matches!(p.kind, Kind::Verbatim(_)), "{a}");
+            assert_eq!(p.codex_args, args(a), "{a}: passed through untouched");
+        }
+        // With flags, ctm must resolve the thread itself and apply them first.
+        let p = plan(&args("--yolo resume"), &pwd(), &vf()).unwrap();
+        assert_eq!(p.kind, Kind::Resume(ThreadRef::Picker));
+        let p = plan(&args("fork -s read-only"), &pwd(), &vf()).unwrap();
+        assert_eq!(p.kind, Kind::Fork(ThreadRef::Picker));
     }
 
     #[test]
@@ -713,7 +742,7 @@ mod tests {
         let p = plan(&args("fork --last"), &pwd(), &vf()).unwrap();
         assert!(matches!(p.kind, Kind::Fork(ThreadRef::Last { .. })));
         assert_eq!(args_with_thread(&p, "new-id"), args("resume new-id"));
-        let p = plan(&args("fork"), &pwd(), &vf()).unwrap();
+        let p = plan(&args("fork -s read-only"), &pwd(), &vf()).unwrap();
         assert_eq!(p.kind, Kind::Fork(ThreadRef::Picker));
         assert_eq!(args_with_thread(&p, "new-id"), args("resume new-id"));
     }

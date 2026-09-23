@@ -35,7 +35,6 @@ use super::codex_threads::{
     describe, describe_effective, find_by_name, parse_effective, parse_thread, pick_last,
     satisfied, short, Effective, ThreadSummary,
 };
-use crate::config::Config;
 use serde_json::{json, Value};
 use std::io::IsTerminal;
 use std::time::Duration;
@@ -100,7 +99,7 @@ async fn launch(args: Vec<String>) -> i32 {
             drop(rpc);
             attach(&bin, &cx, &plan, None).await
         }
-        Kind::Resume(thread) => match prepare_resume(rpc, &cfg, &plan, thread).await {
+        Kind::Resume(thread) => match prepare_resume(rpc, &plan, thread).await {
             Ok(id) => attach(&bin, &cx, &plan, Some(&id)).await,
             Err(Stop { code, message }) => fail(code, &message),
         },
@@ -223,35 +222,33 @@ async fn check_named_profile(rpc: &mut Rpc, plan: &Plan) -> Result<(), Stop> {
 }
 
 /// Steps 1–5 for a resume. Returns the exact thread id to attach to.
-async fn prepare_resume(
-    mut rpc: Rpc,
-    cfg: &Config,
-    plan: &Plan,
-    thread: &ThreadRef,
-) -> Result<String, Stop> {
+async fn prepare_resume(mut rpc: Rpc, plan: &Plan, thread: &ThreadRef) -> Result<String, Stop> {
     let id = resolve(&mut rpc, plan, thread).await?;
     let summary = read_thread(&mut rpc, &id).await?;
 
-    // 2. Guards: never change a session underneath a turn or another terminal.
+    // 2. Rejoining is not an error (ADR-022 amendment, 2026-09-23).
+    //
+    // This used to refuse when the thread was mid-turn, or when ctm's session store
+    // showed it live in another terminal. Both were wrong, and the second one broke
+    // resume outright: a `--remote` TUI outlives its terminal, so ctm only learns of
+    // an exit if the launcher reports it — every session started before 0.2.53, and
+    // any whose report was missed, leaves a row that says "active" forever. A gate
+    // that fails closed on data that is known to go stale refuses forever.
+    //
+    // It was also a restriction the platform does not have. Reconnecting to a live
+    // thread is Codex's own model: quitting a remote TUI prints "Disconnected from
+    // this task. Any running work continues. Reconnect: codex --remote … resume
+    // <id>". So ctm reconnects, and says what it found rather than refusing.
     if summary.status == "active" {
         let what = match summary.active_flags.first().map(String::as_str) {
-            Some("waitingOnApproval") => "waiting on an approval",
-            Some("waitingOnUserInput") => "waiting on your answer",
-            _ => "running a turn",
+            Some("waitingOnApproval") => "is waiting on an approval",
+            Some("waitingOnUserInput") => "is waiting on an answer",
+            _ => "has a turn in progress",
         };
-        return Err(stop(format!(
-            "session {} is {what}; not changing its directory or permissions mid-turn. Let it finish (or answer it in Telegram), then retry; to attach as-is: codex --remote unix://{} resume {id}",
-            short(&id),
-            cfg.hosts.codex.socket_path.display()
-        )));
-    }
-    if let Some(row) = live_in_store(cfg, &id) {
-        return Err(stop(format!(
-            "session {} is live in another terminal (in {}, last active {}); quit it first. If that terminal is gone: ctm codex-exited --thread {id}",
-            short(&id),
-            row.project_dir.as_deref().unwrap_or("?"),
-            row.last_activity
-        )));
+        eprintln!(
+            "ctm: session {} {what} — rejoining it (anything already running keeps running)",
+            short(&id)
+        );
     }
 
     // 3. Load (or rejoin) and read what is in effect now.
@@ -454,23 +451,4 @@ async fn pick_interactively(rpc: &mut Rpc) -> Result<String, Stop> {
         Ok(n) if (1..=listing.len()).contains(&n) => Ok(threads[n - 1].id.clone()),
         _ => Err(stop("nothing resumed")),
     }
-}
-
-/// ctm's session store: is this thread live in a terminal ctm knows about?
-fn live_in_store(cfg: &Config, id: &str) -> Option<crate::session::Session> {
-    let mgr = crate::session::SessionManager::new(&cfg.config_dir, cfg.session_timeout).ok()?;
-    mgr.get_active_sessions().ok()?.into_iter().find(|s| {
-        s.host_kind() == crate::types::HostKind::Codex
-            && (s.id == id
-                || s.metadata
-                    .as_deref()
-                    .and_then(|m| serde_json::from_str::<Value>(m).ok())
-                    .and_then(|v| {
-                        v.get("hostSessionId")
-                            .and_then(Value::as_str)
-                            .map(str::to_string)
-                    })
-                    .as_deref()
-                    == Some(id))
-    })
 }

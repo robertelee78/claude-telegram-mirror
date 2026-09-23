@@ -9,7 +9,7 @@
 > Just pure excellence, done the right way the entire time.
 > Chesterton's fence: always understand the current implementation fully before changing it.
 
-**Status:** Implemented (2026-09-22; amended the same day after review)
+**Status:** Implemented (2026-09-22; amended after review the same day, and again 2026-09-23 — see the amendment at the end)
 **Date:** 2026-09-22
 **Authors:** Robert, Claude
 **Tags:** codex, app-server, resume, permissions, ux
@@ -162,3 +162,49 @@ Both would have blocked the first implementation. The findings that changed it:
   first.
 - The wrapper's "explicit `-C` passes through" rule is gone: `-C` is a directory,
   not a request to leave the app-server; only an explicit `--remote` is.
+
+## Amendment 2026-09-23 — the guards were a footgun; rejoining is not an error
+
+Reported, verbatim: *"it's not even possible for me to rejoin a prior session anymore
+something you did is Catastrophically incorrect"*, and then *"what a stupid foot gun"*.
+Both are right. Reproduced in one command: `codex resume <id>` on any of the user's
+sessions answered
+
+```
+ctm: session 01a071c6 is live in another terminal (in /opt/repo-to-cve, last active …);
+quit it first. If that terminal is gone: ctm codex-exited --thread 01a071c6-…
+```
+
+for every session, permanently.
+
+**What was wrong with it.**
+
+1. **It failed closed on data that is known to go stale.** ctm's session store learns
+   that a Codex TUI exited only if the launcher reports it (§4 above). A `--remote`
+   thread outlives its terminal and emits nothing of its own, so every session started
+   before 0.2.53 — and any whose report was missed, e.g. because the daemon was down —
+   keeps a row that says `active` forever. A gate that refuses while that row exists
+   refuses forever.
+2. **It invented a restriction the platform does not have.** Reconnecting to a live
+   thread is Codex's own model: quitting a remote TUI prints *"Disconnected from this
+   task. Any running work continues. Reconnect: codex --remote … resume <id>"*. The
+   mid-turn refusal was the same mistake in milder form.
+3. **Its escape hatch was a chore with a UUID in it.** The fix for a stale row was a
+   command the user had to type, per session, having first read an error to learn it.
+
+**Decision.** The store-based gate is gone, and a turn in progress is no longer a
+refusal: the launcher applies the settings, attaches, and prints one line saying what
+it found (`session 01a071c6 has a turn in progress — rejoining it (anything already
+running keeps running)`). Nothing about a resume can now be blocked by ctm's own
+bookkeeping.
+
+**Also.** A bare `codex resume` (or `fork`) with no flags to apply is passed straight
+through, so the user gets **codex's own picker** — including its "session directory or
+current directory?" question — instead of ctm's numbered list. ctm's picker now exists
+only for the case codex cannot serve: flags that must reach the thread before it is
+attached, which a remote resume refuses.
+
+**Standing lesson.** A guard that protects against a rare fault by blocking the
+product's main path is a worse defect than the fault. When the evidence a guard depends
+on is derived from ctm's own bookkeeping rather than from the app-server, the guard must
+warn, never refuse.
