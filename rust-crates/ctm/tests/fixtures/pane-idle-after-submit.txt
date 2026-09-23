@@ -1,0 +1,16 @@
+  DONE
+
+✻ Sautéed for 4s · done 10:26 PM
+
+❯ QUEUED_WHILE_BUSY please also say hello
+
+· Schlepping…
+  ⎿  Tip: Use /focus to see just your prompt, a one-line summary of the work, and the response
+                                      tmux focus-events off · add 'set -g focus-events on' to ~/.tmux.c
+───────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+───────────────────────────────────────────────────────────────────────────────────────────────────────
+  ▊ RuFlo V3.44.0 ● qspike  │  Opus 5.5  │  ⏱ 21s  │  ● 7% ctx  │  $0.37
+  Swarm ◉ 1/15  ·  Hooks 0/0  ·  🧠 0%  ·  💾 20MB  ·  🛡 scan pending
+  🐝 ruflo swarm init --topology hierarchical spawns anti-drift agent teams 🔗 (cognitum.one)
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent

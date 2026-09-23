@@ -1005,3 +1005,73 @@ mod tests {
         assert_eq!(extract_agent_id(path), None);
     }
 }
+
+/// Telegram's limit on an inline button's `callback_data`, in bytes.
+pub const CALLBACK_DATA_MAX: usize = 64;
+const TOOL_DETAILS_PREFIX: &str = "tooldetails:";
+
+/// `callback_data` for a tool's Details button, always within Telegram's 64 bytes.
+///
+/// Codex names some tool items `subagent-completed-<uuid>`, which made
+/// `tooldetails:<id>` 67 bytes; Telegram rejected the whole message with
+/// `BUTTON_DATA_INVALID` and ctm dropped it (ADR-024 follow-up, 2026-09-23). An id too
+/// long to fit is sent as `~` plus its tail — the tail carries the uuid, which is what
+/// makes it unique — and [`tool_details_key`] tells the handler to match by suffix.
+pub fn tool_details_callback(tool_use_id: &str) -> String {
+    let full = format!("{TOOL_DETAILS_PREFIX}{tool_use_id}");
+    if full.len() <= CALLBACK_DATA_MAX {
+        return full;
+    }
+    let room = CALLBACK_DATA_MAX - TOOL_DETAILS_PREFIX.len() - 1;
+    let mut start = tool_use_id.len() - room;
+    while !tool_use_id.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("{TOOL_DETAILS_PREFIX}~{}", &tool_use_id[start..])
+}
+
+/// What a Details button refers to: the whole tool id, or the tail of a long one.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ToolDetailsKey<'a> {
+    Exact(&'a str),
+    Suffix(&'a str),
+}
+
+/// Parse the part after `tooldetails:`.
+pub fn tool_details_key(data: &str) -> ToolDetailsKey<'_> {
+    match data.strip_prefix('~') {
+        Some(tail) => ToolDetailsKey::Suffix(tail),
+        None => ToolDetailsKey::Exact(data),
+    }
+}
+
+#[cfg(test)]
+mod callback_data_tests {
+    use super::*;
+
+    #[test]
+    fn details_buttons_always_fit_telegrams_limit() {
+        // The id that broke it, from the live store.
+        let long = "subagent-completed-01a0bdf6-b3b0-7c50-b18e-bffb0ceb33a9";
+        assert!(
+            format!("tooldetails:{long}").len() > CALLBACK_DATA_MAX,
+            "precondition"
+        );
+        let data = tool_details_callback(long);
+        assert!(data.len() <= CALLBACK_DATA_MAX, "{} bytes", data.len());
+        let key = tool_details_key(data.strip_prefix("tooldetails:").unwrap());
+        match key {
+            ToolDetailsKey::Suffix(tail) => {
+                assert!(long.ends_with(tail));
+                assert!(
+                    tail.contains("01a0bdf6-b3b0-7c50-b18e-bffb0ceb33a9"),
+                    "keeps the uuid"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        // A short id is unchanged.
+        assert_eq!(tool_details_callback("call_1"), "tooldetails:call_1");
+        assert_eq!(tool_details_key("call_1"), ToolDetailsKey::Exact("call_1"));
+    }
+}

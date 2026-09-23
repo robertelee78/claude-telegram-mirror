@@ -9,8 +9,10 @@ const SUBMIT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(150
 const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 /// Extra Enters to try when the first one did not submit.
 const SUBMIT_RETRIES: u32 = 2;
-/// How many lines at the bottom of the pane count as "the composer".
-const COMPOSER_LINES: usize = 14;
+/// A horizontal rule in Claude Code's TUI: the input box is drawn between two of them.
+/// Counting `─` rather than matching the whole line tolerates a label on the rule
+/// (Claude Code puts the session name there: `──── agent_comms ─`).
+const RULE_MIN_DASHES: usize = 20;
 
 /// A short, distinctive tail of the injected text, used to recognise it on screen.
 ///
@@ -26,22 +28,42 @@ pub(crate) fn submit_marker(text: &str) -> String {
     squashed.chars().skip(n.saturating_sub(24)).collect()
 }
 
-/// Is `marker` visible in the composer region (the bottom of the pane)?
+/// Claude Code's input box: the line(s) between the last two horizontal rules.
 ///
-/// Only the bottom matters: after a submit the same text is still on screen, just moved
-/// up into the transcript, so searching the whole pane would never see it leave.
-pub(crate) fn composer_contains(pane: &str, marker: &str) -> bool {
-    if marker.is_empty() {
-        return false;
-    }
+/// `None` when the pane has no such pair — not Claude's TUI, or a layout this does not
+/// recognise — in which case "is the text still in the box?" has no answer.
+///
+/// This replaced "the bottom 14 lines", which produced a false "Reply failed" for
+/// messages that *had* been delivered (2026-09-23, 11 of 11 flagged sends were in the
+/// agent's transcript). Both places a delivered message is drawn are above the box: a
+/// just-sent message is the last line of the conversation, and one sent while the
+/// agent is busy is shown as queued (`❯ text` / `ctrl+x ctrl+s to send now`) with the
+/// box itself reading `Press up to edit queued messages`. Captured from Claude Code and
+/// kept as fixtures (`tests/fixtures/pane-*.txt`).
+pub(crate) fn composer_region(pane: &str) -> Option<String> {
     let lines: Vec<&str> = pane.lines().collect();
-    let start = lines.len().saturating_sub(COMPOSER_LINES);
-    let tail: String = lines[start..]
-        .join("")
+    let rules: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.chars().filter(|c| *c == '─').count() >= RULE_MIN_DASHES)
+        .map(|(i, _)| i)
+        .collect();
+    let [.., top, bottom] = rules[..] else {
+        return None;
+    };
+    Some(lines[top + 1..bottom].join(""))
+}
+
+/// Is `marker` still in the input box? `None` when the box cannot be located.
+pub(crate) fn composer_contains(pane: &str, marker: &str) -> Option<bool> {
+    if marker.is_empty() {
+        return None;
+    }
+    let region: String = composer_region(pane)?
         .chars()
         .filter(|c| !c.is_whitespace() && !c.is_control())
         .collect();
-    tail.contains(marker)
+    Some(region.contains(marker))
 }
 
 /// Input injector for sending user input from Telegram to Claude Code CLI via tmux.
@@ -191,8 +213,9 @@ impl InputInjector {
 
         // Wait for the typed text to land in the composer before pressing Enter.
         if !marker.is_empty() {
+            // Unlocatable box: nothing to wait for, go ahead.
             self.wait_until(target, socket, SETTLE_TIMEOUT, |pane| {
-                composer_contains(pane, &marker)
+                composer_contains(pane, &marker).unwrap_or(true)
             });
         }
 
@@ -220,8 +243,11 @@ impl InputInjector {
             if marker.is_empty() {
                 break;
             }
+            // Submitted = the text has left the input box. An unlocatable box is not
+            // evidence of failure: report success, as before this check existed,
+            // rather than a false "Reply failed".
             let submitted = self.wait_until(target, socket, SUBMIT_TIMEOUT, |pane| {
-                !composer_contains(pane, &marker)
+                composer_contains(pane, &marker) != Some(true)
             });
             if submitted {
                 if attempt > 0 {
@@ -633,47 +659,96 @@ pub struct TmuxInfo {
 #[cfg(test)]
 mod tests {
 
+    fn fixture(name: &str) -> String {
+        std::fs::read_to_string(format!(
+            "{}/tests/fixtures/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap()
+    }
+
     #[test]
     fn the_marker_is_the_tail_and_survives_the_tuis_wrapping() {
-        // The composer wraps and indents; the comparison must not care.
         let text = "1) explain this part better. 7) what do you suggest? Again I want this to be simple ux for a user, like a tor hidden service.";
         let m = submit_marker(text);
         assert!(!m.is_empty());
         assert!(text.replace(' ', "").ends_with(&m), "it is the tail: {m}");
+        // Wrapped across several lines inside the box still matches.
+        let rule = "─".repeat(80);
+        let wrapped = format!(
+            "earlier output\n{rule}\n❯ 1) explain this part better. 7) what do you suggest? Again I want\n  this to be simple ux for a user, like a tor hidden service.\n{rule}\n  status line\n"
+        );
+        assert_eq!(composer_contains(&wrapped, &m), Some(true));
+    }
 
-        let wrapped = "some earlier output\n│ > 1) explain this part better. 7) what do you\n│   suggest? Again I want this to be simple ux for a\n│   user, like a tor hidden service.\n";
+    #[test]
+    fn a_message_sent_while_the_agent_is_idle_has_left_the_box() {
+        // Captured from Claude Code right after a submit: the message is the last line
+        // of the conversation, inside the bottom 14 lines — which is what made the old
+        // check report "Reply failed" for a delivered message.
+        let pane = fixture("pane-idle-after-submit.txt");
+        let m = submit_marker("QUEUED_WHILE_BUSY please also say hello");
         assert!(
-            composer_contains(wrapped, &m),
-            "wrapped across lines still matches"
+            pane.contains("QUEUED_WHILE_BUSY"),
+            "precondition: visible on screen"
+        );
+        assert_eq!(composer_contains(&pane, &m), Some(false));
+    }
+
+    #[test]
+    fn a_message_queued_while_the_agent_is_busy_has_left_the_box() {
+        // 2026-09-23 10:52–10:59: nine replies flagged "would not submit", all nine in
+        // the agent's transcript as queued commands. This is how Claude Code draws them.
+        let pane = fixture("pane-queued-while-busy.txt");
+        let m = submit_marker("QUEUED_TWO say hi after");
+        assert!(
+            pane.contains("ctrl+x ctrl+s to send now"),
+            "precondition: queued"
+        );
+        assert_eq!(composer_contains(&pane, &m), Some(false));
+    }
+
+    #[test]
+    fn text_really_stuck_in_the_box_is_still_caught() {
+        let pane = fixture("pane-text-in-composer.txt");
+        let m = submit_marker("STILL_IN_THE_BOX not sent");
+        assert_eq!(composer_contains(&pane, &m), Some(true));
+        // The real agent_comms pane on 2026-09-23 with unsent text in its box.
+        let rule = "─".repeat(120);
+        let real = format!(
+            "✻ Sautéed for 34s · done 10:02 PM\n\n{rule}\n❯ wait, fix it properly\n{rule}\n  ▊ RuFlo V3.44.0 ● vox\n  ⏵⏵ bypass permissions on\n"
+        );
+        assert_eq!(
+            composer_contains(&real, &submit_marker("wait, fix it properly")),
+            Some(true)
         );
     }
 
     #[test]
-    fn only_the_composer_counts_not_the_transcript() {
-        // After a submit the text is still on screen — it moved up into the transcript.
-        // Searching the whole pane would conclude it never submitted.
-        let m = submit_marker("please run the tests and report back");
-        let mut pane = String::from("> please run the tests and report back\n");
-        pane.push_str("• Sure, running them now.\n");
-        for _ in 0..COMPOSER_LINES {
-            pane.push_str("output line\n");
-        }
-        pane.push_str("│ > \n");
-        assert!(
-            !composer_contains(&pane, &m),
-            "submitted: the composer is empty even though the text is visible above"
+    fn a_labelled_rule_still_counts() {
+        // Claude Code puts the session name on the rule above the box.
+        let pane = format!(
+            "{} agent_comms ─\n❯ hello there\n{}\n",
+            "─".repeat(60),
+            "─".repeat(60)
         );
-
-        // Still sitting unsent in the composer is the failing case the operator hit.
-        let unsent = "• earlier output\n│ > please run the tests and report back\n";
-        assert!(composer_contains(unsent, &m));
+        assert_eq!(
+            composer_contains(&pane, &submit_marker("hello there")),
+            Some(true)
+        );
     }
 
     #[test]
-    fn an_empty_or_whitespace_message_has_no_marker_and_never_blocks() {
+    fn no_recognisable_box_means_no_verdict() {
+        // Not Claude's TUI (or a layout this does not know): never a false alarm.
+        assert_eq!(
+            composer_contains("$ some shell\n$ ", &submit_marker("hi")),
+            None
+        );
         assert_eq!(submit_marker("   \n\t "), "");
-        assert!(!composer_contains("anything at all", ""));
+        assert_eq!(composer_contains("anything at all", ""), None);
     }
+
     use super::*;
     use crate::types::is_valid_slash_command;
 

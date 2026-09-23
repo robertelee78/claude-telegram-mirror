@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.57] - 2026-09-23
+
+### Fixed (reported: "messages were going back and forth, but was getting false errors when I sent messages")
+- **"⚠️ Reply failed" when the reply had in fact been delivered.** After typing your Telegram reply into the session and pressing Enter, ctm checked whether the text had left the input box — by looking at the bottom 14 lines of the screen. But a just-sent message sits right there as the last line of the conversation, and one sent while the agent is busy is shown by Claude Code as *queued*, also near the bottom. So ctm concluded it hadn't sent, pressed Enter twice more, and warned you. On 2026-09-23 all 11 flagged replies were in the agent's transcript. ctm now finds the input box itself (the lines between Claude Code's two horizontal rules) and checks only that; if it can't find one it doesn't cry wolf. Proven against a real Claude Code session: a message sent while the agent was busy is reported as sent and then answered. When a reply really is stuck, the warning now says so accurately ("typed into the session but didn't send — it's still in the input box") instead of "tmux not detected".
+- **Some Codex tool calls never reached Telegram.** Codex names some tool items `subagent-completed-<uuid>`, which pushed the Details button's data over Telegram's 64-byte limit; Telegram refused the whole message and ctm dropped it. With 0.2.56's packing, one such button could sink a whole post of tool calls. Long ids now use a short form the Details button still resolves, and if Telegram ever refuses a message for its buttons, the text is sent without them rather than dropped.
+
 ## [0.2.56] - 2026-09-23
 
 ### Fixed (reported: "the agent session responded, its response did not go to telegram")

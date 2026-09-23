@@ -1,0 +1,16 @@
+  ⎿  $ sleep 25
+
+❯ QUEUED_TWO say hi after
+  ctrl+x ctrl+s to send now
+
+✳ Architecting… (running PreToolUse hooks… 1/2 · 23s · ↓ 334 tokens)
+  ⎿  Tip: Dynamic workflows let Claude write a script that orchestrates many agents for you. Mention the keyword ultracode or ask Claude to
+     use a workflow directly.
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ STILL_IN_THE_BOX not sent
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ▊ RuFlo V3.44.0 ● qspike  │  Opus 5.5  │  ⏱ 41s  │  ● 7% ctx  │  $1.08
+  Swarm ◉ 1/15  ·  Hooks 0/0  ·  🧠 15%  ·  💾 20MB  ·  🛡 scan pending
+  ⌨️  ruflo completions bash|zsh|fish installs shell tab-completion 🔗 (cognitum.one)
+  ⏵⏵ auto mode on (shift+tab to cycle)

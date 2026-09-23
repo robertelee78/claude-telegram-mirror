@@ -269,6 +269,30 @@ impl SessionManager {
     }
 
     /// The `(tool, input)` recorded for a tool-use id, if it is still retained.
+    /// The tool whose id ends with `suffix` (a Details button for an id too long for
+    /// Telegram's 64-byte callback data carries only the tail — see
+    /// `types::tool_details_callback`). Exact comparison, no LIKE wildcards.
+    pub fn get_tool_details_by_suffix(&self, suffix: &str) -> Result<Option<(String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT tool, input FROM tool_details \
+                 WHERE substr(tool_use_id, -length(?1)) = ?1 ORDER BY created_at DESC LIMIT 1",
+            )
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        let mut rows = stmt
+            .query(rusqlite::params![suffix])
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        match rows.next().map_err(|e| AppError::Database(e.to_string()))? {
+            Some(r) => {
+                let tool: String = r.get(0).map_err(|e| AppError::Database(e.to_string()))?;
+                let input: String = r.get(1).map_err(|e| AppError::Database(e.to_string()))?;
+                Ok(Some((tool, input)))
+            }
+            None => Ok(None),
+        }
+    }
+
     pub fn get_tool_details(&self, tool_use_id: &str) -> Result<Option<(String, String)>> {
         let mut stmt = self
             .conn

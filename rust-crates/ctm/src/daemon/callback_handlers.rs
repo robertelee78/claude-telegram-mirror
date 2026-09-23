@@ -549,11 +549,18 @@ async fn handle_tool_details_callback(ctx: &HandlerContext, tool_use_id: &str, c
         tracing::warn!("IDOR: callback from wrong chat in tool_details");
         return;
     }
+    // A long id arrives as its tail (Telegram's 64-byte callback limit).
+    let key = crate::types::tool_details_key(tool_use_id);
     let cached = {
         let cache = ctx.tool_cache.read().await;
-        cache
-            .get(tool_use_id)
-            .map(|c| (c.tool.clone(), c.input.clone()))
+        match key {
+            crate::types::ToolDetailsKey::Exact(id) => cache.get(id),
+            crate::types::ToolDetailsKey::Suffix(tail) => cache
+                .iter()
+                .find(|(k, _)| k.ends_with(tail))
+                .map(|(_, v)| v),
+        }
+        .map(|c| (c.tool.clone(), c.input.clone()))
     };
     // Fall back to what was written down when the in-memory entry has aged out or the
     // daemon has restarted since the message was sent.
@@ -561,13 +568,18 @@ async fn handle_tool_details_callback(ctx: &HandlerContext, tool_use_id: &str, c
         Some(hit) => Some(hit),
         None => {
             let tuid = tool_use_id.to_string();
-            ctx.db_op(move |sess| sess.get_tool_details(&tuid).ok().flatten())
-                .await
-                .map(|(tool, input)| {
-                    let parsed = serde_json::from_str(&input)
-                        .unwrap_or(serde_json::Value::String(input.clone()));
-                    (tool, parsed)
-                })
+            ctx.db_op(move |sess| match crate::types::tool_details_key(&tuid) {
+                crate::types::ToolDetailsKey::Exact(id) => sess.get_tool_details(id).ok().flatten(),
+                crate::types::ToolDetailsKey::Suffix(tail) => {
+                    sess.get_tool_details_by_suffix(tail).ok().flatten()
+                }
+            })
+            .await
+            .map(|(tool, input)| {
+                let parsed = serde_json::from_str(&input)
+                    .unwrap_or(serde_json::Value::String(input.clone()));
+                (tool, parsed)
+            })
         }
     };
 

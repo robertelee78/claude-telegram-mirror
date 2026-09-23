@@ -228,9 +228,12 @@ async fn handle_telegram_text(ctx: &HandlerContext, msg: &TgMessage, text: &str)
             session_id = %session.id,
             "ADR-013 D1: tmux injection failed despite having a target"
         );
+        // The pane was found, so "tmux not detected" would be false. What is known is
+        // that the text could not be confirmed as sent: it was typed, and it is still
+        // in the input box (injector.rs checks exactly that box since 0.2.56).
         ctx.bot
             .send_message(
-                "\u{26A0}\u{FE0F} Reply failed \u{2014} tmux not detected. Start Claude Code inside tmux for bidirectional chat.",
+                "\u{26A0}\u{FE0F} Your reply was typed into the session but didn't send \u{2014} it's still in the input box. Press Enter there, or send it again.",
                 None,
                 Some(thread_id),
             )

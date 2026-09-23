@@ -182,6 +182,21 @@ impl FakeTelegram {
                 body_text = String::from_utf8_lossy(&body).into_owned();
             }
             let method = path.rsplit('/').next().unwrap_or("").to_string();
+            // Real Telegram rejects a keyboard whose callback_data exceeds 64 bytes.
+            let bad_buttons = serde_json::from_str::<serde_json::Value>(&body_text)
+                .ok()
+                .and_then(|v| v.get("reply_markup").cloned())
+                .and_then(|m| m.get("inline_keyboard").cloned())
+                .and_then(|rows| rows.as_array().cloned())
+                .is_some_and(|rows| {
+                    rows.iter()
+                        .flat_map(|r| r.as_array().cloned().unwrap_or_default())
+                        .any(|b| {
+                            b.get("callback_data")
+                                .and_then(|d| d.as_str())
+                                .is_some_and(|d| d.len() > 64)
+                        })
+                });
             let mut over_limit = None;
             let (behaviour, hold) = {
                 let mut st = self.state.lock().unwrap();
@@ -190,7 +205,7 @@ impl FakeTelegram {
                     .ok()
                     .and_then(|v| v.get("message_thread_id").and_then(|t| t.as_i64()));
                 let dead = thread.is_some_and(|t| st.dead_topics.contains(&t));
-                if method == "sendMessage" && dead {
+                if method == "sendMessage" && (dead || bad_buttons) {
                     // handled below: Telegram's answer for a deleted topic
                 } else if method == "sendMessage" {
                     if let Some(t) = extract_text(&body_text) {
@@ -225,7 +240,10 @@ impl FakeTelegram {
                     .ok()
                     .and_then(|v| v.get("message_thread_id").and_then(|t| t.as_i64()))
                     .is_some_and(|t| self.state.lock().unwrap().dead_topics.contains(&t));
-            let body = if dead_topic {
+            let body = if bad_buttons {
+                r#"{"ok":false,"error_code":400,"description":"Bad Request: BUTTON_DATA_INVALID"}"#
+                    .to_string()
+            } else if dead_topic {
                 r#"{"ok":false,"error_code":400,"description":"Bad Request: message thread not found"}"#.to_string()
             } else if let Some(retry_after) = over_limit {
                 format!(

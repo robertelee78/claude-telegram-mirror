@@ -441,6 +441,18 @@ impl TelegramBot {
             )));
         }
 
+        // A problem with the *buttons* must never cost the text: send it without them.
+        // (Telegram's button errors all start `BUTTON_`, e.g. BUTTON_DATA_INVALID.)
+        if code == 400 && item.buttons.is_some() && desc.contains("BUTTON_") {
+            tracing::warn!(
+                reason = %self.scrub_token(&desc),
+                "ADR-024: Telegram refused this message's buttons; sending the text without them"
+            );
+            let mut bare = item.clone();
+            bare.buttons = None;
+            return Box::pin(self.send_item(&bare)).await;
+        }
+
         // Any other 400 is Telegram refusing this message's content — retrying it
         // unchanged cannot succeed. Everything that is not a 400 (network, 5xx) has
         // already come back as an `Err` from `api_call` and is retried by the drainer.

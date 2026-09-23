@@ -168,12 +168,14 @@ fn injection_into_a_dead_target_fails_rather_than_claiming_success() {
 /// Run it by starting Claude Code in a tmux server and pointing the test at it:
 ///
 /// ```sh
-/// tmux -S /tmp/c.sock new-session -d -s c "cd /some/dir && exec claude"
+/// tmux -S /tmp/c.sock new-session -d -s c "cd /some/dir && TELEGRAM_MIRROR=false exec claude"
 /// CTM_TEST_TMUX_SOCKET=/tmp/c.sock CTM_TEST_TMUX_TARGET=c:0.0 \
 ///   cargo test --test injector_tmux against_a_real_claude -- --ignored
 /// ```
 ///
-/// It spends one small model turn, which is why it is `#[ignore]`. The shell-pane tests
+/// `TELEGRAM_MIRROR=false` keeps the throwaway session out of your Telegram (its
+/// approval hook would otherwise hold a tool call waiting for you there). It spends a
+/// few small model turns, which is why it is `#[ignore]`. The shell-pane tests
 /// above cover the mechanism; this one confirms the composer geometry of the actual TUI
 /// (its composer sits above a status block, not on the last line).
 #[test]
@@ -200,23 +202,52 @@ fn against_a_real_claude_code_pane() {
         .expect("inject ran");
     assert!(ok, "inject reported the message submitted");
 
-    // Submitted means the composer no longer holds it.
-    let pane = Command::new("tmux")
-        .args(["-S", &socket, "capture-pane", "-t", &target, "-p"])
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-        .unwrap_or_default();
-    let bottom: String = pane
-        .lines()
-        .rev()
-        .take(14)
-        .collect::<Vec<_>>()
-        .join("")
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .collect();
+    let capture = || {
+        Command::new("tmux")
+            .args(["-S", &socket, "capture-pane", "-t", &target, "-p"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_default()
+    };
+    // As a user would judge it: Claude answered. The marker appears twice — the prompt
+    // as sent, and the reply.
+    let answered = (0..120).any(|_| {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        capture().matches(&marker).count() >= 2
+    });
+    assert!(answered, "Claude never answered; pane:\n{}", capture());
+
+    // 2026-09-23's false "Reply failed": a message sent while the agent is busy is
+    // *queued* by Claude Code, and ctm reported that as a failure. Make it busy, send
+    // a second message, and it must be reported as sent — and then be answered.
+    let busy = injector
+        .inject(
+            &target,
+            Some(&socket),
+            "Write the numbers 1 to 400, each on its own line, no other text.",
+        )
+        .expect("inject ran");
+    assert!(busy, "the busy-making prompt was submitted");
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let queued_marker = format!("CTMQUEUED{}", std::process::id());
+    let queued = injector
+        .inject(
+            &target,
+            Some(&socket),
+            &format!("after that, reply with exactly {queued_marker}"),
+        )
+        .expect("inject ran");
     assert!(
-        !bottom.contains(&marker),
-        "the composer emptied; bottom was:\n{bottom}"
+        queued,
+        "a message queued while the agent was busy was reported as failed (the false alarm)"
+    );
+    let answered_after = (0..120).any(|_| {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        capture().matches(&queued_marker).count() >= 2
+    });
+    assert!(
+        answered_after,
+        "the queued message was not answered; pane:\n{}",
+        capture()
     );
 }

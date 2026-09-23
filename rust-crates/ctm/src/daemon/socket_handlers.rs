@@ -759,7 +759,7 @@ pub(super) async fn handle_tool_start(ctx: &HandlerContext, msg: &BridgeMessage)
                 &text,
                 vec![InlineButton {
                     text: "\u{1F4CB} Details".into(),
-                    callback_data: format!("tooldetails:{tool_use_id}"),
+                    callback_data: crate::types::tool_details_callback(&tool_use_id),
                 }],
                 Some(&SendOptions {
                     parse_mode: Some("Markdown".into()),
